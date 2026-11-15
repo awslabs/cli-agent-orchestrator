@@ -3,20 +3,14 @@
 On ``post_create_terminal`` for a ``kiro_cli`` provider, writes the CAO
 memory context to ``<cwd>/.kiro/steering/cao-memory.md``. Kiro CLI natively
 loads every ``*.md`` file under ``.kiro/steering/``, so this file is picked
-up automatically. The plugin owns this file end-to-end and overwrites it
-whole on each run (no in-file markers).
+up automatically. CAO marks its section so disabling project-file writes can
+remove it without changing user-authored text in the same file.
 
-Unlike the Claude Code / Codex plugins, the whole-file overwrite means the
-lost-update race (defect B) does not apply here — there is no
-read-modify-write cycle to serialize, only a full replace. But the target
-path is fixed *per working directory* (``<cwd>/.kiro/steering/cao-memory.md``),
-so two terminals sharing a cwd still write the same file, and the old
-fixed ``.tmp`` idiom is still exposed to defect A (one writer's
-``finally``-unlink deleting the other's live temp file → ``FileNotFoundError``,
-or a half-written temp being published). ``locked_atomic_rewrite`` closes
-that hole too: it uses a unique per-call temp file and an inter-process
-lock, so concurrent overwrites are safe even though the content itself does
-not depend on the prior file state.
+The target path is fixed *per working directory*
+(``<cwd>/.kiro/steering/cao-memory.md``), so its managed-section update uses
+``locked_atomic_rewrite``. This holds an inter-process lock across the
+read-strip-append-publish cycle and writes through a unique temp file, keeping
+both concurrent updates and temp-file collisions safe.
 
 Observer-only: runs after terminal creation, logs-and-skips on every
 error path rather than crashing ``cao-server``.
@@ -36,7 +30,10 @@ from cli_agent_orchestrator.services.memory_injection import (
     memory_blocks_have_same_body,
     stamp_memory_block,
 )
-from cli_agent_orchestrator.utils.atomic_file import locked_atomic_delete, locked_atomic_rewrite
+from cli_agent_orchestrator.utils.atomic_file import (
+    locked_atomic_rewrite,
+    locked_atomic_rewrite_or_delete,
+)
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.backends.base import TerminalBackend
@@ -46,6 +43,9 @@ logger = logging.getLogger(__name__)
 
 STEERING_SUBDIR = ".kiro/steering"
 MEMORY_FILENAME = "cao-memory.md"
+BEGIN_MARKER = "<!-- cao-memory:begin -->"
+END_MARKER = "<!-- cao-memory:end -->"
+SEPARATOR_MARKER = "<!-- cao-memory:separator -->"
 
 
 def get_backend() -> "TerminalBackend":
@@ -208,18 +208,10 @@ class KiroCliMemoryPlugin(CaoPlugin):
                 existing = ""
             if memory_blocks_have_same_body(existing, context_block):
                 return
-            # Whole-file overwrite (no read-modify-write), but routed through
-            # the shared locked-atomic helper so concurrent writers sharing a
-            # cwd cannot collide on the temp file (defect A). The compute
-            # callback ignores the existing content by design: this plugin
-            # owns the file end-to-end.
-            #
-            # locked_atomic_rewrite polls with time.sleep up to the lock
-            # timeout; run it off the event loop so a contended lock cannot
-            # stall cao-server for other terminals.
-            await asyncio.to_thread(
-                locked_atomic_rewrite, target, lambda _existing: context_block + "\n"
-            )
+            # The locked callback replaces CAO's section while preserving
+            # user text. It also makes concurrent writers serialize their
+            # read-strip-append-publish cycles.
+            await asyncio.to_thread(self._write_block, target, context_block)
         except Exception as exc:
             logger.warning(
                 "kiro_cli_memory: write failed for %s: %s",
@@ -287,9 +279,50 @@ class KiroCliMemoryPlugin(CaoPlugin):
 
     @staticmethod
     def _remove_owned_file(target: Path) -> None:
-        try:
-            content = target.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return
-        if "<!-- cao-memory:begin -->" in content or 'generated="' in content:
-            locked_atomic_delete(target, must_exist=False)
+        def strip_cao_content(content: str) -> str:
+            stripped = KiroCliMemoryPlugin._strip_existing_block(content)
+            if stripped != content:
+                return stripped
+            # Files published before managed delimiters were introduced were
+            # CAO-owned whole-file writes, so retain their cleanup behavior.
+            return "" if 'generated="' in content else content
+
+        locked_atomic_rewrite_or_delete(
+            target,
+            strip_cao_content,
+            lambda content: not content.strip(),
+        )
+
+    def _write_block(self, target: Path, context_block: str) -> None:
+        def compute_new_content(existing: str) -> str:
+            stripped = self._strip_existing_block(existing)
+            if stripped == existing and 'generated="' in existing:
+                # Replace CAO's pre-delimiter whole-file format rather than
+                # retaining stale memory alongside the new managed section.
+                stripped = ""
+            separator = "" if not stripped or stripped.endswith("\n") else f"\n{SEPARATOR_MARKER}\n"
+            return f"{stripped}{separator}{BEGIN_MARKER}\n{context_block}\n{END_MARKER}\n"
+
+        locked_atomic_rewrite(target, compute_new_content)
+
+    @staticmethod
+    def _strip_existing_block(content: str) -> str:
+        """Remove managed sections with the same separator logic as the writers."""
+        while True:
+            begin = content.find(BEGIN_MARKER)
+            if begin == -1:
+                break
+            end = content.find(END_MARKER, begin + len(BEGIN_MARKER))
+            next_begin = content.find(BEGIN_MARKER, begin + len(BEGIN_MARKER))
+            if end == -1 or (next_begin != -1 and next_begin < end):
+                content = content[:begin] + content[begin + len(BEGIN_MARKER) :]
+                continue
+            before = content[:begin]
+            inserted_separator = f"\n{SEPARATOR_MARKER}\n"
+            if before.endswith(inserted_separator):
+                before = before[: -len(inserted_separator)]
+            after = content[end + len(END_MARKER) :]
+            if before.endswith("\n") and after.startswith("\n"):
+                after = after[1:]
+            content = before + after
+        return content

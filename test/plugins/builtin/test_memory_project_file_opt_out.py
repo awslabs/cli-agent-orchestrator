@@ -106,7 +106,7 @@ async def test_default_does_not_create_project_file_or_fetch_memory(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", CASES[:2], ids=lambda case: case.provider)
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.provider)
 async def test_default_removes_only_cao_block_and_deletes_cao_only_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: ProviderCase
 ) -> None:
@@ -118,12 +118,30 @@ async def test_default_removes_only_cao_block_and_deletes_cao_only_file(
 
     await case.plugin_type().on_post_create_terminal(_event(case))
 
-    assert target.read_bytes() == b"before\n\nafter\n"
+    assert target.read_bytes() == b"before\nafter\n"
     target.write_text(block, encoding="utf-8")
     await case.plugin_type().on_post_create_terminal(_event(case))
     assert not target.exists()
     await case.plugin_type().on_post_create_terminal(_event(case))
     assert not target.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.provider)
+async def test_write_then_default_cleanup_restores_user_file_byte_for_byte(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: ProviderCase
+) -> None:
+    target = tmp_path / case.relative_target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    original = b"user text\n"
+    target.write_bytes(original)
+    _install_cwd(monkeypatch, case, tmp_path)
+
+    plugin = case.plugin_type()
+    plugin._write_block(target, "<cao-memory>new</cao-memory>")
+    await plugin.on_post_create_terminal(_event(case))
+
+    assert target.read_bytes() == original
 
 
 @pytest.mark.asyncio

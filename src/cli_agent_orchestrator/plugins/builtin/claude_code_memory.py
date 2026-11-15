@@ -24,7 +24,10 @@ from cli_agent_orchestrator.services.memory_injection import (
     stamp_memory_block,
     uniquely_delimited_block,
 )
-from cli_agent_orchestrator.utils.atomic_file import locked_atomic_delete, locked_atomic_rewrite
+from cli_agent_orchestrator.utils.atomic_file import (
+    locked_atomic_rewrite,
+    locked_atomic_rewrite_or_delete,
+)
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.backends.base import TerminalBackend
@@ -37,6 +40,7 @@ logger = logging.getLogger(__name__)
 # a well-known injection boundary.
 BEGIN_MARKER = "<!-- cao-memory:begin -->"
 END_MARKER = "<!-- cao-memory:end -->"
+SEPARATOR_MARKER = "<!-- cao-memory:separator -->"
 CLAUDE_FILENAME = "CLAUDE.md"
 CLAUDE_DIR = ".claude"
 
@@ -285,43 +289,18 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
 
         def compute_new_content(existing: str) -> str:
             stripped = self._strip_existing_block(existing)
-            separator = "" if not stripped or stripped.endswith("\n") else "\n"
+            separator = "" if not stripped or stripped.endswith("\n") else f"\n{SEPARATOR_MARKER}\n"
             return f"{stripped}{separator}{BEGIN_MARKER}\n{context_block}\n{END_MARKER}\n"
 
         locked_atomic_rewrite(target, compute_new_content)
 
     @staticmethod
     def _remove_existing_block(target: Path) -> None:
-        try:
-            content = target.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return
-        stripped = ClaudeCodeMemoryPlugin._remove_delimited_blocks(content)
-        if stripped == content:
-            return
-        if not stripped.strip():
-            locked_atomic_delete(target, must_exist=False)
-            return
-        locked_atomic_rewrite(target, lambda _existing: stripped)
-
-    @staticmethod
-    def _remove_delimited_blocks(content: str) -> str:
-        """Remove complete CAO blocks while preserving every other byte."""
-        cursor = 0
-        pieces: list[str] = []
-        while True:
-            begin = content.find(BEGIN_MARKER, cursor)
-            if begin == -1:
-                pieces.append(content[cursor:])
-                return "".join(pieces)
-            end = content.find(END_MARKER, begin + len(BEGIN_MARKER))
-            next_begin = content.find(BEGIN_MARKER, begin + len(BEGIN_MARKER))
-            if end == -1 or (next_begin != -1 and next_begin < end):
-                pieces.append(content[cursor : begin + len(BEGIN_MARKER)])
-                cursor = begin + len(BEGIN_MARKER)
-                continue
-            pieces.append(content[cursor:begin])
-            cursor = end + len(END_MARKER)
+        locked_atomic_rewrite_or_delete(
+            target,
+            ClaudeCodeMemoryPlugin._strip_existing_block,
+            lambda content: not content.strip(),
+        )
 
     @staticmethod
     def _strip_existing_block(content: str) -> str:
@@ -344,11 +323,13 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
                 # Stray/unclosed BEGIN: drop only the marker, keep all content.
                 content = content[:begin] + content[begin + len(BEGIN_MARKER) :]
                 continue
-            before = content[:begin].rstrip("\n")
-            after = content[end + len(END_MARKER) :].lstrip("\n")
-            if before and after:
-                content = f"{before}\n{after}"
-            else:
-                content = before or after
+            before = content[:begin]
+            inserted_separator = f"\n{SEPARATOR_MARKER}\n"
+            if before.endswith(inserted_separator):
+                before = before[: -len(inserted_separator)]
+            after = content[end + len(END_MARKER) :]
+            if before.endswith("\n") and after.startswith("\n"):
+                after = after[1:]
+            content = before + after
 
         return content
