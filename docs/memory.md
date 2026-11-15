@@ -539,6 +539,14 @@ parse/validate/secret pipeline and reports without writing.
 
 ## Context Injection
 
+CAO normally injects memory without touching the project tree. Interactive
+Claude Code and Codex launches receive the block through the provider's start
+prompt. Orchestrated launches receive it on their first CAO-delivered message,
+which preserves task-aware context-manager selection and workflow replay
+semantics. Providers without either prompt seam, including an interactive Kiro
+launch, receive no start-time memory unless project-file injection is explicitly
+enabled.
+
 CAO injects relevant memories into a new session through its first message:
 
 1. **First-message block** — when an agent receives its first message in a session,

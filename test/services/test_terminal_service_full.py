@@ -832,6 +832,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @pytest.mark.parametrize("provider_name", ["claude_code", "codex"])
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog")
     @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_create_terminal_appends_skill_catalog(
@@ -849,8 +850,10 @@ class TestCreateTerminal:
         mock_fifo_manager,
         mock_status_monitor,
         mock_delete_terminals_by_session,
+        provider_name,
+        monkeypatch,
     ):
-        """Providers that consume runtime prompts should receive the global skill catalog."""
+        """Interactive prompt providers receive memory and the global skill catalog once."""
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
@@ -876,19 +879,39 @@ class TestCreateTerminal:
         mock_log_path = MagicMock()
         mock_log_dir.__truediv__.return_value = mock_log_path
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
-
-        await create_terminal("codex", "developer", new_session=True)
-
-        skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
-        assert skill_prompt == (
-            "## Available Skills\n\n"
-            "The following skills are available exclusively in this CAO orchestration context. "
-            "To load a skill's full content, use the `load_skill` MCP tool provided by the "
-            "CAO MCP server. These skills are not accessible through provider-native skill "
-            "commands or directories.\n\n"
-            "- **cao-worker-protocols**: Worker communication\n"
-            "- **python-testing**: Pytest conventions"
+        memory_calls = []
+        monkeypatch.setattr(
+            terminal_service,
+            "memory_context_for_terminal",
+            lambda terminal_id, task_description="": memory_calls.append(
+                (terminal_id, task_description)
+            )
+            or "<cao-memory>start memory</cao-memory>",
         )
+        terminal_service._memory_injected_terminals.discard("test1234")
+
+        try:
+            await create_terminal(provider_name, "developer", new_session=True)
+
+            skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
+            assert skill_prompt == (
+                "<cao-memory>start memory</cao-memory>\n\n"
+                "## Available Skills\n\n"
+                "The following skills are available exclusively in this CAO orchestration "
+                "context. To load a skill's full content, use the `load_skill` MCP tool "
+                "provided by the CAO MCP server. These skills are not accessible through "
+                "provider-native skill commands or directories.\n\n"
+                "- **cao-worker-protocols**: Worker communication\n"
+                "- **python-testing**: Pytest conventions"
+            )
+            assert memory_calls == [("test1234", "")]
+            assert (
+                terminal_service.inject_memory_context("orchestrated task", "test1234")
+                == "orchestrated task"
+            )
+            assert memory_calls == [("test1234", "")]
+        finally:
+            terminal_service._memory_injected_terminals.discard("test1234")
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")

@@ -13,6 +13,7 @@ import pytest
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.terminal_service import (
     _memory_injected_terminals,
+    _memory_start_prompt,
     inject_memory_context,
 )
 
@@ -118,6 +119,36 @@ class TestInjectMemoryContextFunction:
 
         _memory_injected_terminals.discard("term-cleanup")
         assert "term-cleanup" not in _memory_injected_terminals
+
+
+class TestInteractiveStartPrompt:
+    """Interactive prompt providers use the launch-time memory seam."""
+
+    def setup_method(self):
+        _memory_injected_terminals.clear()
+
+    @patch(
+        "cli_agent_orchestrator.services.settings_service.is_memory_enabled",
+        return_value=False,
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.memory_context_for_terminal")
+    def test_kill_switch_skips_start_memory(self, mock_context, _mock_enabled):
+        assert _memory_start_prompt("skills", "term-off") == "skills"
+        mock_context.assert_not_called()
+        assert "term-off" not in _memory_injected_terminals
+
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
+    @patch("cli_agent_orchestrator.services.terminal_service.memory_context_for_terminal")
+    def test_context_manager_preserves_task_aware_first_message(
+        self, mock_context, mock_service_cls
+    ):
+        mock_service = mock_service_cls.return_value
+        mock_service._get_terminal_context.return_value = {"session_name": "cao-session"}
+        mock_service._find_context_manager_terminal.return_value = {"id": "manager"}
+
+        assert _memory_start_prompt("skills", "term-curated") == "skills"
+        mock_context.assert_not_called()
+        assert "term-curated" not in _memory_injected_terminals
 
 
 class TestClaudeCodeInjection:
