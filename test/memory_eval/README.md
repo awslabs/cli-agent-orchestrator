@@ -29,16 +29,12 @@ assertions or deterministic corpus counts to `test_eval_baseline.py`: a phase
 PR updates its own arm's target, never the legacy `default` arm's target. P1a
 owns visibility, P3 owns default ranking, and P4 owns relationship expansion.
 
-To measure an operator store, first copy it into a newly created temporary
-directory, make that copy read-only, and point the separate operator evaluation
-runner at the copy. Never point an evaluation process at the live CAO home:
+## Future operator-store evaluation
 
-```bash
-scratch="$(mktemp -d)"
-cp -R "$CAO_HOME_DIR/memory" "$scratch/memory"
-CAO_HOME_DIR="$scratch" HOME="$scratch/fake-home" <operator-eval-command>
-```
+An operator-store evaluation runner is planned under #1329 but does not exist
+yet. When implemented, it must evaluate only a read-only copy in a newly
+created temporary directory and retain the same temporary-home refusal used by
+this harness. Never point an evaluation process at the live CAO home.
 
-The production-copy runner must retain the same temporary-home refusal used by
-this harness. The synthetic fixture runner above is the CI baseline and does
-not seed or inspect the copied operator data.
+The synthetic fixture runner above is the CI baseline and does not seed or
+inspect operator data.
