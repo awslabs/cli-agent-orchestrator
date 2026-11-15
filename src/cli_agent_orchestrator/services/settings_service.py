@@ -753,6 +753,7 @@ def get_memory_settings() -> Dict[str, Any]:
         "explain_enabled": True,
         "non_accessing_inspection": False,
         "lifecycle": {"enabled": False},
+        "ranking": {"default_sort": "recency"},
     }
     saved = settings.get("memory", {})
     if not isinstance(saved, dict):
