@@ -24,7 +24,9 @@ def _fixture_home(tmp_path: Path, monkeypatch) -> tuple[Path, tuple[Path, ...]]:
         "- 2026-01-02T00:00:00Z [relationship_mutation] "
         "scope_id=project source_key=b-0123abcd — `relationship created`\n"
         "- 2026-01-02T00:00:01Z [instruction_promotion] "
-        "profile=transformer — `promoted lessons`\n",
+        "profile=transformer — `promoted lessons`\n"
+        "- 2026-01-02T00:00:02Z [memory_stored] "
+        "scope=global — `real operator event`\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(command_module, "MEMORY_BASE_DIR", base)
@@ -40,6 +42,7 @@ def test_doctor_fixtures_is_dry_run_by_default(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert "DRY-RUN" in result.output
     assert "audit_events=2" in result.output
+    assert "audit_bytes=" in result.output
     assert {path: path.read_bytes() for path in files} == before
     assert not (base / ".quarantine").exists()
 
@@ -53,7 +56,7 @@ def test_doctor_apply_requires_backup(tmp_path, monkeypatch):
     assert "--backup" in result.output
 
 
-def test_doctor_apply_backs_up_then_quarantines_matches(tmp_path, monkeypatch):
+def test_doctor_apply_quarantines_topics_but_only_reports_audit_log(tmp_path, monkeypatch):
     base, files = _fixture_home(tmp_path, monkeypatch)
     original = {path.relative_to(base): path.read_bytes() for path in files}
     backup = tmp_path / "backup"
@@ -64,10 +67,23 @@ def test_doctor_apply_backs_up_then_quarantines_matches(tmp_path, monkeypatch):
     )
 
     assert result.exit_code == 0, result.output
-    assert "moved=3" in result.output
-    assert all(not path.exists() for path in files)
-    for relative, content in original.items():
+    assert "audit_events=2" in result.output
+    assert "audit_bytes=" in result.output
+    assert "report-only fixture_relationship_audit,transformer_promotion_audit" in result.output
+    assert "moved=2" in result.output
+
+    topic_files = files[:2]
+    assert all(not path.exists() for path in topic_files)
+    for path in topic_files:
+        relative = path.relative_to(base)
+        content = original[relative]
         assert (backup / relative).read_bytes() == content
         quarantined = list((base / ".quarantine").glob(f"*/{relative}"))
         assert len(quarantined) == 1
         assert quarantined[0].read_bytes() == content
+
+    audit = files[2]
+    audit_relative = audit.relative_to(base)
+    assert audit.read_bytes() == original[audit_relative]
+    assert not (backup / audit_relative).exists()
+    assert not list((base / ".quarantine").glob(f"*/{audit_relative}"))

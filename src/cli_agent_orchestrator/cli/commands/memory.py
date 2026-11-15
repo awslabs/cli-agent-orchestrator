@@ -64,6 +64,7 @@ class _FixtureFinding:
     shapes: tuple[str, ...]
     audit_events: int = 0
     audit_bytes: int = 0
+    report_only: bool = False
 
 
 _RETROSPECTOR_FIXTURE_TEXT = "Use X. Applies when: transforming Y."
@@ -126,6 +127,7 @@ def _scan_fixture_file(base_dir: Path, path: Path) -> _FixtureFinding | None:
         shapes=tuple(sorted(shapes)),
         audit_events=audit_events,
         audit_bytes=audit_bytes,
+        report_only=relative.parts[:2] == ("logs", "memory"),
     )
 
 
@@ -168,7 +170,7 @@ def _prepare_fixture_backup(base_dir: Path, backup: Path, findings: list[_Fixtur
     "--apply",
     "do_apply",
     is_flag=True,
-    help="Back up and move matching files into memory/.quarantine/.",
+    help="Back up and move matching topic files into memory/.quarantine/.",
 )
 @click.option(
     "--backup",
@@ -195,19 +197,28 @@ def doctor_cmd(fixtures: bool, do_apply: bool, backup: Path | None) -> None:
         f"audit_events={audit_events} audit_bytes={audit_bytes}"
     )
     for finding in findings:
-        click.echo(f"{','.join(finding.shapes)} {finding.path.relative_to(base_dir).as_posix()}")
+        disposition = "report-only" if finding.report_only else "quarantine"
+        click.echo(
+            f"{disposition} {','.join(finding.shapes)} "
+            f"{finding.path.relative_to(base_dir).as_posix()}"
+        )
     if not do_apply or not findings:
         return
 
+    movable_findings = [finding for finding in findings if not finding.report_only]
+    if not movable_findings:
+        click.echo("moved=0")
+        return
+
     assert backup is not None
-    _prepare_fixture_backup(base_dir, backup, findings)
+    _prepare_fixture_backup(base_dir, backup, movable_findings)
     quarantine = (
         base_dir
         / ".quarantine"
         / f"fixtures-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
     )
     moved = 0
-    for finding in findings:
+    for finding in movable_findings:
         relative = finding.path.relative_to(base_dir)
         destination = quarantine / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
