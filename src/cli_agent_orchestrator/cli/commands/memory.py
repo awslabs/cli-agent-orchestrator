@@ -572,6 +572,7 @@ def show(key, scope):
                 limit=100,
                 terminal_context=_cwd_context(),
                 scan_all=True,
+                search_mode="metadata",
                 record_access=not is_non_accessing_inspection_enabled(),
             )
         )

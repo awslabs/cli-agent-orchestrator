@@ -4,6 +4,7 @@ CLI command tests mock MemoryService to isolate command logic.
 """
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from test.fixtures.vault_factory import build_vault_fixture
@@ -188,6 +189,42 @@ class TestMemoryList:
 class TestMemoryShow:
     """U8.3: cao memory show — finds key and displays content."""
 
+    def test_memory_show_finds_exact_key_with_bm25_default(self, tmp_path, monkeypatch):
+        """A BM25 query must not hide an exact key outside its top 100 results."""
+        engine = create_engine(f"sqlite:///{tmp_path / 'memory.db'}")
+        Base.metadata.create_all(engine)
+        service = MemoryService(base_dir=tmp_path / "native", db_engine=engine)
+        settings_service.SETTINGS_FILE.write_text(
+            json.dumps({"memory": {"ranking": {"default_sort": "bm25"}}}),
+            encoding="utf-8",
+        )
+        asyncio.run(
+            service.store(
+                content="the requested note",
+                key="exact-key",
+                scope="global",
+                memory_type="reference",
+            )
+        )
+        for number in range(100):
+            asyncio.run(
+                service.store(
+                    content="exact key exact key exact key",
+                    key=f"ranked-note-{number}",
+                    scope="global",
+                    memory_type="reference",
+                )
+            )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.memory._get_memory_service",
+            lambda: service,
+        )
+
+        result = CliRunner().invoke(show, ["exact-key"])
+
+        assert result.exit_code == 0
+        assert "the requested note" in result.output
+
     @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
     def test_memory_show_displays_content(self, mock_get_svc):
         """show command should display full memory content."""
@@ -210,6 +247,7 @@ class TestMemoryShow:
         # Verify CWD context and scan_all are passed so project memories are found
         call_kwargs = mock_svc.recall.call_args.kwargs
         assert call_kwargs.get("scan_all") is True
+        assert call_kwargs.get("search_mode") == "metadata"
         assert "cwd" in (call_kwargs.get("terminal_context") or {})
 
     @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
