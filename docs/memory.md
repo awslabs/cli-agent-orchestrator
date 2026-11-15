@@ -220,8 +220,8 @@ memory_recall(
   scope="project",         # optional, filter by scope
   memory_type=None,        # optional, filter by type
   limit=10,                # optional, default 10, max 100
-  search_mode="hybrid",    # optional: "hybrid" (default), "bm25", "metadata"
-  sort_by="recency",       # optional: "recency" (default), "score", "usage", "relevance"
+  search_mode=None,        # optional: "hybrid" (default), "bm25", "metadata"
+  sort_by=None,            # optional: "recency" (default), "score", "usage", "relevance"
   include_related=False    # optional, expand cross-referenced memories
 )
 ```
@@ -229,6 +229,12 @@ memory_recall(
 `sort_by` controls ranking: `recency` (newest first), `score` (composite 3-factor —
 BM25 relevance + recency + usage), or `usage` (most accessed). When no `scope` is
 given, results follow scope precedence: `session` > `project` > `global`.
+
+`memory.ranking.default_sort` defaults to `recency`, preserving the existing result
+order. Set it to `bm25` to make query recalls with neither `search_mode` nor `sort_by`
+rank like `search_mode="bm25"`; no-query listings remain recency ordered, and explicit
+arguments always win. This is an opt-in measurement against #861's relevance-first
+proposal, not a change to the default.
 
 `relevance` is opt-in and needs a query; omitted, empty and whitespace-only
 queries follow the exact `recency` path. Other sort modes keep their existing

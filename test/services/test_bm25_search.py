@@ -359,7 +359,7 @@ class TestMcpRecallSearchMode:
 
     @patch("cli_agent_orchestrator.mcp_server.server._get_terminal_context_from_env")
     @patch("cli_agent_orchestrator.services.memory_service.MemoryService")
-    def test_mcp_recall_defaults_to_hybrid(self, MockService, mock_ctx):
+    def test_mcp_recall_leaves_default_search_mode_for_service(self, MockService, mock_ctx):
         from cli_agent_orchestrator.mcp_server.server import memory_recall
 
         mock_ctx.return_value = None
@@ -369,4 +369,4 @@ class TestMcpRecallSearchMode:
         _result = run_async(memory_recall(query="test"))
 
         call_kwargs = instance.recall.call_args.kwargs
-        assert call_kwargs["search_mode"] == "hybrid"
+        assert call_kwargs["search_mode"] is None

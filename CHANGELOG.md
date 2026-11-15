@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of skipping them, while `--apply --add-headings` first writes a `.md.bak` copy and then adds
   the heading. Recency-ranked keyword results can shift because previously invisible notes now
   participate; a later phase adds the BM25 default.
+- **Memory recall can opt into BM25-first query ranking** with
+  `memory.ranking.default_sort="bm25"` (#1329). The default remains `recency`;
+  explicit `search_mode` and `sort_by` arguments keep precedence, and no-query listings
+  remain recency ordered.
 - **Codex "Trust this folder?" dialogs (0.156 and later) are accepted before the first input** (#1319).
   Recognise the "Trust this folder?" header and its "enter continue · esc back", "esc quit"
   and "esc cancel" footers while keeping earlier wordings and ignoring dismissed dialogs
@@ -235,6 +239,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   idempotent for its own retries) instead of answering 409, and with `lookup_only=true` it answers
   404, the same as an unused key. Stored key values change, so a keyed retry that spans the
   upgrade creates a new terminal once instead of replaying.
+
+- **Kimi Code 2.3 and Cursor 2026.10.22 replies** (#1149): recognise the new
+  submission/trust and coloured-panel layouts, and recover Kimi execution evidence
+  after long prompt redraws. Kimi turns that finish without a final text answer
+  complete after a short, stable ready interval; fetching their answer still reports
+  an extraction error. **Behaviour change:** synchronous `cao session send` exits 1
+  when fetching the answer fails, instead of silently exiting 0. Ctrl-C still exits 130.
+  Cursor reports an extraction error instead of returning the raw terminal transcript
+  when neither the panel nor the legacy separator layout identifies the answer.
+
 - **Breaking: `GET /agui/v1/stream` is now an AG-UI 1.0 conformant run by default, and
   `POST /agui/v1/stream` is added** (#1193). Each connection is one run: `RUN_STARTED` first,
   `data:`-only frames with `type` in the JSON (no `event:` lines), schema field names, integer
