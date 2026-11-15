@@ -3,9 +3,12 @@
 from pathlib import Path
 
 from click.testing import CliRunner
+from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.cli.commands import memory as command_module
 from cli_agent_orchestrator.cli.commands.memory import memory
+from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+from cli_agent_orchestrator.services.memory_service import MemoryService
 
 
 def _fixture_home(tmp_path: Path, monkeypatch) -> tuple[Path, tuple[Path, ...]]:
@@ -16,11 +19,11 @@ def _fixture_home(tmp_path: Path, monkeypatch) -> tuple[Path, tuple[Path, ...]]:
     for path in (topic, lesson, audit):
         path.parent.mkdir(parents=True, exist_ok=True)
     topic.write_text(
-        "# topic-x\n\n" "## 2026-01-02T00:00:00Z\nalpha\n\n" "## 2026-01-02T00:00:01Z\nbeta\n",
+        "# topic-x\n\n## 2026-01-02T00:00:00Z\nalpha\n\n" + "## 2026-01-02T00:00:01Z\nbeta\n",
         encoding="utf-8",
     )
     lesson.write_text(
-        "# lesson\n\n## 2026-01-02T00:00:00Z\n" "Use X. Applies when: transforming Y.\n",
+        "# lesson\n\n## 2026-01-02T00:00:00Z\n" + "Use X. Applies when: transforming Y.\n",
         encoding="utf-8",
     )
     audit.write_text(
@@ -80,10 +83,41 @@ def test_doctor_apply_requires_backup(tmp_path, monkeypatch):
     assert "--backup" in result.output
 
 
-def test_doctor_apply_quarantines_topics_but_only_reports_audit_log(tmp_path, monkeypatch):
+def test_doctor_apply_removes_topic_projections_but_only_reports_audit_log(
+    tmp_path, monkeypatch, isolated_memory_db
+):
     base, files = _fixture_home(tmp_path, monkeypatch)
     original = {path.relative_to(base): path.read_bytes() for path in files}
     backup = tmp_path / "backup"
+    service = MemoryService(base_dir=base, db_engine=isolated_memory_db)
+    identities = (
+        ("project", "fixture-project", "topic-x", files[0]),
+        ("agent", "transformer", "lesson", files[1]),
+    )
+    for scope, scope_id, key, path in identities:
+        service._update_index(
+            scope,
+            scope_id,
+            key,
+            "feedback",
+            "",
+            path.read_text(encoding="utf-8"),
+            "2026-01-02T00:00:02Z",
+            "add",
+        )
+        service._upsert_metadata(
+            key,
+            "feedback",
+            scope,
+            scope_id,
+            str(path),
+            "",
+            None,
+            None,
+            1,
+        )
+    index_paths = {service.get_index_path(scope, scope_id) for scope, scope_id, _, _ in identities}
+    assert all(path.exists() for path in index_paths)
 
     result = CliRunner().invoke(
         memory,
@@ -105,6 +139,13 @@ def test_doctor_apply_quarantines_topics_but_only_reports_audit_log(tmp_path, mo
         quarantined = list((base / ".quarantine").glob(f"*/{relative}"))
         assert len(quarantined) == 1
         assert quarantined[0].read_bytes() == content
+
+    for index_path in index_paths:
+        index = index_path.read_text(encoding="utf-8")
+        assert "topic-x" not in index
+        assert "lesson" not in index
+    with sessionmaker(bind=isolated_memory_db)() as db:
+        assert db.query(MemoryMetadataModel).count() == 0
 
     audit = files[2]
     audit_relative = audit.relative_to(base)

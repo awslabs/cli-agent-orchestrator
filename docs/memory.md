@@ -385,9 +385,9 @@ fixture events and bytes are counted in dry-run and apply output, but the files
 are never copied, moved, or otherwise changed because they may also contain real
 events. The detector recognises the `topic-x`/`topic-y` fixture keys, the
 synthetic retrospector lesson, `b-<hex8>` and `scope_id=project` relationship
-events, and `transformer` instruction-promotion events. Run
-`cao memory repair --apply` after reviewing a quarantine if the removed topic
-files had metadata/index projections.
+events, and `transformer` instruction-promotion events. For each quarantined
+native topic, apply also removes its `index.md` entry and SQLite metadata row;
+the backup and quarantined copy retain the original file.
 
 ### Key truncation
 

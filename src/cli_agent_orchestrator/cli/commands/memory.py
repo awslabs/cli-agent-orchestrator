@@ -145,6 +145,34 @@ def _fixture_findings(base_dir: Path) -> list[_FixtureFinding]:
     ]
 
 
+def _fixture_memory_identity(base_dir: Path, path: Path) -> tuple[str, str | None, str] | None:
+    """Return the native memory identity encoded by a canonical topic path."""
+    try:
+        relative = path.relative_to(base_dir)
+    except ValueError:
+        return None
+    parts = relative.parts
+    if len(parts) < 4 or parts[1] != "wiki":
+        return None
+    scope = parts[2]
+    if scope not in {item.value for item in MemoryScope}:
+        return None
+    if scope in {MemoryScope.SESSION.value, MemoryScope.AGENT.value}:
+        if len(parts) != 5:
+            return None
+        scope_id, filename = parts[3], parts[4]
+    else:
+        if len(parts) != 4:
+            return None
+        scope_id = parts[0] if scope == MemoryScope.PROJECT.value else None
+        filename = parts[3]
+    key = Path(filename).stem
+    service = MemoryService(base_dir=base_dir)
+    if service.get_wiki_path(scope, scope_id, key).resolve() != path.resolve():
+        return None
+    return scope, scope_id, key
+
+
 def _prepare_fixture_backup(base_dir: Path, backup: Path, findings: list[_FixtureFinding]) -> None:
     try:
         backup.resolve().relative_to(base_dir.resolve())
@@ -216,6 +244,7 @@ def doctor_cmd(fixtures: bool, do_apply: bool, backup: Path | None) -> None:
 
     assert backup is not None
     _prepare_fixture_backup(base_dir, backup, movable_findings)
+    service = MemoryService(base_dir=base_dir)
     quarantine = (
         base_dir
         / ".quarantine"
@@ -224,9 +253,17 @@ def doctor_cmd(fixtures: bool, do_apply: bool, backup: Path | None) -> None:
     moved = 0
     for finding in movable_findings:
         relative = finding.path.relative_to(base_dir)
+        identity = _fixture_memory_identity(base_dir, finding.path)
         destination = quarantine / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(finding.path), str(destination))
+        if identity is not None:
+            scope, scope_id, key = identity
+            index_path = service.get_index_path(scope, scope_id)
+            if index_path.exists():
+                timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                service._update_index(scope, scope_id, key, "", "", "", timestamp, "remove")
+            service._delete_metadata(key, scope, scope_id)
         moved += 1
         click.echo(f"moved {relative.as_posix()} -> {destination.relative_to(base_dir).as_posix()}")
     click.echo(f"moved={moved} backup={backup}")
