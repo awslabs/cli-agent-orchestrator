@@ -24,6 +24,7 @@ _DEFAULTS = {
 
 _BOOL_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _BOOL_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+# To add write_project_files, add its bool default here and a matching InjectionConfig field.
 MEMORY_INJECTION_DEFAULTS = {
     "clear_on_empty": True,
     "v1_fixes": True,
@@ -838,23 +839,26 @@ def get_memory_settings() -> Dict[str, Any]:
 
 def _memory_injection_flag(key: str) -> bool:
     """Read one default-on injection fix; invalid/read errors stay on."""
+    default = MEMORY_INJECTION_DEFAULTS[key]
     try:
         injection = get_memory_settings().get("injection", {})
-        value = injection.get(key, True) if isinstance(injection, dict) else True
+        value = injection.get(key, default) if isinstance(injection, dict) else default
         if isinstance(value, bool):
             return value
         logger.warning(
-            "Invalid memory.injection.%s=%r (expected bool); defaulting to True",
+            "Invalid memory.injection.%s=%r (expected bool); defaulting to %s",
             key,
             value,
+            default,
         )
     except Exception as exc:
         logger.warning(
-            "Failed to read memory.injection.%s, defaulting to True: %s",
+            "Failed to read memory.injection.%s, defaulting to %s: %s",
             key,
+            default,
             exc,
         )
-    return True
+    return default
 
 
 def is_memory_injection_clear_on_empty_enabled() -> bool:
@@ -1313,7 +1317,7 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
                 f"ranking.default_sort must be one of {sorted(DEFAULT_SORT_VALUES)}, got {value!r}"
             )
         coerced = value
-    elif key in {"injection.clear_on_empty", "injection.v1_fixes"}:
+    elif key.startswith("injection.") and key.split(".", 1)[1] in MEMORY_INJECTION_DEFAULTS:
         if not isinstance(value, bool):
             raise ValueError(f"{key} must be a bool")
         coerced = value

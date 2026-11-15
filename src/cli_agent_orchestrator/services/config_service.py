@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 from pydantic import BaseModel, Field
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.services.vault.config import VaultConfig
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite, locked_atomic_write
 
@@ -471,10 +472,17 @@ def _get_owned_section(path: str, default: Any) -> Any:
     if section == "memory":
         if key == "lifecycle.enabled":
             return settings_service.is_memory_lifecycle_enabled()
-        if key in {"injection.clear_on_empty", "injection.v1_fixes"}:
+        if key.startswith("injection."):
+            injection_key = key.split(".", 1)[1]
+            if injection_key not in settings_service.MEMORY_INJECTION_DEFAULTS:
+                raise KeyError(path)
             injection = settings_service.get_memory_settings().get("injection", {})
-            nested_key = key.split(".", 1)[1]
-            return injection.get(nested_key, default) if isinstance(injection, dict) else default
+            injection_default = settings_service.MEMORY_INJECTION_DEFAULTS[injection_key]
+            return (
+                injection.get(injection_key, injection_default)
+                if isinstance(injection, dict)
+                else injection_default
+            )
         if key == "ranking.default_sort":
             ranking = settings_service.get_memory_settings().get("ranking", {})
             return ranking.get("default_sort", default) if isinstance(ranking, dict) else default
@@ -639,6 +647,7 @@ def _set_keep_finished_value(path: str, value: Any) -> Any:
 
 _ALL_PATHS = sorted(
     set(_PATH_TO_ENV.keys())
+    | {f"memory.injection.{key}" for key in settings_service.MEMORY_INJECTION_DEFAULTS}
     | {
         "agents.dirs",
         "agents.extra_dirs",
@@ -654,8 +663,6 @@ _ALL_PATHS = sorted(
         "memory.compile_mode",
         "memory.flush_threshold",
         "memory.compile_timeout_s",
-        "memory.injection.clear_on_empty",
-        "memory.injection.v1_fixes",
         "memory.ranking.default_sort",
         "memory.vault",
         "terminal.keep_finished.enabled",
@@ -746,8 +753,10 @@ class ConfigService:
                 non_accessing_inspection=settings_service.is_non_accessing_inspection_enabled(),
                 lifecycle=LifecycleConfig(enabled=settings_service.is_memory_lifecycle_enabled()),
                 injection=InjectionConfig(
-                    clear_on_empty=_get_value("memory.injection.clear_on_empty", default=True),
-                    v1_fixes=_get_value("memory.injection.v1_fixes", default=True),
+                    **{
+                        key: _get_value(f"memory.injection.{key}", default=default)
+                        for key, default in settings_service.MEMORY_INJECTION_DEFAULTS.items()
+                    }
                 ),
                 ranking=RankingConfig(
                     default_sort=_get_value("memory.ranking.default_sort", default="recency")
