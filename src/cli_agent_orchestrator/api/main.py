@@ -654,15 +654,6 @@ class RunStepRequest(BaseModel):
         description="Delete the created terminal after the step (ignored when reusing)",
     )
     timeout: float = Field(default=600.0, description="Max seconds to wait for completion", gt=0)
-    timeout_excludes_waiting: bool = Field(
-        default=False, description="Pause the completion timeout while awaiting a user answer"
-    )
-    max_waiting: Optional[float] = Field(
-        default=None,
-        gt=0,
-        allow_inf_nan=False,
-        description="Maximum total seconds awaiting user answers when timeout_excludes_waiting is true",
-    )
     working_directory: Optional[str] = Field(
         default=None, description="Working directory for a freshly created terminal"
     )
@@ -845,6 +836,15 @@ class RunStepRequest(BaseModel):
 
     delegation_message: Optional[str] = Field(default=None, min_length=1)
     orchestration_type: Optional[Literal["handoff"]] = None
+    timeout_excludes_waiting: bool = Field(
+        default=False, description="Pause the completion timeout while awaiting a user answer"
+    )
+    max_waiting: Optional[float] = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        description="Maximum total seconds awaiting user answers when timeout_excludes_waiting is true",
+    )
 
     @model_validator(mode="after")
     def validate_waiting_timeout(self) -> "RunStepRequest":
@@ -872,9 +872,6 @@ class RunStepResponse(BaseModel):
     terminal_id: str
     last_message: str
     status: str
-    waited_seconds: Optional[float] = Field(
-        default=None, description="Seconds observed awaiting user answers during completion polling"
-    )
     torn_down: bool = Field(
         default=False,
         description=(
@@ -910,6 +907,10 @@ class RunStepResponse(BaseModel):
             "worker: one sentence saying whether it was kept and why, including any "
             "kept agent torn down to stay within the per-session cap. Absent otherwise."
         ),
+    )
+    waited_seconds: Optional[float] = Field(
+        default=None,
+        description="Seconds observed awaiting user answers when timeout_excludes_waiting is true",
     )
 
 
@@ -5873,8 +5874,7 @@ async def _record_job_state(job_id: Optional[str], state: str, **fields: Any) ->
 @app.post(
     TERMINALS_RUN_STEP_ROUTE,
     response_model=RunStepResponse,
-    # The two #1225 keep fields are the only Optional ones, so this keeps every
-    # response body without a keep byte-identical to the one before #1225.
+    # Omit keep and wait metadata when their options do not apply.
     response_model_exclude_none=True,
     summary="Run one agent step (shared substrate)",
     description=(
@@ -6196,7 +6196,9 @@ async def run_step(
                     last_message=envelope.last_message,
                     status=envelope.status,
                     replayed=True,
-                    waited_seconds=envelope.waited_seconds,
+                    waited_seconds=(
+                        envelope.waited_seconds if body.timeout_excludes_waiting else None
+                    ),
                 )
             if decision.verdict is step_replay.ReplayVerdict.DIVERGED:
                 # FR-3's surfacing. NO fingerprint travels with it, and none can be
@@ -6313,12 +6315,13 @@ async def run_step(
         response_status = (
             result.status.value if hasattr(result.status, "value") else str(result.status)
         )
+        waited_seconds = result.waited_seconds if body.timeout_excludes_waiting else None
         _settle_step(
             result.terminal_id,
             None,
             result.last_message,
             response_status,
-            waited_seconds=result.waited_seconds,
+            waited_seconds=waited_seconds,
         )
         keep_outcome = keep_outcomes[0] if keep_outcomes else keep_service.NOT_APPLICABLE
         _schedule_elastic_terminal_ended(
@@ -6341,7 +6344,7 @@ async def run_step(
             status=response_status,
             # False for a kept worker: it was not torn down (#1203 / #1225).
             torn_down=result.torn_down,
-            waited_seconds=result.waited_seconds,
+            waited_seconds=waited_seconds,
             kept_until=keep_outcome.kept_until if keep_outcome.kept else None,
             keep_note=keep_outcome.note,
         )
