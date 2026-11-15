@@ -17,7 +17,7 @@ import type {
 } from '../api'
 import { useStore } from '../store'
 import { StepEditor } from '../components/workflow/StepEditor'
-import { WorkflowBuilder, STALE_MESSAGE, describeSaveError } from '../components/workflow/WorkflowBuilder'
+import { WorkflowBuilder, STALE_MESSAGE, copyName, describeSaveError, yamlTopLevelName } from '../components/workflow/WorkflowBuilder'
 import { WorkflowFlow, runFlowSteps, runStepStates, flowStateView } from '../components/workflow/WorkflowFlow'
 import { WorkflowLauncher, isYamlWorkflow } from '../components/workflow/WorkflowLauncher'
 import { WorkflowsPanel } from '../components/WorkflowsPanel'
@@ -253,11 +253,282 @@ const SPEC: WorkflowSpec = {
   content_hash: 'hash-1',
 }
 
+describe('WorkflowBuilder: Clone from', () => {
+  const STORED: WorkflowDefRow[] = [
+    { name: 'demo', source_path: '/wf/demo.yaml', mode: 'sequential', step_count: 2, description: 'Demo check', indexed_at: '' },
+    { name: 'demo-copy', source_path: '/wf/demo-copy.yaml', mode: 'sequential', step_count: 2, description: '', indexed_at: '' },
+    { name: 'review_flow', source_path: '/wf/review_flow.py', mode: 'script', step_count: null, description: '', indexed_at: '' },
+  ]
+
+  beforeEach(() => {
+    vi.spyOn(api, 'listProviders').mockResolvedValue(PROVIDERS)
+    vi.spyOn(api, 'searchProfiles').mockImplementation(async q => [result(q)])
+    vi.spyOn(api, 'getProfile').mockImplementation(async name => ({ name, description: '', provider: 'claude_code' }))
+    vi.spyOn(api, 'listWorkflows').mockResolvedValue(STORED)
+    vi.spyOn(api, 'validateWorkflowSource').mockResolvedValue({ status: 'pass', errors: [] })
+  })
+
+  const cloneFrom = () => screen.findByRole('combobox', { name: 'Clone from' })
+
+  it('lists None and each stored YAML workflow by name, but no Python workflow', async () => {
+    render(<WorkflowBuilder mode="create" onClose={() => {}} onSaved={() => {}} />)
+    const select = await cloneFrom()
+    expect(within(select).getAllByRole('option').map(o => o.textContent)).toEqual(['None', 'demo', 'demo-copy'])
+    expect(select).toHaveValue('')
+    expect(screen.getByText(/Only YAML workflows are listed/)).toBeInTheDocument()
+  })
+
+  it('fills a blank form from the copy under a free name, and saves it as a new workflow', async () => {
+    vi.spyOn(api, 'getWorkflowSpec').mockResolvedValue(SPEC)
+    const create = vi.spyOn(api, 'createWorkflow').mockResolvedValue({
+      name: 'demo-copy-2', path: '/wf/demo-copy-2.yaml', content_hash: 'h2', findings: [], status: 'pass_reserved', reserved_notes: [],
+    })
+    const update = vi.spyOn(api, 'updateWorkflow')
+    const onSaved = vi.fn()
+    render(<WorkflowBuilder mode="create" onClose={() => {}} onSaved={onSaved} />)
+    fireEvent.change(await cloneFrom(), { target: { value: 'demo' } })
+    // A blank form is replaced without asking.
+    expect(screen.queryByText(/This replaces everything in the form/)).toBeNull()
+    await waitFor(() => expect(screen.getByLabelText('Workflow name')).toHaveValue('demo-copy-2'))
+    expect(api.getWorkflowSpec).toHaveBeenCalledWith('demo')
+    expect(screen.getByLabelText('Workflow description')).toHaveValue('Demo check')
+    expect(screen.getByLabelText('Workflow input 1 name')).toHaveValue('run_label')
+    expect(screen.getByLabelText('Step 1 id')).toHaveValue('send')
+    expect(screen.getByLabelText('Step 2 id')).toHaveValue('check')
+    expect(screen.getByText(/Cloned from demo\. Saving creates a new workflow and leaves demo unchanged\./)).toBeInTheDocument()
+    expect(screen.getByRole('combobox', { name: 'Clone from' })).toHaveValue('demo')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create workflow' }))
+    await waitFor(() => expect(onSaved).toHaveBeenCalledWith('demo-copy-2', expect.objectContaining({ content_hash: 'h2' })))
+    expect(create.mock.calls[0][0]).toBe('demo-copy-2')
+    expect(create.mock.calls[0][1]).toContain('"name": "demo-copy-2"')
+    expect(create.mock.calls[0][1]).toContain('"aws-profile-name": "beta"')
+    expect(create.mock.calls[0][2]).toBe('yaml')
+    expect(update).not.toHaveBeenCalled()
+  })
+
+  it('asks before replacing a form that is not blank, and keeps the form on Keep editing', async () => {
+    const get = vi.spyOn(api, 'getWorkflowSpec').mockResolvedValue(SPEC)
+    render(<WorkflowBuilder mode="create" onClose={() => {}} onSaved={() => {}} />)
+    const select = await cloneFrom()
+    fireEvent.change(screen.getByLabelText('Workflow name'), { target: { value: 'mine' } })
+
+    fireEvent.change(select, { target: { value: 'demo' } })
+    expect(await screen.findByText(/This replaces everything in the form/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Keep editing' }))
+    expect(screen.queryByText(/This replaces everything in the form/)).toBeNull()
+    expect(screen.getByLabelText('Workflow name')).toHaveValue('mine')
+    expect(select).toHaveValue('')
+    expect(get).not.toHaveBeenCalled()
+
+    fireEvent.change(select, { target: { value: 'demo' } })
+    fireEvent.click(await screen.findByRole('button', { name: 'Replace' }))
+    await waitFor(() => expect(screen.getByLabelText('Workflow name')).toHaveValue('demo-copy-2'))
+
+    // Back to a blank workflow asks too, then clears the form.
+    fireEvent.change(select, { target: { value: '' } })
+    expect(await screen.findByText('This clears everything in the form.')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Replace' }))
+    await waitFor(() => expect(screen.getByLabelText('Workflow name')).toHaveValue(''))
+    expect(screen.getByLabelText('Workflow description')).toHaveValue('')
+    expect(screen.queryByLabelText('Step 2 id')).toBeNull()
+    expect(select).toHaveValue('')
+  })
+
+  it('keeps the form and names the blocking fields when the builder cannot represent the source', async () => {
+    vi.spyOn(api, 'getWorkflowSpec').mockResolvedValue({ ...SPEC, mode: 'parallel' })
+    render(<WorkflowBuilder mode="create" onClose={() => {}} onSaved={() => {}} />)
+    fireEvent.change(await cloneFrom(), { target: { value: 'demo' } })
+    expect(await screen.findByText('mode: parallel')).toBeInTheDocument()
+    expect(screen.getByText(/demo uses fields the builder cannot edit, so it cannot be cloned here/)).toBeInTheDocument()
+    expect(screen.getByLabelText('Workflow name')).toHaveValue('')
+    expect(screen.getByRole('combobox', { name: 'Clone from' })).toHaveValue('')
+  })
+
+  it('shows a failed read inline and keeps the form', async () => {
+    vi.spyOn(api, 'getWorkflowSpec').mockRejectedValue(apiError(404, "unknown workflow 'demo'"))
+    render(<WorkflowBuilder mode="create" onClose={() => {}} onSaved={() => {}} />)
+    fireEvent.change(await cloneFrom(), { target: { value: 'demo' } })
+    expect(await screen.findByText("Could not clone demo: unknown workflow 'demo'")).toBeInTheDocument()
+    expect(screen.getByLabelText('Workflow name')).toHaveValue('')
+  })
+
+  it('has no Clone from when editing, or when no YAML workflow is stored', async () => {
+    vi.spyOn(api, 'getWorkflowSpec').mockResolvedValue(SPEC)
+    const { unmount } = render(<WorkflowBuilder mode="edit" name="demo" onClose={() => {}} onSaved={() => {}} />)
+    await screen.findByTestId('builder-fixed-name')
+    expect(screen.queryByRole('combobox', { name: 'Clone from' })).toBeNull()
+    expect(api.listWorkflows).not.toHaveBeenCalled()
+    unmount()
+
+    vi.spyOn(api, 'listWorkflows').mockResolvedValue([STORED[2]])
+    render(<WorkflowBuilder mode="create" onClose={() => {}} onSaved={() => {}} />)
+    await waitFor(() => expect(api.listWorkflows).toHaveBeenCalled())
+    await settle()
+    expect(screen.queryByRole('combobox', { name: 'Clone from' })).toBeNull()
+  })
+
+  it('copyName picks a free name within the 64-character limit', () => {
+    expect(copyName('demo', [])).toBe('demo-copy')
+    expect(copyName('demo', ['demo-copy'])).toBe('demo-copy-2')
+    expect(copyName('demo', ['demo-copy', 'demo-copy-2'])).toBe('demo-copy-3')
+    const long = 'a'.repeat(64)
+    expect(copyName(long, [])).toBe(`${'a'.repeat(59)}-copy`)
+    expect(copyName(long, [`${'a'.repeat(59)}-copy`])).toBe(`${'a'.repeat(57)}-copy-2`)
+  })
+})
+
+describe('WorkflowBuilder: an editable YAML, and Save validates first', () => {
+  beforeEach(() => {
+    vi.spyOn(api, 'listProviders').mockResolvedValue(PROVIDERS)
+    vi.spyOn(api, 'searchProfiles').mockImplementation(async q => [result(q)])
+    vi.spyOn(api, 'getProfile').mockImplementation(async name => ({ name, description: '', provider: 'claude_code' }))
+    vi.spyOn(api, 'listWorkflows').mockResolvedValue([])
+  })
+
+  const yamlBox = () => screen.getByLabelText('Workflow YAML') as HTMLTextAreaElement
+  const HAND = [
+    'name: hand-made',
+    'description: Written by hand  # comments are kept as written',
+    'mode: sequential',
+    'steps:',
+    '  - id: one',
+    '    provider: claude_code',
+    '    agent: dev',
+    '    prompt: Go.',
+    '',
+  ].join('\n')
+  const written = (name: string) => ({ name, path: `/wf/${name}.yaml`, content_hash: 'h', findings: [], status: 'pass' as const, reserved_notes: [] })
+
+  it('validates the form YAML on the server before it saves it', async () => {
+    const calls: string[] = []
+    vi.spyOn(api, 'validateWorkflowSource').mockImplementation(async () => { calls.push('validate'); return { status: 'pass', errors: [] } })
+    vi.spyOn(api, 'createWorkflow').mockImplementation(async name => { calls.push('create'); return written(name) })
+    const onSaved = vi.fn()
+    render(<WorkflowBuilder mode="create" onClose={() => {}} onSaved={onSaved} />)
+    fireEvent.change(screen.getByLabelText('Workflow name'), { target: { value: 'my-wf' } })
+    await searchAndPick(1, 'dev')
+    await waitFor(() => expect(screen.getByLabelText('Provider for step 1')).toHaveValue('claude_code'))
+    fireEvent.change(screen.getByLabelText('Prompt for step 1'), { target: { value: 'Go.' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create workflow' }))
+    await waitFor(() => expect(onSaved).toHaveBeenCalledWith('my-wf', expect.anything()))
+    expect(calls).toEqual(['validate', 'create'])
+    expect(api.validateWorkflowSource).toHaveBeenCalledWith(yamlBox().value, 'yaml')
+  })
+
+  it('does not save YAML the server finds invalid, and shows why', async () => {
+    const check = vi.spyOn(api, 'validateWorkflowSource').mockResolvedValue({ status: 'fail', errors: ["step 'one': unknown provider 'nope'"] })
+    const create = vi.spyOn(api, 'createWorkflow')
+    render(<WorkflowBuilder mode="create" onClose={() => {}} onSaved={() => {}} />)
+    await settle()
+    fireEvent.change(yamlBox(), { target: { value: HAND } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create workflow' }))
+    expect(await screen.findByText('Not saved: fix the validation errors first.')).toBeInTheDocument()
+    expect(screen.getByText(/unknown provider 'nope'/)).toBeInTheDocument()
+    expect(check).toHaveBeenCalledWith(HAND, 'yaml')
+    expect(create).not.toHaveBeenCalled()
+  })
+
+  it('does not save when validation cannot be reached', async () => {
+    vi.spyOn(api, 'validateWorkflowSource').mockRejectedValue(apiError(503, 'server busy'))
+    const create = vi.spyOn(api, 'createWorkflow')
+    render(<WorkflowBuilder mode="create" onClose={() => {}} onSaved={() => {}} />)
+    await settle()
+    fireEvent.change(yamlBox(), { target: { value: HAND } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create workflow' }))
+    expect(await screen.findByText('Not saved: the workflow could not be validated. server busy')).toBeInTheDocument()
+    expect(create).not.toHaveBeenCalled()
+  })
+
+  it('pauses the form while the YAML is edited by hand, and saves the YAML as written under its own name', async () => {
+    vi.spyOn(api, 'validateWorkflowSource').mockResolvedValue({ status: 'pass', errors: [] })
+    const create = vi.spyOn(api, 'createWorkflow').mockResolvedValue(written('hand-made'))
+    const onSaved = vi.fn()
+    render(<WorkflowBuilder mode="create" onClose={() => {}} onSaved={onSaved} />)
+    await settle()
+    fireEvent.change(screen.getByLabelText('Workflow name'), { target: { value: 'from-the-form' } })
+    fireEvent.change(yamlBox(), { target: { value: HAND } })
+    expect(screen.getByTestId('builder-form-paused')).toHaveTextContent('the form is paused')
+    expect(screen.getByTestId('yaml-edited')).toHaveTextContent('Edited by hand')
+    expect(screen.getByRole('group', { name: 'Workflow form' })).toBeDisabled()
+    expect(screen.getByLabelText('Workflow name')).toBeDisabled()
+    expect(screen.getByTestId('flow-paused')).toHaveTextContent('does not show your YAML edits')
+    // The form's own checks do not apply: in the form, step 1 still has no profile or prompt.
+    fireEvent.click(screen.getByRole('button', { name: 'Create workflow' }))
+    await waitFor(() => expect(onSaved).toHaveBeenCalledWith('hand-made', expect.anything()))
+    expect(create).toHaveBeenCalledWith('hand-made', HAND, 'yaml')
+    expect(screen.queryByText(/problems? marked in the form/)).toBeNull()
+  })
+
+  it('gives the form back when the YAML edits are discarded, after asking', async () => {
+    render(<WorkflowBuilder mode="create" onClose={() => {}} onSaved={() => {}} />)
+    await settle()
+    const generated = yamlBox().value
+    fireEvent.change(yamlBox(), { target: { value: HAND } })
+    fireEvent.click(screen.getAllByRole('button', { name: 'Discard YAML edits' })[0])
+    expect(await screen.findByText('Discard your YAML edits?')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Keep editing' }))
+    expect(yamlBox()).toHaveValue(HAND)
+    fireEvent.click(screen.getAllByRole('button', { name: 'Discard YAML edits' })[0])
+    fireEvent.click(await screen.findByRole('button', { name: 'Discard edits' }))
+    expect(yamlBox()).toHaveValue(generated)
+    expect(screen.queryByTestId('builder-form-paused')).toBeNull()
+    expect(screen.queryByTestId('flow-paused')).toBeNull()
+    expect(screen.getByLabelText('Workflow name')).toBeEnabled()
+  })
+
+  it('gives the form back when the YAML is typed back to what the form writes', async () => {
+    render(<WorkflowBuilder mode="create" onClose={() => {}} onSaved={() => {}} />)
+    await settle()
+    const generated = yamlBox().value
+    fireEvent.change(yamlBox(), { target: { value: `${generated}# a note\n` } })
+    expect(screen.getByTestId('builder-form-paused')).toBeInTheDocument()
+    fireEvent.change(yamlBox(), { target: { value: generated } })
+    expect(screen.queryByTestId('builder-form-paused')).toBeNull()
+  })
+
+  it('saves hand-edited YAML in edit mode with the hash it read', async () => {
+    vi.spyOn(api, 'getWorkflowSpec').mockResolvedValue(SPEC)
+    vi.spyOn(api, 'validateWorkflowSource').mockResolvedValue({ status: 'pass_reserved', errors: [], reserved_notes: ['assign is reserved'] })
+    const update = vi.spyOn(api, 'updateWorkflow').mockResolvedValue({ ...written('demo'), content_hash: 'hash-2', status: 'pass_reserved' })
+    const onSaved = vi.fn()
+    render(<WorkflowBuilder mode="edit" name="demo" onClose={() => {}} onSaved={onSaved} />)
+    await screen.findByTestId('builder-fixed-name')
+    const edited = yamlBox().value.replace('"description": "Demo check"', '"description": "Demo check, edited by hand"')
+    expect(edited).not.toBe(yamlBox().value)
+    fireEvent.change(yamlBox(), { target: { value: edited } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() => expect(onSaved).toHaveBeenCalled())
+    expect(update).toHaveBeenCalledWith('demo', edited, 'hash-1', 'yaml')
+  })
+
+  it('Validate checks the hand-edited YAML', async () => {
+    const check = vi.spyOn(api, 'validateWorkflowSource').mockResolvedValue({ status: 'pass', errors: [] })
+    render(<WorkflowBuilder mode="create" onClose={() => {}} onSaved={() => {}} />)
+    await settle()
+    fireEvent.change(yamlBox(), { target: { value: HAND } })
+    fireEvent.click(screen.getByRole('button', { name: 'Validate' }))
+    expect(await screen.findByText('Valid.')).toBeInTheDocument()
+    expect(check).toHaveBeenCalledWith(HAND, 'yaml')
+  })
+
+  it('yamlTopLevelName reads only a top-level name line', () => {
+    expect(yamlTopLevelName('name: hand-made\nsteps: []\n')).toBe('hand-made')
+    expect(yamlTopLevelName('"name": "my-wf"\n')).toBe('my-wf')
+    expect(yamlTopLevelName("name: 'quoted'  # a comment\n")).toBe('quoted')
+    expect(yamlTopLevelName('inputs:\n  name:\n    type: string\n')).toBeNull()
+    expect(yamlTopLevelName('name: not a valid name\n')).toBeNull()
+    expect(yamlTopLevelName('steps: []\n')).toBeNull()
+  })
+})
+
 describe('WorkflowBuilder', () => {
   beforeEach(() => {
     vi.spyOn(api, 'listProviders').mockResolvedValue(PROVIDERS)
     vi.spyOn(api, 'searchProfiles').mockImplementation(async q => [result(q)])
     vi.spyOn(api, 'getProfile').mockImplementation(async name => ({ name, description: '', provider: 'claude_code' }))
+    // Save validates first. A test that checks validation itself mocks it again.
+    vi.spyOn(api, 'validateWorkflowSource').mockResolvedValue({ status: 'pass', errors: [] })
   })
 
   async function fillValidStep(n = 1, agent = 'sqs-sender-beta') {
@@ -295,7 +566,7 @@ describe('WorkflowBuilder', () => {
       '',
     ].join('\n')
     expect(create).toHaveBeenCalledWith('my-wf', expected, 'yaml')
-    expect(screen.getByLabelText('YAML preview').textContent).toBe(expected)
+    expect(screen.getByLabelText('Workflow YAML')).toHaveValue(expected)
   })
 
   it('shows field errors after the first Save and sends nothing while any remain', async () => {
@@ -430,7 +701,7 @@ describe('WorkflowBuilder', () => {
     fireEvent.change(screen.getByLabelText('Step 2 id'), { target: { value: 'second' } })
     fireEvent.change(screen.getByLabelText('Call type for step 2'), { target: { value: 'assign' } })
     fireEvent.click(screen.getByRole('button', { name: 'Move step 2 up' }))
-    const yaml = () => screen.getByLabelText('YAML preview').textContent as string
+    const yaml = () => (screen.getByLabelText('Workflow YAML') as HTMLTextAreaElement).value
     expect(yaml().indexOf('"id": "second"')).toBeLessThan(yaml().indexOf('"id": "step-1"'))
     const flow = screen.getByRole('group', { name: 'Flow preview' })
     expect(within(flow).getByTestId('flow-step-1')).toHaveTextContent('second')
@@ -441,12 +712,14 @@ describe('WorkflowBuilder', () => {
     expect(within(flow).queryByTestId('flow-step-2')).toBeNull()
   })
 
-  it('carries the secrets note and the note that saving drops comments', async () => {
+  it('carries the secrets note and the note on editing the YAML', async () => {
     render(<WorkflowBuilder mode="create" onClose={() => {}} onSaved={() => {}} />)
     await settle()
     expect(screen.getByText(/journaled in plaintext with every run, so do not enter secrets/)).toBeInTheDocument()
     expect(screen.getByText(/Params are journaled in plaintext, so do not enter secrets/)).toBeInTheDocument()
-    expect(screen.getByText('Saving rewrites the file from this form. Comments in the file are not kept.')).toBeInTheDocument()
+    expect(screen.getByText(
+      'Edit the YAML here, or use the form. Save validates it first. When the form writes the YAML, comments in the file are not kept.',
+    )).toBeInTheDocument()
   })
 
   it.each([
@@ -577,36 +850,45 @@ describe('run flow helpers', () => {
   })
 })
 
-describe('RunDetail shows the flow', () => {
+describe('RunDetail shows the steps', () => {
   beforeEach(() => {
     useStore.setState({ workflowRuns: [], selectedRun: null, selectedRunId: null, wfEvents: [], wfGaps: [], snackbar: null })
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500, statusText: 'Error', json: async () => ({}), text: async () => '' })))
   })
 
-  it('draws the run with the spec call types and the step states', async () => {
+  it('shows the step states in the rail, and the spec call types in the Params tab', async () => {
     vi.spyOn(api, 'getWorkflowSpec').mockResolvedValue({ ...SPEC, steps: [specStep('send', 'handoff'), specStep('fan', 'assign')] })
     render(<RunDetail run={inspection('completed', [{ id: 'send', state: 'completed', attempts: 1 }, { id: 'fan', state: 'failed', attempts: 2 }])} allRuns={[]} />)
-    const flow = screen.getByRole('group', { name: 'Run flow' })
-    expect(within(flow).getByText('Orchestrator (CAO engine)')).toBeInTheDocument()
-    expect(await within(flow).findByText('1 · handoff')).toBeInTheDocument()
-    expect(within(flow).getByText('2 · assign')).toBeInTheDocument()
-    expect(within(flow).getByText('not built yet')).toBeInTheDocument()
-    expect(within(flow).getByTestId('flow-state-1')).toHaveTextContent('Completed')
-    expect(within(flow).getByTestId('flow-state-2')).toHaveTextContent('Failed')
+    expect(screen.getByTestId('rail-step-1')).toHaveAttribute('data-state', 'completed')
+    expect(screen.getByTestId('rail-chip-1')).toHaveTextContent('Completed')
+    expect(screen.getByTestId('rail-step-2')).toHaveAttribute('data-state', 'failed')
+    expect(screen.getByTestId('rail-chip-2')).toHaveTextContent('Failed')
+    // The agent comes from the spec.
+    expect(await within(screen.getByTestId('rail-step-1')).findByText('send-agent')).toBeInTheDocument()
+    // A failed run opens on the failed step.
+    expect(screen.getByTestId('step-console')).toHaveAccessibleName('Step fan')
+    fireEvent.click(screen.getByRole('tab', { name: 'Params' }))
+    const params = screen.getByTestId('step-params')
+    expect(params).toHaveTextContent('assign')
+    expect(within(params).getByText('not built yet')).toBeInTheDocument()
+    fireEvent.click(within(screen.getByTestId('rail-step-1')).getByRole('button'))
+    fireEvent.click(screen.getByRole('tab', { name: 'Params' }))
+    expect(screen.getByTestId('step-params')).toHaveTextContent('handoff')
+    expect(within(screen.getByTestId('step-params')).queryByText('not built yet')).toBeNull()
     expect(api.getWorkflowSpec).toHaveBeenCalledWith('demo')
   })
 
-  it('follows the events for live states, and shows no call label when the spec read fails', async () => {
+  it('follows the events for live states, and says when the spec read fails', async () => {
     const spec = vi.spyOn(api, 'getWorkflowSpec').mockRejectedValue(apiError(404, "unknown workflow 'demo'"))
     useStore.setState({ wfEvents: [ev(1, 'step.started', 'send', 'running'), ev(2, 'step.completed', 'send', 'completed'), ev(3, 'step.started', 'fan', 'running')] })
     render(<RunDetail run={inspection('running', [{ id: 'send', state: 'running', attempts: 1 }, { id: 'fan', state: 'pending', attempts: 0 }])} allRuns={[]} />)
-    const flow = screen.getByRole('group', { name: 'Run flow' })
-    expect(within(flow).getByTestId('flow-state-1')).toHaveTextContent('Completed')
-    expect(within(flow).getByTestId('flow-state-2')).toHaveTextContent('Running')
+    expect(screen.getByTestId('rail-step-1')).toHaveAttribute('data-state', 'completed')
+    expect(screen.getByTestId('rail-step-2')).toHaveAttribute('data-state', 'running')
     await waitFor(() => expect(spec).toHaveBeenCalled())
     await new Promise(r => setTimeout(r, 0))
-    expect(within(flow).getByTestId('flow-edge-1')).toHaveAttribute('data-call', '')
-    expect(within(flow).queryByText(/handoff/)).toBeNull()
+    fireEvent.click(screen.getByRole('tab', { name: 'Params' }))
+    expect(screen.getByRole('tabpanel')).toHaveTextContent("The workflow file could not be read, so this step's params are not shown.")
+    expect(screen.queryByText(/handoff/)).toBeNull()
   })
 })
 
@@ -681,6 +963,8 @@ describe('WorkflowsPanel: New workflow', () => {
     vi.spyOn(api, 'listProviders').mockResolvedValue(PROVIDERS)
     vi.spyOn(api, 'searchProfiles').mockImplementation(async q => [result(q)])
     vi.spyOn(api, 'getProfile').mockImplementation(async name => ({ name, description: '', provider: 'claude_code' }))
+    // Save validates first.
+    vi.spyOn(api, 'validateWorkflowSource').mockResolvedValue({ status: 'pass', errors: [] })
   })
 
   it('opens the builder, and after a save opens the launcher on the saved workflow', async () => {

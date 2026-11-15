@@ -1016,6 +1016,18 @@ WORKFLOW_INPUTS_MAX_BYTES = 32768
 # eviction for this column.
 WORKFLOW_JOURNAL_RESULT_MAX_BYTES = 32768
 
+# The run view's two read-only views of a workflow step's terminal
+# (``services/workflow_step_view.py``, ``GET /workflows/runs/{run_id}/steps/{step_id}/
+# screen`` and ``.../transcript``). Both redact BEFORE they cut, so a secret split at the
+# edge of what is returned is redacted whole and never returned in part: the screen
+# captures 50 lines more than it returns, the transcript reads a 16 KiB margin before
+# the bytes it returns.
+WORKFLOW_STEP_SCREEN_CAPTURE_LINES = 250
+WORKFLOW_STEP_SCREEN_MAX_LINES = 200
+WORKFLOW_STEP_SCREEN_MAX_BYTES = 64 * 1024
+WORKFLOW_STEP_TRANSCRIPT_MAX_BYTES = 256 * 1024
+WORKFLOW_STEP_TRANSCRIPT_MARGIN_BYTES = 16 * 1024
+
 # Byte bound on the persisted execution manifest envelope (issue #583 Bolt 2, NFR-1 /
 # ADR-583-12). Applied to the compact-JSON encoding AFTER redaction (never before — a
 # secret straddling the bound would otherwise survive), on the UTF-8 byte length rather

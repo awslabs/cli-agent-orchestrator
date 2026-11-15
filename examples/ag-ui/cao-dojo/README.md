@@ -172,7 +172,7 @@ fails the recording as the approval bridge's expiry race, never as drift.
 
 | Gate | Where | Command |
 |---|---|---|
-| Leak rule (L1-L14: a mutation case and a near miss for each) | pre-commit, and the Unit Tests job | `uv run pytest test/examples/test_cao_dojo_trace_leaks.py` |
+| Leak rule (L1-L17: a mutation case and a near miss for each) | pre-commit, and the Unit Tests job | `uv run pytest test/examples/test_cao_dojo_trace_leaks.py` |
 | Replay, tier 1 (SDK models, closed shape, lifecycle, cross-plane, upstream controls) | pre-push, and the Unit Tests job | `uv run pytest test/examples/test_cao_dojo_trace_replay.py test/examples/test_cao_dojo_trace_recorder.py` |
 | Replay, tier 1 with upstream `enforceEvents` and `verifyEvents` | CI | `node examples/ag-ui/ag-ui-stock-client-live/verify-trace.mjs <trace.ndjson>...` |
 | Keyless approve/reject/none e2e and tier 2 drift | CI | `uv run python examples/ag-ui/cao-dojo/tools/record_trace.py --mock --check` |
@@ -209,6 +209,40 @@ type-check them.
 ## Not in this page yet
 
 - A replay mode from a recorded trace, and a docs-site build.
-- A browser test of this page in CI. CI checks the trace the page receives (see
-  the gates above), not the page itself.
+- A browser test of either page in CI. Neither this page nor the
+  [raw event inspector](#raw-event-inspector-inspectorhtml) has one: CI checks the trace the
+  page receives (see the gates above), not the pages themselves. The inspector's browser test
+  runs locally and wherever Playwright is installed.
 - The "edit" option. CAO offers it, but this page sends only approve and reject.
+
+## Raw event inspector (`inspector.html`)
+
+A second single-file page, [`inspector.html`](inspector.html), lists every record of a
+recorded `/agui/v1` trace in file order: capture, plane, direction, sequence, type, and
+the frame `timestamp` (epoch milliseconds and UTC) with the record's JSON one click away.
+It reads the committed [`trace/cao-dojo-trace.ndjson`](trace/cao-dojo-trace.ndjson) by
+default, or a trace you pick from disk.
+
+It is a reader of a file, not a client of CAO: no `cao-server`, no `CAO_AGUI_ENABLED`, no
+route, no stream, no token, nothing written. Serve this directory and open it:
+
+```bash
+cd examples/ag-ui/cao-dojo
+python3 -m http.server 8790 --bind 127.0.0.1
+# http://localhost:8790/inspector.html?trace=trace/cao-dojo-trace.ndjson
+```
+
+Only the `CUSTOM` approval cards carry a frame `timestamp` in the published trace; every
+other record shows `—` rather than an invented time. A request record (the
+`RunAgentInput` the recorder posted) has no frame and shows the type `REQUEST`.
+
+The `?trace=` path is resolved against the page and must stay on the page's origin and
+under its directory: a backslash, any whitespace or control character, a scheme, a
+protocol-relative `//host` or a `..` that climbs out is refused with a message and nothing
+is fetched. The browser test tries eight such paths, including `\\evil.example/x` and
+`ht<TAB>tp://evil.example/x`, and fails on any request to another origin.
+
+`pytest test/examples/test_cao_dojo_inspector.py` checks the page statically (no
+dependency, `textContent` only, no write path) and, with Playwright and a Chromium installed, opens it on
+the published trace and compares every row with the `.ndjson`. Without Playwright the
+browser test skips and the static check still runs.

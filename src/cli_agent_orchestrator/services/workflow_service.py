@@ -68,6 +68,7 @@ from cli_agent_orchestrator.services.step_output_store import (
     _validate_key_part,
     step_output_store,
 )
+from cli_agent_orchestrator.services.step_result import build_envelope, serialise_envelope
 
 # RE-EXPORT, not a use (issue #583, unit ``workflow-errors``, BR-2/INV-5). ADR-583-9 MOVED
 # these two exceptions to the ``workflow_errors`` leaf so ``workflow_journal`` can import them
@@ -183,6 +184,11 @@ class StepRunState:
     call_fingerprint: Optional[str] = None
     which_guard_fired: Optional[str] = None  # RESERVED (N8) — always None in MVP
     iterations_run: Optional[int] = None  # RESERVED (N8) — always None in MVP
+    # The text the step's final terminal answered with (``AgentStepResult.last_message``),
+    # carried from ``run_agent_step`` (or the reprompt) to the settle that stores it as the
+    # step's result envelope for the run view. IN-MEMORY ONLY, like ``call_fingerprint``:
+    # the durable copy is ``workflow_run_step.result_json``, redacted and bounded.
+    last_message: Optional[str] = None
 
 
 @dataclass
@@ -359,6 +365,68 @@ def _journal_step(record: RunRecord, step_id: str, error_kind: Optional[str] = N
         Exception
     ) as e:  # noqa: BLE001 — journal write is best-effort; in-memory floor still serves live reads
         logger.debug("journal: update_step '%s/%s' failed: %s", record.run_id, step_id, e)
+
+
+def _journal_step_terminal(record: RunRecord, step_id: str, terminal_id: Optional[str]) -> None:
+    """Best-effort UPDATE of the step row's ``terminal_id`` alone (the run view).
+
+    Its own write because ``update_step`` rewrites every column it lists, and the run
+    view needs the id while the step is still running, long before the step settles.
+    """
+    try:
+        workflow_journal.set_step_terminal(record.run_id, step_id, terminal_id)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 (journal write is best-effort; the step must not fail on it)
+        logger.debug("journal: set_step_terminal '%s/%s' failed: %s", record.run_id, step_id, e)
+
+
+def _journal_step_result(
+    record: RunRecord, step_id: str, status: str, last_message: Optional[str]
+) -> None:
+    """Best-effort write of a settled step's final answer to ``result_json`` (the run view).
+
+    The envelope is the one the script tier stores in ``record_step_completion``:
+    ``build_envelope`` redacts secrets first and then caps the text at
+    ``WORKFLOW_JOURNAL_RESULT_MAX_BYTES``, setting ``redacted`` and ``truncated``. A step
+    that settled without an answer (failed, or cancelled in flight) gets an envelope with
+    empty text, as the script tier stores on its failure arms, so an ABSENT envelope keeps
+    meaning "not settled yet, or settled before this column was filled".
+
+    YAML rows carry no call fingerprint, so this envelope can never make a row replayable:
+    ``step_replay.decide`` halts on an absent fingerprint before it reads an envelope as a
+    result, and the run-step route consults it for script-tier runs only.
+    """
+    st = record.step_states[step_id]
+    try:
+        workflow_journal.set_step_result(
+            record.run_id,
+            step_id,
+            serialise_envelope(build_envelope(last_message or "", status, st.terminal_id)),
+        )
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 (journal write is best-effort; the step must not fail on it)
+        logger.debug("journal: set_step_result '%s/%s' failed: %s", record.run_id, step_id, e)
+
+
+def _journal_clear_step_view(record: RunRecord, step_ids: List[str]) -> None:
+    """Best-effort clear of the run-view columns of steps a resume will run again.
+
+    Clears ``result_json`` so a re-run step never shows the previous attempt's answer,
+    and ``terminal_id`` so it never points at the previous attempt's terminal before its
+    new one starts (the in-memory reset already drops it, B4-BR-10).
+    """
+    for step_id in step_ids:
+        try:
+            workflow_journal.set_step_result(record.run_id, step_id, None)
+            workflow_journal.set_step_terminal(record.run_id, step_id, None)
+        except (
+            Exception
+        ) as e:  # noqa: BLE001 (journal write is best-effort; resume must not fail on it)
+            logger.debug(
+                "journal: clearing the run view of '%s/%s' failed: %s", record.run_id, step_id, e
+            )
 
 
 def _journal_current_step(record: RunRecord) -> None:
@@ -702,6 +770,125 @@ def _topological_order(spec: WorkflowSpec) -> List[WorkflowStep]:
     return [by_id[sid] for sid in order]
 
 
+# ---------------------------------------------------------------------------
+# Recording a step's terminal as soon as it exists (the run view)
+# ---------------------------------------------------------------------------
+# Strong references to terminal recordings still in flight (see ``_TerminalRecorder``).
+_pending_recordings: Set["asyncio.Task[None]"] = set()
+
+
+async def _record_step_terminal(
+    record: RunRecord,
+    step: WorkflowStep,
+    attempt: int,
+    terminal_id: str,
+    *,
+    emit_event: bool,
+) -> None:
+    """Save the step's terminal on its row, then emit ``terminal.created``.
+
+    Row first, so a reader that sees the event and asks for the step's screen finds the
+    terminal already recorded. Both writes are best-effort and never raise.
+    """
+    await _ajournal(_journal_step_terminal, record, step.id, terminal_id)
+    if emit_event:
+        await _journal_event(
+            record,
+            "terminal.created",
+            step_id=step.id,
+            attempt=attempt,
+            terminal_id=terminal_id,
+            provider=step.provider,
+            agent_profile=step.agent,
+        )
+
+
+class _TerminalRecorder:
+    """The ``on_step_terminal_ready`` hook for ONE ``run_agent_step`` call of a YAML step.
+
+    WHERE IT RUNS. ``run_agent_step`` calls the hook through ``_notify_terminal_ready``, a
+    plain synchronous call inside that coroutine, right after
+    ``await terminal_service.create_terminal(...)`` and before the readiness wait. So the
+    hook runs ON THE EVENT LOOP, between two awaits, and must not block: it sets the
+    in-memory terminal id and schedules the durable work (row, then event) as a task on
+    the same loop. ``test_workflow_run_view_engine.py`` pins that the hook runs on the loop
+    thread; if it ever moves to a worker thread, this must switch to
+    ``loop.call_soon_threadsafe``.
+
+    ORDER. The caller awaits :meth:`settle` (or :meth:`settle_failed`) as soon as
+    ``run_agent_step`` returns or raises, before the engine emits anything else for the
+    attempt, so ``terminal.created`` always lands between ``step.attempt.started`` and
+    the attempt's outcome event.
+
+    BEST-EFFORT. ``_notify_terminal_ready`` logs and swallows a hook failure, and the
+    durable writes swallow their own. When the hook never scheduled its task (it raised,
+    or a test replaced ``run_agent_step`` with a fake that ignores the hook), :meth:`settle`
+    records the terminal then, from the id the call returned or raised with. An attempt
+    that opened a terminal therefore records it exactly once either way.
+
+    WHY THE CALLERS CALL ``run_agent_step`` THEMSELVES rather than through a wrapper:
+    ``test_launch_path_invariant.py`` checks every ``run_agent_step`` call site passes its
+    delegation ceiling (``delegating_terminal_id``) as an explicit keyword, so the call
+    stays visible in ``_run_step`` and ``_collect_structured_output``.
+    """
+
+    def __init__(
+        self, record: RunRecord, step: WorkflowStep, attempt: int, *, emit_event: bool
+    ) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._record = record
+        self._step = step
+        self._attempt = attempt
+        self._emit_event = emit_event
+        self._task: Optional["asyncio.Task[None]"] = None
+
+    def __call__(self, terminal_id: str, _call_fingerprint: str) -> None:
+        # The call fingerprint is the script tier's replay identity. A YAML row never
+        # carries one, which keeps YAML rows off the replay gate's verified path.
+        self._record.step_states[self._step.id].terminal_id = terminal_id
+        task = self._loop.create_task(
+            _record_step_terminal(
+                self._record,
+                self._step,
+                self._attempt,
+                terminal_id,
+                emit_event=self._emit_event,
+            )
+        )
+        # The loop keeps only a weak reference to a task. Hold a strong one until it is
+        # done, so a recording outlives a drive that is cancelled before it settles.
+        _pending_recordings.add(task)
+        task.add_done_callback(_pending_recordings.discard)
+        self._task = task
+
+    async def settle(self, terminal_id: Optional[str]) -> None:
+        """Wait for the hook's recording, or record now if the hook never scheduled one."""
+        task = self._task
+        if task is not None:
+            # ``asyncio.wait`` never raises the task's own error, and never cancels it.
+            await asyncio.wait({task})
+            if not task.cancelled() and task.exception() is not None:
+                logger.warning(
+                    "run '%s' step '%s': recording terminal %s failed: %s",
+                    self._record.run_id,
+                    self._step.id,
+                    terminal_id,
+                    task.exception(),
+                )
+            return
+        if terminal_id is None:
+            return  # no terminal was opened (the launch itself was refused or failed)
+        self._record.step_states[self._step.id].terminal_id = terminal_id
+        await _record_step_terminal(
+            self._record, self._step, self._attempt, terminal_id, emit_event=self._emit_event
+        )
+
+    async def settle_failed(self, exc: BaseException) -> None:
+        """:meth:`settle` for a call that raised, with the terminal the error names."""
+        raised = getattr(exc, "terminal_id", None)
+        await self.settle(raised if isinstance(raised, str) else None)
+
+
 async def _collect_structured_output(
     record: RunRecord, step: WorkflowStep, prompt: str
 ) -> StepState:
@@ -745,22 +932,33 @@ async def _collect_structured_output(
         )
         # Re-run on a FRESH terminal with a corrective prompt. A crash here is a
         # run-failure: let the StepExecutionError propagate so the OUTER loop
-        # consumes an attempt (Q6=A / Trace C).
-        result = await run_agent_step(
-            provider=step.provider,
-            agent=step.agent,
-            prompt=_reprompt_prompt(step, prompt),
-            teardown=True,
-            timeout=WORKFLOW_STEP_TIMEOUT,
-            engine=step.engine,
-            env_vars={
-                "CAO_WORKFLOW_RUN_ID": record.run_id,
-                "CAO_WORKFLOW_STEP_ID": step.id,
-            },
-            cancel_event=record.cancel_event,
-            delegating_terminal_id=record.caller_id,
-        )
+        # consumes an attempt (Q6=A / Trace C). The reprompt's terminal is saved on
+        # the step row as soon as it exists, and it gets its own ``terminal.created``
+        # with the same attempt number: it is a second terminal in the same attempt,
+        # and a run view following the first one must learn that it moved.
+        recorder = _TerminalRecorder(record, step, st.attempts, emit_event=True)
+        try:
+            result = await run_agent_step(
+                provider=step.provider,
+                agent=step.agent,
+                prompt=_reprompt_prompt(step, prompt),
+                teardown=True,
+                timeout=WORKFLOW_STEP_TIMEOUT,
+                engine=step.engine,
+                env_vars={
+                    "CAO_WORKFLOW_RUN_ID": record.run_id,
+                    "CAO_WORKFLOW_STEP_ID": step.id,
+                },
+                on_step_terminal_ready=recorder,
+                cancel_event=record.cancel_event,
+                delegating_terminal_id=record.caller_id,
+            )
+        except Exception as exc:
+            await recorder.settle_failed(exc)
+            raise
+        await recorder.settle(result.terminal_id)
         st.terminal_id = result.terminal_id
+        st.last_message = result.last_message
         rec = step_output_store.get(record.run_id, step.id)
         if rec is not None and rec.validated:
             st.output = rec
@@ -822,34 +1020,40 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             agent_profile=step.agent,
         )
         prompt = _build_step_prompt(step, record)  # §4 templating, then the params block
+        # An attempt starts with no answer, so a failed attempt never leaves one behind.
+        st.last_message = None
         try:
-            result = await run_agent_step(
-                provider=step.provider,
-                agent=step.agent,
-                prompt=prompt,
-                teardown=True,
-                timeout=WORKFLOW_STEP_TIMEOUT,
-                engine=step.engine,
-                env_vars={
-                    "CAO_WORKFLOW_RUN_ID": record.run_id,
-                    "CAO_WORKFLOW_STEP_ID": step.id,
-                },
-                cancel_event=record.cancel_event,
-                # The agent that started the run bounds every step it dispatches
-                # (utils/delegation.py); None for an operator-started run.
-                delegating_terminal_id=record.caller_id,
-            )
+            # ``terminal.created`` is emitted from inside this call, as soon as the
+            # step's terminal exists (before the readiness wait), together with the
+            # terminal id on the step row, so the run view can watch the step while it
+            # runs. The recorder is settled before anything else is emitted for the
+            # attempt, which keeps the per-attempt order: attempt.started,
+            # terminal.created, then the outcome.
+            recorder = _TerminalRecorder(record, step, attempt, emit_event=True)
+            try:
+                result = await run_agent_step(
+                    provider=step.provider,
+                    agent=step.agent,
+                    prompt=prompt,
+                    teardown=True,
+                    timeout=WORKFLOW_STEP_TIMEOUT,
+                    engine=step.engine,
+                    env_vars={
+                        "CAO_WORKFLOW_RUN_ID": record.run_id,
+                        "CAO_WORKFLOW_STEP_ID": step.id,
+                    },
+                    on_step_terminal_ready=recorder,
+                    cancel_event=record.cancel_event,
+                    # The agent that started the run bounds every step it dispatches
+                    # (utils/delegation.py); None for an operator-started run.
+                    delegating_terminal_id=record.caller_id,
+                )
+            except Exception as exc:
+                await recorder.settle_failed(exc)
+                raise
+            await recorder.settle(result.terminal_id)
             st.terminal_id = result.terminal_id
-            # U2 emission: a terminal exists for this step (after the id is bound).
-            await _journal_event(
-                record,
-                "terminal.created",
-                step_id=step.id,
-                attempt=attempt,
-                terminal_id=result.terminal_id,
-                provider=step.provider,
-                agent_profile=step.agent,
-            )
+            st.last_message = result.last_message
             # Resolve the structured return INSIDE the try so a crash during the
             # reprompt (§3 re-raises StepExecutionError) is caught below and
             # consumes an attempt (Q6=A, Trace C).
@@ -869,6 +1073,9 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             # carried over from an earlier failed attempt of the same step.
             st.error_kind = None
             await _ajournal(_journal_step, record, step.id)
+            # The run view's answer: an envelope with no text, as the script tier
+            # stores when a step settled without one (never an absent envelope).
+            await _ajournal(_journal_step_result, record, step.id, st.state.value, None)
             # U2 emission (BR-7): a cancellation settles the step SKIPPED — NEVER a
             # failure event. The run converges CANCELLED at the drive-loop finalize.
             await _journal_event(
@@ -939,6 +1146,16 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
         st.error_kind = None
         # §1: persist settled state + output + attempts (error_kind cleared to NULL).
         await _ajournal(_journal_step, record, step.id)
+        # The run view's answer, written before the outcome events so a reader that
+        # reacts to ``step.completed`` finds it. The status is the terminal status the
+        # step finished with, as the script tier's success arm records.
+        await _ajournal(
+            _journal_step_result,
+            record,
+            step.id,
+            getattr(result.status, "value", str(result.status)),
+            st.last_message,
+        )
         # U2 emission: a validated/collected output was received (validation_result
         # distinguishes valid from invalid); then the step settled.
         if st.output is not None:
@@ -985,6 +1202,9 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
     # §1: persist FAILED state + last error + attempts + the structured error kind
     # (BR-6, so a cold read surfaces the kind with no event replay).
     await _ajournal(_journal_step, record, step.id, last_error_kind)
+    # The run view's answer: empty text with status ``failed``, matching what the script
+    # tier stores for a failed step (its failure arms carry no ``last_message``).
+    await _ajournal(_journal_step_result, record, step.id, st.state.value, None)
     # U2 emission: the step is terminally FAILED (carries the last error kind).
     await _journal_event(
         record,
@@ -1396,8 +1616,9 @@ def _rebuild_record_from_journal(run_id: str) -> Optional[RunRecord]:
     can never leave a step absent from the rebuilt record (F8 / B4-RD-3) — the
     engine drive's ``record.step_states[step.id]`` stays total.
 
-    ``reprompted``/``terminal_id`` are NOT journaled (F3): on a kept step they are
-    irrelevant (it is skipped), on a reset step they are cleared anyway (B4-BR-9),
+    ``reprompted`` is NOT journaled (F3), and ``terminal_id`` is journaled only for the
+    run view (``set_step_terminal``), so neither is read back here: on a kept step they
+    are irrelevant (it is skipped), on a reset step they are cleared anyway (B4-BR-9),
     so they default here.
     """
     try:
@@ -1665,7 +1886,8 @@ async def resume_from_last_completed(
        (output reused for templating), UNCONDITIONALLY reset every other state to
        ``PENDING`` (attempts=0, terminal_id=None, error=None, reprompted=False) so
        the failed step + its halted successors re-run with a fresh terminal
-       (B4-BR-10).
+       (B4-BR-10). Those steps' journaled ``result_json`` and ``terminal_id`` are
+       cleared too, so the run view never shows a previous attempt's answer.
     7. Re-enter the SAME Bolt-3 drive over the snapshotted spec's topo order (a
        single execution path, no resume/normal divergence — B4-RD-5). The drive
        skips non-``PENDING`` steps, so the reset above is the only resume-specific
@@ -1720,6 +1942,7 @@ async def resume_from_last_completed(
         # The row existed above but the rebuild degraded it to absent (e.g.
         # corrupt inputs_json) — surface as unknown rather than resuming garbage.
         raise KeyError(f"unknown run_id '{run_id}'")
+    reset_step_ids: List[str] = []
     for st in record.step_states.values():
         if st.state in (StepState.COMPLETED, StepState.COMPLETED_UNVALIDATED):
             continue  # keep done; output reused for {{steps.<id>.output.<field>}}
@@ -1729,6 +1952,8 @@ async def resume_from_last_completed(
         st.terminal_id = None  # fresh terminal on re-run (B4-BR-10)
         st.error = None
         st.output = None
+        st.last_message = None
+        reset_step_ids.append(st.step_id)
 
     # Re-open the run and re-register the rebuilt record as the live cache.
     record.state = RunState.RUNNING
@@ -1747,6 +1972,9 @@ async def resume_from_last_completed(
     # error, cancel, journal-write error).
     _active_drives.add(run_id)
     try:
+        # A step this resume runs again must not show the previous attempt's answer or
+        # terminal in the run view before it starts (best-effort, B4-BR-5).
+        await _ajournal(_journal_clear_step_view, record, reset_step_ids)
         try:
             await asyncio.to_thread(
                 workflow_journal.update_run_state, run_id, RunState.RUNNING.value, None
@@ -1927,6 +2155,9 @@ async def replay_single_step(
     }
     try:
         try:
+            # No terminal recording here, unlike the drive: this call writes nothing for
+            # ``run_id`` (see the docstring), so the replay's terminal never lands on the
+            # recorded step's row or in its events. The payload carries ``terminal_id``.
             result = await run_agent_step(
                 provider=step.provider,
                 agent=step.agent,

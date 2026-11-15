@@ -418,11 +418,25 @@ class KiroV3UnverifiedVersionError(KiroV3Refusal):
 
     code = "kiro_v3_unverified_version"
 
-    def __init__(self, version: str, *, remedy: str = UNVERIFIED_VERSION_REMEDY) -> None:
-        super().__init__(
-            f"{self.code}: kiro-cli {version}'s v3 engine schema was derived statically and "
-            f"is pending operator verification, so CAO does not launch v3 on it. {remedy}"
-        )
+    def __init__(
+        self,
+        version: str,
+        *,
+        remedy: str = UNVERIFIED_VERSION_REMEDY,
+        observed_version: Optional[str] = None,
+    ) -> None:
+        if observed_version is not None:
+            message = (
+                f"{self.code}: kiro-cli {observed_version} would borrow kiro-cli "
+                f"{version}'s schema, which is pending operator verification, so CAO "
+                f"does not launch v3 on it. {remedy}"
+            )
+        else:
+            message = (
+                f"{self.code}: kiro-cli {version}'s v3 engine schema was derived statically and "
+                f"is pending operator verification, so CAO does not launch v3 on it. {remedy}"
+            )
+        super().__init__(message)
         self.version = version
 
 
@@ -496,6 +510,7 @@ def observed_kiro_v3_entry(
     if newest.pending_operator_verification and not allow_unverified:
         raise KiroV3UnverifiedVersionError(
             newest.cli_version,
+            observed_version=version,
             remedy=(
                 "Use a supported verified kiro-cli version, or enable "
                 "kiro.v3_allow_unverified_versions to admit this borrowed schema."

@@ -569,6 +569,19 @@ export interface GapMarker {
   reason: string
 }
 
+/**
+ * A step's saved final answer: the step row's `result_json` envelope as the
+ * inspection returns it. `text` is the agent's last message, with secrets
+ * redacted and capped by the server; `truncated` and `redacted` say whether
+ * either happened.
+ */
+export interface StepResultEnvelope {
+  text: string
+  status: string
+  truncated: boolean
+  redacted: boolean
+}
+
 /** One step's durable projection inside a RunInspection (server StepInspection). */
 export interface StepInspection {
   id: string
@@ -577,9 +590,38 @@ export interface StepInspection {
   output_json?: string | null
   error?: string | null
   error_kind?: string | null
+  /** Set while the step runs, from the moment its terminal exists. */
   terminal_id?: string | null
   reprompted?: number | null
   call_fingerprint?: string | null
+  /** The saved final answer, or null when the row has none (an older run, or a step that has not settled). */
+  result?: StepResultEnvelope | null
+}
+
+/**
+ * `GET /workflows/runs/{run_id}/steps/{step_id}/screen`: a read-only capture of
+ * a running step's screen as plain text, with secrets redacted. 410 once the
+ * step's terminal has ended.
+ */
+export interface StepScreen {
+  terminal_id: string
+  text: string
+  truncated: boolean
+  redacted: boolean
+  /** ISO-8601 UTC time of the capture. */
+  captured_at: string
+}
+
+/**
+ * `GET /workflows/runs/{run_id}/steps/{step_id}/transcript`: the saved
+ * transcript of a finished step, with secrets redacted. 404 until the file
+ * exists, and after retention deletes it.
+ */
+export interface StepTranscript {
+  terminal_id: string
+  text: string
+  truncated: boolean
+  redacted: boolean
 }
 
 /** Enriched single-run inspection (server RunInspection, FR-5.1). */
@@ -1248,12 +1290,28 @@ export const api = {
   // ── Workflow run journal (Issue #504 / U8) — read + delete over the
   // already-built durable-journal APIs. All additive; no server code here.
 
-  // #505's run list (FINAL RunSummaryRow shape). Consumed, not built.
-  listWorkflowRuns: () => fetchJSON<RunSummaryRow[]>('/workflows/runs'),
+  // #505's run list (FINAL RunSummaryRow shape). Consumed, not built. `limit`
+  // is optional; without it the server returns its default page of 50.
+  listWorkflowRuns: (limit?: number) =>
+    fetchJSON<RunSummaryRow[]>(`/workflows/runs${limit != null ? `?limit=${limit}` : ''}`),
 
   // U3 inspect — enriched single-run projection (journal-authoritative).
   inspectWorkflowRun: (runId: string) =>
     fetchJSON<RunInspection>(`/workflows/runs/${encodeURIComponent(runId)}`),
+
+  // A running step's screen as plain text: a read-only capture, so polling it
+  // never attaches to, resizes or types into the agent's terminal. 410 once the
+  // step's terminal has ended; read the transcript then.
+  getWorkflowStepScreen: (runId: string, stepId: string) =>
+    fetchJSON<StepScreen>(
+      `/workflows/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(stepId)}/screen`,
+    ),
+
+  // A finished step's saved transcript. 404 while the file does not exist yet.
+  getWorkflowStepTranscript: (runId: string, stepId: string) =>
+    fetchJSON<StepTranscript>(
+      `/workflows/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(stepId)}/transcript`,
+    ),
 
   // U3/U4 batch event page. `afterSeq` is the replay/next-page cursor (events
   // with seq strictly greater); omit to read from the start of the timeline.

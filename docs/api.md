@@ -34,8 +34,8 @@ see [Configuration](configuration.md) and [Security](../SECURITY.md).
 ### Events and AG-UI
 
 - `/events` and `/events/history` expose server events.
-- `GET`/`POST /agui/v1/stream` serve the fleet as an AG-UI 1.0 run, and
-  `/agui/v1/emit_ui` takes generative UI input. `POST /agui/v1/run` is the run
+- `GET`/`POST /agui/v1/stream` serve the sessions and terminals this server can
+  see as an AG-UI 1.0 run, and `/agui/v1/emit_ui` takes generative UI input. `POST /agui/v1/run` is the run
   plane for approval interrupts, and `GET /agui/v1/capabilities` returns its
   AG-UI 1.0 `AgentCapabilities`.
 
@@ -181,12 +181,17 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
 ### Sessions and terminals
 
 - `/sessions*` creates, lists, inspects, and deletes sessions.
-- `/sessions/{session_name}/terminals*` creates and lists session terminals.
+- `/sessions/{session_name}/terminals*` creates and lists session terminals. Each listed row also carries `status`, the last status the monitor applied (`null` when none has been observed). Unlike `GET /terminals/{id}` it does not re-detect, so a terminal that nothing polls can show `processing` after it went idle, until its status is next polled.
   The list is ordered oldest-first, and index 0 is the session's conductor —
   `cao session status`/`list` rely on that. Sort client-side on `last_active`
   if you need a different order.
 - `/terminals/{terminal_id}*` inspects terminals, sends input or keys, reads
   output and working-directory state, exits providers, and deletes terminals.
+- Terminal responses carry `identity_verified`, whether a `kiro_cli` terminal's
+  identity check has passed: `false` until it has (CAO refuses input to it
+  meanwhile, whatever `status` says), `true` after, `null` for other providers
+  and for Kiro terminals older than the record. See
+  [Kiro CLI](kiro-cli.md).
 - Terminal responses carry `delegate_tools`, the terminal's recorded delegation
   ceiling. `POST /sessions/{session_name}/terminals` requires `caller_id` (403
   without it) and checks the requested `allowed_tools` (client string or profile
@@ -439,6 +444,36 @@ The spec-route scope checks apply when authentication is enabled.
   retention note in [Configuration](configuration.md#memory-memory). It is a
   superset of the older status-snapshot shape, so callers reading only
   `state`/`current_step_id`/`steps[].{id,state,attempts}` are unaffected.
+  - `steps[].terminal_id` is set as soon as the step's terminal exists, while the step
+    runs. Before the run view it was set only after the step ended, and never for YAML
+    runs.
+  - `steps[].result` is the step's final answer, or `null`:
+    `{"text": "...", "status": "completed", "truncated": false, "redacted": false}`.
+    It is parsed from the step's saved result envelope. `text` is the step's last terminal
+    message with secrets redacted (`redacted`) and capped at 32 KiB (`truncated`). A step
+    that failed or was cancelled has empty `text`, and its state as `status`. `result` is
+    `null` for a step that has not settled, for runs from before the run view, and for an
+    envelope that does not parse.
+- `GET /workflows/runs/{run_id}/steps/{step_id}/screen` returns a running step's screen:
+  `{terminal_id, text, truncated, redacted, captured_at}`. `text` is plain text with no
+  escape codes: the visible screen plus the scrollback above it, at most 200 lines and
+  64 KiB, with secrets redacted. Rows the terminal wrapped at its width are joined first,
+  so a secret that wraps is still redacted. herdr cannot join them, so on herdr a secret
+  split across lines is not redacted. `captured_at` is an ISO-8601 UTC time. The capture is
+  read-only: it attaches no client, sends no input and never resizes the agent's window.
+  Malformed `run_id` or `step_id` 400; unknown run or step, or a step with no terminal
+  recorded, 404; a terminal that has ended 410 (read the transcript instead).
+- `GET /workflows/runs/{run_id}/steps/{step_id}/transcript` returns a finished step's saved
+  transcript: `{terminal_id, text, truncated, redacted}`. `text` is the last 256 KiB of the
+  terminal's `<terminal_id>.scrollback` file, starting at a line, with secrets redacted.
+  CAO saves that file with wrapped rows joined, for the same reason as the screen.
+  Secrets are redacted before the text is cut, so a secret split at the cut is never
+  returned in part. `truncated` means the file holds more than `text`. Malformed `run_id`
+  or `step_id` 400; unknown run or step, no terminal recorded, or no transcript file yet
+  (the step is still running, the run predates the run view, or the file was deleted after
+  `RETENTION_DAYS`) 404.
+- Both step routes take the terminal id from the step's journal row, never from the
+  request.
 - `GET /workflows/runs/{run_id}/result` returns the complete retained result. It is
   assembled from the journal, so it answers for a **detached, in-flight, or post-restart**
   run — not only a finished one. No run-level `output` field is returned (run-level output
@@ -474,6 +509,13 @@ The spec-route scope checks apply when authentication is enabled.
   JSON page. `?after_seq=` is the replay cursor and must be `>= 0`; on the SSE arm it
   takes precedence over `Last-Event-ID`. A gap is data the server declares when an
   append was lost — never inferred by the client from seq numbering.
+  - `terminal.created` is emitted as soon as a step's terminal exists, before the step
+    finishes. Each attempt that opens a terminal emits one, carrying `step_id`, `attempt`,
+    `terminal_id`, `provider` and `agent_profile`. Per attempt the order is
+    `step.attempt.started`, `terminal.created`, then the attempt's outcome
+    (`step.completed`, `step.attempt.failed`, `step.failed` or `step.skipped`). The
+    structured-output reprompt runs on a new terminal within the same attempt and emits
+    its own `terminal.created`, with the same `attempt`, after `step.reprompted`.
 - `GET /workflows/runs/{run_id}/compare?against={other_run_id}` reports per-step
   differences between two runs. Outputs are compared at the reference level, never by
   diffing payloads. An unknown id on **either** side is a 404, not a partial compare.
@@ -489,10 +531,10 @@ The spec-route scope checks apply when authentication is enabled.
   terminal's append-only log, for correlating a step with the terminal output it
   produced. `length` is capped server-side.
 
-All five reads above (inspect, events, compare, diagnostics, and the run list)
-require a `cao:read`, `cao:write`, or `cao:admin` scope **when authentication is
-enabled**. With no IdP and no `CAO_AUTH_LOCAL_TOKEN` configured — the default —
-that check is inert.
+All seven reads above (inspect, the step screen and transcript, events, compare,
+diagnostics, and the run list) require a `cao:read`, `cao:write`, or `cao:admin` scope
+**when authentication is enabled**. With no IdP and no `CAO_AUTH_LOCAL_TOKEN` configured,
+which is the default, that check is inert.
 
 See [Workflows](workflows.md).
 
@@ -502,7 +544,8 @@ Read-only views of a CAO cluster's workers, reached through the fleet's worker b
 (`CAO_ELASTIC_BROKER_URL` / `CAO_ELASTIC_BROKER_TOKEN` in cao-server's environment). No
 broker configured, unreachable, or erroring is a `503` carrying the broker's message.
 Releasing workers and shutting the fleet down stay CLI actions (`cao worker release`,
-`cao fleet shutdown`).
+`cao fleet shutdown`). This is the Kubernetes worker fleet behind `cao fleet`, not the
+sessions-and-terminals fleet in the AG-UI stream.
 
 - `GET /fleet/status` mirrors `cao fleet status`: `{broker, live, cleanup_pending, states}`.
 - `GET /fleet/workers` mirrors `cao worker list` (`?all=true` for `--all`):

@@ -10,6 +10,11 @@ for the authoritative, up-to-date list). It
 ships three single-file HTML views plus a lightweight topology widget, driven by
 a small set of MCP tools and backed by an in-process event ring buffer.
 
+Here, and in the [AG-UI docs](agui.md#the-stream), the **fleet** is the sessions
+and terminals one `cao-server` can see. A *runner* is where a terminal executes:
+each terminal in the dashboard snapshot carries a `runner_id`, `null` for a
+local terminal.
+
 The whole surface is **default-off and behavior-preserving**: with
 `CAO_MCP_APPS_ENABLED` unset, nothing is registered and CAO behaves byte-for-byte
 as it does today (localhost-only on `127.0.0.1:9889`).

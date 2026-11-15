@@ -249,9 +249,8 @@ class TestBuildCommand:
         assert _build_command(_GIT, "git+https://example.com/x.git") == [
             "uv",
             "tool",
-            "install",
-            "git+https://example.com/x.git",
-            "--upgrade",
+            "upgrade",
+            _PACKAGE,
             "--reinstall",
         ]
 
@@ -294,26 +293,25 @@ class TestUpdateCommand:
         assert "unpinning from <2.4" in result.output
 
     @patch(f"{_MOD}.subprocess.run")
-    @patch(
-        f"{_MOD}._classify_source",
-        return_value=(_GIT, "git+https://github.com/awslabs/cli-agent-orchestrator.git"),
-    )
     @patch(f"{_MOD}._receipt_path")
     @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
-    def test_git_forces_reinstall(self, _which, _rp, _cls, mock_run):
-        mock_run.return_value = _completed(0)
-        result = CliRunner().invoke(update, [])
-        assert result.exit_code == 0
-        mock_run.assert_called_once_with(
-            [
-                "uv",
-                "tool",
-                "install",
-                "git+https://github.com/awslabs/cli-agent-orchestrator.git",
-                "--upgrade",
-                "--reinstall",
-            ]
+    def test_git_reuses_receipt_with_pin_and_extra(self, _which, receipt_path, mock_run, tmp_path):
+        receipt_path.return_value = _write(
+            tmp_path,
+            """
+[tool]
+requirements = [
+    { name = "cli-agent-orchestrator", git = "https://example.com/cao.git?rev=deadbeef" },
+    { name = "cao-decider-example", specifier = "==1.2.3" },
+]
+""",
         )
+        mock_run.return_value = _completed(0)
+
+        result = CliRunner().invoke(update, [])
+
+        assert result.exit_code == 0
+        mock_run.assert_called_once_with(["uv", "tool", "upgrade", _PACKAGE, "--reinstall"])
 
     @patch(f"{_MOD}.subprocess.run")
     @patch(f"{_MOD}._classify_source", return_value=(_DIR, "/home/me/cli-agent-orchestrator"))

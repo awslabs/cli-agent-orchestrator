@@ -2,10 +2,13 @@
 //
 // The form holds the name (fixed when editing), the description, the declared
 // inputs and an ordered list of step cards (StepEditor). A live flow preview
-// and a read-only YAML preview sit beside it. Validate checks the generated
-// YAML on the server without saving. Save creates the workflow, or replaces it
-// using the content hash read when the editor opened, so a concurrent edit is
-// never overwritten.
+// and the YAML sit beside it. The YAML follows the form until it is edited by
+// hand. From then on the form is paused, and Validate and Save use the YAML as
+// written, until the edits are discarded: the builder does not read YAML text
+// back into the form. Validate checks the YAML on the server without saving.
+// Save validates first and saves only YAML that passes. It creates the
+// workflow, or replaces it using the content hash read when the editor opened,
+// so a concurrent edit is never overwritten.
 //
 // Edit loads the spec as the server parsed it and regenerates the whole file
 // (workflowYaml), so comments are not kept. A workflow the builder cannot
@@ -15,18 +18,28 @@
 // the truth. Picking a profile afterwards does, as it does in create mode.
 //
 // A note above the form says what a YAML workflow cannot do and points to
-// Python workflows for those cases.
+// Python workflows for those cases. In Edit mode, when the workflow has runs, a
+// second note says that changes apply to new runs only.
+//
+// New workflow can clone a stored YAML workflow ("Clone from"). The clone
+// fills the form with that workflow's description, inputs and steps, under a
+// free name such as nightly-check-copy, and Save creates a new workflow; the
+// source is never changed. Python workflows are not listed, because the
+// builder writes YAML only. Replacing a form that is not blank asks first.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, ArrowDown, ArrowUp, Info, ListChecks, Loader2, Plus, Save, Trash2, Workflow, X } from 'lucide-react'
-import { api, type ApiError, type ProviderInfo, type WorkflowValidation, type WorkflowWriteResult } from '../../api'
+import { api, type ApiError, type ProviderInfo, type WorkflowDefRow, type WorkflowValidation, type WorkflowWriteResult } from '../../api'
 import { useStore } from '../../store'
-import { useGeneration } from '../../hooks/useGeneration'
+import { useGeneration, type GenerationToken } from '../../hooks/useGeneration'
 import { ValidationFindings } from '../ValidationFindings'
+import { ConfirmModal } from '../ConfirmModal'
 import { StepEditor } from './StepEditor'
 import { WorkflowFlow } from './WorkflowFlow'
+import { isYamlWorkflow } from './WorkflowLauncher'
 import {
   INPUT_TYPES,
+  NAME_RE,
   applyDeclaredParams,
   applyStepPatch,
   dropDeclaredParams,
@@ -91,10 +104,92 @@ interface StepCard {
 
 type LoadState = 'loading' | 'ready' | 'blocked' | 'error'
 
-const fieldClass = (invalid: boolean) =>
-  `w-full rounded-lg border bg-gray-900 px-2 py-1.5 text-sm text-gray-200 placeholder-gray-600 focus:outline-hidden focus:border-emerald-600 ${
+/** Where a clone for "Clone from" stands. */
+type CopyState =
+  | { status: 'idle' }
+  | { status: 'loading'; source: string }
+  | { status: 'blocked'; source: string; blocking: string[] }
+  | { status: 'error'; source: string; message: string }
+
+/**
+ * A free name for a copy of `source`: source-copy, then source-copy-2 and so
+ * on, cut to the 64 characters a workflow name may have.
+ */
+export function copyName(source: string, taken: Iterable<string>): string {
+  const used = new Set(taken)
+  for (let n = 1; ; n++) {
+    const suffix = n === 1 ? '-copy' : `-copy-${n}`
+    const name = `${source.slice(0, 64 - suffix.length)}${suffix}`
+    if (!used.has(name)) return name
+  }
+}
+
+/** Steps loaded from a file wait for their profile's declared params. */
+function awaitingProfiles(steps: BuilderStep[]): BuilderStep[] {
+  return steps.map(step => (step.agent !== '' ? { ...step, declared: { status: 'loading' as const } } : step))
+}
+
+/**
+ * The workflow name that YAML text declares in a top-level `name:` line, or
+ * null. It picks the name a create request sends when the YAML was edited by
+ * hand, since the server refuses a name that differs from the YAML's. The
+ * server parses and checks the YAML in full; this reads one line only.
+ */
+export function yamlTopLevelName(source: string): string | null {
+  const m = source.match(/^(?:"name"|'name'|name)[ \t]*:[ \t]*(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"'#][^\s#]*))[ \t]*(?:#.*)?$/m)
+  const value = m ? (m[1] ?? m[2] ?? m[3]) : null
+  return value !== null && value !== undefined && NAME_RE.test(value) ? value : null
+}
+
+/** The line under "Clone from": what the clone is doing, or what it copies. */
+function CopyStatus({ copy, copiedFrom }: { copy: CopyState; copiedFrom: string }) {
+  if (copy.status === 'loading') {
+    return (
+      <p className="mt-1 flex items-center gap-1.5 text-[11px] text-gray-500">
+        <Loader2 size={12} className="animate-spin" aria-hidden="true" /> Cloning {copy.source}...
+      </p>
+    )
+  }
+  if (copy.status === 'blocked') {
+    return (
+      <div role="alert" className="mt-1.5 rounded-lg border border-amber-700/50 bg-amber-950/30 p-2 text-xs text-amber-200">
+        <p>{copy.source} uses fields the builder cannot edit, so it cannot be cloned here:</p>
+        <ul className="mt-1 list-disc pl-5 font-mono">
+          {copy.blocking.map(b => <li key={b}>{b}</li>)}
+        </ul>
+      </div>
+    )
+  }
+  if (copy.status === 'error') {
+    return <p role="alert" className="mt-1 text-xs text-red-400">Could not clone {copy.source}: {copy.message}</p>
+  }
+  if (copiedFrom) {
+    return (
+      <p className="mt-0.5 text-[11px] text-gray-500">
+        Cloned from {copiedFrom}. Saving creates a new workflow and leaves {copiedFrom} unchanged.
+      </p>
+    )
+  }
+  return (
+    <p className="mt-0.5 text-[11px] text-gray-500">
+      Pick a workflow to copy its description, inputs and steps. Only YAML workflows are listed.
+    </p>
+  )
+}
+
+const fieldBase = (invalid: boolean, width: string) =>
+  `${width} rounded-lg border bg-gray-900 py-1.5 text-sm text-gray-200 placeholder-gray-600 focus:outline-hidden focus:border-emerald-600 ${
     invalid ? 'border-red-700' : 'border-gray-700'
   }`
+
+/**
+ * A text field's classes. `width` replaces the full width for a field that
+ * shares a row; passing both a width and w-full lets w-full win.
+ */
+const fieldClass = (invalid: boolean, width = 'w-full') => `px-2 ${fieldBase(invalid, width)}`
+
+/** A select's classes: the right padding leaves room for the chevron index.css draws. */
+const selectClass = (invalid: boolean, width = 'w-full') => `pl-2 pr-8 ${fieldBase(invalid, width)}`
 
 function FieldError({ message }: { message?: string }) {
   if (!message) return null
@@ -102,6 +197,30 @@ function FieldError({ message }: { message?: string }) {
 }
 
 const WORKFLOW_DOCS_URL = 'https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/workflows.md'
+
+/** The most runs one read of `GET /workflows/runs` returns: the server's `limit` cap. */
+export const RUN_LIST_MAX_LIMIT = 500
+
+export const FUTURE_RUNS_NOTE =
+  'Changes apply to new runs only. Runs that already started, including runs you resume, keep the version they started with.'
+
+/**
+ * Shown when editing a workflow that has runs. It is accurate for resumed runs
+ * too: resume reads the spec snapshot the run started with, not the file.
+ */
+function FutureRunsNote() {
+  return (
+    <div
+      role="note"
+      aria-label="Changes apply to new runs only"
+      data-testid="builder-future-runs-note"
+      className="mb-4 flex gap-2 rounded-xl border border-sky-800/60 bg-sky-950/30 p-3 text-xs text-sky-200"
+    >
+      <Info size={14} className="mt-0.5 shrink-0 text-sky-300" aria-hidden="true" />
+      <p>{FUTURE_RUNS_NOTE}</p>
+    </div>
+  )
+}
 
 /**
  * What a YAML workflow cannot do, so nobody builds one expecting it to. The engine
@@ -185,6 +304,22 @@ export function WorkflowBuilder(props: WorkflowBuilderProps) {
     return () => { cancelled = true }
   }, [])
 
+  // Whether the workflow being edited has runs, for the future-runs note. The
+  // list is newest first and has no name filter, so read the most it returns.
+  // Best effort: a failed read shows no note.
+  const [hasRuns, setHasRuns] = useState(false)
+  useEffect(() => {
+    setHasRuns(false)
+    if (!editing) return
+    let cancelled = false
+    api.listWorkflowRuns(RUN_LIST_MAX_LIMIT)
+      .then(rows => {
+        if (!cancelled) setHasRuns(Array.isArray(rows) && rows.some(r => r.workflow_name === editName))
+      })
+      .catch(() => { /* no note */ })
+    return () => { cancelled = true }
+  }, [editing, editName])
+
   const loadGen = useGeneration()
   // A profile read from the edit load lands only on steps that still use that
   // profile and still wait for it, so it never undoes a pick made meanwhile.
@@ -192,6 +327,20 @@ export function WorkflowBuilder(props: WorkflowBuilderProps) {
     setCards(cs => cs.map(c => (
       c.step.agent === agent && c.step.declared.status === 'loading' ? { ...c, step: applyStepPatch(c.step, patch) } : c
     )))
+  // Read each distinct step profile once, for the params it declares. Loading
+  // never pre-fills a default: the file is the truth.
+  const readStepProfiles = (steps: BuilderStep[], token: GenerationToken) => {
+    for (const agent of new Set(steps.map(s => s.agent).filter(a => a !== ''))) {
+      api.getProfile(agent)
+        .then(profile => {
+          const params = readDeclaredParams(profile?.params)
+          if (token.isCurrent()) settleDeclared(agent, s => applyDeclaredParams(s, params, false))
+        })
+        .catch(() => {
+          if (token.isCurrent()) settleDeclared(agent, dropDeclaredParams)
+        })
+    }
+  }
   const load = useCallback(() => {
     if (!editing) return
     const token = loadGen.begin()
@@ -200,6 +349,7 @@ export function WorkflowBuilder(props: WorkflowBuilderProps) {
     setSaveError(null)
     setValidation(null)
     setAttempted(false)
+    setYamlDraft(null)
     api.getWorkflowSpec(editName)
       .then(spec => {
         if (!token.isCurrent()) return
@@ -210,8 +360,7 @@ export function WorkflowBuilder(props: WorkflowBuilderProps) {
           setLoadState('blocked')
           return
         }
-        const steps = result.workflow.steps.map(step =>
-          step.agent !== '' ? { ...step, declared: { status: 'loading' as const } } : step)
+        const steps = awaitingProfiles(result.workflow.steps)
         // The route name wins: the server refuses a spec whose name differs from it.
         setName(editName)
         setDescription(result.workflow.description)
@@ -219,18 +368,7 @@ export function WorkflowBuilder(props: WorkflowBuilderProps) {
         setCards(steps.map(step => ({ key: nextKey.current++, step })))
         setExpectedHash(typeof spec.content_hash === 'string' && spec.content_hash !== '' ? spec.content_hash : null)
         setLoadState('ready')
-        // Read each distinct step profile once, for the params it declares.
-        // Loading never pre-fills a default: the file is the truth.
-        for (const agent of new Set(steps.map(s => s.agent).filter(a => a !== ''))) {
-          api.getProfile(agent)
-            .then(profile => {
-              const params = readDeclaredParams(profile?.params)
-              if (token.isCurrent()) settleDeclared(agent, s => applyDeclaredParams(s, params, false))
-            })
-            .catch(() => {
-              if (token.isCurrent()) settleDeclared(agent, dropDeclaredParams)
-            })
-        }
+        readStepProfiles(steps, token)
       })
       .catch((e: ApiError) => {
         if (!token.isCurrent()) return
@@ -248,20 +386,99 @@ export function WorkflowBuilder(props: WorkflowBuilderProps) {
     [name, description, inputs, cards],
   )
   const yaml = useMemo(() => toYaml(wf), [wf])
+  // Hand edits to the YAML panel: null while the YAML follows the form. Once
+  // the YAML is edited by hand, Validate and Save use it as written and the
+  // form is paused, because the builder does not read YAML text back into it.
+  const [yamlDraft, setYamlDraft] = useState<string | null>(null)
+  const yamlEdited = yamlDraft !== null
+  const shownYaml = yamlDraft ?? yaml
+  const [confirmDiscard, setConfirmDiscard] = useState(false)
   const errors = useMemo(() => validateBuilder(wf), [wf])
   const errorCount = Object.keys(errors).length
   const shown = attempted ? errors : {}
 
   // A validation result describes the YAML it checked. Drop it once that changes.
-  const yamlRef = useRef(yaml)
-  yamlRef.current = yaml
-  useEffect(() => { setValidation(null) }, [yaml])
+  const yamlRef = useRef(shownYaml)
+  yamlRef.current = shownYaml
+  useEffect(() => { setValidation(null) }, [shownYaml])
+
+  // Start from: create mode can begin from a copy of a stored YAML workflow.
+  // Best effort: when the list cannot be read, the choice is not shown.
+  const [stored, setStored] = useState<WorkflowDefRow[]>([])
+  useEffect(() => {
+    if (editing) return
+    let cancelled = false
+    api.listWorkflows()
+      .then(rows => { if (!cancelled && Array.isArray(rows)) setStored(rows) })
+      .catch(() => { /* no Start from choice */ })
+    return () => { cancelled = true }
+  }, [editing])
+  const copySources = useMemo(
+    () => stored.filter(isYamlWorkflow).map(w => w.name).sort((a, b) => a.localeCompare(b)),
+    [stored],
+  )
+  const [copiedFrom, setCopiedFrom] = useState('')
+  const [copy, setCopy] = useState<CopyState>({ status: 'idle' })
+  // The choice waiting for "Replace": a source name, or '' for a blank workflow.
+  const [pendingStart, setPendingStart] = useState<string | null>(null)
+  const blankYaml = useMemo(() => toYaml({ name: '', description: '', inputs: [], steps: [newStep('step-1')] }), [])
+
+  const applyStart = (source: string) => {
+    setPendingStart(null)
+    setSaveError(null)
+    setValidation(null)
+    setAttempted(false)
+    setYamlDraft(null)
+    if (source === '') {
+      loadGen.invalidate()
+      setCopy({ status: 'idle' })
+      setCopiedFrom('')
+      setName('')
+      setDescription('')
+      setInputs([])
+      setCards([{ key: nextKey.current++, step: newStep('step-1') }])
+      return
+    }
+    const token = loadGen.begin()
+    setCopy({ status: 'loading', source })
+    api.getWorkflowSpec(source)
+      .then(spec => {
+        if (!token.isCurrent()) return
+        const result = fromSpec(spec)
+        if (!result.ok) {
+          // The form stays as it was: nothing of it is lost.
+          setCopy({ status: 'blocked', source, blocking: result.blocking })
+          return
+        }
+        const steps = awaitingProfiles(result.workflow.steps)
+        setName(copyName(source, stored.map(w => w.name)))
+        setDescription(result.workflow.description)
+        setInputs(result.workflow.inputs)
+        setCards(steps.map(step => ({ key: nextKey.current++, step })))
+        setCopiedFrom(source)
+        setCopy({ status: 'idle' })
+        readStepProfiles(steps, token)
+      })
+      .catch((e: ApiError) => {
+        if (!token.isCurrent()) return
+        setCopy({ status: 'error', source, message: e?.detail || e?.message || 'Failed to load the workflow' })
+      })
+  }
+  // A blank form is replaced at once. Anything else asks first.
+  const startFrom = (source: string) => {
+    if (yaml !== blankYaml) {
+      setPendingStart(source)
+      return
+    }
+    applyStart(source)
+  }
 
   const validate = async () => {
     setAttempted(true)
     setValidation(null)
-    if (errorCount > 0 || validating) return
-    const sent = yaml
+    // The form's own checks apply only while the form writes the YAML.
+    if ((!yamlEdited && errorCount > 0) || validating) return
+    const sent = shownYaml
     setValidating(true)
     try {
       const result = await api.validateWorkflowSource(sent, 'yaml')
@@ -275,24 +492,41 @@ export function WorkflowBuilder(props: WorkflowBuilderProps) {
     }
   }
 
+  // Save validates the YAML on the server first, and saves only YAML that passes.
   const save = async () => {
     if (saveGuard.current) return
     setAttempted(true)
     setSaveError(null)
-    if (errorCount > 0) return
+    if (!yamlEdited && errorCount > 0) return
     if (editing && !expectedHash) {
       setSaveError({ message: 'The server sent no content hash for this workflow, so it cannot be replaced safely. Reload it.', stale: true })
       return
     }
+    const sent = shownYaml
+    // Hand-edited YAML names itself. The server checks that name in full.
+    const saveName = editing ? editName : (yamlEdited ? yamlTopLevelName(sent) ?? name : name)
     saveGuard.current = true
     setSaving(true)
     try {
+      let check: WorkflowValidation
+      try {
+        check = await api.validateWorkflowSource(sent, 'yaml')
+      } catch (e: any) {
+        setValidation(null)
+        setSaveError({ message: `Not saved: the workflow could not be validated. ${e?.detail || e?.message || 'The request failed.'}` })
+        return
+      }
+      if (yamlRef.current === sent) setValidation(check)
+      if (check.status === 'fail') {
+        setSaveError({ message: 'Not saved: fix the validation errors first.' })
+        return
+      }
       const result = editing
-        ? await api.updateWorkflow(editName, yaml, expectedHash as string, 'yaml')
-        : await api.createWorkflow(name, yaml, 'yaml')
-      onSaved(result?.name || name, result)
+        ? await api.updateWorkflow(editName, sent, expectedHash as string, 'yaml')
+        : await api.createWorkflow(saveName, sent, 'yaml')
+      onSaved(result?.name || saveName, result)
     } catch (e) {
-      setSaveError(describeSaveError(e as ApiError, editing ? 'edit' : 'create', editing ? editName : name))
+      setSaveError(describeSaveError(e as ApiError, editing ? 'edit' : 'create', saveName))
     } finally {
       saveGuard.current = false
       setSaving(false)
@@ -379,10 +613,49 @@ export function WorkflowBuilder(props: WorkflowBuilderProps) {
           )}
 
           {ready && <YamlLimitsNote />}
+          {ready && editing && hasRuns && <FutureRunsNote />}
           {ready && (
             <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_24rem]">
               <div className="min-w-0 space-y-4">
+                {yamlEdited && (
+                  <div
+                    role="note"
+                    aria-label="The form is paused"
+                    data-testid="builder-form-paused"
+                    className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-amber-700/50 bg-amber-950/30 p-3 text-xs text-amber-200"
+                  >
+                    <p className="min-w-0 flex-1">
+                      You edited the YAML by hand, so the form is paused. Validate and Save use the YAML as written.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDiscard(true)}
+                      className="shrink-0 rounded-lg border border-amber-700/60 px-2 py-1 text-amber-100 hover:bg-amber-900/40"
+                    >
+                      Discard YAML edits
+                    </button>
+                  </div>
+                )}
+                <fieldset disabled={yamlEdited} aria-label="Workflow form" className="min-w-0 space-y-4 disabled:opacity-50">
                 <section className="space-y-2">
+                  {!editing && copySources.length > 0 && (
+                    <div data-testid="builder-clone-from">
+                      <label className="block">
+                        <span className="text-xs text-gray-400">Clone from</span>
+                        <select
+                          aria-label="Clone from"
+                          value={copy.status === 'loading' ? copy.source : copiedFrom}
+                          onChange={e => startFrom(e.target.value)}
+                          disabled={saving}
+                          className={`mt-1 ${selectClass(false)}`}
+                        >
+                          <option value="">None</option>
+                          {copySources.map(source => <option key={source} value={source}>{source}</option>)}
+                        </select>
+                      </label>
+                      <CopyStatus copy={copy} copiedFrom={copiedFrom} />
+                    </div>
+                  )}
                   {editing ? (
                     <div>
                       <span className="text-xs text-gray-400">Name</span>
@@ -436,13 +709,13 @@ export function WorkflowBuilder(props: WorkflowBuilderProps) {
                             onChange={e => setInput(i, { name: e.target.value })}
                             placeholder="name"
                             spellCheck={false}
-                            className={`w-36 font-mono ${fieldClass(!!nameError)}`}
+                            className={`font-mono ${fieldClass(!!nameError, 'w-36')}`}
                           />
                           <select
                             aria-label={`Workflow input ${i + 1} type`}
                             value={input.type}
                             onChange={e => setInputType(i, e.target.value as InputType)}
-                            className={`w-24 ${fieldClass(false)}`}
+                            className={selectClass(false, 'w-24')}
                           >
                             {INPUT_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
                           </select>
@@ -461,7 +734,7 @@ export function WorkflowBuilder(props: WorkflowBuilderProps) {
                               aria-invalid={!!defaultError}
                               value={input.default ?? ''}
                               onChange={e => setInput(i, { default: e.target.value === '' ? null : e.target.value })}
-                              className={`w-32 ${fieldClass(!!defaultError)}`}
+                              className={selectClass(!!defaultError, 'w-32')}
                             >
                               <option value="">no default</option>
                               <option value="true">true</option>
@@ -475,7 +748,7 @@ export function WorkflowBuilder(props: WorkflowBuilderProps) {
                               value={input.default ?? ''}
                               onChange={e => setInput(i, { default: e.target.value === '' ? null : e.target.value })}
                               placeholder={input.type === 'int' ? 'default, a whole number' : 'default (optional)'}
-                              className={`min-w-0 flex-1 ${fieldClass(!!defaultError)}`}
+                              className={fieldClass(!!defaultError, 'min-w-0 flex-1')}
                             />
                           )}
                           <button
@@ -558,33 +831,70 @@ export function WorkflowBuilder(props: WorkflowBuilderProps) {
                     <Plus size={13} aria-hidden="true" /> Add step
                   </button>
                 </section>
+                </fieldset>
               </div>
 
               <aside className="min-w-0 space-y-3">
                 <section className="rounded-xl border border-gray-800 p-3">
                   <h4 className="mb-2 text-sm font-semibold text-gray-300">Flow</h4>
-                  <WorkflowFlow
-                    label="Flow preview"
-                    steps={wf.steps.map(s => ({ id: s.id, call: s.call, agent: s.agent, provider: s.provider }))}
-                  />
+                  {/* The flow is drawn from the form, so it pauses with the form. */}
+                  {yamlEdited && (
+                    <p className="mb-2 text-[11px] text-amber-200" data-testid="flow-paused">
+                      Paused with the form, so it does not show your YAML edits.
+                    </p>
+                  )}
+                  <div className={yamlEdited ? 'opacity-50' : undefined}>
+                    <WorkflowFlow
+                      label="Flow preview"
+                      steps={wf.steps.map(s => ({ id: s.id, call: s.call, agent: s.agent, provider: s.provider }))}
+                    />
+                  </div>
                 </section>
                 <section className="rounded-xl border border-gray-800 p-3">
-                  <h4 className="text-sm font-semibold text-gray-300">YAML</h4>
+                  <div className="mb-1 flex items-center gap-2">
+                    <h4 className="text-sm font-semibold text-gray-300">YAML</h4>
+                    {yamlEdited && (
+                      <span className="rounded-sm bg-amber-900/40 px-1.5 py-0.5 text-[10px] font-medium text-amber-200" data-testid="yaml-edited">
+                        Edited by hand
+                      </span>
+                    )}
+                  </div>
                   <p className="mb-2 text-[11px] text-gray-500">
-                    Saving rewrites the file from this form. Comments in the file are not kept.
+                    {yamlEdited
+                      ? 'Saved as written, comments included. Save validates it first.'
+                      : 'Edit the YAML here, or use the form. Save validates it first. When the form writes the YAML, comments in the file are not kept.'}
                   </p>
-                  <pre aria-label="YAML preview" className="max-h-96 overflow-auto rounded-sm bg-gray-950 p-2 font-mono text-[11px] text-gray-300">
-                    {yaml}
-                  </pre>
+                  <textarea
+                    aria-label="Workflow YAML"
+                    value={shownYaml}
+                    // Typing the form's own YAML back exactly puts the form back in charge.
+                    onChange={e => setYamlDraft(e.target.value === yaml ? null : e.target.value)}
+                    disabled={saving}
+                    spellCheck={false}
+                    autoCapitalize="off"
+                    autoCorrect="off"
+                    wrap="off"
+                    rows={22}
+                    className="block h-96 w-full resize-y rounded-sm border border-gray-800 bg-gray-950 p-2 font-mono text-[11px] leading-relaxed text-gray-300 focus:border-emerald-600 focus:outline-hidden"
+                  />
+                  {yamlEdited && (
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDiscard(true)}
+                      className="mt-2 rounded-lg border border-gray-700 px-2 py-1 text-xs text-gray-300 hover:bg-gray-800"
+                    >
+                      Discard YAML edits
+                    </button>
+                  )}
                 </section>
               </aside>
             </div>
           )}
         </div>
 
-        {ready && ((attempted && errorCount > 0) || validation || saveError) && (
+        {ready && ((attempted && errorCount > 0 && !yamlEdited) || validation || saveError) && (
           <div className="space-y-2 border-t border-gray-800 px-4 py-3 text-xs">
-            {attempted && errorCount > 0 && (
+            {attempted && errorCount > 0 && !yamlEdited && (
               <p role="alert" className="text-red-300">
                 Fix the {errorCount === 1 ? 'problem' : `${errorCount} problems`} marked in the form first.
               </p>
@@ -658,6 +968,30 @@ export function WorkflowBuilder(props: WorkflowBuilderProps) {
           </button>
         </div>
       </div>
+      <ConfirmModal
+        open={pendingStart !== null}
+        title={pendingStart ? `Clone ${pendingStart}?` : 'Clear the form?'}
+        message={
+          pendingStart
+            ? `The form fills with the description, inputs and steps of ${pendingStart}. This replaces everything in the form.`
+            : 'This clears everything in the form.'
+        }
+        confirmLabel="Replace"
+        cancelLabel="Keep editing"
+        variant="warning"
+        onConfirm={() => { if (pendingStart !== null) applyStart(pendingStart) }}
+        onCancel={() => setPendingStart(null)}
+      />
+      <ConfirmModal
+        open={confirmDiscard}
+        title="Discard your YAML edits?"
+        message="The YAML goes back to what the form shows, and you can use the form again."
+        confirmLabel="Discard edits"
+        cancelLabel="Keep editing"
+        variant="warning"
+        onConfirm={() => { setYamlDraft(null); setConfirmDiscard(false) }}
+        onCancel={() => setConfirmDiscard(false)}
+      />
     </div>
   )
 }

@@ -3,6 +3,20 @@
 A browser dashboard for the person supervising a CAO fleet. It reads two AG-UI
 surfaces and nothing else:
 
+- **Fleet**, from the ambient stream (`/agui/v1/stream`). The `STATE_SNAPSHOT` and
+  `STATE_DELTA` frames are folded into the sessions and terminals one `cao-server`
+  can see, grouped by the runner each terminal runs on (a terminal with no runner
+  is `local`). Each terminal shows a card built here from the terminal and the
+  snapshot's read-only profile catalog (`name`, `source`, `role`, `loadable`), not
+  from anything an agent wrote. It has no controls. A delta the dashboard does not
+  understand is not applied: the panel shows a banner that it may be out of sync, and
+  it does not ask the server for a new snapshot. Recovery is a reconnect, which
+  starts a new run and sends one. A **Host resources** strip above the groups shows
+  the snapshot's `host` entry for the machine running `cao-server`: CPU %, load per
+  core, memory used and memory pressure, as numbers. A figure the server could not
+  read shows `—`, never 0 (CPU shows a dash until two samples 30 to 60 seconds apart
+  exist), and no entry shows "not reported". It refreshes when the fleet changes and
+  at most every 30 seconds, so an idle fleet shows its last sample.
 - **Approvals**, from the run plane (`POST /agui/v1/run`). When a terminal is
   waiting on a permission prompt, the run ends `RUN_FINISHED(interrupt)` and the
   dashboard shows a card for each open interrupt. You answer Approve, Deny, or
@@ -21,6 +35,8 @@ view/      React 19 + Vite 8 UI over core/
 fixtures/  frames captured from a real cao-server (see fixtures/README.md)
 e2e/       keyless end-to-end check: core/ driven headless against cao-server and mock_cli
 ```
+
+The page ships a minimal stylesheet, `view/styles.css` (no fonts or remote URLs; light, with a dark variant under `prefers-color-scheme`).
 
 ## Run it
 

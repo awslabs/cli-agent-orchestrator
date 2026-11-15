@@ -6,14 +6,15 @@
 // Params come in two parts. The params the profile declares each get a typed
 // row, required ones first, under "Params from the profile". Free-form rows
 // below hold every other name. Every value is fixed here and saved in the
-// file.
+// file, exactly as typed: a value that starts or ends with a space gets a
+// warning, and is neither trimmed nor blocked.
 //
 // The editor is controlled. It reports changes as patches, so a late profile
 // lookup merges into the newest step instead of overwriting edits made while
 // it was in flight. It shows the errors it is given; validateBuilder computes
 // them.
 
-import { useEffect, useId, useState } from 'react'
+import { useEffect, useId, useState, type ReactNode } from 'react'
 import { ChevronDown, ChevronRight, Copy, Loader2, Plus, Search, X } from 'lucide-react'
 import { api, type ApiError, type ProfileSearchResult, type ProviderInfo } from '../../api'
 import { useStore } from '../../store'
@@ -71,14 +72,50 @@ const CALL_HINTS: Record<StepCall, string> = {
   send_message: 'Sends the prompt to an agent that an earlier step started.',
 }
 
-const fieldClass = (invalid: boolean) =>
-  `w-full rounded-lg border bg-gray-900 px-2 py-1.5 text-sm text-gray-200 placeholder-gray-600 focus:outline-hidden focus:border-emerald-600 ${
+const fieldBase = (invalid: boolean, width: string) =>
+  `${width} rounded-lg border bg-gray-900 py-1.5 text-sm text-gray-200 placeholder-gray-600 focus:outline-hidden focus:border-emerald-600 ${
     invalid ? 'border-red-700' : 'border-gray-700'
   }`
+
+/**
+ * A text field's classes. `width` replaces the full width for a field that
+ * shares a row; passing both a width and w-full lets w-full win.
+ */
+const fieldClass = (invalid: boolean, width = 'w-full') => `px-2 ${fieldBase(invalid, width)}`
+
+/** A select's classes: the right padding leaves room for the chevron index.css draws. */
+const selectClass = (invalid: boolean, width = 'w-full') => `pl-2 pr-8 ${fieldBase(invalid, width)}`
+
+/**
+ * The grid of the declared param rows. The name column is as wide as the
+ * longest name, up to 15rem, so the controls all start in the same place.
+ */
+const DECLARED_GRID = 'grid grid-cols-[fit-content(15rem)_minmax(0,1fr)] items-start gap-x-3 gap-y-1.5'
 
 function FieldError({ message }: { message?: string }) {
   if (!message) return null
   return <p className="mt-0.5 text-xs text-red-400">{message}</p>
+}
+
+/**
+ * A warning for a param value that starts or ends with a space, or null. The
+ * value is saved exactly as typed, spaces included, so the warning only points
+ * them out; it never trims the value and never blocks saving. Any whitespace
+ * counts, because a tab or a non-breaking space pasted from a document is just
+ * as hard to see.
+ */
+export function paramSpaceWarning(value: string): string | null {
+  const starts = /^\s/.test(value)
+  const ends = /\s$/.test(value)
+  if (starts && ends) return 'This value starts and ends with a space.'
+  if (starts) return 'This value starts with a space.'
+  if (ends) return 'This value ends with a space.'
+  return null
+}
+
+function SpaceWarning({ id, message }: { id: string; message: string | null }) {
+  if (!message) return null
+  return <p id={id} className="mt-0.5 text-xs text-amber-300" data-testid="param-space-warning">{message}</p>
 }
 
 /** The placeholder of a declared param's text field: its default, or a hint at its type. */
@@ -88,10 +125,22 @@ function declaredPlaceholder(param: DeclaredParam): string {
 }
 
 /**
+ * A param name with a soft line break after each _ . and -. The name column
+ * grows to fit the longest name, up to a limit; a longer name then wraps
+ * between its words, as in partition_key_ / value, and never mid-word.
+ */
+export function breakableName(name: string): ReactNode[] {
+  return name.split(/(?<=[_.-])/).flatMap((part, i) => (i === 0 ? [part] : [<wbr key={i} />, part]))
+}
+
+/**
  * One typed row for a param the profile declares: its name, marked * when
  * required, its control and its description. An enum or a bool is a select,
  * with an empty choice only when the param is optional. An int or a string is
  * a text field, and the value stays text.
+ *
+ * The row is two cells of the grid DECLARED_GRID sets up, so every row's
+ * control starts at the same place, after the longest name.
  */
 function DeclaredParamRow({ param, value, error, label, descriptionId, onChange }: {
   param: DeclaredParam
@@ -101,17 +150,20 @@ function DeclaredParamRow({ param, value, error, label, descriptionId, onChange 
   descriptionId: string
   onChange: (value: string) => void
 }) {
+  const warning = paramSpaceWarning(value)
+  const warningId = `${descriptionId}-space`
+  const describedBy = [param.description ? descriptionId : null, warning ? warningId : null].filter(Boolean).join(' ')
   const common = {
     'aria-label': label,
     'aria-invalid': !!error,
     'aria-required': param.required || undefined,
-    'aria-describedby': param.description ? descriptionId : undefined,
+    'aria-describedby': describedBy || undefined,
   }
   const choices = param.enum ?? (param.type === 'bool' ? ['true', 'false'] : null)
   // A value from the file that is not a choice stays visible, so its error makes sense.
   const shown = choices && value !== '' && !choices.includes(value) ? [value, ...choices] : choices
   const control = shown ? (
-    <select {...common} value={value} onChange={e => onChange(e.target.value)} className={fieldClass(!!error)}>
+    <select {...common} value={value} onChange={e => onChange(e.target.value)} className={selectClass(!!error)}>
       {!param.required && <option value="">{param.default !== null ? `not set (default: ${param.default})` : 'not set'}</option>}
       {param.required && value === '' && <option value="" disabled>Pick a value</option>}
       {shown.map(c => <option key={c} value={c}>{c}</option>)}
@@ -128,14 +180,15 @@ function DeclaredParamRow({ param, value, error, label, descriptionId, onChange 
     />
   )
   return (
-    <div className="flex items-start gap-1.5" data-testid="declared-param" data-name={param.name}>
-      <span className="w-40 shrink-0 break-all pt-1.5 font-mono text-sm text-gray-200">
-        {param.name}
+    <div className="contents" data-testid="declared-param" data-name={param.name}>
+      <span className="pt-1.5 font-mono text-sm text-gray-200 [overflow-wrap:anywhere]">
+        {breakableName(param.name)}
         {param.required && <span aria-hidden="true" className="ml-0.5 text-red-400">*</span>}
       </span>
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0">
         {control}
         {param.description && <p id={descriptionId} className="mt-0.5 text-[11px] text-gray-500">{param.description}</p>}
+        <SpaceWarning id={warningId} message={warning} />
         <FieldError message={error} />
       </div>
     </div>
@@ -345,7 +398,7 @@ export function StepEditor({ step, index, errors = {}, providers, onChange }: St
               aria-invalid={!!errors.provider}
               value={step.provider}
               onChange={e => pickProvider(e.target.value)}
-              className={`mt-1 ${fieldClass(!!errors.provider)}`}
+              className={`mt-1 ${selectClass(!!errors.provider)}`}
             >
               <option value="">Pick a provider</option>
               {providerOptions.map(p => (
@@ -375,7 +428,7 @@ export function StepEditor({ step, index, errors = {}, providers, onChange }: St
             aria-label={`Call type for step ${n}`}
             value={step.call}
             onChange={e => onChange({ call: e.target.value as StepCall })}
-            className={`mt-1 ${fieldClass(false)}`}
+            className={`mt-1 ${selectClass(false)}`}
           >
             {STEP_CALLS.map(c => <option key={c} value={c}>{CALL_LABELS[c]}</option>)}
           </select>
@@ -410,23 +463,29 @@ export function StepEditor({ step, index, errors = {}, providers, onChange }: St
                 This profile declares no params. Clone it above, or edit it in the Profiles tab, to add some.
               </p>
             )}
-            {declared.status === 'ready' && declaredRows.map(({ param, k }) => (
-              <DeclaredParamRow
-                key={param.name}
-                param={param}
-                value={declared.values[k] ?? ''}
-                error={errors[`declared.${k}`]}
-                label={`Step ${n} param ${param.name}`}
-                descriptionId={`${uid}-declared-${k}`}
-                onChange={value => setDeclaredValue(param.name, value)}
-              />
-            ))}
+            {declared.status === 'ready' && declaredRows.length > 0 && (
+              <div className={DECLARED_GRID}>
+                {declaredRows.map(({ param, k }) => (
+                  <DeclaredParamRow
+                    key={param.name}
+                    param={param}
+                    value={declared.values[k] ?? ''}
+                    error={errors[`declared.${k}`]}
+                    label={`Step ${n} param ${param.name}`}
+                    descriptionId={`${uid}-declared-${k}`}
+                    onChange={value => setDeclaredValue(param.name, value)}
+                  />
+                ))}
+              </div>
+            )}
           </div>
         )}
         <div className="mt-1.5 space-y-1.5">
           {step.params.map((p, j) => {
             const keyError = errors[`params.${j}.key`]
             const valueError = errors[`params.${j}.value`]
+            const warning = paramSpaceWarning(p.value)
+            const warningId = `${uid}-param-${j}-space`
             return (
               <div key={j}>
                 <div className="flex items-center gap-1.5">
@@ -437,27 +496,29 @@ export function StepEditor({ step, index, errors = {}, providers, onChange }: St
                     onChange={e => setParam(j, { key: e.target.value })}
                     placeholder="name"
                     spellCheck={false}
-                    className={`w-40 font-mono ${fieldClass(!!keyError)}`}
+                    className={`font-mono ${fieldClass(!!keyError, 'w-40 shrink-0')}`}
                   />
                   <input
                     aria-label={`Step ${n} param ${j + 1} value`}
                     aria-invalid={!!valueError}
+                    aria-describedby={warning ? warningId : undefined}
                     value={p.value}
                     onChange={e => setParam(j, { value: e.target.value })}
                     placeholder="value"
                     spellCheck={false}
-                    className={`flex-1 ${fieldClass(!!valueError)}`}
+                    className={fieldClass(!!valueError, 'min-w-0 flex-1')}
                   />
                   <button
                     type="button"
                     onClick={() => removeParam(j)}
                     aria-label={`Remove step ${n} param ${j + 1}`}
-                    className="p-1 text-gray-500 hover:text-red-400"
+                    className="shrink-0 p-1 text-gray-500 hover:text-red-400"
                   >
                     <X size={14} aria-hidden="true" />
                   </button>
                 </div>
                 <FieldError message={keyError} />
+                <SpaceWarning id={warningId} message={warning} />
                 <FieldError message={valueError} />
               </div>
             )
@@ -519,7 +580,7 @@ export function StepEditor({ step, index, errors = {}, providers, onChange }: St
                 aria-label={`On failure for step ${n}`}
                 value={step.onFailure}
                 onChange={e => onChange({ onFailure: e.target.value as OnFailure })}
-                className={`mt-1 ${fieldClass(false)}`}
+                className={`mt-1 ${selectClass(false)}`}
               >
                 <option value="">engine default</option>
                 <option value="halt">halt</option>

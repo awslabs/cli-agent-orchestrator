@@ -1,6 +1,8 @@
 import { useMemo, useState, useSyncExternalStore, type FormEvent } from "react";
 import {
+  agentCardFor,
   batch,
+  groupByRunner,
   ownerText,
   propRows,
   stateText,
@@ -13,6 +15,8 @@ import {
   type Card,
   type Controller,
   type Entry,
+  type Fleet,
+  type FleetTerminal,
   type Panel,
   type Timeline,
   type TimelineEntry,
@@ -29,7 +33,7 @@ export interface AppProps {
 }
 
 export function App({ store, server, ambientStatus }: AppProps) {
-  const { board, panel, timeline } = useSyncExternalStore(store.subscribe, store.getSnapshot);
+  const { board, panel, timeline, fleet } = useSyncExternalStore(store.subscribe, store.getSnapshot);
   const { controller } = store;
   const run = (fn: () => Promise<unknown>) => {
     void fn();
@@ -47,6 +51,7 @@ export function App({ store, server, ambientStatus }: AppProps) {
         </button>
       </header>
       <Approvals board={board} controller={controller} onDone={run} />
+      <FleetPanel fleet={fleet} />
       <GenUiPanel panel={panel} />
       <TimelinePanel timeline={timeline} />
     </main>
@@ -163,6 +168,104 @@ function InterruptCard({
           </button>
         </form>
       ) : null}
+    </article>
+  );
+}
+
+function FleetPanel({ fleet }: { fleet: Fleet }) {
+  const groups = useMemo(() => groupByRunner(fleet), [fleet]);
+  return (
+    <section aria-label="Fleet">
+      <h2>Fleet (ambient stream)</h2>
+      <p>
+        The agents this server can see, grouped by the runner each one runs on. A terminal with no runner is
+        local. Cards come from the CAO profile catalog, not from anything an agent wrote. This panel has no
+        controls.
+      </p>
+      {fleet.stale ? (
+        <p role="status">
+          The fleet may be out of sync: a change from the stream could not be applied. It is corrected by the next
+          snapshot, which a reconnect brings.
+        </p>
+      ) : null}
+      <HostStrip fleet={fleet} />
+      {groups.length === 0 ? <p>No terminals yet.</p> : null}
+      {groups.map((group) => (
+        <section key={group.runnerId === null ? "group:local" : `runner:${group.runnerId}`} aria-label={`Runner ${group.label}`}>
+          <h3>{group.label}</h3>
+          <p>
+            {group.terminals.length} {group.terminals.length === 1 ? "terminal" : "terminals"}
+            {group.waiting > 0 ? `, ${group.waiting} waiting for an answer` : ""}
+          </p>
+          {group.sessions.map((session) => (
+            <div key={session.name}>
+              <h4>
+                Session {session.name || "(none)"} <small>({session.status})</small>
+              </h4>
+              <ul>
+                {session.terminals.map((terminal) => (
+                  <li key={terminal.id}>
+                    <TerminalRow terminal={terminal} fleet={fleet} />
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </section>
+      ))}
+    </section>
+  );
+}
+
+const shown = (value: number | null, unit = ""): string => (value === null ? "—" : `${value}${unit}`);
+
+/** Host resources. Numbers only; a missing one is "—", never 0. The server reports the local host only. */
+function HostStrip({ fleet }: { fleet: Fleet }) {
+  const local = fleet.host.find((entry) => entry.runnerId === null) ?? null;
+  return (
+    <section aria-label="Host resources">
+      <p>
+        <strong>Host resources</strong>
+      </p>
+      {local === null ? (
+        <p>Host resources: not reported.</p>
+      ) : (
+        <dl>
+          <dt>CPU</dt>
+          <dd>{shown(local.cpuPercent, "%")}</dd>
+          <dt>Load per core</dt>
+          <dd>{shown(local.loadPerCore)}</dd>
+          <dt>Memory used</dt>
+          <dd>{shown(local.memoryUsedPercent, "%")}</dd>
+          <dt>Memory pressure</dt>
+          <dd>{local.memoryPressure ?? "—"}</dd>
+        </dl>
+      )}
+      <p>
+        <small>
+          Local host only. Numbers refresh when the fleet changes and at most every 30 seconds, so an idle fleet
+          shows the last sample{local?.sampledAt ? ` (taken ${local.sampledAt})` : ""}.
+        </small>
+      </p>
+    </section>
+  );
+}
+
+function TerminalRow({ terminal, fleet }: { terminal: FleetTerminal; fleet: Fleet }) {
+  const card = agentCardFor(terminal, fleet.profiles);
+  return (
+    <article aria-label="agent_card">
+      <h5>
+        {terminal.id}: {terminal.status ?? "unknown"}
+      </h5>
+      <dl>
+        {Object.entries(card).map(([key, value]) => (
+          <div key={key}>
+            <dt>{key}</dt>
+            <dd>{value}</dd>
+          </div>
+        ))}
+      </dl>
     </article>
   );
 }

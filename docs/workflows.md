@@ -359,6 +359,45 @@ Choose the shape by how the run is triggered, because the client-side ceilings d
 Always **pre-announce the run-id** before starting, so you (or the user) can
 `cao workflow status <id>` and `cao workflow cancel <id>`.
 
+## Watching a run
+
+The web UI's run view shows each step's state, its final answer and its terminal. It reads
+them from three places, which any client with read scope can read too.
+
+**The final answer.** When a YAML step settles, it saves its final answer the way a script
+step does: the step's last terminal message, with secrets redacted and capped at 32 KiB.
+`GET /workflows/runs/{run_id}` returns it as `steps[].result`, an object with `text`,
+`status`, `truncated` and `redacted`. A step that failed, or was cancelled while it ran,
+saves an answer with empty `text`, and its state (`failed` or `skipped`) as `status`.
+`result` is `null` for a step that has not settled, and for steps of runs from before this
+change. A resume clears the saved answer of each step it runs again. The answer is kept in
+the run journal regardless of `workflow_journal_capture_output`, like the rest of the step
+row (see [Configuration](configuration.md#memory-memory)).
+
+**The live screen.** A step's `terminal_id` is set as soon as its terminal exists, while
+the step runs. `GET /workflows/runs/{run_id}/steps/{step_id}/screen` returns that terminal's
+screen as plain text: the last 200 lines, redacted. Rows the terminal wrapped at its width
+are joined first, so a secret that wraps is still redacted. herdr cannot join them, so on
+herdr a secret split across lines is not redacted. It is a read-only capture. It never
+attaches to the terminal, sends input or resizes the agent's window. It returns `410` once
+the terminal has ended.
+
+**The transcript.** When a step's terminal ends, CAO saves its scrollback, with wrapped
+rows joined the same way. After that,
+`GET /workflows/runs/{run_id}/steps/{step_id}/transcript` returns the last 256 KiB of it,
+redacted. The cleanup service deletes it with the terminal's other logs after 14 days
+(`RETENTION_DAYS`). The saved answer stays, because it is in the journal. A step that timed
+out or crashed keeps its terminal open for inspection, so its screen stays readable and its
+transcript appears only when that terminal is deleted.
+
+**Event timing.** `terminal.created` is emitted as soon as the step's terminal exists,
+before the step finishes. Each attempt that opens a terminal emits one, after
+`step.attempt.started` and before the attempt's outcome (`step.completed`,
+`step.attempt.failed`, `step.failed` or `step.skipped`). When a step's structured output is
+missing or invalid, its one reprompt runs on a new terminal in the same attempt: the step's
+`terminal_id` moves to that terminal, and a second `terminal.created`, with the same
+attempt number, says so.
+
 ## Fan-out (concurrency)
 
 To run steps concurrently, use a `concurrent.futures.ThreadPoolExecutor` and give

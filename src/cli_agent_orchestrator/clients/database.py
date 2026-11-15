@@ -3517,6 +3517,9 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
                 "session_incarnation_id": t.session_incarnation_id,
+                # As stored, None included (#1131), read from the row already
+                # fetched here: no extra query per terminal.
+                "identity_verified": t.identity_verified,
                 # #1225: end of the keep window for a kept child, else None.
                 "kept_until": kept_until,
                 "last_active": t.last_active,
@@ -3625,6 +3628,9 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
                 "session_incarnation_id": t.session_incarnation_id,
+                # As stored, None included (#1131), read from the row already
+                # fetched here: no extra query per terminal.
+                "identity_verified": t.identity_verified,
                 # #1225: end of the keep window for a kept child, else None.
                 "kept_until": kept_until,
                 "last_active": t.last_active,
@@ -3661,6 +3667,9 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
                 "session_incarnation_id": t.session_incarnation_id,
+                # As stored, None included (#1131), read from the row already
+                # fetched here: no extra query per terminal.
+                "identity_verified": t.identity_verified,
                 # #1225: end of the keep window for a kept child, else None.
                 "kept_until": kept_until,
                 "last_active": t.last_active,
