@@ -142,7 +142,9 @@ def test_invalid_default_sort_warns_and_falls_back_to_recency(svc, monkeypatch, 
 
     with caplog.at_level(logging.WARNING):
         actual = _keys(svc, query="orchid")
+        repeated = _keys(svc, query="orchid")
 
     assert actual == _keys(svc, query="orchid", search_mode="hybrid", sort_by="recency")
-    assert "memory.ranking.default_sort" in caplog.text
+    assert repeated == actual
+    assert caplog.text.count("Invalid memory.ranking.default_sort") == 1
     assert validate_default_sort("not-a-sort") == "recency"

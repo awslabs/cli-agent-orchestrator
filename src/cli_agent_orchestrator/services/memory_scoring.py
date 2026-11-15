@@ -16,6 +16,7 @@ and future-dated timestamps.
 
 import logging
 import math
+import threading
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
@@ -37,6 +38,8 @@ USAGE_NORMALISER = 100
 SortBy = Literal["score", "recency", "usage", "relevance"]
 SORT_BY_VALUES: frozenset = frozenset({"score", "recency", "usage", "relevance"})
 DEFAULT_SORT_VALUES: frozenset = frozenset({"recency", "bm25"})
+_warned_invalid_default_sorts: set[tuple[str, str]] = set()
+_warned_invalid_default_sorts_lock = threading.Lock()
 
 # Scope precedence. Lower index = higher precedence in the
 # final scope-stable sort that runs AFTER score sorting in ``recall()``.
@@ -129,11 +132,16 @@ def validate_sort_by(sort_by: str) -> str:
 
 def validate_default_sort(default_sort: object) -> str:
     """Return a valid configured default sort, falling back safely to recency."""
-    if default_sort not in DEFAULT_SORT_VALUES:
-        logger.warning(
-            "Invalid memory.ranking.default_sort=%r; using recency",
-            default_sort,
-        )
+    if not isinstance(default_sort, str) or default_sort not in DEFAULT_SORT_VALUES:
+        warning_key = (type(default_sort).__qualname__, repr(default_sort))
+        with _warned_invalid_default_sorts_lock:
+            should_warn = warning_key not in _warned_invalid_default_sorts
+            _warned_invalid_default_sorts.add(warning_key)
+        if should_warn:
+            logger.warning(
+                "Invalid memory.ranking.default_sort=%r; using recency",
+                default_sort,
+            )
         return "recency"
     return str(default_sort)
 
