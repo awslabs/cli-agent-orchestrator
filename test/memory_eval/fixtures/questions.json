@@ -1,0 +1,22 @@
+[
+  {"id":"Q01","kw":"beacon alpha01","nl":"Which beacon does Atlas use for stage one?","gold":["atlas-protocol-01"]},
+  {"id":"Q02","kw":"beacon alpha02","nl":"What is the Atlas stage two beacon?","gold":["atlas-protocol-02"]},
+  {"id":"Q03","kw":"beacon alpha03","nl":"Find Atlas's third stage beacon.","gold":["atlas-protocol-03"]},
+  {"id":"Q04","kw":"beacon alpha04","nl":"Which beacon belongs to Atlas stage four?","gold":["atlas-protocol-04"]},
+  {"id":"Q05","kw":"beacon alpha05","nl":"Tell me the beacon for the fifth Atlas stage.","gold":["atlas-protocol-05"]},
+  {"id":"Q06","kw":"beacon alpha06","nl":"What signal is used by Atlas at stage six?","gold":["atlas-protocol-06"]},
+  {"id":"Q07","kw":"beacon alpha07","nl":"Retrieve the seventh Atlas beacon.","gold":["atlas-protocol-07"]},
+  {"id":"Q08","kw":"beacon alpha08","nl":"Name Atlas's beacon for stage eight.","gold":["atlas-protocol-08"]},
+  {"id":"Q09","kw":"beacon alpha09","nl":"Which beacon is for the ninth Atlas stage?","gold":["atlas-protocol-09"]},
+  {"id":"Q10","kw":"beacon alpha10","nl":"Atlas stage ten needs which beacon?","gold":["atlas-protocol-10"]},
+  {"id":"Q11","kw":"beacon alpha11","nl":"Find the stage eleven Atlas signal.","gold":["atlas-protocol-11"]},
+  {"id":"Q12","kw":"beacon alpha12","nl":"What is the Atlas beacon in stage twelve?","gold":["atlas-protocol-12"]},
+  {"id":"Q13","kw":"beacon alpha13","nl":"Identify the thirteenth Atlas beacon.","gold":["atlas-protocol-13"]},
+  {"id":"Q14","kw":"beacon alpha14","nl":"Which signal is assigned to Atlas stage fourteen?","gold":["atlas-protocol-14"]},
+  {"id":"Q15","kw":"beacon alpha15","nl":"Give me Atlas's fifteenth stage beacon.","gold":["atlas-protocol-15"]},
+  {"id":"Q16","kw":"beacon alpha16","nl":"Find the beacon for stage sixteen in Atlas.","gold":["atlas-protocol-16"]},
+  {"id":"Q17","kw":"beacon alpha17","nl":"What does Atlas use at stage seventeen?","gold":["atlas-protocol-17"]},
+  {"id":"Q18","kw":"beacon alpha18","nl":"Retrieve Atlas stage eighteen's beacon.","gold":["atlas-protocol-18"]},
+  {"id":"Q19","kw":"beacon alpha19","nl":"Which beacon serves the nineteenth Atlas stage?","gold":["atlas-protocol-19"]},
+  {"id":"Q20","kw":"beacon alpha20","nl":"Name the beacon at Atlas stage twenty.","gold":["atlas-protocol-20"]}
+]
