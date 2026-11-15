@@ -179,6 +179,52 @@ async def test_default_removes_recognizable_kiro_file_but_not_user_file(
 
 
 @pytest.mark.asyncio
+async def test_default_removes_unstamped_v254_kiro_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    case = CASES[2]
+    target = tmp_path / case.relative_target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        "<cao-memory>\n"
+        "## Context from CAO Memory\n"
+        "- [project] released content\n"
+        "</cao-memory>\n",
+        encoding="utf-8",
+    )
+    _install_cwd(monkeypatch, case, tmp_path)
+
+    await case.plugin_type().on_post_create_terminal(_event(case))
+
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", CASES[:2], ids=lambda case: case.provider)
+async def test_default_removes_unstamped_v254_claude_and_codex_block(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: ProviderCase
+) -> None:
+    target = tmp_path / case.relative_target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        "before\n"
+        f"{case.module.BEGIN_MARKER}\n"
+        "<cao-memory>\n"
+        "## Context from CAO Memory\n"
+        "- [project] released content\n"
+        "</cao-memory>\n"
+        f"{case.module.END_MARKER}\n"
+        "after\n",
+        encoding="utf-8",
+    )
+    _install_cwd(monkeypatch, case, tmp_path)
+
+    await case.plugin_type().on_post_create_terminal(_event(case))
+
+    assert target.read_bytes() == b"before\nafter\n"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.provider)
 async def test_opt_in_write_matches_e5b708fd_output(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: ProviderCase

@@ -43,7 +43,8 @@ logger = logging.getLogger(__name__)
 STEERING_SUBDIR = ".kiro/steering"
 MEMORY_FILENAME = "cao-memory.md"
 _CAO_GENERATED_MEMORY_FILE = re.compile(
-    r'^\s*<cao-memory generated="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z">'
+    r'\A\s*<cao-memory(?: generated="[^"]*")?>.*</cao-memory>\s*\Z',
+    re.DOTALL,
 )
 
 
