@@ -37,10 +37,36 @@ def test_default_baseline_preserves_known_failure_shapes(tmp_path):
     report = evaluate(tmp_path / "memory-eval-home")
 
     assert set(ARMS) <= set(report["arms"])
-    assert report["hygiene"]["invisible_notes"] == 7
+    assert report["arms"]["default"]["invisible_notes"] == 7
+    assert (
+        report["arms"]["p1a_visibility"]["invisible_notes"]
+        <= report["arms"]["default"]["invisible_notes"]
+    )
     assert report["arms"]["default"]["kw_p1"] < report["arms"]["bm25"]["kw_p1"]
+    assert report["arms"]["default"]["kw_p1"] <= report["arms"]["p3_bm25"]["kw_p1"]
     assert report["arms"]["default"]["multihop_full"] < 1
     assert time.monotonic() - started < 60
+
+
+def test_arm_settings_are_isolated(tmp_path, monkeypatch):
+    baseline = evaluate(tmp_path / "baseline")["arms"]["default"]
+    monkeypatch.setitem(
+        ARMS,
+        "unknown_setting",
+        {
+            "settings": {"memory": {"unknown_eval_setting": True}},
+            "recall": {
+                "search_mode": "hybrid",
+                "sort_by": "recency",
+                "include_related": False,
+                "limit": 10,
+            },
+        },
+    )
+
+    report = evaluate(tmp_path / "with-unknown-setting")
+
+    assert report["arms"]["default"] == baseline
 
 
 def test_results_are_stable_across_python_hash_seeds(tmp_path):

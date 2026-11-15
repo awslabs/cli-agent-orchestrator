@@ -10,7 +10,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -24,38 +27,48 @@ FIXTURE_DIR = Path(__file__).parent / "fixtures"
 _TEMP_ROOT = Path(tempfile.gettempdir()).resolve()
 _TIMESTAMP = re.compile(r"## \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 
-# Later phases extend these named arms.  Every arm keeps its retrieval
-# settings explicit so a production default change cannot silently alter it.
+# Later phases extend these named arms.  Each arm has its own settings home and
+# process, so a production default change cannot silently alter another arm.
 ARMS: dict[str, dict[str, Any]] = {
     "default": {
-        "search_mode": "hybrid",
-        "sort_by": "recency",
-        "include_related": False,
-        "limit": 10,
+        "settings": {"memory": {"parser": {"lenient": False}}},
+        "recall": {
+            "search_mode": "hybrid",
+            "sort_by": "recency",
+            "include_related": False,
+            "limit": 10,
+        },
     },
     "bm25": {
-        "search_mode": "bm25",
-        "sort_by": "recency",
-        "include_related": False,
-        "limit": 10,
+        "settings": {},
+        "recall": {
+            "search_mode": "bm25",
+            "sort_by": "recency",
+            "include_related": False,
+            "limit": 10,
+        },
     },
     "p1a_visibility": {
-        "search_mode": "hybrid",
-        "sort_by": "recency",
-        "include_related": False,
-        "limit": 10,
+        "settings": {"memory": {"parser": {"lenient": True}}},
+        "recall": {
+            "search_mode": "hybrid",
+            "sort_by": "recency",
+            "include_related": False,
+            "limit": 10,
+        },
     },
     "p3_bm25": {
-        "search_mode": "bm25",
-        "sort_by": "recency",
-        "include_related": False,
-        "limit": 10,
+        "settings": {"memory": {"ranking": {"default_sort": "bm25"}}},
+        "recall": {"include_related": False, "limit": 10},
     },
     "p4_relationships": {
-        "search_mode": "bm25",
-        "sort_by": "recency",
-        "include_related": True,
-        "limit": 10,
+        "settings": {},
+        "recall": {
+            "search_mode": "bm25",
+            "sort_by": "recency",
+            "include_related": True,
+            "limit": 10,
+        },
     },
 }
 
@@ -128,12 +141,15 @@ def _rewrite_fixture_shape(service: MemoryService, note: dict[str, Any], home: P
         )
 
 
-async def build_memory_home(home: Path) -> MemoryService:
+async def build_memory_home(home: Path, settings: dict[str, Any]) -> MemoryService:
     """Build the entire fixture corpus through the real in-process service."""
     resolved = assert_temporary_home(home)
-    if resolved.exists():
-        raise ValueError("memory eval home must not already exist")
-    (resolved / "db").mkdir(parents=True)
+    # Importing CAO with CAO_HOME_DIR set creates its standard home directory
+    # before this function runs.  The parent evaluator already verifies that
+    # the requested root was fresh before it starts this child process.
+    resolved.mkdir(parents=True, exist_ok=True)
+    (resolved / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+    (resolved / "db").mkdir(parents=True, exist_ok=True)
     engine = create_engine(f"sqlite:///{resolved / 'db' / 'memory-eval.sqlite'}")
     Base.metadata.create_all(engine)
     service = MemoryService(base_dir=resolved / "memory", db_engine=engine)
@@ -159,7 +175,9 @@ def _rank(keys: list[str], gold: set[str]) -> int | None:
     return None
 
 
-async def _arm_metrics(service: MemoryService, home: Path, arm: dict[str, Any]) -> dict[str, float]:
+async def _arm_metrics(
+    service: MemoryService, home: Path, recall: dict[str, Any]
+) -> dict[str, float]:
     context = _context(home)
     questions = _read_json("questions.json")
     multihop = _read_json("questions_multihop.json")
@@ -174,7 +192,7 @@ async def _arm_metrics(service: MemoryService, home: Path, arm: dict[str, Any]) 
                 terminal_context=context,
                 scan_all=True,
                 record_access=False,
-                **arm,
+                **recall,
             )
             keys = [memory.key for memory in results if not memory.is_related]
             ranks[wording].append(_rank(keys, set(question["gold"])))
@@ -188,7 +206,7 @@ async def _arm_metrics(service: MemoryService, home: Path, arm: dict[str, Any]) 
             terminal_context=context,
             scan_all=True,
             record_access=False,
-            **arm,
+            **recall,
         )
         found = {memory.key for memory in results}
         needed = set(question["needs"])
@@ -202,7 +220,7 @@ async def _arm_metrics(service: MemoryService, home: Path, arm: dict[str, Any]) 
             terminal_context=context,
             scan_all=True,
             record_access=False,
-            **arm,
+            **recall,
         )
         keys = [memory.key for memory in results if not memory.is_related]
         current_rank = _rank(keys, {check["current"]})
@@ -249,25 +267,68 @@ def _invisible_notes(service: MemoryService, home: Path) -> int:
     return invisible
 
 
-async def _evaluate(home: Path) -> dict[str, Any]:
-    service = await build_memory_home(home)
+async def _evaluate_arm(home: Path, arm: dict[str, Any]) -> dict[str, Any]:
+    service = await build_memory_home(home, dict(arm["settings"]))
+    metrics = await _arm_metrics(service, home, dict(arm["recall"]))
+    metrics["invisible_notes"] = _invisible_notes(service, home)
+    return metrics
+
+
+def _evaluate_arm_in_child(home: Path, name: str, arm: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate one arm where CAO_HOME_DIR is resolved before service imports."""
+    child_env = os.environ.copy()
+    child_env["CAO_HOME_DIR"] = str(home)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "test.memory_eval.harness",
+            "--home",
+            str(home),
+            "--arm",
+            name,
+            "--arm-config",
+            json.dumps(arm, sort_keys=True),
+        ],
+        check=True,
+        capture_output=True,
+        env=child_env,
+        text=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def _evaluate(home: Path) -> dict[str, Any]:
+    resolved = assert_temporary_home(home)
+    if resolved.exists():
+        raise ValueError("memory eval home must not already exist")
     return {
         "fixture_notes": len(_read_json("notes.json")),
-        "hygiene": {"invisible_notes": _invisible_notes(service, home)},
-        "arms": {name: await _arm_metrics(service, home, arm) for name, arm in ARMS.items()},
+        "arms": {
+            name: _evaluate_arm_in_child(resolved / name, name, arm) for name, arm in ARMS.items()
+        },
     }
 
 
 def evaluate(home: Path) -> dict[str, Any]:
     """Seed and evaluate a synthetic memory home.  ``home`` must be fresh."""
-    return asyncio.run(_evaluate(assert_temporary_home(home)))
+    return _evaluate(assert_temporary_home(home))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", type=Path, required=True, help="fresh temporary fixture home")
+    parser.add_argument("--arm", help="evaluate one arm")
+    parser.add_argument("--arm-config", help="JSON configuration for --arm")
     args = parser.parse_args()
-    print(json.dumps(evaluate(args.home), sort_keys=True))
+    if args.arm:
+        arm = json.loads(args.arm_config) if args.arm_config else ARMS[args.arm]
+        report = asyncio.run(_evaluate_arm(assert_temporary_home(args.home), arm))
+    else:
+        if args.arm_config:
+            parser.error("--arm-config requires --arm")
+        report = evaluate(args.home)
+    print(json.dumps(report, sort_keys=True))
 
 
 if __name__ == "__main__":

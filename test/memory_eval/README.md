@@ -13,10 +13,13 @@ directory:
 uv run python -m test.memory_eval.harness --home "$(mktemp -d)/memory-home"
 ```
 
-Later phases add an explicitly named entry to `ARMS` in `harness.py`, then add
-only relation-based assertions or deterministic corpus counts to
-`test_eval_baseline.py`. P1a owns visibility, P3 owns default ranking, and P4
-owns relationship expansion.
+Later phases add an explicitly named entry to `ARMS` in `harness.py`. An arm
+has a `settings` object, written to that arm's temporary `CAO_HOME_DIR`, and
+its `recall` arguments. The harness starts a fresh process and home for every
+arm, so settings cannot leak between measurements. Add only relation-based
+assertions or deterministic corpus counts to `test_eval_baseline.py`: a phase
+PR updates its own arm's target, never the legacy `default` arm's target. P1a
+owns visibility, P3 owns default ranking, and P4 owns relationship expansion.
 
 To measure an operator store, first copy it into a newly created temporary
 directory, make that copy read-only, and point the separate operator evaluation

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Synthetic memory-evaluation arms run with their own CAO settings homes**, so
+  future memory phases can measure their setting without changing the legacy baseline (#1329).
 - **Synthetic memory retrieval evaluation fixtures and baseline harness** provide
   deterministic CI measurements for future memory improvements (#1329).
 - **Codex "Trust this folder?" dialogs (0.156 and later) are accepted before the first input** (#1319).
