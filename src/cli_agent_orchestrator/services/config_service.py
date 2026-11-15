@@ -26,7 +26,7 @@ under the *nested* schema described in issue #357.
 import json
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -71,12 +71,17 @@ class InjectionConfig(BaseModel):
     v1_fixes: bool = True
 
 
+class RankingConfig(BaseModel):
+    default_sort: Literal["recency", "bm25"] = "recency"
+
+
 class MemoryConfig(BaseModel):
     enabled: bool = True
     explain_enabled: bool = True
     non_accessing_inspection: bool = False
     lifecycle: LifecycleConfig = Field(default_factory=LifecycleConfig)
     injection: InjectionConfig = Field(default_factory=InjectionConfig)
+    ranking: RankingConfig = Field(default_factory=RankingConfig)
     compile_mode: str = "llm"
     flush_threshold: float = 0.85
     compile_timeout_s: float = 120.0
@@ -470,6 +475,9 @@ def _get_owned_section(path: str, default: Any) -> Any:
             injection = settings_service.get_memory_settings().get("injection", {})
             nested_key = key.split(".", 1)[1]
             return injection.get(nested_key, default) if isinstance(injection, dict) else default
+        if key == "ranking.default_sort":
+            ranking = settings_service.get_memory_settings().get("ranking", {})
+            return ranking.get("default_sort", default) if isinstance(ranking, dict) else default
         if key == "enabled":
             return settings_service.is_memory_enabled()
         if key == "lint_enabled":
@@ -648,6 +656,7 @@ _ALL_PATHS = sorted(
         "memory.compile_timeout_s",
         "memory.injection.clear_on_empty",
         "memory.injection.v1_fixes",
+        "memory.ranking.default_sort",
         "memory.vault",
         "terminal.keep_finished.enabled",
         "terminal.keep_finished.idle_window_minutes",
@@ -739,6 +748,9 @@ class ConfigService:
                 injection=InjectionConfig(
                     clear_on_empty=_get_value("memory.injection.clear_on_empty", default=True),
                     v1_fixes=_get_value("memory.injection.v1_fixes", default=True),
+                ),
+                ranking=RankingConfig(
+                    default_sort=_get_value("memory.ranking.default_sort", default="recency")
                 ),
                 lint_enabled=_get_value("memory.lint_enabled", default=True),
                 compile_mode=_get_value("memory.compile_mode", default="llm"),

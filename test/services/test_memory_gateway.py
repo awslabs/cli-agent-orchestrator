@@ -115,6 +115,35 @@ async def test_remote_forget_reconstructs_typed_result(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_remote_recall_omits_none_fields(monkeypatch):
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner:9889")
+
+    async def run_inline(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(memory_gateway.asyncio, "to_thread", run_inline)
+    post = Mock(return_value={"memories": []})
+    monkeypatch.setattr(memory_gateway, "_post", post)
+
+    result = await memory_gateway.recall_memory(
+        query=None,
+        scope=None,
+        memory_type=None,
+        limit=10,
+        terminal_context=None,
+        search_mode=None,
+        sort_by=None,
+        include_related=False,
+    )
+
+    assert result == []
+    assert post.call_args.args == (
+        "/internal/memory/recall",
+        {"limit": 10, "include_related": False},
+    )
+
+
+@pytest.mark.asyncio
 async def test_remote_store_reconstructs_partial_write_error(monkeypatch):
     monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner:9889")
 

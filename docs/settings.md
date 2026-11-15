@@ -8,4 +8,6 @@ For the on-demand memory ranking diagnostic, see [Memory explain](memory.md#on-d
 
 `memory.injection.clear_on_empty` and `memory.injection.v1_fixes` default to `true`. Set either key to `false` with `cao config set` to disable that injection-hygiene behavior.
 
+`memory.ranking.default_sort` defaults to `recency`; set it to `bm25` to opt query recall into BM25-first results. No-query listings remain recency ordered.
+
 `memory.non_accessing_inspection` defaults to `false`; see [Operator inspection](memory.md#non-accessing-operator-inspection-opt-in). `CAO_MEMORY_NON_ACCESSING_INSPECTION` overrides the file value.

@@ -178,6 +178,25 @@ class TestConfigSet:
 
         assert result.exit_code != 0
         assert "must be a bool" in result.output
+
+    def test_set_memory_ranking_default_sort_round_trips(self, runner, _isolated_settings):
+        result = runner.invoke(config, ["set", "memory.ranking.default_sort", "bm25"])
+        assert result.exit_code == 0
+
+        on_disk = json.loads(_isolated_settings["settings"].read_text())
+        assert on_disk["memory"]["ranking"]["default_sort"] == "bm25"
+
+        get_result = runner.invoke(config, ["get", "memory.ranking.default_sort"])
+        assert get_result.exit_code == 0
+        assert json.loads(get_result.output) == "bm25"
+        assert ConfigService.get_config().memory.ranking.default_sort == "bm25"
+
+    def test_set_invalid_memory_ranking_default_sort_errors(self, runner, _isolated_settings):
+        result = runner.invoke(config, ["set", "memory.ranking.default_sort", "score"])
+
+        assert result.exit_code != 0
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "ranking.default_sort must be one of" in result.output
         assert not _isolated_settings["settings"].exists()
 
     def test_set_network_key_succeeds_persists_and_warns(self, runner, _isolated_settings):

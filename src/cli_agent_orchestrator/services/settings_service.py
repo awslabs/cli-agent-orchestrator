@@ -758,6 +758,7 @@ def get_memory_settings() -> Dict[str, Any]:
         "non_accessing_inspection": False,
         "lifecycle": {"enabled": False},
         "injection": dict(MEMORY_INJECTION_DEFAULTS),
+        "ranking": {"default_sort": "recency"},
     }
     saved = settings.get("memory", {})
     if not isinstance(saved, dict):
@@ -1263,6 +1264,7 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``lifecycle.enabled`` (bool) — opt-in supersedes lifecycle.
         ``injection.clear_on_empty`` (bool) — replace stale provider blocks on empty retrieval.
         ``injection.v1_fixes`` (bool) — enable injection traversal and clipping fixes.
+        ``ranking.default_sort`` (str) — ``recency`` or ``bm25`` query recall default.
         ``non_accessing_inspection`` (bool) — opt-in operator reads without access bumps.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
         ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
@@ -1302,6 +1304,14 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
     elif key == "lifecycle.enabled":
         if not isinstance(value, bool):
             raise ValueError("lifecycle.enabled must be a bool")
+        coerced = value
+    elif key == "ranking.default_sort":
+        from cli_agent_orchestrator.services.memory_scoring import DEFAULT_SORT_VALUES
+
+        if not isinstance(value, str) or value not in DEFAULT_SORT_VALUES:
+            raise ValueError(
+                f"ranking.default_sort must be one of {sorted(DEFAULT_SORT_VALUES)}, got {value!r}"
+            )
         coerced = value
     elif key in {"injection.clear_on_empty", "injection.v1_fixes"}:
         if not isinstance(value, bool):
@@ -1345,6 +1355,11 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
             if not isinstance(injection, dict):
                 injection = {}
             memory["injection"] = {**injection, key.split(".", 1)[1]: coerced}
+        elif key == "ranking.default_sort":
+            ranking = memory.get("ranking", {})
+            if not isinstance(ranking, dict):
+                ranking = {}
+            memory["ranking"] = {**ranking, "default_sort": coerced}
         else:
             memory[key] = coerced
         settings["memory"] = memory
