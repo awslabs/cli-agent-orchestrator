@@ -69,10 +69,11 @@ VALID_SEARCH_MODES = ("metadata", "bm25", "hybrid")
 _CANONICAL_ENTRY_HEADING_RE = re.compile(
     r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$", re.MULTILINE
 )
-_LOOSE_HEADING_TIMESTAMP_RE = re.compile(
-    r"^## [^\n]*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)[^\n]*$",
+_LENIENT_ENTRY_HEADING_RE = re.compile(
+    r"^#{2,} [^\n]*?(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)[^\n]*$",
     re.MULTILINE,
 )
+_LEGACY_ENTRY_TIMESTAMP_RE = re.compile(r"## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)")
 _COMPILED_MARKER_RE = re.compile(
     r"^<!-- cao-compiled: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z entries=\d+ -->$"
 )
@@ -109,7 +110,7 @@ def _matches_all_terms(query: str, content: str) -> bool:
 
 
 MEMORY_DISABLED_MESSAGE = (
-    "memory subsystem is disabled. Set memory.enabled=true in settings.json " "to re-enable."
+    "memory subsystem is disabled. Set memory.enabled=true in settings.json to re-enable."
 )
 
 _VaultProjectionResult = TypeVar("_VaultProjectionResult")
@@ -248,9 +249,7 @@ def _validate_project_id_override(raw: str) -> str:
     if "\x00" in raw:
         raise ValueError("project_id override contains null byte")
     if not _PROJECT_ID_OVERRIDE_PATTERN.match(raw):
-        raise ValueError(
-            "project_id override must match ^[a-zA-Z0-9._\\-]{1,128}$; " f"got {raw!r}"
-        )
+        raise ValueError(f"project_id override must match ^[a-zA-Z0-9._\\-]{{1,128}}$; got {raw!r}")
     return raw
 
 
@@ -4136,23 +4135,36 @@ class MemoryService:
         scope = scope.rstrip(" |")
         memory_type = memory_type.rstrip(" |")
 
-        timestamps = _CANONICAL_ENTRY_HEADING_RE.findall(file_content)
-        loose_heading_matches = list(_LOOSE_HEADING_TIMESTAMP_RE.finditer(file_content))
-        if timestamps:
-            created_at = datetime.strptime(timestamps[0], "%Y-%m-%dT%H:%M:%SZ").replace(
-                tzinfo=timezone.utc
-            )
-            updated_at = datetime.strptime(timestamps[-1], "%Y-%m-%dT%H:%M:%SZ").replace(
-                tzinfo=timezone.utc
-            )
+        from cli_agent_orchestrator.services.settings_service import is_memory_parser_lenient
+
+        lenient = is_memory_parser_lenient()
+        heading_matches: list[re.Match[str]] = []
+        timestamps: list[datetime] = []
+        if lenient:
+            for match in _LENIENT_ENTRY_HEADING_RE.finditer(file_content):
+                value = match.group("timestamp")
+                try:
+                    parsed = datetime.strptime(
+                        value if len(value) == 20 else value.replace("Z", ":00Z"),
+                        "%Y-%m-%dT%H:%M:%SZ",
+                    ).replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                heading_matches.append(match)
+                timestamps.append(parsed)
         else:
-            from cli_agent_orchestrator.services.settings_service import (
-                is_memory_parser_lenient,
-            )
-
-            if not is_memory_parser_lenient():
+            timestamp_texts = _LEGACY_ENTRY_TIMESTAMP_RE.findall(file_content)
+            if not timestamp_texts:
                 return None
+            timestamps = [
+                datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                for value in timestamp_texts
+            ]
 
+        if timestamps:
+            created_at = timestamps[0]
+            updated_at = timestamps[-1]
+        else:
             # Leniency applies only to an otherwise-canonical topic. A random
             # Markdown file in the wiki tree must not become a memory merely
             # because its filename resembles a key.
@@ -4177,18 +4189,6 @@ class MemoryService:
             memory_type = header_match.group("type").strip()
             tags = normalize_memory_tags(header_match.group("tags"))
 
-            loose_timestamps: list[datetime] = []
-            for match in loose_heading_matches:
-                value = match.group(1)
-                try:
-                    parsed = datetime.strptime(
-                        value if len(value) == 20 else value.replace("Z", ":00Z"),
-                        "%Y-%m-%dT%H:%M:%SZ",
-                    ).replace(tzinfo=timezone.utc)
-                except ValueError:
-                    continue
-                loose_timestamps.append(parsed)
-
             def _entry_time(name: str) -> Optional[datetime]:
                 value = entry.get(name)
                 if isinstance(value, datetime):
@@ -4207,11 +4207,7 @@ class MemoryService:
                 return None
 
             file_time = datetime.fromtimestamp(wiki_file.stat().st_mtime, tz=timezone.utc)
-            created_at = (
-                min(loose_timestamps)
-                if loose_timestamps
-                else _entry_time("created_at") or file_time
-            )
+            created_at = _entry_time("created_at") or file_time
             updated_at = _entry_time("updated_at") or file_time
 
         lines = file_content.splitlines()
@@ -4228,7 +4224,7 @@ class MemoryService:
                 body_lines.pop(0)
 
         compiled = any(_COMPILED_MARKER_RE.fullmatch(line) for line in body_lines)
-        if compiled or (not timestamps and not loose_heading_matches):
+        if compiled or not timestamps:
             body_lines = [line for line in body_lines if not _COMPILED_MARKER_RE.fullmatch(line)]
             while body_lines and not body_lines[0].strip():
                 body_lines.pop(0)
@@ -4237,12 +4233,13 @@ class MemoryService:
                 while body_lines and not body_lines[0].strip():
                     body_lines.pop(0)
             latest_content = self._strip_existing_see_also("\n".join(body_lines)).strip()
-        elif loose_heading_matches and not timestamps:
+        elif lenient:
             latest_content = self._strip_existing_see_also(
-                file_content[loose_heading_matches[-1].end() :]
+                file_content[heading_matches[-1].end("timestamp") :]
             ).strip()
         else:
-            last_section = file_content.rsplit(f"## {timestamps[-1]}", 1)
+            timestamp_text = timestamps[-1].strftime("%Y-%m-%dT%H:%M:%SZ")
+            last_section = file_content.rsplit(f"## {timestamp_text}", 1)
             latest_content = last_section[-1].strip() if len(last_section) > 1 else ""
 
         if not latest_content:

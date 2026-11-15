@@ -77,7 +77,7 @@ def test_compiled_article_without_entry_heading_parses_whole_body(
 
     assert memory is not None
     assert memory.content == (
-        "## Overview\nPreviously invisible detail.\n\n" "## Decision\nKeep the whole article."
+        "## Overview\nPreviously invisible detail.\n\n## Decision\nKeep the whole article."
     )
 
 
@@ -122,6 +122,63 @@ def test_lenient_false_restores_legacy_invisibility(
     )
 
     assert memory is None
+
+
+@pytest.mark.parametrize("lenient", [True, False])
+@pytest.mark.parametrize(
+    ("timestamp", "expected_created", "expected_updated", "expected_content"),
+    [
+        (
+            "### 2026-01-01T00:00:00Z\n",
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            "body one",
+        ),
+        (
+            "## 2026-01-01T00:00:00Z \n",
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            "body one",
+        ),
+        (
+            "## 2026-01-01T00:00:00Z - Summary\n",
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            "- Summary\nbody one",
+        ),
+        (
+            "## 2026-01-01T00:00:00Z\nold body\n\n## 2026-02-01T00:00:00Z (edited)\n",
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 2, 1, tzinfo=timezone.utc),
+            "(edited)\nbody one",
+        ),
+    ],
+)
+def test_legacy_heading_shapes_preserve_dates_and_latest_content(
+    tmp_path: Path,
+    engine: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    lenient: bool,
+    timestamp: str,
+    expected_created: datetime,
+    expected_updated: datetime,
+    expected_content: str,
+) -> None:
+    monkeypatch.setattr(
+        settings_service,
+        "get_memory_settings",
+        lambda: {"parser": {"lenient": lenient}},
+    )
+    path = _topic(tmp_path, "legacy-shape", "body one", timestamp=timestamp)
+
+    memory = MemoryService(tmp_path, engine)._parse_wiki_file(
+        path, path.read_text(encoding="utf-8"), _entry("legacy-shape")
+    )
+
+    assert memory is not None
+    assert memory.created_at == expected_created
+    assert memory.updated_at == expected_updated
+    assert memory.content == expected_content
 
 
 def test_recall_returns_previously_invisible_topic(tmp_path: Path, engine: Any) -> None:
