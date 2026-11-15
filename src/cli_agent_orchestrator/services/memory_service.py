@@ -2504,7 +2504,7 @@ class MemoryService:
         explicit_sort_by = sort_by is not None
         search_mode = "hybrid" if search_mode is None else search_mode
         sort_by = "recency" if sort_by is None else sort_by
-        if query and not explicit_search_mode and not explicit_sort_by:
+        if query and query.strip() and not explicit_search_mode and not explicit_sort_by:
             from cli_agent_orchestrator.services.memory_scoring import validate_default_sort
             from cli_agent_orchestrator.services.settings_service import get_memory_settings
 

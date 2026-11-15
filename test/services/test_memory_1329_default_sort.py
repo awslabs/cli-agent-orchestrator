@@ -103,6 +103,19 @@ def test_bm25_default_sort_keeps_no_query_listing_recency(svc, monkeypatch):
     assert _keys(svc) == _keys(svc, search_mode="hybrid", sort_by="recency")
 
 
+def test_bm25_default_sort_keeps_whitespace_query_listing_recency(svc, monkeypatch):
+    _seed(svc)
+    monkeypatch.setattr(
+        settings_service,
+        "get_memory_settings",
+        lambda: {"ranking": {"default_sort": "bm25"}},
+    )
+
+    assert _keys(svc, query="   ") == _keys(
+        svc, query="   ", search_mode="hybrid", sort_by="recency"
+    )
+
+
 def test_explicit_search_and_sort_win_over_bm25_default_sort(svc, monkeypatch):
     _seed(svc)
     monkeypatch.setattr(
