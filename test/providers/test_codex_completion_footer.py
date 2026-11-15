@@ -58,8 +58,14 @@ class TestSeparateShortcutsBar:
     @pytest.mark.parametrize("separator", [[], [""]])
     def test_completed_turn_and_extraction(self, separator):
         frame = [
-            *TASK, "• Mean 3.", "  Worked for 2s • 4:19 PM", "", COMPOSER,
-            STATUS_BAR, *separator, SHORTCUTS_BAR,
+            *TASK,
+            "• Mean 3.",
+            "  Worked for 2s • 4:19 PM",
+            "",
+            COMPOSER,
+            STATUS_BAR,
+            *separator,
+            SHORTCUTS_BAR,
         ]
         provider = footer_provider((0, 169, 0))
         assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
@@ -72,16 +78,25 @@ class TestSeparateShortcutsBar:
 
     def test_streaming_reply_with_quoted_footer_is_not_completed(self):
         frame = [
-            *TASK, "• Example:", "  Worked for 2s • 4:19 PM", "  More text follows",
-            COMPOSER, STATUS_BAR, SHORTCUTS_BAR,
+            *TASK,
+            "• Example:",
+            "  Worked for 2s • 4:19 PM",
+            "  More text follows",
+            COMPOSER,
+            STATUS_BAR,
+            SHORTCUTS_BAR,
         ]
         assert footer_provider().get_status_from_screen(frame) != TerminalStatus.COMPLETED
 
     def test_quoted_footer_and_background_notice_match_visual_heuristic(self):
         frame = [
-            *TASK, "• Example:", "  Worked for 2s • 4:19 PM",
+            *TASK,
+            "• Example:",
+            "  Worked for 2s • 4:19 PM",
             "  1 background terminal running · /ps to view · /stop to close",
-            COMPOSER, STATUS_BAR, SHORTCUTS_BAR,
+            COMPOSER,
+            STATUS_BAR,
+            SHORTCUTS_BAR,
         ]
         assert footer_provider().get_status_from_screen(frame) == TerminalStatus.COMPLETED
 
@@ -98,8 +113,12 @@ class TestSeparateShortcutsBar:
 
     def test_draft_composer_excludes_both_bars(self):
         frame = [
-            *TASK, "• Mean 3.", "  Worked for 2s • 4:19 PM", "› draft message",
-            STATUS_BAR, SHORTCUTS_BAR,
+            *TASK,
+            "• Mean 3.",
+            "  Worked for 2s • 4:19 PM",
+            "› draft message",
+            STATUS_BAR,
+            SHORTCUTS_BAR,
         ]
         assert footer_provider().extract_current_composer("\n".join(frame)) == "› draft message"
 

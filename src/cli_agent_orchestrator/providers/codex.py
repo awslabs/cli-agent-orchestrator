@@ -499,9 +499,19 @@ def _tui_status_bar_start(lines: list[str]) -> Optional[int]:
         previous = index - 1
         while previous >= bottom and index - previous <= 3 and not lines[previous].strip():
             previous -= 1
-        if previous >= bottom and index - previous <= 3 and (
-            (re.search(r"\?\s+for shortcuts", lines[index]) and re.search(r"·\s+[~/]", lines[previous]))
-            or (re.search(r"·\s+[~/]", lines[index]) and re.fullmatch(r"\s*\?\s+for shortcuts\s*", lines[previous]))
+        if (
+            previous >= bottom
+            and index - previous <= 3
+            and (
+                (
+                    re.search(r"\?\s+for shortcuts", lines[index])
+                    and re.search(r"·\s+[~/]", lines[previous])
+                )
+                or (
+                    re.search(r"·\s+[~/]", lines[index])
+                    and re.fullmatch(r"\s*\?\s+for shortcuts\s*", lines[previous])
+                )
+            )
         ):
             return previous
         return index
