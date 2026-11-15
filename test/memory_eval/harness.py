@@ -17,12 +17,12 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import create_engine
 
-from cli_agent_orchestrator.clients.database import Base
-from cli_agent_orchestrator.services.memory_service import MemoryService
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.services.memory_service import MemoryService
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 _TEMP_ROOT = Path(tempfile.gettempdir()).resolve()
@@ -145,9 +145,11 @@ def _rewrite_fixture_shape(service: MemoryService, note: dict[str, Any], home: P
 async def build_memory_home(home: Path, settings: dict[str, Any]) -> MemoryService:
     """Build the entire fixture corpus through the real in-process service."""
     resolved = assert_temporary_home(home)
-    # Importing CAO with CAO_HOME_DIR set creates its standard home directory
-    # before this function runs.  The parent evaluator already verifies that
-    # the requested root was fresh before it starts this child process.
+    os.environ["CAO_HOME_DIR"] = str(resolved)
+
+    from cli_agent_orchestrator.clients.database import Base
+    from cli_agent_orchestrator.services.memory_service import MemoryService
+
     resolved.mkdir(parents=True, exist_ok=True)
     (resolved / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
     (resolved / "db").mkdir(parents=True, exist_ok=True)
@@ -327,13 +329,15 @@ def main() -> None:
     parser.add_argument("--arm", help="evaluate one arm")
     parser.add_argument("--arm-config", help="JSON configuration for --arm")
     args = parser.parse_args()
+    home = assert_temporary_home(args.home)
+    os.environ["CAO_HOME_DIR"] = str(home)
     if args.arm:
         arm = json.loads(args.arm_config) if args.arm_config else ARMS[args.arm]
-        report = asyncio.run(_evaluate_arm(assert_temporary_home(args.home), arm))
+        report = asyncio.run(_evaluate_arm(home, arm))
     else:
         if args.arm_config:
             parser.error("--arm-config requires --arm")
-        report = evaluate(args.home)
+        report = evaluate(home)
     print(json.dumps(report, sort_keys=True))
 
 

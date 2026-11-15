@@ -123,3 +123,30 @@ def test_results_are_stable_across_python_hash_seeds(tmp_path):
         outputs.append(completed.stdout)
 
     assert len(set(outputs)) == 1
+
+
+def test_cli_leaves_process_home_untouched(tmp_path):
+    process_home = tmp_path / "process-home"
+    process_home.mkdir()
+    fixture_home = tmp_path / "fixture-home"
+    env = os.environ.copy()
+    env["HOME"] = str(process_home)
+    env.pop("CAO_HOME_DIR", None)
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "test.memory_eval.harness",
+            "--home",
+            str(fixture_home),
+            "--arm",
+            "default",
+        ],
+        check=True,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+    assert list(process_home.iterdir()) == []
