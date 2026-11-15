@@ -672,7 +672,7 @@ class TestSendSync:
     @patch("cli_agent_orchestrator.cli.commands.session.api_http.post")
     @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
     def test_send_sync_output_fetch_error(self, mock_get, mock_post, mock_time, runner):
-        """Output fetch failure after completion is silently ignored."""
+        """A completed status cannot turn an output-fetch failure into success."""
         resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
         pre_send_status_resp = MagicMock(status_code=200)
         pre_send_status_resp.json.return_value = {"status": "idle"}
@@ -690,7 +690,8 @@ class TestSendSync:
 
         result = runner.invoke(session, ["send", "cao-test", "question"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1
+        assert "Failed to retrieve the agent response" in result.output
 
     @patch("cli_agent_orchestrator.cli.commands.session.sys.exit")
     @patch("cli_agent_orchestrator.utils.terminal.time")
