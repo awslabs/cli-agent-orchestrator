@@ -139,6 +139,25 @@ class TestClaudeCodeInjection:
         assert injected.index("<cao-memory>") < injected.index(ORIGINAL_MESSAGE)
 
 
+class TestCodexInjection:
+    """U8.4: Codex first message contains <cao-memory> block."""
+
+    def setup_method(self):
+        _memory_injected_terminals.clear()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
+    def test_codex_injection(self, mock_svc_cls):
+        """First message to Codex terminal should include <cao-memory> block."""
+        mock_svc_cls.return_value.get_curated_memory_context.return_value = SAMPLE_MEMORY_CONTEXT
+
+        injected = inject_memory_context(ORIGINAL_MESSAGE, "term-codex-001")
+
+        assert "<cao-memory>" in injected
+        assert "</cao-memory>" in injected
+        assert ORIGINAL_MESSAGE in injected
+        assert injected.index("<cao-memory>") < injected.index(ORIGINAL_MESSAGE)
+
+
 class TestKiroInjection:
     """U8.4: Kiro CLI first message contains <cao-memory> block."""
 

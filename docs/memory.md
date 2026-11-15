@@ -11,8 +11,8 @@ CAO's memory system gives agents persistent, cross-session storage. Agents store
 - **Search**: keyword (BM25), recency, or hybrid; results ranked by recency, a
   composite 3-factor score (BM25 + recency + usage), or usage.
 - **Cross-references** between related memories, expandable on recall.
-- **Auto-injection** into each provider's config file on terminal creation, plus a
-  `<cao-memory>` block prepended to the agent's first message.
+- **Auto-injection** as a `<cao-memory>` block prepended to each terminal's first
+  message.
 - **LLM wiki compaction** (`cao memory compact`) that rewrites topic articles.
 - **Linting** (`cao memory lint`) for orphans, contradictions, stale claims, and more.
 - **Self-healing** (`cao memory heal`) that turns lint findings into fixes — dry-run
@@ -320,16 +320,12 @@ marks links active by default when status is omitted). API authentication is
 off by default. These writers therefore also control injection suppression;
 the lifecycle flag adds no new authorization boundary.
 
-Lifecycle changes are reflected in provider memory blocks when the next terminal
-of that provider is created in the cwd: `claude_code` writes
-`.claude/CLAUDE.md`, `codex` writes `AGENTS.md`, and `kiro_cli` writes
-`.kiro/steering/cao-memory.md`. A successful empty retrieval writes a stamped
-`<!-- no memories selected -->` block, replacing stale content. Fetch, path
-validation and write failures still leave the previous block in place. Kiro
-owns its steering file and replaces the whole file; Claude Code and Codex
-replace only their delimited blocks. All three retain their cwd and symlink
+Lifecycle changes are reflected in the next terminal's first-message memory
+block. A successful empty retrieval supplies a stamped `<!-- no memories
+selected -->` block. The legacy provider-file path remains available only with
+`memory.injection.write_project_files=true`; it retains its cwd and symlink
 containment checks. When the existing and selected block bodies are identical,
-the provider file is left byte-for-byte unchanged, including its existing
+the opted-in provider file is left byte-for-byte unchanged, including its existing
 `generated` stamp.
 Frozen workflow replays continue using the recorded memory block without
 rechecking lifecycle; another terminal creation does not invalidate that
@@ -537,14 +533,16 @@ parse/validate/secret pipeline and reports without writing.
 
 ## Context Injection
 
-CAO injects relevant memories into a new session two ways:
+CAO injects relevant memories into a new session through its first message:
 
 1. **First-message block** — when an agent receives its first message in a session,
    CAO prepends a `<cao-memory>` block containing relevant memories.
-2. **Provider config file** — built-in event plugins for Claude Code, Codex, and Kiro CLI
-   write the same block into each provider's per-project config file (e.g.
-   `.claude/CLAUDE.md`) on terminal creation, delimited by `cao-memory` markers so
-   repeated runs overwrite the same section.
+Provider project-file writes are disabled by default because `.claude/CLAUDE.md`,
+`AGENTS.md`, and Kiro steering files can be tracked and accidentally committed.
+Set `memory.injection.write_project_files=true` to restore the legacy writes.
+With the default, CAO removes its old delimited blocks from Claude Code and Codex
+files, or its recognizable Kiro steering file; tracked files can therefore show
+as modified or deleted once.
 
 The block format:
 
@@ -568,19 +566,17 @@ explicit recall. An oversized first item is reduced to its first sentence plus
 scope stopping at the oversized item. (`memory_get` is not available yet, so the suffix
 names the key directly.)
 
-These hygiene fixes default on. Set `memory.injection.clear_on_empty` to `false` to keep
+These hygiene fixes default on for opted-in project-file writes. Set
+`memory.injection.clear_on_empty` to `false` to keep
 an existing provider block when retrieval is empty. Set `memory.injection.v1_fixes` to
 `false` to restore the legacy stop-at-first-oversized-item behavior and single project
 directory lookup. `memory.enabled=false` remains a full opt-out and does not create or
 rewrite provider files.
 
 The operator's local `memory.enabled` / `CAO_MEMORY_ENABLED` switch always wins over a
-configured remote memory owner (`CAO_MEMORY_API_URL`) for context injection: with the
-switch off, the owner is never called and no block is injected, exactly as when there is
-no remote owner at all. This covers both injection routes above — the first-message block
-and the Claude Code/Codex/Kiro CLI provider-config-file event plugins — because both call through
-the same gateway function (`memory_gateway.memory_context_for_terminal`), which checks the
-switch before reaching the owner. The frozen-replay path applies the same switch itself,
+configured remote memory owner (`CAO_MEMORY_API_URL`) for first-message context injection:
+with the switch off, the owner is never called and no block is injected, exactly as when
+there is no remote owner at all. The frozen-replay path applies the same switch itself,
 before resolving through the gateway (`frozen_run_memory.py:144`) and again before injecting
 a recorded block (`terminal_service.py:455`). The `memory_store`, `memory_recall` and
 `memory_forget` MCP tools check the same switch before they branch to a remote owner, so with

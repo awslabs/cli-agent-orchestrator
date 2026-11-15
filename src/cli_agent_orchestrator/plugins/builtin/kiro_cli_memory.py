@@ -96,6 +96,15 @@ def memory_injection_clear_on_empty_enabled() -> bool:
     return is_memory_injection_clear_on_empty_enabled()
 
 
+def memory_injection_write_project_files_enabled() -> bool:
+    """Resolve the opt-in project-file writer only on the handler path."""
+    from cli_agent_orchestrator.services.settings_service import (
+        is_memory_injection_write_project_files_enabled,
+    )
+
+    return is_memory_injection_write_project_files_enabled()
+
+
 def get_terminal_metadata(terminal_id: str):
     """Lazy indirection onto ``clients.database.get_terminal_metadata``.
 
@@ -146,6 +155,10 @@ class KiroCliMemoryPlugin(CaoPlugin):
                 "kiro_cli_memory: no working directory for %s; skipping",
                 event.terminal_id,
             )
+            return
+
+        if not memory_injection_write_project_files_enabled():
+            await self._remove_project_file_memory(working_directory)
             return
 
         if not memory_is_enabled():
@@ -214,6 +227,20 @@ class KiroCliMemoryPlugin(CaoPlugin):
                 exc,
             )
 
+    async def _remove_project_file_memory(self, working_directory: str) -> None:
+        """Delete a recognizable CAO-owned steering file without fetching memory."""
+        try:
+            target = self._validated_target_path(working_directory)
+            await asyncio.to_thread(self._remove_owned_file, target)
+        except ValueError as exc:
+            logger.warning(
+                "kiro_cli_memory: path validation rejected %s: %s",
+                working_directory,
+                exc,
+            )
+        except Exception as exc:
+            logger.warning("kiro_cli_memory: cleanup failed for %s: %s", working_directory, exc)
+
     # ------------------------------------------------------------------
     # helpers
 
@@ -257,3 +284,12 @@ class KiroCliMemoryPlugin(CaoPlugin):
         except ValueError:
             raise ValueError(f"target {target} escapes working directory {base}")
         return target
+
+    @staticmethod
+    def _remove_owned_file(target: Path) -> None:
+        try:
+            content = target.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return
+        if "<!-- cao-memory:begin -->" in content or 'generated="' in content:
+            target.unlink()

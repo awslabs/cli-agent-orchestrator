@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Provider memory file writes now default off** (#1335). CAO delivers each terminal's
+  memory in its first message rather than writing it into project files that can be
+  committed. Set `memory.injection.write_project_files=true` to opt back into the
+  legacy provider-file behavior.
+
 - **Memory injection no longer leaves stale provider context or drops a scope behind one
   long note** (#1329). Claude Code, Codex and Kiro provider files receive UTC-stamped
   blocks, including an explicit empty block when no memories are selected. A launch whose

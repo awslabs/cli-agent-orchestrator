@@ -15,6 +15,15 @@ from cli_agent_orchestrator.plugins.builtin.claude_code_memory import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _enable_project_file_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory."
+        "memory_injection_write_project_files_enabled",
+        lambda: True,
+    )
+
+
 def _event(provider: str = "claude_code", terminal_id: str = "t1") -> PostCreateTerminalEvent:
     return PostCreateTerminalEvent(
         terminal_id=terminal_id,

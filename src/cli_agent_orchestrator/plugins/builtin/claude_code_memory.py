@@ -89,6 +89,15 @@ def memory_injection_clear_on_empty_enabled() -> bool:
     return is_memory_injection_clear_on_empty_enabled()
 
 
+def memory_injection_write_project_files_enabled() -> bool:
+    """Resolve the opt-in project-file writer only on the handler path."""
+    from cli_agent_orchestrator.services.settings_service import (
+        is_memory_injection_write_project_files_enabled,
+    )
+
+    return is_memory_injection_write_project_files_enabled()
+
+
 def get_terminal_metadata(terminal_id: str):
     """Lazy indirection onto ``clients.database.get_terminal_metadata``.
 
@@ -139,6 +148,10 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
                 "claude_code_memory: no working directory for %s; skipping",
                 event.terminal_id,
             )
+            return
+
+        if not memory_injection_write_project_files_enabled():
+            await self._remove_project_file_memory(working_directory)
             return
 
         if not memory_is_enabled():
@@ -202,6 +215,20 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
                 exc,
             )
 
+    async def _remove_project_file_memory(self, working_directory: str) -> None:
+        """Remove CAO's old block without fetching memory or changing user text."""
+        try:
+            target = self._validated_target_path(working_directory)
+            await asyncio.to_thread(self._remove_existing_block, target)
+        except ValueError as exc:
+            logger.warning(
+                "claude_code_memory: path validation rejected %s: %s",
+                working_directory,
+                exc,
+            )
+        except Exception as exc:
+            logger.warning("claude_code_memory: cleanup failed for %s: %s", working_directory, exc)
+
     # ------------------------------------------------------------------
     # helpers
 
@@ -262,6 +289,39 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
             return f"{stripped}{separator}{BEGIN_MARKER}\n{context_block}\n{END_MARKER}\n"
 
         locked_atomic_rewrite(target, compute_new_content)
+
+    @staticmethod
+    def _remove_existing_block(target: Path) -> None:
+        try:
+            content = target.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return
+        stripped = ClaudeCodeMemoryPlugin._remove_delimited_blocks(content)
+        if stripped == content:
+            return
+        if not stripped.strip():
+            target.unlink()
+            return
+        locked_atomic_rewrite(target, lambda _existing: stripped)
+
+    @staticmethod
+    def _remove_delimited_blocks(content: str) -> str:
+        """Remove complete CAO blocks while preserving every other byte."""
+        cursor = 0
+        pieces: list[str] = []
+        while True:
+            begin = content.find(BEGIN_MARKER, cursor)
+            if begin == -1:
+                pieces.append(content[cursor:])
+                return "".join(pieces)
+            end = content.find(END_MARKER, begin + len(BEGIN_MARKER))
+            next_begin = content.find(BEGIN_MARKER, begin + len(BEGIN_MARKER))
+            if end == -1 or (next_begin != -1 and next_begin < end):
+                pieces.append(content[cursor : begin + len(BEGIN_MARKER)])
+                cursor = begin + len(BEGIN_MARKER)
+                continue
+            pieces.append(content[cursor:begin])
+            cursor = end + len(END_MARKER)
 
     @staticmethod
     def _strip_existing_block(content: str) -> str:
