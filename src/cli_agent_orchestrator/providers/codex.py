@@ -486,17 +486,24 @@ STARTUP_IDLE_PLACEHOLDER_PATTERN = (
 CODEX_WELCOME_PATTERN = r"OpenAI Codex"
 
 
+_BACKGROUND_TERMINALS_RE = re.compile(
+    r"\s*\d+ background terminals? running · /ps to view · /stop to close\s*"
+)
+
+
 def _tui_status_bar_start(lines: list[str]) -> Optional[int]:
     bottom = max(len(lines) - IDLE_PROMPT_TAIL_LINES, 0)
     for index in range(len(lines) - 1, bottom - 1, -1):
         if not re.search(TUI_FOOTER_PATTERN, lines[index]):
             continue
-        if re.search(r"\?\s+for shortcuts", lines[index]):
-            previous = index - 1
-            while previous >= bottom and not lines[previous].strip():
-                previous -= 1
-            if previous >= bottom and re.search(r"·\s+[~/]", lines[previous]):
-                return previous
+        previous = index - 1
+        while previous >= bottom and index - previous <= 3 and not lines[previous].strip():
+            previous -= 1
+        if previous >= bottom and index - previous <= 3 and (
+            (re.search(r"\?\s+for shortcuts", lines[index]) and re.search(r"·\s+[~/]", lines[previous]))
+            or (re.search(r"·\s+[~/]", lines[index]) and re.fullmatch(r"\s*\?\s+for shortcuts\s*", lines[previous]))
+        ):
+            return previous
         return index
     return None
 
@@ -525,6 +532,20 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
             footer_start_idx = j
         elif re.match(rf"\s*{IDLE_PROMPT_PATTERN}", line):
             footer_start_idx = j
+            # A notice without a preceding completion footer could be reply text.
+            # This remains a visual heuristic: a reply can imitate both rows.
+            notice_idx = j - 1
+            while notice_idx >= 0 and not all_lines[notice_idx].strip():
+                notice_idx -= 1
+            if notice_idx >= 0 and _BACKGROUND_TERMINALS_RE.fullmatch(all_lines[notice_idx]):
+                preceding = notice_idx - 1
+                while preceding >= 0 and not all_lines[preceding].strip():
+                    preceding -= 1
+                # Bare clocks are ambiguous without the provider version here.
+                if preceding >= 0 and _is_completion_footer(
+                    all_lines[preceding], BARE_CLOCK_FOOTER_VERSIONS[1]
+                ):
+                    footer_start_idx = notice_idx
             break
         else:
             break
