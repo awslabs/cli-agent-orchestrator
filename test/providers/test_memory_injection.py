@@ -211,7 +211,7 @@ class TestConfigFilesNotMutated:
 
         context = self._store_and_get_context(tmp_path)
 
-        assert "<cao-memory>" in context
+        assert "<cao-memory " in context
         assert claude_md.read_text() == original
 
     def test_agents_md_not_mutated(self, tmp_path: Path):
@@ -223,7 +223,7 @@ class TestConfigFilesNotMutated:
 
         context = self._store_and_get_context(tmp_path)
 
-        assert "<cao-memory>" in context
+        assert "<cao-memory " in context
         assert agents_md.read_text() == original
 
     def test_kiro_steering_not_mutated(self, tmp_path: Path):
@@ -236,7 +236,7 @@ class TestConfigFilesNotMutated:
 
         context = self._store_and_get_context(tmp_path)
 
-        assert "<cao-memory>" in context
+        assert "<cao-memory " in context
         assert steering_md.read_text() == original
 
 
@@ -267,7 +267,7 @@ class TestMemoryContextGeneration:
         svc._get_terminal_context = lambda terminal_id: ctx
         context = svc.get_memory_context_for_terminal("term-001")
 
-        assert "<cao-memory>" in context
+        assert "<cao-memory " in context
         assert "</cao-memory>" in context
         assert "type-hints" in context
 

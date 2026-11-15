@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from test.services.test_scoring import _row, _stamp_updated_at
 from test.services.vault.test_vault_injection_renderer import _injectable_renderer
@@ -23,6 +24,12 @@ from cli_agent_orchestrator.services.memory_service import MemoryService
 
 STAMP = datetime(2026, 1, 1, tzinfo=timezone.utc)
 CTX = {"cwd": "/pins/project", "session_name": "pin-session", "caller_scope": "global"}
+
+
+def _without_generated_stamp(block: str) -> str:
+    pattern = r'<cao-memory generated="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z">'
+    assert re.search(pattern, block)
+    return re.sub(pattern, "<cao-memory>", block, count=1)
 
 
 @pytest.fixture(params=["absent", "explicit"])
@@ -292,7 +299,7 @@ class TestInjectionParity:
             db.query(MemoryMetadataModel).filter_by(key="cap-00").update({"related_keys": "cap-10"})
             db.commit()
         _edge(factory, "cap-00", "project", "pin-project", "cap-01")
-        assert svc.get_memory_context(CTX) == (
+        assert _without_generated_stamp(svc.get_memory_context(CTX)) == (
             "<cao-memory>\n## Context from CAO Memory\n"
             "- [session] session-pin: pin pin body\n"
             "- [project] cap-00: body 00\n- [project] cap-01: body 01\n"
@@ -326,7 +333,7 @@ class TestInjectionParity:
                 .count()
                 == 1
             )
-        assert svc.get_memory_context_for_terminal("worker") == (
+        assert _without_generated_stamp(svc.get_memory_context_for_terminal("worker")) == (
             "<cao-memory>\n## Context from CAO Memory\n"
             "- [project] design: Design\n- [project] replacement: Replacement\n</cao-memory>"
         )

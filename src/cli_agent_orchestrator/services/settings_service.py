@@ -24,6 +24,10 @@ _DEFAULTS = {
 
 _BOOL_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _BOOL_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+MEMORY_INJECTION_DEFAULTS = {
+    "clear_on_empty": True,
+    "v1_fixes": True,
+}
 
 
 class SettingsUnreadableError(RuntimeError):
@@ -753,6 +757,7 @@ def get_memory_settings() -> Dict[str, Any]:
         "explain_enabled": True,
         "non_accessing_inspection": False,
         "lifecycle": {"enabled": False},
+        "injection": dict(MEMORY_INJECTION_DEFAULTS),
     }
     saved = settings.get("memory", {})
     if not isinstance(saved, dict):
@@ -760,6 +765,14 @@ def get_memory_settings() -> Dict[str, Any]:
         saved = {}
     result = dict(defaults)
     result.update(saved)
+    saved_injection = saved.get("injection", {})
+    if not isinstance(saved_injection, dict):
+        logger.warning(
+            "Invalid settings.memory.injection=%r (expected object); using defaults",
+            saved_injection,
+        )
+        saved_injection = {}
+    result["injection"] = {**MEMORY_INJECTION_DEFAULTS, **saved_injection}
     # Vault config has cross-field safety invariants and is intentionally
     # available only through get_vault_config().
     result.pop("vault", None)
@@ -820,6 +833,37 @@ def get_memory_settings() -> Dict[str, Any]:
 
     result["lint_enabled"] = is_memory_lint_enabled(settings=settings)
     return result
+
+
+def _memory_injection_flag(key: str) -> bool:
+    """Read one default-on injection fix; invalid/read errors stay on."""
+    try:
+        injection = get_memory_settings().get("injection", {})
+        value = injection.get(key, True) if isinstance(injection, dict) else True
+        if isinstance(value, bool):
+            return value
+        logger.warning(
+            "Invalid memory.injection.%s=%r (expected bool); defaulting to True",
+            key,
+            value,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to read memory.injection.%s, defaulting to True: %s",
+            key,
+            exc,
+        )
+    return True
+
+
+def is_memory_injection_clear_on_empty_enabled() -> bool:
+    """Whether empty builds replace stale provider blocks (default true)."""
+    return _memory_injection_flag("clear_on_empty")
+
+
+def is_memory_injection_v1_fixes_enabled() -> bool:
+    """Whether the v1 builder skips/clips and follows aliases (default true)."""
+    return _memory_injection_flag("v1_fixes")
 
 
 def get_vault_config(*, canonicalize: bool = True):

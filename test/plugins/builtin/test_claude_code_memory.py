@@ -1,5 +1,7 @@
 """Tests for the Claude Code memory-injection plugin."""
 
+import json
+import re
 import threading
 from pathlib import Path
 
@@ -83,6 +85,7 @@ async def test_writes_memory_block_on_post_create_terminal(
     assert BEGIN_MARKER in content
     assert END_MARKER in content
     assert "stan prefers pytest" in content
+    assert re.search(r'<cao-memory generated="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z">', content)
 
 
 @pytest.mark.asyncio
@@ -128,7 +131,7 @@ async def test_replaces_existing_memory_block_on_rerun(
     await plugin.on_post_create_terminal(_event())
 
     content = target.read_text(encoding="utf-8")
-    assert "<cao-memory>NEW</cao-memory>" in content
+    assert ">NEW</cao-memory>" in content
     assert "<cao-memory>OLD</cao-memory>" not in content
     assert "Hand-written content." in content, "prior user content must be preserved"
     assert content.count(BEGIN_MARKER) == 1
@@ -159,11 +162,94 @@ async def test_skips_write_when_memory_context_empty(
         "cli_agent_orchestrator.plugins.builtin.claude_code_memory.MemoryService",
         lambda: type("F", (), {"get_memory_context_for_terminal": lambda self, t: ""})(),
     )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory."
+        "memory_injection_clear_on_empty_enabled",
+        lambda: False,
+    )
 
     plugin = ClaudeCodeMemoryPlugin()
     await plugin.on_post_create_terminal(_event())
 
     assert not (tmp_path / ".claude").exists()
+
+
+@pytest.mark.asyncio
+async def test_empty_context_replaces_stale_block_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / ".claude" / "CLAUDE.md"
+    target.parent.mkdir()
+    target.write_text(
+        "# Project Notes\n" f"{BEGIN_MARKER}\n<cao-memory>STALE</cao-memory>\n{END_MARKER}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_terminal_metadata",
+        lambda terminal_id: {
+            "tmux_session": "cao-test-session",
+            "tmux_window": "developer-abcd",
+            "id": terminal_id,
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_backend",
+        lambda: type(
+            "FakeBackend", (), {"get_pane_working_directory": lambda self, s, w: str(tmp_path)}
+        )(),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.MemoryService",
+        lambda: type("F", (), {"get_memory_context_for_terminal": lambda self, t: ""})(),
+    )
+
+    await ClaudeCodeMemoryPlugin().on_post_create_terminal(_event())
+
+    content = target.read_text(encoding="utf-8")
+    assert "STALE" not in content
+    assert "<!-- no memories selected -->" in content
+    assert re.search(r'<cao-memory generated="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z">', content)
+    assert "# Project Notes" in content
+
+
+@pytest.mark.asyncio
+async def test_clear_on_empty_false_preserves_stale_block(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cli_agent_orchestrator.services import settings_service
+
+    target = tmp_path / ".claude" / "CLAUDE.md"
+    target.parent.mkdir()
+    original = f"{BEGIN_MARKER}\n<cao-memory>STALE</cao-memory>\n{END_MARKER}\n"
+    target.write_text(original, encoding="utf-8")
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps({"memory": {"injection": {"clear_on_empty": False}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings_service, "SETTINGS_FILE", settings_path)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_terminal_metadata",
+        lambda terminal_id: {
+            "tmux_session": "cao-test-session",
+            "tmux_window": "developer-abcd",
+            "id": terminal_id,
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_backend",
+        lambda: type(
+            "FakeBackend", (), {"get_pane_working_directory": lambda self, s, w: str(tmp_path)}
+        )(),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.MemoryService",
+        lambda: type("F", (), {"get_memory_context_for_terminal": lambda self, t: ""})(),
+    )
+
+    await ClaudeCodeMemoryPlugin().on_post_create_terminal(_event())
+
+    assert target.read_text(encoding="utf-8") == original
 
 
 @pytest.mark.asyncio

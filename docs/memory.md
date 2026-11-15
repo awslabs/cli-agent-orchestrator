@@ -320,17 +320,15 @@ marks links active by default when status is omitted). API authentication is
 off by default. These writers therefore also control injection suppression;
 the lifecycle flag adds no new authorization boundary.
 
-Lifecycle changes do not retract provider memory blocks already persisted
-in `<cwd>/.claude/CLAUDE.md`, `<cwd>/AGENTS.md` or Kiro's
-`<cwd>/.kiro/steering/cao-memory.md`. Claude Code, Codex and Kiro memory
-handlers refresh only their own provider's file when a terminal of that
-provider is created in that cwd: `claude_code` writes `.claude/CLAUDE.md`,
-`codex` writes `AGENTS.md`, and `kiro_cli` writes `.kiro/steering/cao-memory.md`.
-Retrieval must return a nonempty block and the write must succeed. Empty
-retrieval, fetch failures or write failures leave the previous block in place.
-Kiro owns its steering file and replaces the whole file; Claude Code and Codex
-replace only their delimited blocks. Kiro also validates the cwd and target
-before writing; missing cwd or failed validation leaves its old file intact.
+Lifecycle changes are reflected in provider memory blocks when the next terminal
+of that provider is created in the cwd: `claude_code` writes
+`.claude/CLAUDE.md`, `codex` writes `AGENTS.md`, and `kiro_cli` writes
+`.kiro/steering/cao-memory.md`. A successful empty retrieval writes a stamped
+`<!-- no memories selected -->` block, replacing stale content. Fetch, path
+validation and write failures still leave the previous block in place. Kiro
+owns its steering file and replaces the whole file; Claude Code and Codex
+replace only their delimited blocks. All three retain their cwd and symlink
+containment checks.
 Frozen workflow replays continue using the recorded memory block without
 rechecking lifecycle; another terminal creation does not invalidate that
 snapshot. A fresh workflow run resolves current memory.
@@ -549,7 +547,7 @@ CAO injects relevant memories into a new session two ways:
 The block format:
 
 ```
-<cao-memory>
+<cao-memory generated="2026-11-15T03:00:00Z">
 ## Context from CAO Memory
 - [session] recent-decision: Use the existing auth middleware, do not rewrite
 - [project] testing-framework: Always use pytest for testing in this project
@@ -562,7 +560,17 @@ The block format:
 Memories are selected in scope precedence order: `session` > `project` > `global`. Each
 scope is independently capped — at most `MEMORY_MAX_PER_SCOPE` (10) entries and
 `MEMORY_SCOPE_BUDGET_CHARS` (1000) characters per scope — so one scope cannot monopolize
-the injection budget.
+the injection budget. Project injection follows recorded `cwd_hash` aliases, matching
+explicit recall. An oversized first item is reduced to its first sentence plus
+`… (full note: <key>)`; later items that fit are still considered instead of the whole
+scope stopping at the oversized item. (`memory_get` is not available yet, so the suffix
+names the key directly.)
+
+These hygiene fixes default on. Set `memory.injection.clear_on_empty` to `false` to keep
+an existing provider block when retrieval is empty. Set `memory.injection.v1_fixes` to
+`false` to restore the legacy stop-at-first-oversized-item behavior and single project
+directory lookup. `memory.enabled=false` remains a full opt-out and does not create or
+rewrite provider files.
 
 The operator's local `memory.enabled` / `CAO_MEMORY_ENABLED` switch always wins over a
 configured remote memory owner (`CAO_MEMORY_API_URL`) for context injection: with the

@@ -25,6 +25,10 @@ from typing import TYPE_CHECKING
 
 from cli_agent_orchestrator.plugins import PostCreateTerminalEvent, hook
 from cli_agent_orchestrator.plugins.base import CaoPlugin
+from cli_agent_orchestrator.services.memory_injection import (
+    empty_memory_block,
+    stamp_memory_block,
+)
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
 
 if TYPE_CHECKING:
@@ -71,6 +75,22 @@ def MemoryService() -> "_MemoryService":
     from cli_agent_orchestrator.services.memory_service import MemoryService as _MemoryService
 
     return _MemoryService()
+
+
+def memory_is_enabled() -> bool:
+    """Resolve the operator's memory switch only on the handler path."""
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    return is_memory_enabled()
+
+
+def memory_injection_clear_on_empty_enabled() -> bool:
+    """Resolve the default-on stale-block fix only on the handler path."""
+    from cli_agent_orchestrator.services.settings_service import (
+        is_memory_injection_clear_on_empty_enabled,
+    )
+
+    return is_memory_injection_clear_on_empty_enabled()
 
 
 def get_terminal_metadata(terminal_id: str):
@@ -125,6 +145,9 @@ class CodexMemoryPlugin(CaoPlugin):
             )
             return
 
+        if not memory_is_enabled():
+            return
+
         try:
             if remote_memory_url():
                 context_block = await asyncio.to_thread(
@@ -141,7 +164,11 @@ class CodexMemoryPlugin(CaoPlugin):
             )
             return
 
-        if not context_block:
+        if context_block:
+            context_block = stamp_memory_block(context_block)
+        elif memory_injection_clear_on_empty_enabled():
+            context_block = empty_memory_block()
+        else:
             logger.debug(
                 "codex_memory: no memory context for %s; skipping write",
                 event.terminal_id,
