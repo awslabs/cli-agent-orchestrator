@@ -280,7 +280,9 @@ def _mismatch(m, holder, pr_author, base, repo):
     if scope.get("repo") != repo:
         return f"wrong_repo:{mid} repo={repo}"
     want_author = scope.get("pr_author")
-    if want_author != "*" and want_author != pr_author:
+    if want_author != "*" and (
+            not isinstance(want_author, str)
+            or want_author.casefold() != pr_author.casefold()):
         return f"wrong_author:{mid} author={pr_author}"
     if scope.get("base") != base:
         return f"wrong_base:{mid} base={base}"

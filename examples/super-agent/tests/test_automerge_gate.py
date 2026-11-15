@@ -373,6 +373,18 @@ def test_mandate_scope_author_must_match(tmp_path):
     expect(gate(tmp_path, pr(), [review()], mandates=m), DENY, "DENY")
 
 
+@pytest.mark.parametrize("author,word", [("Alice", "ARM"), ("colleague", "DENY")])
+def test_pr_author_login_ignores_case(tmp_path, author, word):
+    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "revoked": False,
+                       "granted_by": "user", "holder": "shepherd",
+                       "conditions": {}, "scope": dict(SCOPE, pr_author="alice")}]}
+    ids = dict(IDS, ours=["alice"])
+    out = expect(gate(tmp_path, pr(author={"login": author}), [review()],
+                      mandates=m, ids=ids), ARM if word == "ARM" else DENY, word)
+    if word == "DENY":
+        assert out.startswith("DENY not_our_pr")
+
+
 # --- the hold-on-findings window, whatever commit a review sits on ---
 
 def test_later_review_on_an_old_sha_holds(tmp_path):

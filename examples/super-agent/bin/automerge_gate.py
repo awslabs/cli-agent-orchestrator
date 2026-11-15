@@ -427,7 +427,10 @@ def decide(action, pr, reviews, commits, issue_comments, review_comments, requir
     number = pr["number"]
     author = (pr.get("author") or {}).get("login")
     scope_author = limits["pr_author"]
-    if author not in ids["ours"] or (scope_author != "*" and author != scope_author):
+    author_key = author.casefold() if isinstance(author, str) else None
+    ours = {login.casefold() for login in ids["ours"]}
+    scope_key = scope_author.casefold() if isinstance(scope_author, str) else None
+    if author_key not in ours or (scope_author != "*" and author_key != scope_key):
         return "DENY", f"not_our_pr author={author}", None
     if pr["baseRefName"] != "main":
         return "DENY", f"base_not_main base={pr['baseRefName']}", None

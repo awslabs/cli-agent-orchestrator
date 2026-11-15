@@ -91,6 +91,15 @@ def test_wrong_author(tmp_path):
     assert rc == 1 and out.startswith("DENY wrong_author")
 
 
+@pytest.mark.parametrize("author,word", [("Alice", "ALLOW"), ("colleague", "DENY wrong_author")])
+def test_pr_author_login_ignores_case(tmp_path, author, word):
+    data = act(doc())
+    data["mandates"][0]["scope"]["pr_author"] = "alice"
+    rc, out = check(tmp_path, data, author=author)
+    assert rc == (0 if word == "ALLOW" else 1)
+    assert out.startswith(word)
+
+
 def test_wrong_base(tmp_path):
     rc, out = check(tmp_path, act(doc()), base="feat/stacked")
     assert rc == 1 and out.startswith("DENY wrong_base")
