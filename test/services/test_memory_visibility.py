@@ -15,7 +15,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel
-from cli_agent_orchestrator.services import memory_reconciliation, settings_service
+from cli_agent_orchestrator.services import memory_reconciliation, settings_service, wiki_compiler
 from cli_agent_orchestrator.services.memory_reconciliation import (
     MemoryReconciliationService,
     RepairAction,
@@ -244,6 +244,41 @@ def test_repair_honours_disabled_lenient_parser(
     assert report.records[0].finding.kind == "malformed_timestamp"
     with sessionmaker(bind=engine)() as db:
         assert db.query(MemoryMetadataModel).count() == 0
+
+
+def test_compact_headingless_topic_uses_metadata_updated_at(
+    tmp_path: Path,
+    engine: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _topic(tmp_path, "compact-headingless", "A headingless compact candidate.")
+    article = path.read_text(encoding="utf-8")
+    updated_at = datetime(2025, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    with sessionmaker(bind=engine)() as db:
+        db.add(
+            MemoryMetadataModel(
+                key="compact-headingless",
+                memory_type="reference",
+                scope="global",
+                scope_id=None,
+                file_path=str(path),
+                tags="visibility",
+                created_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+                updated_at=updated_at,
+            )
+        )
+        db.commit()
+
+    async def return_article(*args: Any, **kwargs: Any) -> str:
+        return article
+
+    monkeypatch.setattr(wiki_compiler, "_build_llm_client", lambda *args, **kwargs: object())
+    monkeypatch.setattr(wiki_compiler, "_llm_call", return_article)
+
+    result = asyncio.run(MemoryService(tmp_path, engine).compact(key="compact-headingless"))
+
+    assert result["compact-headingless"] == "applied"
+    assert "## 2025-01-02T03:04:05Z" in path.read_text(encoding="utf-8")
 
 
 def test_add_headings_backs_up_before_write_and_is_idempotent(

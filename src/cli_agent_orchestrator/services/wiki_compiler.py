@@ -53,6 +53,10 @@ ELISION_MARKER = "[... earlier content elided by CAO compiler — see git histor
 _SENTINEL_STRIP_RE = re.compile(r"<<<CAO_(NEW_OBSERVATION|EXISTING_ARTICLE)_(BEGIN|END)_v\d+>>>")
 _ID_HEADER_RE = re.compile(r"^<!--\s*id:\s*([^\s>][^>]*?)\s*-->")
 _ENTRY_HEADING_RE = re.compile(r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)$", re.MULTILINE)
+_LOOSE_ENTRY_HEADING_RE = re.compile(
+    r"^#{2,} [^\n]*?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)[^\n]*$",
+    re.MULTILINE,
+)
 _CANONICAL_ENTRY_HEADING_RE = re.compile(
     r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$", re.MULTILINE
 )
@@ -224,13 +228,24 @@ def _canonical_timestamp(value: str) -> str:
     return normalized
 
 
-def _resolve_newest_entry_at(existing: str, new_entry: str, newest_entry_at: Optional[str]) -> str:
+def _resolve_newest_entry_at(
+    existing: str,
+    new_entry: str,
+    newest_entry_at: Optional[str],
+    fallback_updated_at: Optional[str],
+) -> str:
     """Resolve the fact timestamp without letting compilation refresh recency."""
     if newest_entry_at is not None:
         return _canonical_timestamp(newest_entry_at)
-    existing_timestamps = _ENTRY_HEADING_RE.findall(existing)
-    if existing_timestamps and not new_entry.strip():
-        return max(_canonical_timestamp(value) for value in existing_timestamps)
+    if not new_entry.strip():
+        existing_timestamps = _ENTRY_HEADING_RE.findall(existing)
+        if existing_timestamps:
+            return max(_canonical_timestamp(value) for value in existing_timestamps)
+        loose_timestamps = _LOOSE_ENTRY_HEADING_RE.findall(existing)
+        if loose_timestamps:
+            return max(_canonical_timestamp(value) for value in loose_timestamps)
+        if fallback_updated_at is not None:
+            return _canonical_timestamp(fallback_updated_at)
     # Direct compile callers predating the explicit timestamp parameter cannot
     # supply the new observation's fact time. Keep their behavior deterministic
     # at call time; the production store path always supplies newest_entry_at.
@@ -628,6 +643,7 @@ async def compile(
     timeout_s: float = DEFAULT_TIMEOUT_S,
     provider_hint: Optional[str] = None,
     newest_entry_at: Optional[str] = None,
+    fallback_updated_at: Optional[str] = None,
 ) -> CompileResult:
     """Merge ``new_entry`` into ``existing_content``; return a ``CompileResult``.
 
@@ -644,14 +660,17 @@ async def compile(
     new_bytes = (new_entry or "").encode("utf-8")
     if len(new_bytes) > NEW_ENTRY_MAX_BYTES:
         raise ValueError(
-            f"new_entry exceeds {NEW_ENTRY_MAX_BYTES} byte cap " f"(got {len(new_bytes)} bytes)"
+            f"new_entry exceeds {NEW_ENTRY_MAX_BYTES} byte cap (got {len(new_bytes)} bytes)"
         )
 
     sanitised_new = _strip_sentinels(new_entry or "")
     sanitised_existing = _strip_sentinels(_truncate_existing(existing_content or ""))
     expected_header = _expected_header(topic_key, existing_content or "")
     canonical_entry_at = _resolve_newest_entry_at(
-        existing_content or "", new_entry or "", newest_entry_at
+        existing_content or "",
+        new_entry or "",
+        newest_entry_at,
+        fallback_updated_at,
     )
 
     fallback = _append_fallback(existing_content or "", new_entry or "")

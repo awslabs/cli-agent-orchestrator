@@ -138,7 +138,7 @@ class TestU17PlanCases:
         [
             "",
             "## 2026-11-13T04:03:02Z\nOld heading body.\n",
-            ("## 2026-11-12T03:02:01Z\nOlder body.\n" "## 2026-11-14T05:53:12Z\nNewest body.\n"),
+            ("## 2026-11-12T03:02:01Z\nOlder body.\n## 2026-11-14T05:53:12Z\nNewest body.\n"),
         ],
         ids=["zero", "one", "two"],
     )
@@ -176,6 +176,28 @@ class TestU17PlanCases:
                 "",
                 topic_key="prefer-pytest",
                 timeout_s=5.0,
+            )
+        )
+
+        canonical = re.findall(
+            r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$",
+            result.compiled_content,
+            re.MULTILINE,
+        )
+        assert result.used_llm is True
+        assert canonical == ["2025-01-02T03:04:05Z"]
+
+    def test_compaction_prefers_loose_heading_to_metadata_fallback(self, fake_llm):
+        existing = f"{EXISTING_BODY.rstrip()}\n\n### 2025-01-02T03:04:05Z (edited)\nOld fact.\n"
+        fake_llm.set_response(_good_compiled())
+
+        result = _run(
+            wiki_compiler.compile(
+                existing,
+                "",
+                topic_key="prefer-pytest",
+                timeout_s=5.0,
+                fallback_updated_at="2026-02-03T04:05:06Z",
             )
         )
 
@@ -458,8 +480,7 @@ class TestT4LinkInjection:
 
     def test_compile_rejects_external_link_u1(self, fake_llm):
         bad = (
-            f"{EXISTING_HEADER}\n# prefer-pytest\n\n"
-            "see [x](https://example.com) for details. " * 3
+            f"{EXISTING_HEADER}\n# prefer-pytest\n\nsee [x](https://example.com) for details. " * 3
         )
         fake_llm.set_response(bad)
         result = _run(
@@ -487,7 +508,7 @@ class TestT4LinkInjection:
 
     def test_compile_rejects_autolink(self, fake_llm):
         """Rule 7 must catch ``<scheme://...>`` autolinks."""
-        bad = f"{EXISTING_HEADER}\n# prefer-pytest\n\n" "visit <https://evil.example.com> now. " * 3
+        bad = f"{EXISTING_HEADER}\n# prefer-pytest\n\nvisit <https://evil.example.com> now. " * 3
         fake_llm.set_response(bad)
         result = _run(
             wiki_compiler.compile(
@@ -556,9 +577,7 @@ class TestT5ApiKeyHandling:
 
 class TestT6MarkdownInjection:
     def test_compile_rejects_script_tag(self, fake_llm):
-        bad = (
-            f"{EXISTING_HEADER}\n# prefer-pytest\n\n" "intro <script>alert(1)</script> outro. " * 3
-        )
+        bad = f"{EXISTING_HEADER}\n# prefer-pytest\n\nintro <script>alert(1)</script> outro. " * 3
         fake_llm.set_response(bad)
         result = _run(
             wiki_compiler.compile(
@@ -624,9 +643,7 @@ class TestT7HeaderOverride:
     def test_compile_constructs_header_for_new_topic(self, fake_llm):
         """When existing == "" the canonical header is built from topic_key."""
         ok = (
-            "<!-- id: brand-new-topic -->\n"
-            "# brand-new-topic\n\n"
-            "First fact about brand-new-topic.\n"
+            "<!-- id: brand-new-topic -->\n# brand-new-topic\n\nFirst fact about brand-new-topic.\n"
         )
         fake_llm.set_response(ok)
         # Use a long-enough new_entry so the shrink guard is satisfied.
@@ -638,12 +655,7 @@ class TestT7HeaderOverride:
         assert result.compiled_content.lstrip().startswith("<!-- id: brand-new-topic -->")
 
     def test_compile_rejects_yaml_frontmatter(self, fake_llm):
-        bad = (
-            "---\n"
-            "title: prefer-pytest\n"
-            "---\n"
-            f"{EXISTING_HEADER}\n# prefer-pytest\n\nbody. " * 2
-        )
+        bad = f"---\ntitle: prefer-pytest\n---\n{EXISTING_HEADER}\n# prefer-pytest\n\nbody. " * 2
         fake_llm.set_response(bad)
         result = _run(
             wiki_compiler.compile(
@@ -654,11 +666,7 @@ class TestT7HeaderOverride:
         assert "output_validation:2" in (result.fallback_reason or "")
 
     def test_compile_rejects_duplicate_id_header(self, fake_llm):
-        bad = (
-            f"{EXISTING_HEADER}\n# prefer-pytest\n\n"
-            "body line.\n\n"
-            f"{EXISTING_HEADER}\nmore body.\n"
-        )
+        bad = f"{EXISTING_HEADER}\n# prefer-pytest\n\nbody line.\n\n{EXISTING_HEADER}\nmore body.\n"
         fake_llm.set_response(bad)
         result = _run(
             wiki_compiler.compile(

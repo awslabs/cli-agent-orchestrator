@@ -1519,6 +1519,7 @@ class MemoryService:
                     new_entry=new_entry,
                     pre_append_content=pre_append_content,
                     newest_entry_at=newest_entry_at,
+                    fallback_updated_at=None,
                     expected_content=expected_content,
                     provider_hint=provider_hint,
                 )
@@ -1561,6 +1562,7 @@ class MemoryService:
         new_entry: str,
         pre_append_content: str,
         newest_entry_at: Optional[str],
+        fallback_updated_at: Optional[str],
         expected_content: str,
         provider_hint: Optional[str],
     ) -> str:
@@ -1602,6 +1604,7 @@ class MemoryService:
                 timeout_s=get_compile_timeout_s(),
                 provider_hint=provider_hint,
                 newest_entry_at=newest_entry_at,
+                fallback_updated_at=fallback_updated_at,
             )
         except Exception as e:  # noqa: BLE001 — compile is best-effort
             logger.warning(f"background wiki compile failed (key={key}): {e}")
@@ -1790,13 +1793,22 @@ class MemoryService:
                             updated = updated.replace(tzinfo=timezone.utc)
                         if last_compiled >= updated:
                             continue
-                    candidates.append((row.key, row.scope_id))
+                    row_updated = row.updated_at
+                    if row_updated is not None:
+                        if row_updated.tzinfo is None:
+                            row_updated = row_updated.replace(tzinfo=timezone.utc)
+                        else:
+                            row_updated = row_updated.astimezone(timezone.utc)
+                        fallback_updated_at = row_updated.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    else:
+                        fallback_updated_at = None
+                    candidates.append((row.key, row.scope_id, fallback_updated_at))
         except Exception as e:  # noqa: BLE001
             logger.warning(f"compact: candidate query failed: {e}")
             return {"_summary": {"error": str(e)}}
 
         results: dict = {}
-        for topic_key, topic_scope_id in candidates:
+        for topic_key, topic_scope_id, fallback_updated_at in candidates:
             wiki_path = self.get_wiki_path(scope, topic_scope_id, topic_key)
             try:
                 article = wiki_path.read_text(encoding="utf-8")
@@ -1812,6 +1824,7 @@ class MemoryService:
                 new_entry="",
                 pre_append_content=article,
                 newest_entry_at=None,
+                fallback_updated_at=fallback_updated_at,
                 expected_content=article,
                 provider_hint=provider_hint,
             )
