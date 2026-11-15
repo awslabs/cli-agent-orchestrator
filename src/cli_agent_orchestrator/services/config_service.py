@@ -66,10 +66,15 @@ class LifecycleConfig(BaseModel):
     enabled: bool = False
 
 
+class MemoryParserConfig(BaseModel):
+    lenient: bool = True
+
+
 class MemoryConfig(BaseModel):
     enabled: bool = True
     explain_enabled: bool = True
     non_accessing_inspection: bool = False
+    parser: MemoryParserConfig = Field(default_factory=MemoryParserConfig)
     lifecycle: LifecycleConfig = Field(default_factory=LifecycleConfig)
     compile_mode: str = "llm"
     flush_threshold: float = 0.85
@@ -460,6 +465,8 @@ def _get_owned_section(path: str, default: Any) -> Any:
     if section == "memory":
         if key == "lifecycle.enabled":
             return settings_service.is_memory_lifecycle_enabled()
+        if key == "parser.lenient":
+            return settings_service.is_memory_parser_lenient()
         if key == "enabled":
             return settings_service.is_memory_enabled()
         if key == "lint_enabled":
@@ -636,6 +643,7 @@ _ALL_PATHS = sorted(
         "memory.compile_mode",
         "memory.flush_threshold",
         "memory.compile_timeout_s",
+        "memory.parser.lenient",
         "memory.vault",
         "terminal.keep_finished.enabled",
         "terminal.keep_finished.idle_window_minutes",
@@ -723,6 +731,7 @@ class ConfigService:
                 enabled=_get_value("memory.enabled", default=True),
                 explain_enabled=settings_service.is_memory_explain_enabled(),
                 non_accessing_inspection=settings_service.is_non_accessing_inspection_enabled(),
+                parser=MemoryParserConfig(lenient=settings_service.is_memory_parser_lenient()),
                 lifecycle=LifecycleConfig(enabled=settings_service.is_memory_lifecycle_enabled()),
                 lint_enabled=_get_value("memory.lint_enabled", default=True),
                 compile_mode=_get_value("memory.compile_mode", default="llm"),

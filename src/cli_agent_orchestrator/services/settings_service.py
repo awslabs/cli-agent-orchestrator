@@ -752,6 +752,7 @@ def get_memory_settings() -> Dict[str, Any]:
         "instruction_promotion_enabled": False,
         "explain_enabled": True,
         "non_accessing_inspection": False,
+        "parser": {"lenient": True},
         "lifecycle": {"enabled": False},
     }
     saved = settings.get("memory", {})
@@ -905,6 +906,20 @@ def is_non_accessing_inspection_enabled() -> bool:
     except Exception:
         logger.warning("Failed to read memory.non_accessing_inspection; defaulting to False")
         return False
+
+
+def is_memory_parser_lenient() -> bool:
+    """Lenient native-topic parser: nested file value > True; read errors stay on."""
+    try:
+        memory = get_memory_settings()
+        parser = memory.get("parser", {})
+        if not isinstance(parser, dict) or not isinstance(parser.get("lenient", True), bool):
+            logger.warning("Invalid memory.parser.lenient; defaulting to True")
+            return True
+        return bool(parser.get("lenient", True))
+    except Exception:
+        logger.warning("Failed to read memory.parser.lenient; defaulting to True")
+        return True
 
 
 def is_memory_lifecycle_enabled() -> bool:
@@ -1218,6 +1233,7 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``explain_enabled`` (bool) — on-demand CLI relevance diagnostic.
         ``lifecycle.enabled`` (bool) — opt-in supersedes lifecycle.
         ``non_accessing_inspection`` (bool) — opt-in operator reads without access bumps.
+        ``parser.lenient`` (bool) — parse valid native topics without canonical timestamps.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
         ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
         ``learning_enabled`` (bool) — workflow self-learning (outcome capture).
@@ -1257,7 +1273,7 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         if not isinstance(value, bool):
             raise ValueError("lifecycle.enabled must be a bool")
         coerced = value
-    elif key in {"explain_enabled", "non_accessing_inspection"}:
+    elif key in {"explain_enabled", "non_accessing_inspection", "parser.lenient"}:
         if not isinstance(value, bool):
             raise ValueError(f"{key} must be a bool, got {type(value).__name__}")
         coerced = value
@@ -1290,6 +1306,11 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
             if not isinstance(lifecycle, dict):
                 lifecycle = {}
             memory["lifecycle"] = {**lifecycle, "enabled": coerced}
+        elif key == "parser.lenient":
+            parser = memory.get("parser", {})
+            if not isinstance(parser, dict):
+                parser = {}
+            memory["parser"] = {**parser, "lenient": coerced}
         else:
             memory[key] = coerced
         settings["memory"] = memory

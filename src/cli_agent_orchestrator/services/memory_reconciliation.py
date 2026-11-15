@@ -29,6 +29,10 @@ from cli_agent_orchestrator.services.memory_format import (
 _KEY_RE = re.compile(r"^[a-z0-9-]{1,60}$")
 _SCOPE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _TIMESTAMP_RE = re.compile(r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$", re.MULTILINE)
+_LOOSE_TIMESTAMP_RE = re.compile(
+    r"^## [^\n]*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)[^\n]*$",
+    re.MULTILINE,
+)
 _INDEX_ID_RE = re.compile(r"^- \[(?P<key>[^\]]+)\]\((?P<path>[^)]+)\)")
 
 # ``memory_metadata.updated_at`` is nullable; the dedupe survivor tiebreak
@@ -58,6 +62,7 @@ class RepairAction(str, Enum):
     UNSAFE_PATH = "unsafe_path"
     FAILED = "failed"
     MIGRATION_ROLLBACK = "migration_rollback"
+    INDEX_WITH_FALLBACK_DATES = "index_with_fallback_dates"
 
 
 @dataclass(frozen=True, order=True)
@@ -113,6 +118,7 @@ class RepairReport:
             "conflict": 0,
             "unsafe_path": 0,
             "migration_rollback": 0,
+            "index_with_fallback_dates": 0,
         }
         for record in self.records:
             if record.status in counts:
@@ -168,6 +174,7 @@ class _Topic:
     updated_text: str
     token_estimate: int
     index_token_estimate: int
+    used_fallback_dates: bool = False
 
 
 @dataclass(frozen=True)
@@ -494,7 +501,9 @@ class MemoryReconciliationService:
 
         return candidates, findings
 
-    def _parse_candidate(self, candidate: _Candidate) -> _Topic | RepairRecord:
+    def _parse_candidate(
+        self, candidate: _Candidate, identity_rows: Iterable[_Row] = ()
+    ) -> _Topic | RepairRecord:
         path = candidate.file_path
         identity = MemoryIdentity(path.stem, candidate.scope, candidate.scope_id)
         if _first_symlink_component(path, self.base_dir) is not None:
@@ -598,27 +607,62 @@ class MemoryReconciliationService:
                 identity,
             )
         timestamp_texts = _TIMESTAMP_RE.findall(text)
-        if not timestamp_texts:
-            return self._candidate_record(
-                path,
-                RepairAction.MALFORMED,
-                "malformed_timestamp",
-                "topic contains no canonical entry timestamp",
-                identity,
+        used_fallback_dates = not timestamp_texts
+        if timestamp_texts:
+            try:
+                timestamps = [
+                    datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                    for value in timestamp_texts
+                ]
+            except ValueError:
+                return self._candidate_record(
+                    path,
+                    RepairAction.MALFORMED,
+                    "malformed_timestamp",
+                    "topic contains an invalid entry timestamp",
+                    identity,
+                )
+            created_at = min(timestamps)
+            updated_at = max(timestamps)
+        else:
+            body = "\n".join(lines[2:]).strip()
+            if not body:
+                return self._candidate_record(
+                    path,
+                    RepairAction.MALFORMED,
+                    "empty_topic",
+                    "topic contains no body",
+                    identity,
+                )
+            loose_timestamps: list[datetime] = []
+            for value in _LOOSE_TIMESTAMP_RE.findall(text):
+                try:
+                    parsed = datetime.strptime(
+                        value if len(value) == 20 else value.replace("Z", ":00Z"),
+                        "%Y-%m-%dT%H:%M:%SZ",
+                    ).replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                loose_timestamps.append(parsed)
+            rows = list(identity_rows)
+            row_created = [row.created_at for row in rows if row.created_at is not None]
+            row_updated = [row.updated_at for row in rows if row.updated_at is not None]
+            try:
+                file_time = datetime.fromtimestamp(resolved.stat().st_mtime, tz=timezone.utc)
+            except OSError:
+                return self._candidate_record(
+                    path,
+                    RepairAction.MALFORMED,
+                    "unreadable_topic",
+                    "topic modification time could not be read",
+                    identity,
+                )
+            created_at = (
+                min(loose_timestamps)
+                if loose_timestamps
+                else min(row_created) if row_created else file_time
             )
-        try:
-            timestamps = [
-                datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                for value in timestamp_texts
-            ]
-        except ValueError:
-            return self._candidate_record(
-                path,
-                RepairAction.MALFORMED,
-                "malformed_timestamp",
-                "topic contains an invalid entry timestamp",
-                identity,
-            )
+            updated_at = max(row_updated) if row_updated else file_time
         return _Topic(
             identity=identity,
             file_path=resolved,
@@ -627,11 +671,12 @@ class MemoryReconciliationService:
             memory_id=header.group("id"),
             memory_type=memory_type,
             tags=normalize_memory_tags(header.group("tags")),
-            created_at=min(timestamps),
-            updated_at=max(timestamps),
-            updated_text=max(timestamp_texts),
+            created_at=created_at,
+            updated_at=updated_at,
+            updated_text=updated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
             token_estimate=len(text) // 4,
             index_token_estimate=int(len(text.split()) * 1.3),
+            used_fallback_dates=used_fallback_dates,
         )
 
     def _load_rows(self) -> list[_Row]:
@@ -842,6 +887,8 @@ class MemoryReconciliationService:
             index_state = self._load_index_state(topic.index_path, project_scope_id)
         if not self._index_is_current(topic, index_state):
             actions.append(RepairAction.REBUILD_INDEX)
+        if topic.used_fallback_dates and actions:
+            actions.insert(0, RepairAction.INDEX_WITH_FALLBACK_DATES)
         if not actions:
             actions.append(RepairAction.UNCHANGED)
         return RepairRecord(
@@ -861,7 +908,19 @@ class MemoryReconciliationService:
                     )
                 }
                 if dedupe_stale
-                else {}
+                else (
+                    {
+                        "finding": RepairFinding(
+                            kind="fallback_dates",
+                            message=(
+                                "topic has no canonical entry timestamp; "
+                                "metadata and index use fallback dates"
+                            ),
+                        )
+                    }
+                    if topic.used_fallback_dates
+                    else {}
+                )
             ),
         )
 
@@ -869,17 +928,17 @@ class MemoryReconciliationService:
         """Return a deterministic pure-read repair plan."""
         candidates, records = self._iter_candidates()
         rows = self._load_rows()
+        rows_by_identity, rows_by_path = self._row_maps(rows)
         topics: list[_Topic] = []
         parsed_records: list[RepairRecord] = []
         for candidate in candidates:
-            parsed = self._parse_candidate(candidate)
+            identity = MemoryIdentity(candidate.file_path.stem, candidate.scope, candidate.scope_id)
+            parsed = self._parse_candidate(candidate, rows_by_identity.get(identity, ()))
             if isinstance(parsed, RepairRecord):
                 parsed_records.append(parsed)
             else:
                 topics.append(parsed)
         index_states = self._load_index_states(topics)
-
-        rows_by_identity, rows_by_path = self._row_maps(rows)
 
         by_identity: dict[MemoryIdentity, list[_Topic]] = {}
         by_path: dict[Path, list[_Topic]] = {}
@@ -1162,6 +1221,32 @@ class MemoryReconciliationService:
         )
 
     @staticmethod
+    def _add_heading_backup_first(topic: _Topic) -> None:
+        """Add one canonical heading after durably preserving the original bytes."""
+        path = topic.file_path
+        original = path.read_text(encoding="utf-8")
+        backup = path.with_suffix(f"{path.suffix}.bak")
+        if backup.exists():
+            if backup.read_text(encoding="utf-8") != original:
+                raise RuntimeError("existing heading backup does not match the topic")
+        else:
+            backup_tmp = backup.parent / f".{backup.name}.tmp"
+            backup_tmp.write_text(original, encoding="utf-8")
+            os.replace(str(backup_tmp), str(backup))
+
+        lines = original.splitlines()
+        rendered = [
+            *lines[:2],
+            "",
+            f"## {topic.updated_text}",
+            *lines[2:],
+        ]
+        rewritten = "\n".join(rendered).rstrip() + "\n"
+        topic_tmp = path.parent / f".{path.name}.heading.tmp"
+        topic_tmp.write_text(rewritten, encoding="utf-8")
+        os.replace(str(topic_tmp), str(path))
+
+    @staticmethod
     def _failed_record(record: RepairRecord, exc: Exception) -> RepairRecord:
         return RepairRecord(
             identity=record.identity,
@@ -1187,7 +1272,7 @@ class MemoryReconciliationService:
             )
         )
 
-    def apply(self) -> RepairReport:
+    def apply(self, *, add_headings: bool = False) -> RepairReport:
         """Apply valid repairs per record and raise only after all are attempted."""
         planned = self.plan()
         results: list[RepairRecord] = []
@@ -1286,16 +1371,43 @@ class MemoryReconciliationService:
                 current_items: list[tuple[RepairRecord, _Topic]] = []
                 for record, candidate, _ in locked:
                     try:
-                        parsed = self._parse_candidate(candidate)
+                        identity_rows = (
+                            rows_by_identity.get(record.identity, ())
+                            if record.identity is not None
+                            else ()
+                        )
+                        parsed = self._parse_candidate(candidate, identity_rows)
                         if isinstance(parsed, RepairRecord):
                             results.append(parsed)
                             continue
+                        added_heading = add_headings and parsed.used_fallback_dates
+                        if added_heading:
+                            self._add_heading_backup_first(parsed)
+                            parsed = self._parse_candidate(candidate, identity_rows)
+                            if isinstance(parsed, RepairRecord):
+                                results.append(parsed)
+                                continue
                         current = self._plan_topic(
                             parsed,
                             rows_by_identity=rows_by_identity,
                             rows_by_path=rows_by_path,
                             index_state=index_state,
                         )
+                        if added_heading:
+                            current = replace(
+                                current,
+                                actions=(
+                                    RepairAction.INDEX_WITH_FALLBACK_DATES,
+                                    *current.actions,
+                                ),
+                                finding=RepairFinding(
+                                    kind="fallback_dates",
+                                    message=(
+                                        "topic had no canonical entry timestamp; "
+                                        "a backed-up heading was added"
+                                    ),
+                                ),
+                            )
                         if current.status == "skipped":
                             results.append(current)
                             continue
@@ -1375,12 +1487,30 @@ class MemoryReconciliationService:
                     fresh_by_identity, fresh_by_path = fresh_maps
                     for index in conflicted_indexes:
                         record = results[index]
+                        identity = record.identity
+                        if identity is None:
+                            continue
                         try:
-                            parsed = self._parse_candidate(self._candidate_from_record(record))
+                            candidate = self._candidate_from_record(record)
+                            parsed = self._parse_candidate(
+                                candidate,
+                                fresh_by_identity.get(identity, ()),
+                            )
                         except Exception:
                             continue
                         if isinstance(parsed, RepairRecord):
                             continue
+                        if add_headings and parsed.used_fallback_dates:
+                            try:
+                                self._add_heading_backup_first(parsed)
+                                parsed = self._parse_candidate(
+                                    candidate,
+                                    fresh_by_identity.get(identity, ()),
+                                )
+                            except Exception:
+                                continue
+                            if isinstance(parsed, RepairRecord):
+                                continue
                         replanned = self._plan_topic(
                             parsed,
                             rows_by_identity=fresh_by_identity,
@@ -1665,6 +1795,7 @@ class MemoryReconciliationService:
         *,
         apply: bool = False,
         receipt_id: Optional[str] = None,
+        add_headings: bool = False,
     ) -> RepairReport:
         """Plan by default; mutate only when explicitly requested.
 
@@ -1683,7 +1814,7 @@ class MemoryReconciliationService:
             )
         self._strict_index = True
         try:
-            report = self.apply()
+            report = self.apply(add_headings=add_headings)
             return RepairReport(
                 records=report.records + self._migration_receipt_findings(),
                 applied=True,

@@ -36,6 +36,7 @@ from cli_agent_orchestrator.models.memory import Memory, MemoryScope, MemoryType
 from cli_agent_orchestrator.services import memory_eligibility
 from cli_agent_orchestrator.services.memory_archive.base import ExportReport, ImportReport
 from cli_agent_orchestrator.services.memory_format import (
+    TOPIC_HEADER_RE,
     normalize_memory_tags,
     parse_index_entry,
 )
@@ -64,6 +65,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 VALID_SEARCH_MODES = ("metadata", "bm25", "hybrid")
+
+_CANONICAL_ENTRY_HEADING_RE = re.compile(
+    r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$", re.MULTILINE
+)
+_LOOSE_HEADING_TIMESTAMP_RE = re.compile(
+    r"^## [^\n]*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)[^\n]*$",
+    re.MULTILINE,
+)
+_COMPILED_MARKER_RE = re.compile(
+    r"^<!-- cao-compiled: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z entries=\d+ -->$"
+)
 
 # #861: cap hybrid score/usage widening at 200 per source, never below the requested limit.
 HYBRID_CANDIDATE_MIN = 50
@@ -1077,6 +1089,7 @@ class MemoryService:
                         # version just written already contains the new entry,
                         # so merging into it would feed the LLM a duplicate.
                         pre_append_content=existing_content,  # noqa: F821
+                        newest_entry_at=timestamp,
                         # Concurrency token: the bytes this store() wrote. If
                         # the file differs when the compile finishes, a newer
                         # store won the race and the result is dropped.
@@ -1475,6 +1488,7 @@ class MemoryService:
         key: str,
         new_entry: str,
         pre_append_content: str,
+        newest_entry_at: Optional[str],
         expected_content: str,
         provider_hint: Optional[str],
     ) -> None:
@@ -1505,6 +1519,7 @@ class MemoryService:
                     key=key,
                     new_entry=new_entry,
                     pre_append_content=pre_append_content,
+                    newest_entry_at=newest_entry_at,
                     expected_content=expected_content,
                     provider_hint=provider_hint,
                 )
@@ -1546,6 +1561,7 @@ class MemoryService:
         key: str,
         new_entry: str,
         pre_append_content: str,
+        newest_entry_at: Optional[str],
         expected_content: str,
         provider_hint: Optional[str],
     ) -> str:
@@ -1586,6 +1602,7 @@ class MemoryService:
                 topic_key=key,
                 timeout_s=get_compile_timeout_s(),
                 provider_hint=provider_hint,
+                newest_entry_at=newest_entry_at,
             )
         except Exception as e:  # noqa: BLE001 — compile is best-effort
             logger.warning(f"background wiki compile failed (key={key}): {e}")
@@ -1795,6 +1812,7 @@ class MemoryService:
                 key=topic_key,
                 new_entry="",
                 pre_append_content=article,
+                newest_entry_at=None,
                 expected_content=article,
                 provider_hint=provider_hint,
             )
@@ -4118,21 +4136,117 @@ class MemoryService:
         scope = scope.rstrip(" |")
         memory_type = memory_type.rstrip(" |")
 
-        # Extract all timestamped entries
-        timestamps = re.findall(r"## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)", file_content)
-        if not timestamps:
+        timestamps = _CANONICAL_ENTRY_HEADING_RE.findall(file_content)
+        loose_heading_matches = list(_LOOSE_HEADING_TIMESTAMP_RE.finditer(file_content))
+        if timestamps:
+            created_at = datetime.strptime(timestamps[0], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+            updated_at = datetime.strptime(timestamps[-1], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+        else:
+            from cli_agent_orchestrator.services.settings_service import (
+                is_memory_parser_lenient,
+            )
+
+            if not is_memory_parser_lenient():
+                return None
+
+            # Leniency applies only to an otherwise-canonical topic. A random
+            # Markdown file in the wiki tree must not become a memory merely
+            # because its filename resembles a key.
+            header_match = next(
+                (
+                    TOPIC_HEADER_RE.fullmatch(line)
+                    for line in file_content.splitlines()
+                    if TOPIC_HEADER_RE.fullmatch(line) is not None
+                ),
+                None,
+            )
+            if header_match is None:
+                return None
+            try:
+                uuid.UUID(header_match.group("id"))
+                MemoryScope(header_match.group("scope").strip())
+                MemoryType(header_match.group("type").strip())
+            except ValueError:
+                return None
+            memory_id = header_match.group("id")
+            scope = header_match.group("scope").strip()
+            memory_type = header_match.group("type").strip()
+            tags = normalize_memory_tags(header_match.group("tags"))
+
+            loose_timestamps: list[datetime] = []
+            for match in loose_heading_matches:
+                value = match.group(1)
+                try:
+                    parsed = datetime.strptime(
+                        value if len(value) == 20 else value.replace("Z", ":00Z"),
+                        "%Y-%m-%dT%H:%M:%SZ",
+                    ).replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                loose_timestamps.append(parsed)
+
+            def _entry_time(name: str) -> Optional[datetime]:
+                value = entry.get(name)
+                if isinstance(value, datetime):
+                    return (
+                        value.replace(tzinfo=timezone.utc)
+                        if value.tzinfo is None
+                        else value.astimezone(timezone.utc)
+                    )
+                if isinstance(value, str):
+                    try:
+                        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+                            tzinfo=timezone.utc
+                        )
+                    except ValueError:
+                        return None
+                return None
+
+            file_time = datetime.fromtimestamp(wiki_file.stat().st_mtime, tz=timezone.utc)
+            created_at = (
+                min(loose_timestamps)
+                if loose_timestamps
+                else _entry_time("created_at") or file_time
+            )
+            updated_at = _entry_time("updated_at") or file_time
+
+        lines = file_content.splitlines()
+        header_index = next(
+            (index for index, line in enumerate(lines) if TOPIC_HEADER_RE.fullmatch(line)),
+            -1,
+        )
+        body_lines = lines[header_index + 1 :] if header_index >= 0 else lines
+        while body_lines and not body_lines[0].strip():
+            body_lines.pop(0)
+        if body_lines and body_lines[0].startswith("# "):
+            body_lines.pop(0)
+            while body_lines and not body_lines[0].strip():
+                body_lines.pop(0)
+
+        compiled = any(_COMPILED_MARKER_RE.fullmatch(line) for line in body_lines)
+        if compiled or (not timestamps and not loose_heading_matches):
+            body_lines = [line for line in body_lines if not _COMPILED_MARKER_RE.fullmatch(line)]
+            while body_lines and not body_lines[0].strip():
+                body_lines.pop(0)
+            if compiled and body_lines and _CANONICAL_ENTRY_HEADING_RE.fullmatch(body_lines[0]):
+                body_lines.pop(0)
+                while body_lines and not body_lines[0].strip():
+                    body_lines.pop(0)
+            latest_content = self._strip_existing_see_also("\n".join(body_lines)).strip()
+        elif loose_heading_matches and not timestamps:
+            latest_content = self._strip_existing_see_also(
+                file_content[loose_heading_matches[-1].end() :]
+            ).strip()
+        else:
+            last_section = file_content.rsplit(f"## {timestamps[-1]}", 1)
+            latest_content = last_section[-1].strip() if len(last_section) > 1 else ""
+
+        if not latest_content:
             return None
-
-        created_at = datetime.strptime(timestamps[0], "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc
-        )
-        updated_at = datetime.strptime(timestamps[-1], "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc
-        )
-
-        # Extract content (everything after the last ## timestamp line)
-        last_section = file_content.rsplit(f"## {timestamps[-1]}", 1)
-        latest_content = last_section[-1].strip() if len(last_section) > 1 else ""
 
         return Memory(
             id=memory_id,

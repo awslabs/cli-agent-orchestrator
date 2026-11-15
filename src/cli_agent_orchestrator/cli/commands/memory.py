@@ -70,7 +70,13 @@ def memory():
     default=None,
     help="Plan or apply rollback for exactly one migration receipt.",
 )
-def repair_cmd(do_apply, receipt_id):
+@click.option(
+    "--add-headings",
+    is_flag=True,
+    default=False,
+    help="With --apply, back up and add canonical headings to fallback-dated topics.",
+)
+def repair_cmd(do_apply, receipt_id, add_headings):
     """Reconcile topics into SQLite and index.md.
 
     Reconciles the surviving canonical topics. Dry-run unless --apply.
@@ -97,7 +103,14 @@ def repair_cmd(do_apply, receipt_id):
             click.echo(f"{record.status} {label} [{actions}]{detail}")
 
     try:
-        report = service.reconcile(apply=do_apply, receipt_id=receipt_id)
+        if add_headings:
+            report = service.reconcile(
+                apply=do_apply,
+                receipt_id=receipt_id,
+                add_headings=True,
+            )
+        else:
+            report = service.reconcile(apply=do_apply, receipt_id=receipt_id)
     except MemoryReconciliationError as exc:
         report = exc.report
         render_report(report)

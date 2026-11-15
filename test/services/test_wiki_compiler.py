@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
 import time
 from typing import Any, List
 
@@ -118,16 +119,73 @@ class TestU17PlanCases:
         fake_llm.set_response(merged)
         result = _run(
             wiki_compiler.compile(
-                EXISTING_BODY, NEW_ENTRY, topic_key="prefer-pytest", timeout_s=5.0
+                EXISTING_BODY,
+                NEW_ENTRY,
+                topic_key="prefer-pytest",
+                timeout_s=5.0,
+                newest_entry_at="2026-11-14T05:53:12Z",
             )
         )
         assert result.used_llm is True
         assert result.fallback_reason is None
         assert "pytest-asyncio" in result.compiled_content
         assert "User prefers pytest" in result.compiled_content
-        # No timestamped append marker (Phase 1/2 shape)
-        assert "## 20" not in result.compiled_content
+        assert "## 2026-11-14T05:53:12Z" in result.compiled_content
         assert len(fake_llm.calls) == 1
+
+    @pytest.mark.parametrize(
+        "llm_headings",
+        [
+            "",
+            "## 2026-11-13T04:03:02Z\nOld heading body.\n",
+            ("## 2026-11-12T03:02:01Z\nOlder body.\n" "## 2026-11-14T05:53:12Z\nNewest body.\n"),
+        ],
+        ids=["zero", "one", "two"],
+    )
+    def test_compile_owns_exactly_one_heading_dated_by_newest_entry(self, fake_llm, llm_headings):
+        fake_llm.set_response(_good_compiled(llm_headings))
+
+        result = _run(
+            wiki_compiler.compile(
+                EXISTING_BODY,
+                NEW_ENTRY,
+                topic_key="prefer-pytest",
+                timeout_s=5.0,
+                newest_entry_at="2026-11-14T05:53:12Z",
+            )
+        )
+
+        canonical = re.findall(
+            r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$",
+            result.compiled_content,
+            re.MULTILINE,
+        )
+        assert result.used_llm is True
+        assert canonical == ["2026-11-14T05:53:12Z"]
+        assert result.compiled_content.count("<!-- cao-compiled:") == 1
+        assert "entries=" in result.compiled_content
+        assert "2026-11-13T04:03:02Z" not in canonical
+
+    def test_compaction_preserves_newest_fact_date(self, fake_llm):
+        existing = f"{EXISTING_BODY.rstrip()}\n\n## 2025-01-02T03:04:05Z\nOld fact.\n"
+        fake_llm.set_response(_good_compiled())
+
+        result = _run(
+            wiki_compiler.compile(
+                existing,
+                "",
+                topic_key="prefer-pytest",
+                timeout_s=5.0,
+            )
+        )
+
+        canonical = re.findall(
+            r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$",
+            result.compiled_content,
+            re.MULTILINE,
+        )
+        assert result.used_llm is True
+        assert canonical == ["2025-01-02T03:04:05Z"]
 
     def test_compile_fallback_on_timeout(self, fake_llm):
         """U1.7: mock LLM timeout → fallback to append, no exception."""

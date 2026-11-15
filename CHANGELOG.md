@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Memory topics without a canonical entry heading are visible again** (#1329). The
+  default-on `memory.parser.lenient` parser accepts a valid topic header with body content,
+  including minute-precision timestamps; set it to `false` for the legacy behavior. LLM
+  compiles now carry exactly one CAO-owned heading dated by the newest entry, so compilation
+  does not refresh a fact's recency. `cao memory repair` indexes fallback-dated topics instead
+  of skipping them, while `--apply --add-headings` first writes a `.md.bak` copy and then adds
+  the heading. Recency-ranked keyword results can shift because previously invisible notes now
+  participate; a later phase adds the BM25 default.
 - **Codex "Trust this folder?" dialogs (0.156 and later) are accepted before the first input** (#1319).
   Recognise the "Trust this folder?" header and its "enter continue · esc back", "esc quit"
   and "esc cancel" footers while keeping earlier wordings and ignoring dismissed dialogs
