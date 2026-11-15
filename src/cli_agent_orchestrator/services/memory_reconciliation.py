@@ -625,6 +625,18 @@ class MemoryReconciliationService:
             created_at = min(timestamps)
             updated_at = max(timestamps)
         else:
+            from cli_agent_orchestrator.services.settings_service import (
+                is_memory_parser_lenient,
+            )
+
+            if not is_memory_parser_lenient():
+                return self._candidate_record(
+                    path,
+                    RepairAction.MALFORMED,
+                    "malformed_timestamp",
+                    "topic contains no canonical entry timestamp",
+                    identity,
+                )
             body = "\n".join(lines[2:]).strip()
             if not body:
                 return self._candidate_record(
@@ -660,7 +672,9 @@ class MemoryReconciliationService:
             created_at = (
                 min(loose_timestamps)
                 if loose_timestamps
-                else min(row_created) if row_created else file_time
+                else min(row_created)
+                if row_created
+                else file_time
             )
             updated_at = max(row_updated) if row_updated else file_time
         return _Topic(
@@ -785,7 +799,9 @@ class MemoryReconciliationService:
         except OSError:
             return None
 
-    def _row_maps(self, rows: Iterable[_Row]) -> tuple[
+    def _row_maps(
+        self, rows: Iterable[_Row]
+    ) -> tuple[
         dict[MemoryIdentity, list[_Row]],
         dict[Path, list[_Row]],
     ]:

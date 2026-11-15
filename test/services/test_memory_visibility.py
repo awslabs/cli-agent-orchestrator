@@ -224,6 +224,28 @@ def test_repair_indexes_and_reports_fallback_dates(tmp_path: Path, engine: Any) 
         assert row.updated_at == expected_mtime.replace(tzinfo=None)
 
 
+def test_repair_honours_disabled_lenient_parser(
+    tmp_path: Path,
+    engine: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _topic(tmp_path, "strict-repair", "A headingless topic.")
+    monkeypatch.setattr(
+        settings_service,
+        "get_memory_settings",
+        lambda: {"parser": {"lenient": False}},
+    )
+
+    report = MemoryReconciliationService(tmp_path, engine).reconcile(apply=True)
+
+    assert report.counts["malformed"] == 1
+    assert report.records[0].actions == (RepairAction.MALFORMED,)
+    assert report.records[0].finding is not None
+    assert report.records[0].finding.kind == "malformed_timestamp"
+    with sessionmaker(bind=engine)() as db:
+        assert db.query(MemoryMetadataModel).count() == 0
+
+
 def test_add_headings_backs_up_before_write_and_is_idempotent(
     tmp_path: Path,
     engine: Any,
