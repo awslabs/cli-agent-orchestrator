@@ -124,6 +124,20 @@ def test_full_long_wikilink_resolves_to_truncated_memory_key():
     assert result.target_key == truncated
 
 
+def test_filename_match_wins_over_an_untruncated_authored_key():
+    result = resolve_wikilink(
+        "release-plan",
+        embed=False,
+        candidates=(
+            LinkCandidate("release-plan", "Plans/Q3 Release.md"),
+            LinkCandidate("archived-plan", "Archive/release-plan.md"),
+        ),
+    )
+
+    assert result.outcome == "resolved"
+    assert result.target_key == "archived-plan"
+
+
 def test_wikilink_extraction_preserves_embed_flag_and_raw_target():
     result = extract_wikilinks("See [[Design|display]] and ![[folder/Other#Part]].")
 
