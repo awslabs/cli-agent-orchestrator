@@ -2187,7 +2187,7 @@ async def memory_forget(
         default="project",
         description=(
             'Scope of the memory to remove: "global", "project", "session", '
-            '"agent", or "federated"'
+            + '"agent", or "federated"'
         ),
     ),
 ) -> Dict[str, Any]:
@@ -2532,13 +2532,17 @@ async def store_lesson(
             },
             timeout=_mcp_timeout(),
         )
-        return {
+        result = {
             "success": True,
             "key": payload["key"],
             "scope": payload["scope"],
             "scope_id": payload["scope_id"],
             "target_agent_profile": payload["target_agent_profile"],
         }
+        if payload.get("key_truncated") is True:
+            result["key_truncated"] = True
+            result["requested_key"] = payload["requested_key"]
+        return result
     except requests.RequestException as e:
         partial = _partial_write_payload(e)
         if partial is not None:
