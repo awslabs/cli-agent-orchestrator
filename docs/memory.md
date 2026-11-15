@@ -395,7 +395,7 @@ Memory keys remain capped at 60 characters. When an explicit `memory_store`
 key is cut to that limit, its success result adds `key_truncated: true` and
 `requested_key`; ordinary store results are unchanged. Link targets pass through
 the same key sanitiser, so a full long target resolves to its stored truncated
-key, and `cao memory lint` reports links that needed truncation.
+key, and `cao memory lint` reports `related_keys` targets that needed truncation.
 
 ### On-demand relevance explain
 
