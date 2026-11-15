@@ -1218,6 +1218,7 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``enabled`` (bool) — master switch for the memory subsystem.
         ``explain_enabled`` (bool) — on-demand CLI relevance diagnostic.
         ``lifecycle.enabled`` (bool) — opt-in supersedes lifecycle.
+        ``ranking.default_sort`` (str) — ``recency`` or ``bm25`` query recall default.
         ``non_accessing_inspection`` (bool) — opt-in operator reads without access bumps.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
         ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
@@ -1258,6 +1259,14 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         if not isinstance(value, bool):
             raise ValueError("lifecycle.enabled must be a bool")
         coerced = value
+    elif key == "ranking.default_sort":
+        from cli_agent_orchestrator.services.memory_scoring import DEFAULT_SORT_VALUES
+
+        if not isinstance(value, str) or value not in DEFAULT_SORT_VALUES:
+            raise ValueError(
+                f"ranking.default_sort must be one of {sorted(DEFAULT_SORT_VALUES)}, got {value!r}"
+            )
+        coerced = value
     elif key in {"explain_enabled", "non_accessing_inspection"}:
         if not isinstance(value, bool):
             raise ValueError(f"{key} must be a bool, got {type(value).__name__}")
@@ -1291,6 +1300,11 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
             if not isinstance(lifecycle, dict):
                 lifecycle = {}
             memory["lifecycle"] = {**lifecycle, "enabled": coerced}
+        elif key == "ranking.default_sort":
+            ranking = memory.get("ranking", {})
+            if not isinstance(ranking, dict):
+                ranking = {}
+            memory["ranking"] = {**ranking, "default_sort": coerced}
         else:
             memory[key] = coerced
         settings["memory"] = memory
