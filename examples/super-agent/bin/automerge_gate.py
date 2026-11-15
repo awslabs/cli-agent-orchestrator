@@ -76,7 +76,7 @@ def _state_schema():
 
 
 SS = _state_schema()
-NEVER_PRS: set = set()  # a code floor (empty in the sample); mandates.json never_prs adds to it
+NEVER_PRS: set = set()  # a code floor (empty in the example); mandates.json never_prs adds to it
 DEFAULT_CAP = 1500
 OK_CONCLUSIONS = {"SUCCESS", "SKIPPED", "NEUTRAL"}
 PENDING_STATES = {"PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED"}

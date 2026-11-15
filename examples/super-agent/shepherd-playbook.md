@@ -1,7 +1,7 @@
 # Shepherd playbook
 
 The shepherd's profile (`agents/pr_shepherd.md`) says *what* to do. This file says *how*.
-`KIT` = `${SUPER_AGENT_HOME:-$HOME/super-agent}` (your copy of this sample), `PB` = `KIT/pr-watch`,
+`KIT` = `${SUPER_AGENT_HOME:-$HOME/super-agent}` (your copy of this example), `PB` = `KIT/pr-watch`,
 `REPO` = your repo (`your-org/your-repo` in the shipped files), `API` = `http://localhost:9889`.
 Rule files: `KIT/rules/watcher.md`, `KIT/rules/auto-merge.md` and
 `KIT/rules/hold-on-findings.md`, plus `PB/RUNBOOK.md`. Where they say "tell the user", tell

@@ -1,6 +1,6 @@
 {
   "policy_version": "example-1",
-  "about": "Standing OKs from the user, as structured records. This is the sample's starting set: replace your-org/your-repo and your-login with your own repo and GitHub login, and keep shepherd_mode observe until you trust the proposals. Only the conductor edits this file, and only on the user's explicit words; it mirrors every change to CAO memory and bumps policy_version. check_mandate.py reads it before every outside action.",
+  "about": "Standing OKs from the user, as structured records. This is the example's starting set: replace your-org/your-repo and your-login with your own repo and GitHub login, and keep shepherd_mode observe until you trust the proposals. Only the conductor edits this file, and only on the user's explicit words; it mirrors every change to CAO memory and bumps policy_version. check_mandate.py reads it before every outside action.",
   "shepherd_mode": "observe",
   "paused": false,
   "paused_by": null,
@@ -232,7 +232,7 @@
       "revoked": true,
       "revoked_by": "user",
       "revoked_at": "<date>",
-      "revoked_source": "off by default in the sample: the reviewer is optional. Set revoked to false only if you run cao_pr_reviewer and want the conductor to approve its two workflow plans."
+      "revoked_source": "off by default in the example: the reviewer is optional. Set revoked to false only if you run cao_pr_reviewer and want the conductor to approve its two workflow plans."
     },
     {
       "id": "M8-clear-hold",

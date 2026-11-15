@@ -2,7 +2,7 @@
 
 The conductor's profile (`agents/cao_conductor.md`) says *what* to do. This file says *how*.
 Read the section you need when you need it. `KIT` = `${SUPER_AGENT_HOME:-$HOME/super-agent}`
-(your copy of this sample), `PB` = `KIT/pr-watch`, `REPO` = your repo (`your-org/your-repo` in
+(your copy of this example), `PB` = `KIT/pr-watch`, `REPO` = your repo (`your-org/your-repo` in
 the shipped files), `API` = `http://localhost:9889` (the default `cao-server` address).
 
 ## 0. Resource rules (hard rule: "too many resources would lead the machine dead")

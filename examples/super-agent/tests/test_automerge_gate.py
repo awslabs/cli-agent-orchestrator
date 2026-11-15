@@ -234,7 +234,7 @@ def test_stacked_base_denied(tmp_path):
 
 
 def never_mandates(numbers):
-    """A mandates doc whose M6 lists never_prs; the sample's code floor is empty."""
+    """A mandates doc whose M6 lists never_prs; the example's code floor is empty."""
     return {"mandates": [{"id": "M6", "action": "arm_automerge", "revoked": False,
                        "granted_by": "user", "holder": "shepherd", "scope": SCOPE,
                           "conditions": {"never_prs": list(numbers)}}]}
@@ -246,7 +246,7 @@ def test_never_automerge_prs_denied(tmp_path, n):
     assert expect(gate(tmp_path, pr(number=n), [review()], mandates=m), DENY, "DENY") == f"DENY never_automerge_pr #{n}"
 
 
-def test_the_sample_has_no_hidden_never_floor(tmp_path):
+def test_the_example_has_no_hidden_never_floor(tmp_path):
     expect(gate(tmp_path, pr(number=901), [review()]), ARM, "ARM")
 
 

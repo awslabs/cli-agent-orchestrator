@@ -1,6 +1,6 @@
 # Super agent: one conductor, a PR shepherd and standing OKs as data
 
-This sample is a real working setup, generalised: you talk to **one** agent, the conductor,
+This example is a real working setup, generalised: you talk to **one** agent, the conductor,
 and CAO runs everything else behind it. A PR shepherd looks after your own open pull
 requests until they merge, an optional reviewer reviews other people's, and short-lived
 workers do each job. The rules that matter are small scripts, not prompt text, and the kit
@@ -175,7 +175,7 @@ python3 bin/check_mandate.py --holder shepherd --action ff_fix_push --pr-author 
 ## Standing OKs: the mandates and the GO ledger
 Your permissions live in `mandates.json` as records: who holds each one, which action it
 covers, and its scope (repo, PR author, base branch). A revoked OK stays in the file, marked
-revoked. These are the sample's standing OKs:
+revoked. These are the example's standing OKs:
 
 | Id | Holder | Action |
 |---|---|---|
@@ -325,7 +325,7 @@ shepherd and conductor work the same. The poll loop still watches PRs listed in
 **Do I have to use all of it?** No. A good order is: the conductor and one short-lived helper
 first; then the pause switch; then the shepherd, in observe mode.
 
-**How do I run the tests?** Run them on the sample as shipped (or on a fresh copy): a few of
+**How do I run the tests?** Run them on the example as shipped (or on a fresh copy): a few of
 them check the shipped placeholders in `mandates.json`.
 ```sh
 cd "${SUPER_AGENT_HOME:-$HOME/super-agent}"

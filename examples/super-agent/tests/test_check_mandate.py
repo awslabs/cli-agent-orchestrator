@@ -162,7 +162,7 @@ def test_second_mandate_for_same_action_can_match(tmp_path):
     assert check(tmp_path, d) == (0, "ALLOW M1b")
 
 
-# --- the shipped mandates.json encodes the sample's standing OKs, unwidened ---
+# --- the shipped mandates.json encodes the example's standing OKs, unwidened ---
 
 def shipped():
     return json.loads((KIT / "mandates.json").read_text())

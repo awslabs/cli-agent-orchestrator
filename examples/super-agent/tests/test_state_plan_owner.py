@@ -49,7 +49,7 @@ def test_plan_ledger_row_field_fails_closed(tmp_path, case):
 def test_kit_plan_ledger_is_valid_when_present():
     led = KIT / "state" / "plan-approvals.jsonl"
     if not led.exists():
-        pytest.skip("the sample ships no plan ledger; you record your own baselines")
+        pytest.skip("the example ships no plan ledger; you record your own baselines")
     ss = load("state_schema")
     assert all(r["kind"] in {"baseline", "approval"} for r in ss.load_plan_ledger(led))
 

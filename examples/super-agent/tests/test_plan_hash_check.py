@@ -114,7 +114,7 @@ def test_unreadable_script_refuses(tmp_path):
 
 
 def test_the_kit_ledger_is_the_default(tmp_path):
-    """Without SUPER_AGENT_STATE_DIR the check reads KIT/state/plan-approvals.jsonl. The sample
+    """Without SUPER_AGENT_STATE_DIR the check reads KIT/state/plan-approvals.jsonl. The example
     ships no baseline (you record your own), so a fresh copy refuses every script."""
     if (KIT / "state" / "plan-approvals.jsonl").exists():
         pytest.skip("this kit copy has its own recorded baselines")
