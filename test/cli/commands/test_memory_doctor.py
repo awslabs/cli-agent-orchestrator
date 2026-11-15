@@ -15,7 +15,10 @@ def _fixture_home(tmp_path: Path, monkeypatch) -> tuple[Path, tuple[Path, ...]]:
     audit = base / "logs" / "memory" / "2026-01-02.md"
     for path in (topic, lesson, audit):
         path.parent.mkdir(parents=True, exist_ok=True)
-    topic.write_text("# topic-x\n\n## 2026-01-02T00:00:00Z\nalpha\n", encoding="utf-8")
+    topic.write_text(
+        "# topic-x\n\n" "## 2026-01-02T00:00:00Z\nalpha\n\n" "## 2026-01-02T00:00:01Z\nbeta\n",
+        encoding="utf-8",
+    )
     lesson.write_text(
         "# lesson\n\n## 2026-01-02T00:00:00Z\n" "Use X. Applies when: transforming Y.\n",
         encoding="utf-8",
@@ -45,6 +48,27 @@ def test_doctor_fixtures_is_dry_run_by_default(tmp_path, monkeypatch):
     assert "audit_bytes=" in result.output
     assert {path: path.read_bytes() for path in files} == before
     assert not (base / ".quarantine").exists()
+
+
+def test_doctor_requires_each_fixture_key_and_content_pair(tmp_path, monkeypatch):
+    base = tmp_path / "memory"
+    wiki = base / "global" / "wiki"
+    wiki.mkdir(parents=True)
+    notes = {
+        "topic-x.md": "# topic-x\n\nReal operator content.\n",
+        "real-topic.md": "# real-topic\n\nalpha\n\nbeta\n",
+        "lesson.md": "# lesson\n\nA real retrospective lesson.\n",
+        "real-lesson.md": "# real-lesson\n\nUse X. Applies when: transforming Y.\n",
+    }
+    for name, content in notes.items():
+        (wiki / name).write_text(content, encoding="utf-8")
+    monkeypatch.setattr(command_module, "MEMORY_BASE_DIR", base)
+
+    result = CliRunner().invoke(memory, ["doctor", "--fixtures"])
+
+    assert result.exit_code == 0, result.output
+    assert "fixture_files=0" in result.output
+    assert {path.name for path in wiki.glob("*.md")} == set(notes)
 
 
 def test_doctor_apply_requires_backup(tmp_path, monkeypatch):

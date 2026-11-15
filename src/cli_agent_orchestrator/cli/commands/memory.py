@@ -67,6 +67,9 @@ class _FixtureFinding:
     report_only: bool = False
 
 
+_TOPIC_FIXTURE_KEYS = frozenset({"topic-x", "topic-y"})
+_TOPIC_FIXTURE_LINES = frozenset({"alpha", "beta"})
+_RETROSPECTOR_FIXTURE_KEY = "lesson"
 _RETROSPECTOR_FIXTURE_TEXT = "Use X. Applies when: transforming Y."
 _EDGE_FIXTURE_KEY_RE = re.compile(r"\b(?:source_key|target_key)=b-[0-9a-f]{8}\b")
 _PROJECT_EDGE_RE = re.compile(r"\bscope_id=project(?:\s|$)")
@@ -111,13 +114,14 @@ def _scan_fixture_file(base_dir: Path, path: Path) -> _FixtureFinding | None:
         except OSError:
             return None
     else:
-        if path.stem in {"topic-x", "topic-y"}:
-            shapes.add("fixture_topic_key")
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return None
-        if _RETROSPECTOR_FIXTURE_TEXT in content:
+        content_lines = {line.strip() for line in content.splitlines()}
+        if path.stem in _TOPIC_FIXTURE_KEYS and _TOPIC_FIXTURE_LINES <= content_lines:
+            shapes.add("fixture_topic_key")
+        if path.stem == _RETROSPECTOR_FIXTURE_KEY and _RETROSPECTOR_FIXTURE_TEXT in content_lines:
             shapes.add("retrospector_fixture_text")
 
     if not shapes:
