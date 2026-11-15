@@ -32,6 +32,11 @@ def test_fixture_corpus_has_required_synthetic_shapes():
     assert any(note["shape"] == "minute_precision" for note in notes)
     assert any(len(note["key"]) == 61 for note in notes)
     assert sum("supersedes" in note for note in notes) == 3
+    assert {note["key"]: note["supersedes"] for note in notes if "supersedes" in note} == {
+        "revision-01-current": "revision-01-stale",
+        "revision-02-current": "revision-02-stale",
+        "revision-03-current": "revision-03-stale",
+    }
     assert sum(note.get("contradiction", False) for note in notes) == 2
 
 
