@@ -15,6 +15,7 @@ import pytest
 KIT = Path(os.environ.get("SUPER_AGENT_KIT", Path(__file__).resolve().parent.parent))
 BIN = KIT / "bin"
 TESTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(BIN))  # a few tests import the scripts directly
 
 
 def base_env(tmp_path, **extra):
