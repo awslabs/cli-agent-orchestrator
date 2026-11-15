@@ -10,6 +10,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from cli_agent_orchestrator.services.memory_injection import (
     memory_blocks_have_same_body,
@@ -87,6 +88,20 @@ def test_injection_settings_default_to_hygiene_fixes() -> None:
         "clear_on_empty": True,
         "v1_fixes": True,
     }
+
+
+def test_terminal_context_lookup_failure_is_not_reported_as_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cli_agent_orchestrator.clients import database
+
+    def locked_session():
+        raise OperationalError("SELECT terminals", {}, Exception("database is locked"))
+
+    monkeypatch.setattr(database, "SessionLocal", locked_session)
+
+    with pytest.raises(RuntimeError, match="Could not get terminal context"):
+        MemoryService(base_dir=tmp_path).get_memory_context_for_terminal("worker")
 
 
 def test_idempotency_compares_only_the_uniquely_delimited_managed_block() -> None:

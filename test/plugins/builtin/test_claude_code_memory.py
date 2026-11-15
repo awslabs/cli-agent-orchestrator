@@ -416,6 +416,43 @@ async def test_memory_fetch_failure_is_logged_not_raised(
 
 
 @pytest.mark.asyncio
+async def test_terminal_lookup_failure_preserves_existing_block(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from sqlalchemy.exc import OperationalError
+
+    from cli_agent_orchestrator.clients import database
+
+    target = tmp_path / ".claude" / "CLAUDE.md"
+    target.parent.mkdir()
+    original = f"{BEGIN_MARKER}\n<cao-memory>GOOD</cao-memory>\n{END_MARKER}\n"
+    target.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_terminal_metadata",
+        lambda terminal_id: {
+            "tmux_session": "cao-test-session",
+            "tmux_window": "developer-abcd",
+            "id": terminal_id,
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_backend",
+        lambda: type(
+            "FakeBackend", (), {"get_pane_working_directory": lambda self, s, w: str(tmp_path)}
+        )(),
+    )
+
+    def locked_session():
+        raise OperationalError("SELECT terminals", {}, Exception("database is locked"))
+
+    monkeypatch.setattr(database, "SessionLocal", locked_session)
+
+    await ClaudeCodeMemoryPlugin().on_post_create_terminal(_event())
+
+    assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
 async def test_missing_terminal_metadata_short_circuits(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -5043,4 +5043,4 @@ class MemoryService:
             return ctx
         except Exception as e:
             logger.warning(f"Could not get terminal context for {terminal_id}: {e}")
-            return None
+            raise RuntimeError(f"Could not get terminal context for {terminal_id}") from e
