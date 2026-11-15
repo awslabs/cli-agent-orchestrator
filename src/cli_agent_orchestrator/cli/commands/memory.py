@@ -9,6 +9,7 @@ import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import click
 
@@ -157,6 +158,7 @@ def _fixture_memory_identity(base_dir: Path, path: Path) -> tuple[str, str | Non
     scope = parts[2]
     if scope not in {item.value for item in MemoryScope}:
         return None
+    scope_id: Optional[str]
     if scope in {MemoryScope.SESSION.value, MemoryScope.AGENT.value}:
         if len(parts) != 5:
             return None
