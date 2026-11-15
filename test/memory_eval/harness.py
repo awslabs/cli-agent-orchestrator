@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -177,13 +178,14 @@ def _rank(keys: list[str], gold: set[str]) -> int | None:
 
 async def _arm_metrics(
     service: MemoryService, home: Path, recall: dict[str, Any]
-) -> dict[str, float]:
+) -> dict[str, Any]:
     context = _context(home)
     questions = _read_json("questions.json")
     multihop = _read_json("questions_multihop.json")
     current_checks = _read_json("current_checks.json")
     ranks: dict[str, list[int | None]] = {"kw": [], "nl": []}
     payload_tokens: list[float] = []
+    result_key_orders: list[list[str]] = []
 
     for question in questions:
         for wording in ("kw", "nl"):
@@ -195,6 +197,7 @@ async def _arm_metrics(
                 **recall,
             )
             keys = [memory.key for memory in results if not memory.is_related]
+            result_key_orders.append(keys)
             ranks[wording].append(_rank(keys, set(question["gold"])))
             payload_tokens.append(sum(len(memory.content) for memory in results) / 4)
 
@@ -243,6 +246,9 @@ async def _arm_metrics(
         "multihop_coverage": sum(coverage) / len(coverage),
         "current_first": sum(current_first) / len(current_first),
         "tokens_per_recall": sum(payload_tokens) / len(payload_tokens),
+        # Keep hash-seed checks sensitive to retrieval-order regressions even
+        # when aggregate ranking metrics happen to remain unchanged.
+        "result_key_order_hash": hashlib.sha256(json.dumps(result_key_orders).encode()).hexdigest(),
     }
 
 
