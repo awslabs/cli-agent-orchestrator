@@ -158,6 +158,28 @@ class TestConfigSet:
         assert get_result.exit_code == 0
         assert json.loads(get_result.output) is False
 
+    @pytest.mark.parametrize("name", ["clear_on_empty", "v1_fixes"])
+    def test_set_memory_injection_bool_round_trips(self, runner, _isolated_settings, name):
+        path = f"memory.injection.{name}"
+        result = runner.invoke(config, ["set", path, "false"])
+        assert result.exit_code == 0
+
+        on_disk = json.loads(_isolated_settings["settings"].read_text())
+        assert on_disk["memory"]["injection"][name] is False
+
+        get_result = runner.invoke(config, ["get", path])
+        assert get_result.exit_code == 0
+        assert json.loads(get_result.output) is False
+        assert getattr(ConfigService.get_config().memory.injection, name) is False
+
+    @pytest.mark.parametrize("name", ["clear_on_empty", "v1_fixes"])
+    def test_set_memory_injection_rejects_non_bool(self, runner, _isolated_settings, name):
+        result = runner.invoke(config, ["set", f"memory.injection.{name}", "0"])
+
+        assert result.exit_code != 0
+        assert "must be a bool" in result.output
+        assert not _isolated_settings["settings"].exists()
+
     def test_set_network_key_succeeds_persists_and_warns(self, runner, _isolated_settings):
         """network.* is schema-only (no runtime effect yet) — set() still
         succeeds and persists, but must warn the operator on stderr."""

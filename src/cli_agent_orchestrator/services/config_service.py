@@ -66,11 +66,17 @@ class LifecycleConfig(BaseModel):
     enabled: bool = False
 
 
+class InjectionConfig(BaseModel):
+    clear_on_empty: bool = True
+    v1_fixes: bool = True
+
+
 class MemoryConfig(BaseModel):
     enabled: bool = True
     explain_enabled: bool = True
     non_accessing_inspection: bool = False
     lifecycle: LifecycleConfig = Field(default_factory=LifecycleConfig)
+    injection: InjectionConfig = Field(default_factory=InjectionConfig)
     compile_mode: str = "llm"
     flush_threshold: float = 0.85
     compile_timeout_s: float = 120.0
@@ -460,6 +466,10 @@ def _get_owned_section(path: str, default: Any) -> Any:
     if section == "memory":
         if key == "lifecycle.enabled":
             return settings_service.is_memory_lifecycle_enabled()
+        if key in {"injection.clear_on_empty", "injection.v1_fixes"}:
+            injection = settings_service.get_memory_settings().get("injection", {})
+            nested_key = key.split(".", 1)[1]
+            return injection.get(nested_key, default) if isinstance(injection, dict) else default
         if key == "enabled":
             return settings_service.is_memory_enabled()
         if key == "lint_enabled":
@@ -636,6 +646,8 @@ _ALL_PATHS = sorted(
         "memory.compile_mode",
         "memory.flush_threshold",
         "memory.compile_timeout_s",
+        "memory.injection.clear_on_empty",
+        "memory.injection.v1_fixes",
         "memory.vault",
         "terminal.keep_finished.enabled",
         "terminal.keep_finished.idle_window_minutes",
@@ -724,6 +736,10 @@ class ConfigService:
                 explain_enabled=settings_service.is_memory_explain_enabled(),
                 non_accessing_inspection=settings_service.is_non_accessing_inspection_enabled(),
                 lifecycle=LifecycleConfig(enabled=settings_service.is_memory_lifecycle_enabled()),
+                injection=InjectionConfig(
+                    clear_on_empty=_get_value("memory.injection.clear_on_empty", default=True),
+                    v1_fixes=_get_value("memory.injection.v1_fixes", default=True),
+                ),
                 lint_enabled=_get_value("memory.lint_enabled", default=True),
                 compile_mode=_get_value("memory.compile_mode", default="llm"),
                 flush_threshold=_get_value("memory.flush_threshold", default=0.85),

@@ -223,6 +223,8 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 | `enabled` | `true` | Master switch for the memory subsystem. |
 | `compile_mode` | `"llm"` | `llm` or `append`. `append` skips the LLM wiki-compiler entirely. |
 | `lifecycle.enabled` | `false` | Opt-in active supersedes exclusion for injection plus recall demotion/labels. Nested under `memory.lifecycle`; env override `CAO_MEMORY_LIFECYCLE_ENABLED`. Read/validation errors leave it off. |
+| `injection.clear_on_empty` | `true` | Replace an existing managed provider block with an empty stamped block after a successful retrieval selects no memories. |
+| `injection.v1_fixes` | `true` | Enable project-alias traversal, per-scope clipping, and skip-oversized injection hygiene fixes. |
 | `non_accessing_inspection` | `false` | CLI list/show and HTTP GET memory views skip access counters when on. MCP/internal recall still counts. Env override: `CAO_MEMORY_NON_ACCESSING_INSPECTION`; read errors leave it off. |
 | `explain_enabled` | `true` | On-demand `cao memory list --query Q --explain` diagnostic. Env override: `CAO_MEMORY_EXPLAIN_ENABLED` (env > file > default). Does not alter recall defaults or gate `sort_by="relevance"`. |
 | `flush_threshold` | `0.85` | Context-usage fraction that triggers a memory flush. |

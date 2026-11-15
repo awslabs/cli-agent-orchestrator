@@ -1261,6 +1261,8 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``enabled`` (bool) — master switch for the memory subsystem.
         ``explain_enabled`` (bool) — on-demand CLI relevance diagnostic.
         ``lifecycle.enabled`` (bool) — opt-in supersedes lifecycle.
+        ``injection.clear_on_empty`` (bool) — replace stale provider blocks on empty retrieval.
+        ``injection.v1_fixes`` (bool) — enable injection traversal and clipping fixes.
         ``non_accessing_inspection`` (bool) — opt-in operator reads without access bumps.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
         ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
@@ -1301,6 +1303,10 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         if not isinstance(value, bool):
             raise ValueError("lifecycle.enabled must be a bool")
         coerced = value
+    elif key in {"injection.clear_on_empty", "injection.v1_fixes"}:
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} must be a bool")
+        coerced = value
     elif key in {"explain_enabled", "non_accessing_inspection"}:
         if not isinstance(value, bool):
             raise ValueError(f"{key} must be a bool, got {type(value).__name__}")
@@ -1334,6 +1340,11 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
             if not isinstance(lifecycle, dict):
                 lifecycle = {}
             memory["lifecycle"] = {**lifecycle, "enabled": coerced}
+        elif key.startswith("injection."):
+            injection = memory.get("injection", {})
+            if not isinstance(injection, dict):
+                injection = {}
+            memory["injection"] = {**injection, key.split(".", 1)[1]: coerced}
         else:
             memory[key] = coerced
         settings["memory"] = memory
