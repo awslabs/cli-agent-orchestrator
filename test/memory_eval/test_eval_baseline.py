@@ -4,7 +4,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 from test.memory_eval.harness import (
@@ -33,9 +32,9 @@ def test_harness_refuses_non_temporary_home():
         assert_temporary_home(Path.cwd())
 
 
-def test_default_baseline_preserves_known_failure_shapes():
+def test_default_baseline_preserves_known_failure_shapes(tmp_path):
     started = time.monotonic()
-    report = evaluate(Path(tempfile.mkdtemp(dir=tempfile.gettempdir())) / "memory-eval-home")
+    report = evaluate(tmp_path / "memory-eval-home")
 
     assert set(ARMS) <= set(report["arms"])
     assert report["hygiene"]["invisible_notes"] == 7
@@ -44,7 +43,7 @@ def test_default_baseline_preserves_known_failure_shapes():
     assert time.monotonic() - started < 60
 
 
-def test_results_are_stable_across_python_hash_seeds():
+def test_results_are_stable_across_python_hash_seeds(tmp_path):
     script = (
         "import json, sys; "
         "from pathlib import Path; "
@@ -60,7 +59,7 @@ def test_results_are_stable_across_python_hash_seeds():
                 sys.executable,
                 "-c",
                 script,
-                str(Path(tempfile.mkdtemp(dir=tempfile.gettempdir())) / f"seed-{seed}"),
+                str(tmp_path / f"seed-{seed}"),
             ],
             check=True,
             capture_output=True,
