@@ -127,6 +127,43 @@ def test_project_injection_keeps_only_newest_copy_across_aliases(tmp_path: Path)
     assert block.count("build-cmd") == 1
 
 
+def test_project_injection_does_not_reparse_machine_wide_indexes(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    ctx = _ctx(repo)
+    service = MemoryService(base_dir=memory_dir)
+    for scope in ("global", "project", "federated"):
+        asyncio.run(
+            service.store(
+                content=f"{scope} note",
+                scope=scope,
+                memory_type="project",
+                key=f"{scope}-note",
+                terminal_context=ctx,
+            )
+        )
+
+    parsed_indexes: list[Path] = []
+    original_parse_index = service._parse_index
+
+    def record_parse(index_path: Path) -> list[dict]:
+        parsed_indexes.append(index_path)
+        return original_parse_index(index_path)
+
+    service._parse_index = record_parse  # type: ignore[method-assign]
+
+    service.get_memory_context(ctx, budget_chars=9000)
+
+    global_index = memory_dir / "global" / "wiki" / "index.md"
+    project_id = service.resolve_scope_id("project", ctx)
+    project_index = memory_dir / str(project_id) / "wiki" / "index.md"
+    federated_index = memory_dir / "federated" / "wiki" / "index.md"
+    assert parsed_indexes.count(global_index) == 2
+    assert parsed_indexes.count(project_index) == 1
+    assert federated_index not in parsed_indexes
+
+
 def test_injection_settings_default_to_hygiene_fixes() -> None:
     from cli_agent_orchestrator.services.settings_service import get_memory_settings
 

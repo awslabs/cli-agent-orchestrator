@@ -4485,7 +4485,11 @@ class MemoryService:
             )
             scope_entries: list[tuple[Path, str, dict]] = []
             native_wiki_dirs = (
-                [native_dir / "wiki" for native_dir in native_dirs]
+                [
+                    native_dir / "wiki"
+                    for native_dir in native_dirs
+                    if native_dir not in {self.base_dir / "global", self.base_dir / "federated"}
+                ]
                 if scope_val == MemoryScope.PROJECT.value and v1_fixes
                 else ([wiki_dir] if native_dirs else [])
             )
