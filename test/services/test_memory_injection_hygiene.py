@@ -202,3 +202,18 @@ def test_idempotency_compares_only_the_uniquely_delimited_managed_block() -> Non
 
     assert managed is not None
     assert not memory_blocks_have_same_body(managed, "<cao-memory>SAME</cao-memory>")
+
+
+def test_idempotency_compares_content_after_literal_closing_tag() -> None:
+    existing = (
+        '<cao-memory generated="2000-01-01T00:00:00Z">\n'
+        "Use </cao-memory> literally, then use v1 of the API.\n"
+        "</cao-memory>"
+    )
+    proposed = (
+        '<cao-memory generated="2001-01-01T00:00:00Z">\n'
+        "Use </cao-memory> literally, then use v2 of the API.\n"
+        "</cao-memory>"
+    )
+
+    assert not memory_blocks_have_same_body(existing, proposed)
