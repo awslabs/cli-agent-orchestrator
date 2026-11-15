@@ -24,7 +24,7 @@ from cli_agent_orchestrator.services.memory_injection import (
     stamp_memory_block,
     uniquely_delimited_block,
 )
-from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_delete, locked_atomic_rewrite
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.backends.base import TerminalBackend
@@ -300,7 +300,7 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
         if stripped == content:
             return
         if not stripped.strip():
-            target.unlink()
+            locked_atomic_delete(target, must_exist=False)
             return
         locked_atomic_rewrite(target, lambda _existing: stripped)
 

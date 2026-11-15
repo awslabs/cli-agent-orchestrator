@@ -36,7 +36,7 @@ from cli_agent_orchestrator.services.memory_injection import (
     memory_blocks_have_same_body,
     stamp_memory_block,
 )
-from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_delete, locked_atomic_rewrite
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.backends.base import TerminalBackend
@@ -292,4 +292,4 @@ class KiroCliMemoryPlugin(CaoPlugin):
         except FileNotFoundError:
             return
         if "<!-- cao-memory:begin -->" in content or 'generated="' in content:
-            target.unlink()
+            locked_atomic_delete(target, must_exist=False)

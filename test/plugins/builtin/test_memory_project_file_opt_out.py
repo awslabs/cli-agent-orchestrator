@@ -122,6 +122,8 @@ async def test_default_removes_only_cao_block_and_deletes_cao_only_file(
     target.write_text(block, encoding="utf-8")
     await case.plugin_type().on_post_create_terminal(_event(case))
     assert not target.exists()
+    await case.plugin_type().on_post_create_terminal(_event(case))
+    assert not target.exists()
 
 
 @pytest.mark.asyncio
@@ -136,6 +138,8 @@ async def test_default_removes_recognizable_kiro_file_but_not_user_file(
 
     await case.plugin_type().on_post_create_terminal(_event(case))
 
+    assert not target.exists()
+    await case.plugin_type().on_post_create_terminal(_event(case))
     assert not target.exists()
     target.write_text("user steering\n", encoding="utf-8")
     await case.plugin_type().on_post_create_terminal(_event(case))
