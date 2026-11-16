@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import shlex
 import stat
 from pathlib import Path
@@ -435,6 +436,28 @@ def test_recorded_tool_turn_reads_processing_then_completed(size):
         TerminalStatus.PROCESSING,
         TerminalStatus.COMPLETED,
     ]
+
+
+@pytest.mark.parametrize("size", [37, 333, 1024, 4096])
+def test_recorded_tool_turn_without_reports_reads_processing_then_completed(size):
+    """OMP before 18.8.7, or with ``terminal.programStatus`` off, sends no OSC 7501.
+
+    The screen markers alone must then hold PROCESSING through the turn: OMP 18
+    also draws ``╰─`` frames mid-turn (the band frame, tool-box bottoms), which
+    must not retire the spinner status row.
+    """
+    raw = re.sub(
+        r"\x1b\]7501;[^\x07\x1b]*(?:\x07|\x1b\\)", "", load_fixture("omp18_tool_turn.raw.txt")
+    )
+    dispatch = raw.index(TOOL_TURN_PROMPT) - 150
+    provider = make_provider()
+    provider.record_status_chunk(raw[:dispatch], epoch=0)
+    assert provider._program_status is None
+
+    _dispatch(provider, TOOL_TURN_PROMPT)
+    # StatusMonitor never lets UNKNOWN (no marker drawn yet) replace a known status.
+    statuses = [s for s in _replay(provider, raw[dispatch:], size) if s != TerminalStatus.UNKNOWN]
+    assert statuses == [TerminalStatus.PROCESSING, TerminalStatus.COMPLETED]
 
 
 def test_idle_report_as_the_paste_lands_is_not_completion():

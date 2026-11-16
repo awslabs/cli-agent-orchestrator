@@ -318,6 +318,8 @@ class OmpProvider(BaseProvider):
         marker_start: int,
         marker_end: int,
         live_frame_tail_pattern: Optional[re.Pattern] = None,
+        retired_by_frame: bool = True,
+        turn_ran: bool = False,
     ) -> bool:
         if any(
             match.start() > marker_start
@@ -326,23 +328,36 @@ class OmpProvider(BaseProvider):
         ):
             return True
 
-        ready_frames = [
-            match for match in _READY_FRAME_PATTERN.finditer(clean) if match.start() > marker_start
-        ]
+        # A spinner status row is retired only by a later ``π`` row or status
+        # line. OMP 18 also draws ``╰─`` during a turn (the bare band frame and
+        # tool-box bottoms such as ``╰─── elapsed 3.0s ───╯``), so a later frame
+        # is no evidence the turn ended.
+        ready_frames = (
+            [
+                match
+                for match in _READY_FRAME_PATTERN.finditer(clean)
+                if match.start() > marker_start
+            ]
+            if retired_by_frame
+            else []
+        )
         # An 18.x idle status row retires the marker only once the turn has
-        # visibly run since it: a spinner row at or after the marker, then
-        # ``π``. A ``π`` row drawn right after ``⎋ Working…`` is the turn's
-        # first frame, before the spinner starts.
+        # visibly run: a spinner row at or after the marker, then ``π``, or a
+        # dispatched turn already seen running. A ``π`` row drawn right after
+        # ``⎋ Working…`` is the turn's first frame, before the spinner starts;
+        # at the end OMP redraws the working row once more after the last
+        # spinner frame, then ``π``.
         spinner_rows = [
             match.start()
             for match in _WORKING_STATUS_ROW_PATTERN.finditer(clean)
             if match.start() >= marker_start
         ]
-        if spinner_rows:
+        anchor = spinner_rows[0] if spinner_rows else (marker_start if turn_ran else None)
+        if anchor is not None:
             ready_frames += [
                 match
                 for match in _READY_STATUS_ROW_PATTERN.finditer(clean)
-                if match.start() > spinner_rows[0]
+                if match.start() > anchor
             ]
         if not ready_frames:
             return False
@@ -399,18 +414,28 @@ class OmpProvider(BaseProvider):
         if not clean.strip():
             return TerminalStatus.UNKNOWN
         candidates = []
-        for pattern, status, live_frame_tail_pattern in (
-            (_WAITING_PATTERN, TerminalStatus.WAITING_USER_ANSWER, None),
-            (_ERROR_PATTERN, TerminalStatus.ERROR, _ERROR_LIVE_FRAME_TAIL_PATTERN),
-            (_WORKING_PATTERN, TerminalStatus.PROCESSING, _WORKING_LIVE_FRAME_TAIL_PATTERN),
-            (_WORKING_STATUS_ROW_PATTERN, TerminalStatus.PROCESSING, _STATUS_ROW_LIVE_TAIL_PATTERN),
+        for pattern, status, live_frame_tail_pattern, retired_by_frame in (
+            (_WAITING_PATTERN, TerminalStatus.WAITING_USER_ANSWER, None, True),
+            (_ERROR_PATTERN, TerminalStatus.ERROR, _ERROR_LIVE_FRAME_TAIL_PATTERN, True),
+            (_WORKING_PATTERN, TerminalStatus.PROCESSING, _WORKING_LIVE_FRAME_TAIL_PATTERN, True),
+            (
+                _WORKING_STATUS_ROW_PATTERN,
+                TerminalStatus.PROCESSING,
+                _STATUS_ROW_LIVE_TAIL_PATTERN,
+                False,
+            ),
         ):
             matches = list(pattern.finditer(clean))
             if not matches:
                 continue
             marker = matches[-1]
             if not self._has_later_ready_frame(
-                clean, marker.start(), marker.end(), live_frame_tail_pattern
+                clean,
+                marker.start(),
+                marker.end(),
+                live_frame_tail_pattern,
+                retired_by_frame,
+                self._turn_activity_seen,
             ):
                 candidates.append((marker.start(), status))
 

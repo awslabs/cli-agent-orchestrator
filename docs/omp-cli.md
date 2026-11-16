@@ -119,6 +119,15 @@ row). OMP reports `idle` once more as it accepts the paste, the tail of the
 previous screen can still look ready, and an earlier turn's `done` or `error`
 is no verdict for the new one.
 
+OMP writes these reports from 18.8.7, while `terminal.programStatus` is on (the
+default; CAO keeps the user's setting). Without them, CAO decides from the
+screen markers below. A spinner status row then stays live until a later `π`
+row or status line, because OMP 18 also draws `╰─` frames during a turn (the
+band frame and tool-box bottoms). The spinner must be a braille frame, as in
+the `unicode` and `nerd` symbol presets; the `ascii` preset's `- \ | /` frames
+are not read as turn activity, so keep `terminal.programStatus` on with that
+preset or a custom spinner theme.
+
 Screen markers, from OMP 17.2.10 and 18.x fixtures:
 
 | CAO state | OMP 17.2.10 | OMP 18.x |
