@@ -172,18 +172,36 @@ tls_b64="$(live secret cao-hub-tls tls.crt)"
 ca_pem="$(live configmap cao-hub-ca ca.crt)"
 printf '%s' "${tls_b64}" | base64 -d > "${CTX}/tls.crt"
 printf '%s\n' "${ca_pem}" > "${CTX}/ca.crt"
-if [ -z "${tls_b64}" ] || [ -z "${ca_pem}" ] \
-  || ! openssl verify -x509_strict -purpose sslserver -verify_hostname "cao-server.${NS}.svc" \
+tls_holds() {  # the certificate verifies strictly against the CA, 30+ days left
+  openssl verify -x509_strict -purpose sslserver -verify_hostname "cao-server.${NS}.svc" \
     -CAfile "${CTX}/ca.crt" "${CTX}/tls.crt" >/dev/null 2>&1 \
-  || ! openssl x509 -checkend 2592000 -noout -in "${CTX}/tls.crt" >/dev/null 2>&1; then
+    && openssl x509 -checkend 2592000 -noout -in "${CTX}/tls.crt" >/dev/null 2>&1
+}
+if [ -z "${tls_b64}" ] || [ -z "${ca_pem}" ] || ! tls_holds; then
   (
     cd "${CTX}"
-    openssl req -x509 -new -nodes -newkey rsa:3072 -sha256 -days 365 \
-      -subj "/CN=cao-remote hub CA" -addext "keyUsage=critical,keyCertSign,cRLSign" \
+    # Every extension spelled out, in a config of its own, not left to the
+    # openssl version's defaults or to the ambient OPENSSL_CONF (with an
+    # empty one, req adds no basicConstraints to the CA).
+    cat > ca.cnf <<'CNF'
+[req]
+distinguished_name = dn
+x509_extensions = v3_ca
+prompt = no
+[dn]
+CN = cao-remote hub CA
+[v3_ca]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always
+CNF
+    openssl req -config ca.cnf -x509 -new -nodes -newkey rsa:3072 -sha256 -days 365 \
       -keyout ca.key -out ca.crt 2>/dev/null
-    openssl req -new -nodes -newkey rsa:3072 -sha256 \
-      -subj "/CN=cao-server.${NS}.svc" -keyout tls.key -out tls.csr 2>/dev/null
-    # Every extension spelled out, not left to the openssl version's defaults.
+    printf '[req]\ndistinguished_name = dn\nprompt = no\n[dn]\nCN = cao-server.%s.svc\n' \
+      "${NS}" > csr.cnf
+    openssl req -config csr.cnf -new -nodes -newkey rsa:3072 -sha256 \
+      -keyout tls.key -out tls.csr 2>/dev/null
     {
       printf 'subjectAltName=DNS:cao-server.%s.svc,DNS:cao-server.%s,DNS:cao-server\n' "${NS}" "${NS}"
       printf 'basicConstraints=critical,CA:FALSE\n'
@@ -193,8 +211,16 @@ if [ -z "${tls_b64}" ] || [ -z "${ca_pem}" ] \
     } > ext.cnf
     openssl x509 -req -in tls.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 365 -sha256 \
       -extfile ext.cnf -out tls.crt 2>/dev/null
-    rm -f ca.key ca.srl tls.csr ext.cnf
+    rm -f ca.key ca.srl tls.csr ext.cnf ca.cnf csr.cnf
   )
+  # What was just issued must pass the same check, or every later run would
+  # issue again and the runners might reject the hub: stop before applying.
+  if ! tls_holds; then
+    echo "the newly issued hub TLS material does not pass strict verification" >&2
+    openssl verify -x509_strict -purpose sslserver -verify_hostname "cao-server.${NS}.svc" \
+      -CAfile "${CTX}/ca.crt" "${CTX}/tls.crt" >&2 || true
+    exit 1
+  fi
   k -n "${NS}" create secret tls cao-hub-tls --cert="${CTX}/tls.crt" --key="${CTX}/tls.key" \
     --dry-run=client -o yaml | k apply -f -
   k -n "${NS}" create configmap cao-hub-ca --from-file=ca.crt="${CTX}/ca.crt" \

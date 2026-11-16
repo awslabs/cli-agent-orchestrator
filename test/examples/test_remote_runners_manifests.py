@@ -740,6 +740,7 @@ def deploy(tmp_path):
 
     run.state = state
     run.home = home
+    run.bin = bin_dir
     run.openssl = openssl
     return run
 
@@ -1003,6 +1004,65 @@ def test_the_issued_tls_material_passes_strict_verification(deploy, tmp_path):
     leaf = text(tmp_path / "issued.crt", "basicConstraints,keyUsage,extendedKeyUsage")
     assert "CA:FALSE" in leaf and "Digital Signature, Key Encipherment" in leaf
     assert "TLS Web Server Authentication" in leaf
+
+
+@pytest.mark.parametrize(
+    "conf",
+    [
+        "",  # empty: req then adds no basicConstraints or key IDs of its own
+        # One that would make the CA a leaf if deploy.sh used it.
+        "[req]\ndistinguished_name = dn\nx509_extensions = bad\n[dn]\n"
+        "[bad]\nbasicConstraints = critical,CA:FALSE\nkeyUsage = digitalSignature\n",
+    ],
+    ids=["empty", "hostile"],
+)
+def test_the_issued_tls_material_does_not_depend_on_the_ambient_openssl_config(
+    deploy, tmp_path, conf
+):
+    (tmp_path / "ambient.cnf").write_text(conf)
+    done = deploy(OPENSSL_CONF=str(tmp_path / "ambient.cnf"))
+    assert done.returncode == 0, done.stderr
+    ca, cert = _live_tls(deploy.state)
+    verified = _strict_verify(deploy, tmp_path, ca, cert)
+    assert verified.returncode == 0, verified.stdout + verified.stderr
+    (tmp_path / "issued-ca.crt").write_text(ca)
+    ext = subprocess.run(
+        [
+            deploy.openssl,
+            "x509",
+            "-noout",
+            "-ext",
+            "basicConstraints,keyUsage,subjectKeyIdentifier,authorityKeyIdentifier",
+            "-in",
+            str(tmp_path / "issued-ca.crt"),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "X509v3 Basic Constraints: critical" in ext and "CA:TRUE" in ext
+    assert "Certificate Sign, CRL Sign" in ext
+    assert "Subject Key Identifier" in ext and "Authority Key Identifier" in ext
+
+
+def test_newly_issued_material_that_fails_the_check_stops_the_deploy(deploy):
+    """An openssl that signs a 10-day certificate: the run must not apply it."""
+    wrapper = deploy.bin / "openssl"
+    wrapper.unlink()
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        'case " $* " in *" -CAkey "*)\n'
+        f'  exec {deploy.openssl} "$@" -days 10 ;;\n'
+        "esac\n"
+        f'exec {deploy.openssl} "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    done = deploy()
+    assert done.returncode == 1
+    assert "does not pass strict verification" in done.stderr
+    assert not (deploy.state / "obj-cao-hub-tls").exists()
+    assert not (deploy.state / "obj-cao-hub-ca").exists()
+    assert "kind: StatefulSet" not in (deploy.state / "applied.yaml").read_text()
 
 
 def test_material_from_a_ca_without_key_usage_is_issued_again(deploy, tmp_path):
