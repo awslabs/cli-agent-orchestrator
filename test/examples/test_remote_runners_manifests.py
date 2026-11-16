@@ -805,6 +805,53 @@ def test_a_rebuild_pushes_a_new_image_for_the_same_content(deploy):
     assert f"cao-server:{tag}" in (deploy.state / "applied.yaml").read_text()
 
 
+def _images(state):
+    """The image of each workload as last applied."""
+    images = {}
+    for doc in yaml.safe_load_all(state.joinpath("applied.yaml").read_text()):
+        if doc and doc["kind"] in ("StatefulSet", "Deployment"):
+            (container,) = doc["spec"]["template"]["spec"]["containers"]
+            images[doc["metadata"]["name"]] = container["image"]
+    return images
+
+
+def test_a_plain_run_after_a_rebuild_keeps_the_rebuilt_image(deploy):
+    assert deploy(CAO_IMAGE_TAG="").returncode == 0
+    content_tag = (deploy.state / "image").read_text()
+    assert deploy(CAO_IMAGE_TAG="", CAO_IMAGE_REBUILD="1").returncode == 0
+    rebuilt = (deploy.state / "image").read_text()
+    assert rebuilt != content_tag
+    _fresh_argv(deploy.state)
+    # E.g. the README's TLS rotation or a model change: the content tag is
+    # still in the repository, but the pods stay on the rebuild.
+    (deploy.state / "obj-cao-hub-tls").unlink()
+    done = deploy(CAO_IMAGE_TAG="")
+    assert done.returncode == 0, done.stderr
+    assert _argv(deploy.state, "docker") == ""
+    assert f"imageTag={rebuilt}" in _argv(deploy.state, "aws")
+    assert {i.rsplit(":", 1)[1] for i in _images(deploy.state).values()} == {rebuilt}
+    # An explicit tag still wins over the live image.
+    assert deploy(CAO_IMAGE_TAG=content_tag).returncode == 0
+    assert {i.rsplit(":", 1)[1] for i in _images(deploy.state).values()} == {content_tag}
+
+
+def test_a_live_image_of_other_content_or_tag_is_not_kept(deploy):
+    assert deploy(CAO_IMAGE_TAG="").returncode == 0
+    content_tag = (deploy.state / "image").read_text()
+    repo = "111122223333.dkr.ecr.ap-southeast-2.amazonaws.com/cao-test/cao-server"
+    applied = deploy.state / "applied.yaml"
+    for live in (
+        f"{repo}:abc1234-000000000000-r20260101000000",  # a rebuild of other content
+        f"{repo}:{content_tag}-r2026",  # not a rebuild suffix
+        f"{repo}:{content_tag}-r20260101000000x",
+        f"other.example/cao-server:{content_tag}-r20260101000000",  # another repository
+    ):
+        applied.write_text(applied.read_text().replace(f"{repo}:{content_tag}", live))
+        done = deploy(CAO_IMAGE_TAG="")
+        assert done.returncode == 0, done.stderr
+        assert set(_images(deploy.state).values()) == {f"{repo}:{content_tag}"}, live
+
+
 def test_an_unknown_rebuild_value_is_refused(deploy):
     done = deploy(CAO_IMAGE_REBUILD="yes")
     assert done.returncode == 2

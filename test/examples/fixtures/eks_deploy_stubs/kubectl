@@ -26,6 +26,20 @@ sys.stdout.write((doc.get("data") or {}).get(key, ""))
 PY
     fi
     [ -e "$STATE/obj-$name" ] ;;
+  *" get statefulset cao-server "*)
+    # The image of the last StatefulSet applied (obj-cao-server may be the
+    # Service, which has the same name).
+    [ -e "$STATE/applied.yaml" ] || exit 0  # --ignore-not-found
+    exec "$STUB_PYTHON" - "$STATE/applied.yaml" <<'PY'
+import sys, yaml
+image = ""
+for doc in yaml.safe_load_all(open(sys.argv[1])):
+    if doc and doc["kind"] == "StatefulSet":
+        (server,) = [c for c in doc["spec"]["template"]["spec"]["containers"] if c["name"] == "cao-server"]
+        image = server["image"]
+sys.stdout.write(image)
+PY
+    ;;
   apply*|*" apply "*)
     if [ "$file" = "-" ]; then cat > "$STATE/last-apply"; else cat "$file" > "$STATE/last-apply"; fi
     if [ -n "${STUB_APPLY_FAILS_ON:-}" ] && grep -q "$STUB_APPLY_FAILS_ON" "$STATE/last-apply"; then

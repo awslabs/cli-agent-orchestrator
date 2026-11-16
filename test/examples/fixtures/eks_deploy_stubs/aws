@@ -1,6 +1,6 @@
 #!/bin/sh
 # Stub aws for the EKS deploy.sh test: stack outputs, the endpoint check, an
-# image that exists once pushed, a registry password. Only the exact calls
+# image that exists once pushed (each tag pushed stays), a registry password. Only the exact calls
 # deploy.sh makes are answered; anything else fails. Nothing reaches AWS.
 printf '%s\n' "$*" >> "$STATE/aws.argv"
 query="contains(cluster.resourcesVpcConfig.publicAccessCidrs, '0.0.0.0/0')"
@@ -26,7 +26,7 @@ case "$*" in
       echo "An error occurred (AccessDeniedException) when calling the DescribeImages operation" >&2
       exit 254
     fi
-    [ "$(cat "$STATE/image" 2>/dev/null)" = "${6#imageTag=}" ] && exit 0
+    grep -qxF -- "${6#imageTag=}" "$STATE/images" 2>/dev/null && exit 0
     echo "An error occurred (ImageNotFoundException) when calling the DescribeImages operation" >&2
     exit 254 ;;
   "ecr get-login-password") echo registry-password ;;

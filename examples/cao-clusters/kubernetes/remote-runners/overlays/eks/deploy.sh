@@ -18,7 +18,10 @@
 #                      not changed, with no cached layers, so it takes the OS
 #                      package fixes published since the last build (the
 #                      default tag names only this checkout's files, so a
-#                      re-run reuses the pushed image)
+#                      re-run reuses the pushed image). A later run without
+#                      it keeps the rebuilt image cao-server runs, as long as
+#                      the files are the same; set CAO_IMAGE_TAG to go back to
+#                      another pushed image.
 set -euo pipefail
 
 if [ "$#" -ne 1 ]; then
@@ -81,6 +84,20 @@ trap 'rm -rf "${CTX}"' EXIT
 export KUBECONFIG="${CTX}/kubeconfig"
 aws eks update-kubeconfig --name "${CLUSTER}" --kubeconfig "${KUBECONFIG}" >/dev/null
 k() { kubectl "$@"; }
+
+# A plain run (no CAO_IMAGE_TAG, no rebuild) after a CAO_IMAGE_REBUILD=1 run
+# keeps the rebuilt image of the same content that cao-server runs, rather
+# than going back to the content tag, which is still in the repository, and
+# rolling the pods back to the packages from before the rebuild. A content
+# change gives a new content tag, and with it a new build.
+if [ -z "${CAO_IMAGE_TAG:-}" ] && [ "${CAO_IMAGE_REBUILD:-}" != 1 ]; then
+  live_image="$(k -n "${NS}" get statefulset cao-server --ignore-not-found \
+    -o 'jsonpath={.spec.template.spec.containers[?(@.name=="cao-server")].image}')"
+  if [[ "${live_image}" =~ ^"${REPO_URI}:${TAG}"-r[0-9]{14}$ ]]; then
+    TAG="${live_image##*:}"
+    echo "keeping the rebuilt image ${live_image}"
+  fi
+fi
 
 # 1. NetworkPolicy enforcement. In Auto Mode it is off until this ConfigMap
 #    exists, and NetworkPolicy objects are accepted and ignored meanwhile. It

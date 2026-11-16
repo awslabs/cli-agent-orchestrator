@@ -183,6 +183,10 @@ examples/cao-clusters/kubernetes/remote-runners/overlays/eks/deploy.sh cao-remot
   upgrades are not in that digest: to take package fixes published since the
   last build, run with `CAO_IMAGE_REBUILD=1`, which builds a new image from
   a fresh base pull with no cached layers, pushes it and rolls the pods onto it.
+  Later runs without it (a TLS rotation, a model change) keep that rebuilt
+  image while the files are the same, instead of going back to the image from
+  before the rebuild; a change to the files builds a new image as usual. To
+  run a different pushed image, set `CAO_IMAGE_TAG` to its tag.
 - **Model:** `claude_code` on Bedrock, model `CAO_BEDROCK_MODEL` (default
   `au.anthropic.claude-sonnet-4-6`; choose one your region serves). Of the CAO
   pods, only the runners get AWS credentials, and those allow only invoking the
