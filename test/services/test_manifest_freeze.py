@@ -241,11 +241,11 @@ def test_an_available_baseline_is_part_of_the_identity_and_unavailable_baselines
 
 
 def test_non_git_plan_ids_bind_root_and_git_golden_is_unchanged(tmp_path, monkeypatch):
-    """The golden value is pinned under an empty profile store (see ``_store`` below).
-
-    Without pinning ``usable_agent_dirs``/extra/disabled dirs and the local store, this golden hash
-    would also depend on whatever agent profiles happen to be installed on the machine running the
-    test — the same leakage ``_store`` exists to prevent for the profile-set-digest tests below.
+    """The golden covers the checked-in built-in profile set and an empty local store. It moves, by design,
+    whenever a bundled ``agent_store/*.md`` changes, because the built-in profiles are part of plan identity
+    (docs/workflows.md). Update it only together with a CHANGELOG line telling users that every ``plan_id``
+    changes and plans need re-approval. A move from any other change is a regression unless it ships with a
+    scheme bump (see ``test_plan_identifier.test_the_digest_of_a_known_field_set_is_pinned``).
     """
     _store(tmp_path, monkeypatch)
     a, b = tmp_path / "a", tmp_path / "b"
@@ -267,7 +267,7 @@ def test_non_git_plan_ids_bind_root_and_git_golden_is_unchanged(tmp_path, monkey
     )
     assert (
         _frozen()["plan_id"]
-        == "plan-v2:c89991b472d5f8aed662a8677d00770f3ae19224d17c95112f3863545f248d38"
+        == "plan-v2:c4f71c4c8f4e58270e0c82afb7c9a58ab7a6969408171be744c66db313c1837c"
     )
 
 
@@ -437,7 +437,9 @@ def _store(tmp_path, monkeypatch, **profiles) -> None:
 
     Patches the module-global the real scan and the real read both consult, so these tests exercise
     ``_list_installed_profiles`` and ``_read_agent_profile_source`` rather than a stub of them. The
-    built-in packaged store is still scanned and is identical across the cases, so it cancels out.
+    built-in packaged store is still scanned and is identical across the cases, so it cancels out of the
+    comparative tests below; the absolute golden in
+    ``test_non_git_plan_ids_bind_root_and_git_golden_is_unchanged`` does include it.
 
     Provider and extra directories are pinned to empty so a stray entry in a real
     ``~/.claude/agents``-style directory on the machine running the tests cannot change which assertions
