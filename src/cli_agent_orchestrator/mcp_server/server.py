@@ -2458,8 +2458,8 @@ async def store_lesson(
     target_agent_profile: str = Field(
         description=(
             "Agent profile the lesson is for (e.g. 'transformer'). The lesson is "
-            "stored in THAT profile's agent scope so it reaches that agent's "
-            "future sessions."
+            "stored in THAT profile's agent scope; that agent finds it by calling "
+            "memory_recall (it is not injected into its sessions)."
         )
     ),
     content: str = Field(

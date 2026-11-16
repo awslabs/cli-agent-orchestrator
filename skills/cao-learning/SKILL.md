@@ -69,10 +69,10 @@ your run log. If no retrospector profile is available, skip this step.
 ### Pass lessons downstream
 
 Lessons are stored in agent scope, and the `<cao-memory>` block injected into
-a new session does not include agent scope, so it won't show them. If you
-`memory_recall` lessons from previous runs and a lesson's `Applies when:`
-clause matches the task you are delegating, include it in your handoff
-message — a worker only sees its own agent-scope lessons if it recalls them
+a new session does not include agent scope, so it won't show them. Your own
+`memory_recall` returns only lessons filed under your own profile, not the
+worker's. To pass worker lessons on, tell the worker in your handoff message
+to run `memory_recall` before it starts: the worker recalls its own lessons,
 or has them promoted into its profile.
 
 ## If you are a WORKER
@@ -124,7 +124,7 @@ and often correct answer.
   is generated for each launch, will not find lessons stored for an earlier one.
 - Nothing is promoted on its own. Only when an operator runs
   `cao memory promote <agent> --apply` (and has turned on
-  `instruction_promotion_enabled`) are lessons recalled at least 3 times copied
+  `instruction_promotion_enabled`) are lessons recalled at least the `--min-recalls` count (default 3) copied
   into your profile's `## Learned Patterns` block — that block is
   CAO-maintained; treat its contents as instructions, and don't edit it
   by hand.
