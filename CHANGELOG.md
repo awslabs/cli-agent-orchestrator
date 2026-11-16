@@ -7,15 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- **Docs: the retrospector profile, the `store_lesson` description, the self-learning guides and the `cao-learning` skill no longer say lessons reach future sessions or can be recalled by a curator or supervisor** (#1335, #1329).
+- **Docs: the retrospector profile, the `store_lesson` description, the self-learning guides and the `cao-learning` skill no longer say lessons reach future sessions or can be recalled by a curator or supervisor, or that they are injected into new sessions** (#1335, #1329).
   A lesson is found only by the owning agent's `memory_recall` or a promoted `## Learned Patterns` block.
   A supervisor's recall returns only lessons under its own profile, so it tells the worker to recall.
-- **Approval effect:** This release edits the bundled `retrospector` profile, and bundled profiles are part of every script-tier plan identity, so after upgrading every `plan_id` changes and the first new run of each script-tier plan is refused until you re-approve it with `cao workflow approve <plan_id>`. A run admitted before the upgrade resumes on its frozen `plan_id`, but its next `retrospector` step is refused with "changed after this run was approved", and you start a new run. YAML workflows and runs with approval enforcement off are unaffected.
-- **Docs: the `cao-learning` skill and self-learning guide no longer claim lessons are injected into new sessions** (#1335, #1329).
   Lessons live in agent scope, which the session-start `<cao-memory>` block does not include, so an agent
   finds them through `memory_recall` or a promoted `## Learned Patterns` block. Promotion happens only when
   an operator runs `cao memory promote --apply`, and lessons filed under an ephemeral agent's generated name
   are not found by a later one.
+- **Approval effect:** This release edits the bundled `retrospector` profile, and bundled profiles are part of every script-tier plan identity, so after upgrading every `plan_id` changes and the first new run of each script-tier plan is refused until you re-approve it with `cao workflow approve <plan_id>`. A run admitted before the upgrade resumes on its frozen `plan_id`, but its next `retrospector` step is refused with "changed after this run was approved", and you start a new run. YAML workflows and runs with approval enforcement off are unaffected. If you installed `retrospector` for Kiro, Copilot or OpenCode, run `cao install retrospector` first and then re-approve: those providers keep the old prompt until you reinstall, and the installed files are plan-identity inputs too, so a reinstall after you re-approve moves every `plan_id` again.
 - **Memory recall can opt into BM25-first query ranking** with
   `memory.ranking.default_sort="bm25"` (#1329). The default remains `recency`;
   explicit `search_mode` and `sort_by` arguments keep precedence, and no-query listings

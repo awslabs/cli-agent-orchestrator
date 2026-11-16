@@ -188,7 +188,8 @@ Lesson contract (enforced by the profile's rules):
 - **Type `feedback`** for hard-won corrections (permanent), `project` for
   project facts.
 - **1–2 sentences ending with `Applies when: <trigger>`** — the trigger
-  clause is what lets curators match the lesson against future tasks.
+  clause lets the agent tell, when it recalls the lesson, whether it applies
+  to the task.
 - Learn from failures **and** successes; cite the task label; store nothing
   when no general pattern emerged ("no lessons" is a valid outcome).
 - Never store transcripts, logs, stack traces, or secrets.
