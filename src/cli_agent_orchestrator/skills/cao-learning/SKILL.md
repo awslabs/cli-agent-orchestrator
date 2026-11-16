@@ -1,10 +1,12 @@
 ---
 name: cao-learning
-description: Report task outcomes and distill lessons so the team improves across
-  runs — report_outcome after each unit of work, retrospector handoffs at natural
-  boundaries, and recalling stored lessons. Use in workflows that run repeatedly
-  over similar work items. Requires memory.learning_enabled; degrade silently when
-  the tools report disabled.
+description: Use when a delegated unit of work finishes and its outcome should be
+  reported, when a workflow reaches a natural boundary where a retrospector should
+  distill lessons, or when stored lessons should shape the next attempt. Report task
+  outcomes and distill lessons so the team improves across runs — report_outcome after
+  each unit of work, retrospector handoffs at natural boundaries, and recalling stored
+  lessons. Also use in workflows that run repeatedly over similar work items. Requires
+  memory.learning_enabled; degrade silently when the tools report disabled.
 ---
 
 # CAO Self-Learning
@@ -67,10 +69,10 @@ your run log. If no retrospector profile is available, skip this step.
 ### Pass lessons downstream
 
 Lessons are stored in agent scope, and the `<cao-memory>` block injected into
-a new session does not include agent scope, so it won't show them. If you
-`memory_recall` lessons from previous runs and a lesson's `Applies when:`
-clause matches the task you are delegating, include it in your handoff
-message — a worker only sees its own agent-scope lessons if it recalls them
+a new session does not include agent scope, so it won't show them. Your own
+`memory_recall` returns only lessons filed under your own profile, not the
+worker's. To pass worker lessons on, tell the worker in your handoff message
+to run `memory_recall` before it starts: the worker recalls its own lessons,
 or has them promoted into its profile.
 
 ## If you are a WORKER
@@ -96,7 +98,7 @@ or has them promoted into its profile.
    ```
 
    Format contract: 1–2 sentence conclusion, then `Applies when: <trigger>`.
-   The trigger clause is how future curators match your lesson to a task.
+   The trigger clause lets you tell, when you recall the lesson, whether it applies to the task.
 3. **Correct, don't accumulate.** If a stored lesson proves wrong, re-store
    the corrected text under the SAME key (or `memory_forget` it). Never store
    a contradicting lesson under a new key.
@@ -122,7 +124,7 @@ and often correct answer.
   is generated for each launch, will not find lessons stored for an earlier one.
 - Nothing is promoted on its own. Only when an operator runs
   `cao memory promote <agent> --apply` (and has turned on
-  `instruction_promotion_enabled`) are lessons recalled at least 3 times copied
+  `instruction_promotion_enabled`) are lessons recalled at least the `--min-recalls` count (default 3) copied
   into your profile's `## Learned Patterns` block — that block is
   CAO-maintained; treat its contents as instructions, and don't edit it
   by hand.

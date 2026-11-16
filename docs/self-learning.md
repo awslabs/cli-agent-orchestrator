@@ -188,7 +188,8 @@ Lesson contract (enforced by the profile's rules):
 - **Type `feedback`** for hard-won corrections (permanent), `project` for
   project facts.
 - **1–2 sentences ending with `Applies when: <trigger>`** — the trigger
-  clause is what lets curators match the lesson against future tasks.
+  clause lets the agent tell, when it recalls the lesson, whether it applies
+  to the task.
 - Learn from failures **and** successes; cite the task label; store nothing
   when no general pattern emerged ("no lessons" is a valid outcome).
 - Never store transcripts, logs, stack traces, or secrets.
@@ -223,7 +224,7 @@ A lesson is **eligible** when all of:
   promotable);
 - `access_count >= 3` (configurable via `--min-recalls`) — i.e. it was
   *recalled* at least 3 times after storage. Recall frequency is the
-  reinforcement signal: every recall means an agent or curator found the
+  reinforcement signal: every recall means the agent found the
   lesson relevant again;
 - ≤ 400 characters (compact it first if longer).
 
@@ -324,7 +325,7 @@ Measured result (LLM-judged proxy task, median-of-3 scoring): on work items
 where the baseline struggled, the learning arm won 6/6 with a mean +11-point
 gain (sign test p = 0.016); on items the baseline already handled well the
 effect was neutral (−0.1). Cost: roughly 2× worker latency from the injected
-lesson context — worth it where the alternative is repeated fix iterations.
+lesson context (the experiment branch injected lessons; current CAO does not) — worth it where the alternative is repeated fix iterations.
 
 ## Limitations
 

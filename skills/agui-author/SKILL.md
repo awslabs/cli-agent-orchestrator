@@ -4,8 +4,9 @@ description: Author live dashboard UI from an agent via the `emit_ui` MCP tool. 
   one of six allow-listed components (approval_card, choice_prompt, diff_summary,
   progress, metric, agent_card) with JSON props and it renders in any dashboard
   that handles CAO's `cao.generative_ui` event. Use when you want the operator to
-  see a decision, a diff, or a status readout instead of scrolling terminal text.
-  Arbitrary HTML/markup is refused.
+  see a decision, a diff, or a status readout instead of scrolling terminal text. Also use
+  when the user says "show this on the dashboard", "ask me to approve it in the UI", or
+  "render a progress card". Arbitrary HTML/markup is refused.
 ---
 
 # Authoring generative UI over AG-UI

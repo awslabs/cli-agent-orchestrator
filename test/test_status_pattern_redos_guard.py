@@ -76,6 +76,7 @@ REGISTRY: dict[str, tuple[str, int]] = {
     "codex._IDLE_PROMPT_STRICT_RE": ("search", 0),
     "codex.TUI_PROGRESS_PATTERN": ("search", re.MULTILINE),
     "codex.TUI_FOOTER_PATTERN": ("search", 0),
+    "codex._BACKGROUND_TERMINALS_RE": ("fullmatch", 0),
     "codex.UPDATE_DIALOG_PATTERN": ("search", 0),
     "codex.STARTUP_ACTIVITY_PATTERN": ("search", re.MULTILINE),
     "codex._CONFIG_PROFILE_ERROR_COMPACT": ("search", 0),
@@ -236,6 +237,21 @@ def test_registered_pattern_is_linear_where_it_is_used(name):
     # Backstop for shapes the structure check cannot see: count the steps.
     growth = nonlinear_shapes(pattern_probe(source, mode, flags), input_shapes(source, flags))
     assert growth == [], f"{name} ({mode}) does not grow linearly on: {growth[:3]}"
+
+
+@pytest.mark.parametrize(
+    ("notice", "matches"),
+    [
+        ("1 background terminal running · /ps to view · /stop to close", True),
+        ("  2 background terminals running · /ps to view · /stop to close  ", True),
+        ("prefix 1 background terminal running · /ps to view · /stop to close", False),
+        ("1 background terminal running · /ps to view · /stop to close extra", False),
+        ("1 background terminal running", False),
+    ],
+)
+def test_background_terminals_notice_fullmatch(notice, matches):
+    pattern = DISCOVERED["codex._BACKGROUND_TERMINALS_RE"]
+    assert bool(re.fullmatch(pattern, notice)) is matches
 
 
 @pytest.mark.parametrize("name", sorted(set(DISCOVERED) - set(REGISTRY) - set(EXEMPT)))
