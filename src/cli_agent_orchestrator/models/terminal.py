@@ -166,6 +166,17 @@ class Terminal(BaseModel):
         ),
     )
     engine: Optional[KiroEngine] = Field(None, description="Resolved Kiro engine")
+    identity_verified: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Whether CAO has recorded that this kiro_cli terminal passed its identity "
+            "check (#1074), as stored on its row: False until the check passes, and "
+            "while it is False CAO refuses input to the terminal whatever ``status`` "
+            "says. None for other providers and for Kiro rows written before the "
+            "column existed (#1131). Read-only: the input gate decides on the row, "
+            "never on this field."
+        ),
+    )
     shell_command: Optional[str] = Field(
         None, description="Shell process name captured before kiro launch"
     )

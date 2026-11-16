@@ -40,8 +40,11 @@ The harness also calls `POST /agui/v1/emit_ui`, acting as an agent.
   on both transports at once: `EventSource` on `GET`, and fetch on `POST` with a
   token (auth is off on this server, so any token is accepted; the point is the
   `POST` path).
-- An off-list `emit_ui` call: HTTP 400, and nothing reaches either stream within
-  a 2 s settle window.
+- An off-list `emit_ui` call: HTTP 400, and exactly one refusal frame on each
+  stream within a 2 s settle window (#1158), attributed to the terminal, named
+  `iframe_embed.<8 hex>`, with no props; the marker in the call's props never
+  appears in the stream. With `CAO_E2E_CAPTURE_OFFLIST=<file>` it writes that
+  `RAW` frame to the file (`fixtures/raw-offlist.json` was captured this way).
 - A token stream that drops loses nothing: the first request asks the server to
   end it after 2 s (`forwardedProps.cao.maxSeconds`), a component is emitted
   while the client waits to reconnect, and it must arrive after the reconnect,
@@ -99,3 +102,16 @@ real Claude Code permission prompt through `core/` (#1156). It is never run by
 `npm run e2e` or by CI, because it needs a logged-in Claude Code and spends two
 model turns. Its header says what it touches; run `./e2e/live-claude-code.sh
 --dry-run` to see what it would do. The app's README has its usage.
+
+## Timeline screenshot (browser)
+
+After `e2e.ts`, `run.sh` runs `timeline.spec.ts` with Playwright, against the same
+private server. It opens the dashboard at `127.0.0.1:5173` (vite, started by
+`playwright.config.ts`), starts an assign and a handoff from a supervisor
+terminal, and checks that the session timeline panel renders both calls. The
+panel is saved to `e2e/artifacts/timeline-panel.png`. A missing panel fails the
+run. A failing run keeps its screenshot and video under `e2e/test-results/`.
+
+The browser is Chromium from `npm run playwright:install`, which the CI job runs
+as its own step. Locally, set `CAO_E2E_CHROME` to an installed Chromium to reuse
+it. The script never installs a browser.

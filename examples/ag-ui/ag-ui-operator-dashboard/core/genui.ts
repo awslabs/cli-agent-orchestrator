@@ -28,6 +28,12 @@ export const GENERATIVE_UI_EVENT = "cao.generative_ui";
 export const MAX_PANEL_ENTRIES = 200;
 
 /**
+ * At most this many refused entries are kept, the newest, apart from the real
+ * components, so a flood of refusals can never push a real entry out of the panel.
+ */
+export const MAX_REFUSED_ENTRIES = 20;
+
+/**
  * The newest this many event ids are remembered for dedupe. It is larger than
  * {@link MAX_PANEL_ENTRIES}, so a replay after a reconnect does not bring back
  * an entry that was dropped from the panel a little earlier.
@@ -42,7 +48,7 @@ export interface Owner {
 
 export type Entry =
   | { kind: "component"; eventId: string; component: Component; props: Record<string, unknown>; owner: Owner }
-  | { kind: "refused"; eventId: string; component: string; owner: Owner };
+  | { kind: "refused"; eventId: string; component: string; owner: Owner; moreRefused?: number };
 
 export interface Panel {
   entries: Entry[];
@@ -91,20 +97,45 @@ export function entryFor(frame: Frame): Entry | null {
   if (frame.type === "RAW") {
     const event = (frame.event ?? {}) as Record<string, unknown>;
     if (typeof event.rejected_component !== "string") return null;
-    return {
+    const entry: Entry = {
       kind: "refused",
       eventId: eventIdOf(frame, event.event_id),
       component: event.rejected_component,
       owner: ownerOf(frame),
     };
+    // The server's count of refusals folded into this one: a positive integer, shown as text.
+    const more = event.more_refused;
+    if (typeof more === "number" && Number.isSafeInteger(more) && more > 0) entry.moreRefused = more;
+    return entry;
   }
   return null;
 }
 
 /**
+ * Keep the newest {@link MAX_REFUSED_ENTRIES} refused entries and the newest
+ * {@link MAX_PANEL_ENTRIES} entries overall, never dropping a real component for
+ * a refusal. Arrival order is kept.
+ */
+function capEntries(entries: Entry[]): Entry[] {
+  let refused = entries.filter((e) => e.kind === "refused").length;
+  let excess = Math.max(0, entries.length - MAX_PANEL_ENTRIES);
+  const out: Entry[] = [];
+  for (const entry of entries) {
+    if (entry.kind === "refused" && (refused > MAX_REFUSED_ENTRIES || excess > 0)) {
+      refused -= 1;
+      excess = Math.max(0, excess - 1);
+      continue;
+    }
+    out.push(entry);
+  }
+  return out.slice(-MAX_PANEL_ENTRIES);
+}
+
+/**
  * Add one frame. A repeated event id (a `<rid>.<i>` cursor replays a whole
  * record) is dropped. The panel and its dedupe memory are both bounded:
- * {@link MAX_PANEL_ENTRIES} and {@link MAX_SEEN_EVENT_IDS}, newest kept.
+ * {@link MAX_PANEL_ENTRIES} and {@link MAX_SEEN_EVENT_IDS}, newest kept, with
+ * refusals capped apart at {@link MAX_REFUSED_ENTRIES}.
  */
 export function reduceFrame(panel: Panel, frame: Frame): Panel {
   const entry = entryFor(frame);
@@ -119,7 +150,7 @@ export function reduceFrame(panel: Panel, frame: Frame): Panel {
       seen.delete(old);
     }
   }
-  return { entries: [...panel.entries, entry].slice(-MAX_PANEL_ENTRIES), seen };
+  return { entries: capEntries([...panel.entries, entry]), seen };
 }
 
 /** The props of an ambient `approval_card` that names an interrupt, for a hint only. */

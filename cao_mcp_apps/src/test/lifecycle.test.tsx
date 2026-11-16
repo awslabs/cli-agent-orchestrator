@@ -158,6 +158,7 @@ describe("AgentView — interval poll refreshes the snapshot", () => {
       agent_profile: "builder",
       status: "idle",
       last_active: null,
+      runner_id: null,
       output_tail: "boot",
       scopes: [],
     };
@@ -191,6 +192,7 @@ describe("AgentStatus — open affordance", () => {
       window: "w0",
       status: "idle",
       last_active: null,
+      runner_id: null,
     };
     const onOpen = vi.fn();
     render(<AgentStatus terminal={terminal} onOpen={onOpen} />);

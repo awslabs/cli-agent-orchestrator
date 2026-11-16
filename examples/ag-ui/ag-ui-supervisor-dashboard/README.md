@@ -6,8 +6,9 @@ construct library.
 ## What it shows
 
 - Folding `STATE_SNAPSHOT` and `STATE_DELTA` frames into a local fleet view
-- Deriving `hierarchy()` (session-to-terminal grouping)
-- Deriving `supervisor_snapshot()` (active counts, provider distribution, waiting terminals)
+- Deriving `hierarchy()` (session-to-terminal grouping) and `hierarchy_by_runner()`
+- Deriving `by_runner()` (terminals grouped by `runner_id`; no runner is the `local` group)
+- Deriving `supervisor_snapshot()` (active counts, provider distribution, waiting terminals, `by_runner`)
 - Rollup counters from lifecycle frames (STEP_STARTED, TOOL_CALL_START, etc.)
 - Seen-Set deduplication (replayed frames are no-ops)
 

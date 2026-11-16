@@ -45,6 +45,8 @@ export interface TerminalView {
   window: string | null;
   status: string | null;
   last_active: string | null;
+  /** The remote runner the terminal runs on; `null` is local. A label only. */
+  runner_id: string | null;
 }
 
 /** The pure projection produced by `build_dashboard_snapshot`. */
@@ -64,6 +66,8 @@ export interface AgentDetailSnapshot {
   agent_profile: string | null;
   status: string | null;
   last_active: string | null;
+  /** The remote runner the terminal runs on; `null` is local. A label only. */
+  runner_id: string | null;
   output_tail: string;
   scopes: string[];
 }

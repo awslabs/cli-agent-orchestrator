@@ -166,7 +166,7 @@ Pick a pattern with the user:
 
 | Pattern | Command | Survives a CAO upgrade? | Touches CAO itself? |
 | --- | --- | --- | --- |
-| A: reinstall the tool with the decider added | `uv tool install <CAO source> <each existing extra> --with "cao-decider-jev @ <source>" --reinstall` | Only for an unpinned PyPI install upgraded with `uv tool upgrade`. For a git or version-pinned install, `cao update` drops it (see below). | Yes: CAO is reinstalled and may move to a newer version |
+| A: reinstall the tool with the decider added | `uv tool install <CAO source> <each existing extra> --with "cao-decider-jev @ <source>" --reinstall` | For Git and unpinned PyPI installs, `cao update` preserves recorded extras. Version-pinned PyPI and local reinstall guidance are covered below. | Yes: CAO is reinstalled and may move to a newer version |
 | B: add it to the tool's environment | `uv pip install --python "$CAO_PY" "cao-decider-jev @ <source>"` | **No.** The receipt never records it, so any CAO upgrade silently drops it | Not CAO's own package, but it can change dependencies CAO shares (such as `httpx`). Run it with `--dry-run` first and show the user the changes |
 
 **For pattern A, copy the source and the extras from the receipt.** The `cli-agent-orchestrator`
@@ -205,14 +205,13 @@ What you should see: `['fixed_table', 'jev']`. `fixed_table` is CAO's built-in d
 went into the wrong environment.
 
 **Tell the user about upgrades.** The check above shows that the decider loads *now*, and
-whether the receipt records it. It can't promise the decider survives the next upgrade, and
-often it won't:
+whether the receipt records it. Upgrade behavior depends on the source:
 
-- `cao update` on a git install runs `uv tool install <git source> --upgrade --reinstall` without
-  any `--with`, so it removes the decider even after pattern A;
+- `cao update` on a Git install runs `uv tool upgrade cli-agent-orchestrator --reinstall`.
+  It reuses the recorded Git ref and keeps deciders recorded by pattern A;
 - `cao update` on a version-pinned PyPI install (a receipt entry with a `specifier`) runs
-  `uv tool install cli-agent-orchestrator@latest --upgrade`, also without `--with`, so it removes
-  the decider too. An unpinned PyPI install runs `uv tool upgrade`, which keeps it;
+  `uv tool install cli-agent-orchestrator@latest --upgrade` without `--with`, so it removes
+  the decider. An unpinned PyPI install runs `uv tool upgrade`, which keeps recorded deciders;
 - on a local install, `cao update` changes nothing and prints a reinstall command that has no
   `--with` either;
 - after pattern B, any upgrade removes it.

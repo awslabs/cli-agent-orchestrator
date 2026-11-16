@@ -177,11 +177,43 @@ class EventLog:
         # Id not found among fresh rows: replay everything (client dedupes).
         return fresh
 
+    def count_event_type(self, event_type: str, *, within_ttl: bool = False) -> int:
+        """How many buffered rows have ``detail["event_type"] == event_type``.
+
+        With ``within_ttl`` the count is of the rows ``history()`` would return: a
+        row older than the TTL, or with an unparseable timestamp, is not counted,
+        so expired rows can't keep a share of the ring full. Without it the count
+        is of the raw ring's slots, as before.
+        """
+
+        cutoff = datetime.now(timezone.utc) - TTL if within_ttl else None
+        with self._lock:
+            count = 0
+            for event in self._buf:
+                detail = event.get("detail")
+                if not isinstance(detail, dict) or detail.get("event_type") != event_type:
+                    continue
+                if cutoff is not None and not _inside_ttl(event, cutoff):
+                    continue
+                count += 1
+            return count
+
     def __len__(self) -> int:
         """Return the current number of buffered events (<= RING_CAPACITY)."""
 
         with self._lock:
             return len(self._buf)
+
+
+def _inside_ttl(event: Dict, cutoff: datetime) -> bool:
+    """Whether ``event``'s timestamp is at or after ``cutoff``, as ``history()`` judges it."""
+    try:
+        ts = datetime.fromisoformat(event["timestamp"])
+    except (KeyError, ValueError):  # the same two history() skips
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts >= cutoff
 
 
 _log: Optional[EventLog] = None

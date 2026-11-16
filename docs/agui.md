@@ -29,10 +29,12 @@ to a build without the feature.
 
 The ambient stream is one [AG-UI 1.0](https://docs.ag-ui.com/) run that
 narrates the **fleet**: the sessions and terminals one `cao-server` can see.
-(A remote CAO deployment is a *runtime*; each runtime has its own fleet and its
-own stream.) Every frame is a `data:` line whose JSON carries its `type`, as the
-AG-UI SSE binding requires; there are no `event:` lines. A stock client such as
-`@ag-ui/client`'s `HttpAgent` reads it with no CAO code, and the pinned
+A *runner* is where a terminal executes. A terminal with no runner is local
+(`runner_id` is `null`), and a terminal placed on a remote runner carries that
+runner's id, so the fleet is the local and the remote terminals together; a
+runner does not have a stream of its own. Every frame is a `data:` line whose
+JSON carries its `type`, as the AG-UI SSE binding requires; there are no
+`event:` lines. A stock client such as `@ag-ui/client`'s `HttpAgent` reads it with no CAO code, and the pinned
 upstream `verifyEvents` accepts it (see [Verification](#verification)).
 
 A short run, captured from the conformance tests (`metadata` trimmed):
@@ -78,6 +80,115 @@ There are two ways in:
   characters; default `cao-fleet-<uuid>`, fixed for the server process),
   `since`, `maxSeconds`, and `access_token` (see Auth). Every connection is a
   new run with a new `runId`.
+
+### The fleet snapshot
+
+The first `STATE_SNAPSHOT` hydrates the fleet and later `STATE_DELTA` patches
+keep it current. Its keys:
+
+| Key | Content |
+|---|---|
+| `sessions` | `{id, name, status}` per session. Replaced whole on any change |
+| `terminals` | `{id, session_name, provider, agent_profile, window, status, last_active, runner_id}` per terminal. `status` is the last status the status monitor applied to the terminal, `null` when none has been observed (it can differ from `GET /terminals/{id}`; see Status below). Replaced whole on any change |
+| `counts` | `{sessions, terminals}`. Patched per key |
+| `scopes` | The scopes the caller holds |
+| `profiles` | The profile catalog, below. Present on the ambient stream only |
+| `host` | Host resources, below. Ambient stream only, local host only, numbers only. Replaced whole |
+
+**Status.** A terminal row has no status column; the snapshot adds the status monitor's
+last applied reading for each terminal. It is read without re-detecting anything,
+capturing a pane or writing, so it costs one dictionary lookup per terminal. That also
+means it is **not** a copy of what `GET /terminals/{id}` reports: that route runs
+`get_status`, which re-detects a cached `processing` from the output buffer (a TUI such as
+kiro-cli can keep emitting escape sequences after it is idle, so the debounce never fires
+and the cached value stays `processing`) and can recover a stuck one with a pane capture.
+Doing the same here would write a status row, publish an event and fork a process, so it
+does not: a terminal that nothing else polls can show `processing` after it went idle,
+until its status is next polled. Like that route it shows a durable deferred-init
+failure as `error`, a terminal whose first message is not yet delivered as `unknown`
+rather than `idle`, and a remote terminal whose runner is out of reach or whose output
+stream has a gap as `unknown`. The ambient
+stream rebuilds the snapshot when a fleet record arrives (a launch, a kill, a message) and
+also when a terminal's status changes: it listens to the in-process status topic, which
+the status monitor publishes only on a change, and coalesces the changes to one refresh
+per 2 seconds per stream, always delivering the last one. A status change alone therefore
+produces a `STATE_DELTA` within about 2 seconds. This adds no publisher, no thread and no
+timer (the stream's own wait wakes for it), and it exists only while the stream is open,
+so with `CAO_AGUI_ENABLED` unset it costs nothing. The deprecated legacy framing still
+refreshes on fleet records only.
+
+The cost is **per stream**: each open stream rebuilds the snapshot itself, in a worker
+thread so that the event loop is not held, which is one `list_sessions` (a tmux
+subprocess) plus about `1 + 2 * S` database reads for `S` sessions, at most once per 2
+seconds per stream and only while statuses are changing. An idle fleet does no work.
+With many streams open, a burst of status changes multiplies that work by the number of
+streams. A snapshot cache shared by all streams for a second or two would remove that; it is
+a possible follow-up under the laptop rule (#519) and is not part of this change. A plain
+time-based cache is not enough for that: it could serve a snapshot taken before the very
+change that triggered the refresh, so it would need invalidation on the status and
+fleet events and a key for the scope set and the catalog flag.
+On an event-inbox backend (herdr) the monitor holds no reading, so `status` stays `null`.
+
+`runner_id` is a label for the remote runner a terminal runs on, or `null` for
+a local terminal. It is the only runner field on the wire, and it is metadata:
+no terminal output, path or argument is in this snapshot. Frames name a terminal
+by id, so a consumer joins to the snapshot to learn its runner; the session
+timeline entries, handoff interrupts and `SUBAGENT_*` frames do not repeat it.
+(The MCP Apps `DashboardSnapshot`, the run plane's snapshot and the deprecated
+[legacy framing](#legacy-framing) keep their schema, but their terminal rows also
+carry `runner_id` and a live, non-null `status` where one was observed.)
+
+Because `terminals` is replaced whole on any change, a status change re-sends the whole
+array (one row per terminal), and `host` changes about once per 30 seconds of fleet
+activity. That is by design: each refresh (a fleet record, or a status change at most
+every 2 seconds) rebuilds the snapshot and sends the whole `terminals` array if any row
+changed.
+
+**Profile catalog.** `profiles` is a read-only list of `{name, source, role,
+loadable}`, one per installed agent profile, so a dashboard can name the profile
+behind a terminal. `source` is a label such as `built-in`, never a path. The
+description, prompt, tools and MCP servers of a profile are not on the wire. It
+is read with the same scopes as `GET /agents/profiles`, it is scanned at most
+every 30 seconds rather than per event, and it is not scoped to a tenant or an
+owner (that is #778). No AG-UI route writes a profile.
+
+**Host resources.** `host` is a list of zero or one entries for the machine that
+runs `cao-server`: `{runner_id: null, sampled_at, cpu_percent, load_per_core,
+memory_used_percent, memory_pressure}`. Every number is a plain number
+(`cpu_percent` and `memory_used_percent` are integers, `load_per_core` has one
+decimal), and `memory_pressure` is `normal`, `warn` or `critical`. No process
+name, argument, path, host name or user is in it, and there is no per-terminal
+figure. A value the server could not read is left out, never sent as 0, and
+`host: []` or a missing key both mean "not reported". Only the local host is
+probed, so a remote runner has no entry. `load_per_core` divides the host-wide
+1-minute load average by the cores this process may use, so inside a container limited
+by a cgroup CPU *quota* (not a cpuset) it mis-states the container's own load.
+
+- It rides the ambient stream only, under the same switch as `profiles`, so the
+  deprecated legacy framing, the run plane and MCP Apps never carry it.
+- It is read with the same scopes as the rest of the snapshot, has no write
+  path and adds no route.
+- It is sampled at most every 30 seconds, off the event loop: the stream serves the
+  cached sample and a stale one starts a background refresh, so a snapshot taken
+  just after the 30 seconds lapse shows the previous sample (`sampled_at` says when)
+  and the next one the new sample. The stream recomputes the snapshot when the fleet
+  changes, so an idle fleet keeps its last sample, and each refresh changes
+  `sampled_at`, which is one whole-key `/host` replace per 30 seconds of fleet
+  activity and never one per event. It is cheap by design (#519's laptop rule): no
+  timer of its own, one probe per 30 seconds of activity.
+- CPU needs two samples 30 to 60 seconds apart. The first sample after start has no
+  `cpu_percent`, and neither has a sample taken more than 60 seconds after the
+  previous one, so after a quiet spell the first reading shows a dash and the
+  second shows a figure.
+- `memory_used_percent` is `psutil`'s available-based figure, `100 * (total -
+  available) / total`. It is not the "used" of Activity Monitor or `top`, so compare
+  those only loosely.
+- `memory_pressure` is a heuristic, and it is not comparable across platforms.
+  On Linux it is the kernel's PSI `some avg10` figure for memory (below 10
+  `normal`, below 40 `warn`, else `critical`), omitted when PSI is not
+  available. On macOS it is the kernel's own pressure level. Other platforms
+  report none. A container's CPU or memory limit (cgroup quota) is not seen:
+  the numbers are the host's.
 
 ### Event mapping
 
@@ -262,8 +373,9 @@ reconnects with its cursor and the missed records are replayed. (The MCP Apps
 
 ## Legacy framing
 
-`?framing=cao-legacy` on `GET /agui/v1/stream` serves the pre-1.0 wire,
-byte-for-byte: named `event:` lines, snake_case data, `RUN_STARTED`/`STEP_*`
+`?framing=cao-legacy` on `GET /agui/v1/stream` serves the pre-1.0 wire, unchanged
+except that the terminal rows of its fleet snapshot gain `runner_id` and a live
+`status` (and it never carries the profile catalog or the host entry): named `event:` lines, snake_case data, `RUN_STARTED`/`STEP_*`
 per session and terminal, `TEXT_MESSAGE_CONTENT` for `send_message`, and no run
 lifecycle. It is **deprecated**: the response carries
 `Deprecation: @1793750400` (2026-11-04) and a `Link` header pointing here, and
@@ -286,7 +398,9 @@ a client that knows CAO's `cao.generative_ui` event renders it the same way
 whichever provider wrote it. The safety model is what makes
 that shippable over *untrusted* agents: an agent may only emit a **closed
 allow-list of named components with JSON props** — no HTML, no script, no
-`eval`, no iframe. An off-list component is **refused, never rendered**.
+`eval`, no iframe. An off-list component is **refused, never rendered**: the
+caller gets a 400, and operators see a metadata-only refusal record on the
+stream (see below).
 
 **Wire path.** An agent calls the `emit_ui` MCP tool (or
 `POST /agui/v1/emit_ui`) → the intent rides a CAO event as a `ui` block
@@ -316,7 +430,62 @@ on the run plane.
 progress, metric, agent_card}`; unknown components are refused (mapped to `RAW`
 with `rejected_component`); props must be JSON-serializable and are size-bounded
 (8 KB), degrading safely. `POST /agui/v1/emit_ui` rejects off-list components and
-oversized/non-serializable props with `400` before anything reaches the bus.
+oversized/non-serializable props with `400`; an oversized or non-serializable
+intent reaches nothing.
+
+**An off-list call never renders: a refusal record with no props is emitted so
+operators see it** (#1158). Alongside the `400`, the server publishes a record it
+builds from a fixed schema (`services/agui/refusal.py`); nothing from the
+request is copied into it except the cleaned name, and the props are never read.
+On the stream it is the `RAW` frame above:
+
+```text
+data: {"type": "RAW", "source": "cao", "subagentRunId": "terminal:<id>",
+       "event": {"cao_kind": "generative_ui", "rejected_component": "iframe.<8 hex>",
+                 "more_refused": 3, "event_id": "...", "terminal_id": "...",
+                 "session_name": "...", "timestamp": "...", "kind": "other"},
+       "metadata": {"cao": {"eventId": "...", "terminalId": "...", "sessionName": "..."}}}
+```
+
+- **The name** has every character outside `[A-Za-z0-9_.-]` replaced by `_`, is
+  cut to 24 characters, and always ends in `.` and 8 hex digits of the SHA-256 of
+  the requested name. It is at most 33 bytes (24 characters, `.`, 8 hex digits), and it can never equal an
+  allow-listed name, so the stream can never render it as one. The name is
+  caller text, not redacted: the visible part is what the caller sent, cleaned
+  of unsafe characters and cut short, so an agent that puts message text in
+  `component` by mistake exposes up to 24 characters of it to every reader of
+  the `cao:read` stream and the 24-hour event log. The hash keeps names apart;
+  it does not hide the prefix.
+- **Attribution** comes from CAO, not the body: the terminal only if CAO has a
+  row for it, its session from that row, and the subagent derived from the
+  terminal. Any other terminal id, the body's `session_name` and any other key
+  are ignored, and the record is unattributed. (An authorised caller can still
+  name another terminal CAO knows, as on the on-list path.)
+- **Scope.** Without `cao:write` (when auth is on), the scope check answers
+  first, with `401` or `403`, and nothing is published. The `400` is the answer
+  to an authorised caller.
+- **Flood control.** A call repeating a (terminal, name) pair within 10 s is
+  folded into `more_refused`. Each terminal publishes at most 5 records per 10 s,
+  and the server 20; the rest are folded too. `more_refused` is a count carried
+  by that terminal's next published record, so it is reported only with the
+  bucket's next refusal: a flood that stops leaves its tail unreported, and a
+  bucket the limiter evicts (it tracks at most 256 terminals) loses its count.
+- **The event log.** Refusals hold at most a tenth of the event log's 500-record
+  ring, which is how far a `since` or `Last-Event-ID` replay of real events
+  reaches back; past that share a refusal is folded instead of recorded. Only
+  refusal rows still inside the 24-hour window count, the rows `history()`
+  returns, so an expired flood does not keep the share full. When the share
+  fills, the server logs one warning (once per fill) and folds further
+  refusals into a count. A folded refusal is not published, so the operator sees
+  no record for it; the warning in the server log is the only trace.
+- **Delivery.** The record is in the event log, so its SSE id is one a
+  `Last-Event-ID` reconnect resumes from. It is published with
+  `SseBus.publish_lossy`, which skips a subscriber whose queue is half full or
+  more. When a real event then meets a full queue, the newest queued refusal is
+  dropped to make room for it, so refusals never cause an overflow (`RUN_ERROR
+  cao.stream_overflow`) that the real events alone would not. A skipped or
+  dropped record is lost to that client; it stays in the log for a later `since`
+  replay.
 
 ### Safety model
 
@@ -324,6 +493,8 @@ oversized/non-serializable props with `400` before anything reaches the bus.
 |---|---|---|
 | Agent emits arbitrary HTML/script | No HTML on the wire — only named components + JSON props | `TestGenerativeUI` |
 | Agent names an off-list component (e.g. `iframe`) | Refused server-side (→ RAW / 400) | `test_off_list_component_is_refused` |
+| Off-list names that clean to an allowed one (`metric!`) | The hash is always appended | `test_a_name_that_cleans_to_an_allowed_name_is_still_a_refusal` |
+| A flood of off-list calls | Deduped, rate-limited and folded; published lossily, and queued refusals give way to real events | `test_a_10k_off_list_flood_loses_no_real_event_and_ends_no_stream` |
 | Agent floods the bus with a huge payload | Props capped at 8 KB → `{_truncated: true}` | `test_oversized_props_are_truncated` |
 | Non-serializable props | Degrade to `{}` | `test_non_serializable_props_degrade_to_empty` |
 | Message-body leakage | Bodies never in the props path (metadata-only contract) | privacy tests |
@@ -526,8 +697,15 @@ and derives a `projection()` view without I/O.
 Folds `STATE_SNAPSHOT` and `STATE_DELTA` frames to maintain a local copy of the
 fleet topology. Derives:
 
-- `hierarchy()`: session-name keyed dict with terminal lists and counts
-- `supervisor_snapshot()`: active sessions, provider distribution, waiting terminals, rollup counters
+- `hierarchy()`: session-name keyed dict with terminal lists and counts, and the
+  `runner_ids` present in each session
+- `hierarchy_by_runner()`: the same, keyed by `(runner_id, session_name)`, so
+  two runners that both own a session called `main` stay apart
+- `by_runner()`: terminals grouped by `runner_id`, local (`null`) first, then
+  by id: `{runner_id, label, terminal_count, waiting, by_status}` per group. A
+  list, because JSON cannot key an object by `null`. A fleet whose terminals have
+  no runner is exactly one `local` group
+- `supervisor_snapshot()`: active sessions, provider distribution, waiting terminals, `by_runner`, rollup counters
 
 **Frames folded:** STATE_SNAPSHOT, STATE_DELTA, STEP_STARTED/FINISHED,
 RUN_STARTED/FINISHED, TOOL_CALL_START/END/RESULT (rollup counters).
@@ -641,7 +819,8 @@ The GIFs are committed under [`docs/media/`](media/) and re-generated + uploaded
 as CI artifacts (`agui-construct-demos`) on every run.
 
 **SupervisorDashboardStream** — folds `STATE_SNAPSHOT`/`STATE_DELTA` into a live
-fleet view (active sessions, provider distribution, waiting terminals):
+fleet view (active sessions, provider distribution, waiting terminals, and the
+terminals grouped by runner):
 
 ![SupervisorDashboardStream example asserting its fold logic](media/ag-ui-supervisor-dashboard-demo.gif)
 

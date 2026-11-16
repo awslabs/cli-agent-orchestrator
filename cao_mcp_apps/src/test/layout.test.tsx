@@ -31,6 +31,7 @@ function snapshotWith(n: number): DashboardSnapshot {
       window: "w",
       status: "idle",
       last_active: null,
+      runner_id: null,
     })),
     counts: { sessions: 1, terminals: n },
     scopes: ["cao:read", "cao:write", "cao:admin"],

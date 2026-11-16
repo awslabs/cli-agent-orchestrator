@@ -362,6 +362,20 @@ describe('StepEditor: params from the profile', () => {
     expect(screen.getByLabelText('Step 1 param index_name')).not.toHaveAttribute('aria-describedby')
   })
 
+  it('wraps a long name only after _ . or -, never mid-word, and keeps its * with it', async () => {
+    render(<StepHarness />)
+    await searchAndPick(1, 'dynamodb-query-agent')
+    const group = await declaredGroup()
+    const row = within(group).getAllByTestId('declared-param').find(r => r.dataset.name === 'partition_key_type')
+    const name = row?.firstElementChild as HTMLElement
+    // A soft break after each underscore, and no break-anywhere class on the name.
+    expect(name.querySelectorAll('wbr')).toHaveLength(2)
+    expect(name.className).not.toMatch(/break-all/)
+    expect(name.textContent).toBe('partition_key_type*')
+    // The soft breaks do not split the name for a text query either.
+    expect(within(group).getByText('partition_key_type')).toBe(name)
+  })
+
   it('renders a text field for string and int, and a select for enum and bool, with an empty choice only when optional', async () => {
     render(<StepHarness />)
     await searchAndPick(1, 'dynamodb-query-agent')
@@ -534,6 +548,8 @@ const EDIT_SPEC: WorkflowSpec = {
 describe('WorkflowBuilder with declared params', () => {
   beforeEach(() => {
     vi.spyOn(api, 'listProviders').mockResolvedValue(PROVIDERS)
+    // Save validates first.
+    vi.spyOn(api, 'validateWorkflowSource').mockResolvedValue({ status: 'pass', errors: [] })
   })
 
   it('blocks Save while a required param is empty, then writes the declared values first', async () => {

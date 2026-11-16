@@ -348,6 +348,24 @@ class TestCreateSessionEnvironmentFiltering:
         # CAO_TERMINAL_ID is always overwritten
         assert env["CAO_TERMINAL_ID"] == "tid1"
 
+    def test_histfile_points_at_dev_null_over_inherited_and_forwarded(self, tmux, tmp_path):
+        """The pane shell must not write agent launch commands to the user's history."""
+        mock_window = MagicMock()
+        mock_window.name = "w"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+
+        with patch.dict(
+            os.environ, {"HOME": "/home/user", "HISTFILE": "/home/user/.bash_history"}, clear=True
+        ):
+            tmux.create_session(
+                "ses", "w", "tid1", str(tmp_path), extra_env={"HISTFILE": "/tmp/operator_hist"}
+            )
+
+        env = tmux.server.new_session.call_args.kwargs["environment"]
+        assert env["HISTFILE"] == "/dev/null"
+
     def test_large_prefix_vars_dropped(self, tmux, tmp_path):
         large_value = "x" * 2048  # exactly 2048 bytes, should be dropped (< 2048 fails)
         env = self._get_passed_environment(
@@ -541,6 +559,26 @@ class TestCreateWindow:
         tmux.create_window("ses", "agent-window", "tid2", str(tmp_path))
 
         assert _SET_HISTORY_LIMIT in tmux.server.cmd.call_args_list
+
+    def test_create_window_sets_histfile_to_dev_null_over_forwarded(self, tmux, tmp_path):
+        """The window shell must not write agent launch commands to the user's history."""
+        mock_window = MagicMock()
+        mock_window.name = "agent-window"
+        mock_session = MagicMock()
+        mock_session.new_window.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        tmux.create_window(
+            "ses",
+            "agent-window",
+            "tid2",
+            str(tmp_path),
+            extra_env={"HISTFILE": "/tmp/operator_hist"},
+        )
+
+        env = mock_session.new_window.call_args.kwargs["environment"]
+        assert env["HISTFILE"] == "/dev/null"
+        assert env["CAO_TERMINAL_ID"] == "tid2"
 
     def test_create_window_session_not_found(self, tmux, tmp_path):
         tmux.server.sessions.get.return_value = None

@@ -73,7 +73,7 @@ names.
 
 Before anything is allocated:
 
-- the kiro-cli version is one CAO supports (see below);
+- the kiro-cli version is listed, or qualifies for operator opt-in observed admission (see below);
 - the agent is not unrestricted (`*`);
 - the profile's `kiroConfig.effort`, if set, is a plain level such as `high`;
 - no `KIRO_HOME` other than `~/.kiro` reaches the launch;
@@ -288,14 +288,73 @@ The 3.1.0 probe is tested against captured help. No 2.37.1 help capture is
 available, so its coverage is schema lookup, pending refusal, opt-in admission
 and launch tests; it has no captured-help probe cases.
 
-Any other version refuses v3; v2 is not affected. A new kiro-cli release needs a
-CAO update before v3 runs on it.
+By default, any other version refuses v3; v2 is not affected. An unlisted
+release needs a CAO update or the operator opt-in below before v3 runs on it.
 
 The pending 2.36.0–3.0.0 versions reuse 2.35.1's v3 engine schema. 3.1.0 ships
 a different engine, statically reviewed with equal render-facing fields and tags,
 so CAO renders the same tools and rules. The pending rows are based on static
 review, without running a chat. What a pending version still lacks is a live run
 of the operator checklist.
+
+### Observed admission (operator only)
+
+Observed admission applies only to ephemeral Kiro v3 helpers, whose launch path
+checks the sealed home and operator migration markers as well as the header,
+workspace, `/mcp list` and `/tools` before task input. Installed-agent and other
+non-helper v3 launches remain strict even with this setting.
+
+Strict admission remains the default. Only the exact JSON string `"observed"`
+in the server's `settings.json` enables observed admission. There is no environment
+variable or launch flag; set it in `settings.json` or with
+`cao config set kiro.v3_admission observed`. Other strings, types, or an
+absent/unreadable setting retain strict admission.
+
+```json
+{ "kiro": { "v3_admission": "observed" } }
+```
+
+Listed versions keep their existing pending-verification rule. An unlisted version
+must parse as canonical ASCII `MAJOR.MINOR.PATCH` (no leading zeros, at most six
+digits per part), be at least `2.35.1` and below `4.0.0`, and
+advertise `v3` as an accepted `--agent-engine` value. CAO borrows the schema of the
+newest listed row in the **same major** at or below that version. If that row is
+pending, its own `kiro.v3_allow_unverified_versions` opt-in is required. Without
+that opt-in, the launch refuses with `kiro_v3_unverified_version`, naming that
+pending row. CAO never falls back to an older verified row or borrows from another
+major. With no same-major predecessor, the launch refuses.
+
+Both listed 3.x rows are pending, so using kiro-cli 3.2.0 currently requires both
+settings below. Until the operator verifies 3.1.0 live, borrowing its schema for
+3.2.0 requires `kiro.v3_allow_unverified_versions` as well as observed admission:
+
+```json
+{ "kiro": { "v3_admission": "observed", "v3_allow_unverified_versions": true } }
+```
+
+Every observed admission carries a `launch_notes` entry and a server-log WARNING
+naming the probed version and the version whose schema it borrowed, including
+"(pending operator verification)" when applicable and the existing pending-version
+warning and note. The durable `kiro_home_prepared` event records `admission=observed`,
+`kiro_version`, and `borrowed_from`. All existing checks still run before any task:
+the agent header, workspace, helper home and
+migration markers, and exact grant/server attestation from `/tools` and `/mcp list`.
+An agent file that the engine rejects, an extra tool or server, a missing
+`cao-mcp-server`, or an unreadable panel fails closed and tears down the helper.
+
+Observed admission relies on what `/tools` and `/mcp list` report. It does not attest
+the engine bundle or prove that a future engine enforces deny rules while reporting
+the expected tools. It remains operator opt-in, and the live check on kiro-cli
+3.2.0 is still owed by the operator.
+
+| Refusal code | Condition and remedy |
+|---|---|
+| `kiro_v3_observed_refused` | Unlisted version fails parsing, the floor/ceiling, v3 capability, or same-major predecessor check; use a supported version or qualify a schema, with the pending opt-in when applicable. |
+| `kiro_v3_unsupported_version` | Strict mode finds an unlisted version; use a supported version. |
+| `kiro_v3_unverified_version` | A listed version is pending, or the newest same-major row borrowed by observed admission is pending (even if an older row is verified), without `kiro.v3_allow_unverified_versions`; complete the operator checklist or enable that opt-in for the checklist. |
+
+Live-check refusal codes remain unchanged, including `kiro_v3_tools_mismatch`,
+`kiro_v3_mcp_not_ready`, and the agent-identity and home/marker refusals below.
 
 ### Pending versions (operator only)
 
@@ -658,7 +717,7 @@ uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -k KiroCli -o 
    - kiro-cli itself reads the `cao install` directory only when it is `~/.kiro/agents/` or `$KIRO_HOME/agents/`. With `CAO_AGENTS_DIR` set in the server's environment *before it starts*, a launch passes the check above and is then refused at the header check below, after kiro-cli has started. `cao-server --agents-dir` is different: it sets `CAO_AGENTS_DIR` after `cao install`'s own directory is already bound from the default, so the check above never searches it, and such a launch is refused early as `agent_not_found` -- the `cao install` remedy below does not help that case.
    - After kiro-cli starts, and before any task is typed, every TUI header row on the screen (a row that starts with `<agent> · <model> · ◔ N%` at the left edge, with up to three short columns between the model and the gauge, such as the effort and thinking settings in `<agent> · <model> · thinking · low · ◔ N%`) must name the agent, and the screen must not show kiro-cli's fallback notice for that agent (`agent "<name>" not found, using "kiro_default"` on v2; on v3 `… using "default"`, after `not found`, `needs upgrading for this agent engine` or `has an invalid config`), whatever the header shows. A notice naming another agent does not refuse on its own. If any header row names another agent, no header row can be read, or the notice for the requested agent is shown, no task is typed and CAO closes the terminal's window -- or, if that close cannot be confirmed, refuses input to it instead. A synchronous create fails with `400`. A deferred create (assign, handoff, or `cao launch --headless` with a task) records the failure on the terminal, so `GET /terminals/{id}` reads `ERROR`, and closes the window (or refuses input, per above) even when the terminal has no caller and its record is kept for an external owner. An agent file that kiro-cli cannot parse ends here; run `kiro-cli agent list` and look for `Error:` lines. A header whose agent name is elided (`…`) or wrapped, by a narrow pane or a long name, names no agent: it is read again and then refused as `header_not_found`. So is a pane left in Kiro's plan mode, whose header shows `Plan · <model>` instead of the agent's name, except that it is refused as `identity_mismatch`.
    - The header proves the agent's *name*, not which definition of it is running. A `.kiro/agents/<name>.json` in the launch directory wins over the installed one (kiro-cli prints `WARNING: Agent conflict for <name>. Using workspace version.`), so a launch that passes the check can run a workspace definition with more tools than the installed profile. Refusing that for bounded launches is tracked as a follow-up.
-   - A Kiro terminal takes typed input only once CAO has recorded that its header check passed. Until then `POST /terminals/{id}/input`, `/key` and `/exit` and `cao session send <session> <message> --terminal <id>` are refused with `409`, and inbox delivery does not type into it: a queued message waits while the terminal is still starting, and is delivered once the check passes. While the terminal is still starting the refusal is temporary (`has not passed its Kiro identity check yet`). The web terminal (`/terminals/{id}/ws`) drops the attached pane's own keystrokes the same way, and typing works once the check passes, without reconnecting; attaching to a pane whose runtime was already reclaimed is refused outright. **But `/ws` is a full tmux (or herdr) client of the whole session it attaches to** -- its prefix keys, the mouse, or the tmux command prompt can still switch to and type into another pane in that session, including an unverified one. That is not new to this check (`/ws` had no such gate before it either); it is tracked as a follow-up to scope the web terminal to only the pane it attached to. If startup ended without the record -- the header was refused, startup timed out before the header was read (a slow MCP server, say), or `cao-server` restarted mid-start -- the window is closed as above, input stays refused, and the failure in `GET /terminals/{id}` carries `untrusted_runtime: true`. Attaching the web terminal to such a terminal is refused once its window is closed. Delete the terminal and launch it again. A Kiro terminal whose check passed before a `cao-server` restart still accepts a re-sent task.
+   - A Kiro terminal takes typed input only once CAO has recorded that its header check passed. `GET /terminals/{id}`, `GET /sessions/{name}` and `GET /sessions/{name}/terminals` report that record as `identity_verified`: `false` until the check passes and `true` after it (a create response reads `true` for a synchronous launch and `false` for a deferred one, still being checked); `null` for other providers and for Kiro terminals created before CAO kept the record. A client choosing where to send work should skip a Kiro terminal reading `false`, whatever its `status` says. Until the check passes, `POST /terminals/{id}/input`, `/key` and `/exit` and `cao session send <session> <message> --terminal <id>` are refused with `409`, and inbox delivery does not type into it: a queued message waits while the terminal is still starting, and is delivered once the check passes. While the terminal is still starting the refusal is temporary (`has not passed its Kiro identity check yet`). The web terminal (`/terminals/{id}/ws`) drops the attached pane's own keystrokes the same way, and typing works once the check passes, without reconnecting; attaching to a pane whose runtime was already reclaimed is refused outright. **But `/ws` is a full tmux (or herdr) client of the whole session it attaches to** -- its prefix keys, the mouse, or the tmux command prompt can still switch to and type into another pane in that session, including an unverified one. That is not new to this check (`/ws` had no such gate before it either); it is tracked as a follow-up to scope the web terminal to only the pane it attached to. If startup ended without the record -- the header was refused, startup timed out before the header was read (a slow MCP server, say), or `cao-server` restarted mid-start -- the window is closed as above, input stays refused, and the failure in `GET /terminals/{id}` carries `untrusted_runtime: true`. Attaching the web terminal to such a terminal is refused once its window is closed. Delete the terminal and launch it again. A Kiro terminal whose check passed before a `cao-server` restart still accepts a re-sent task.
    - Kiro terminals launched by a CAO version before this check carry no record and are not re-verified: they keep accepting input across the upgrade, unless they carry a startup failure. One whose initial message had not been delivered when `cao-server` restarted for the upgrade keeps its window, but the restart records that failure, so input to it is refused. Relaunch them to get the check.
    - Fix: `cao install <name> --provider kiro_cli`, then retry. Kiro's built-in agents (`kiro_default`, `kiro_planner`, and `kiro_help`, which kiro-cli 2.35 ships as `kiro_guide`) have no agent file, so they cannot be launched through CAO. The v3 engine's fallback agent, which its header shows as `Default` and its notice names `default`, is refused like `kiro_default`, even when requested by name and even with an agent file of that name (#1167). `cao launch --memory` on Kiro also needs `cao install memory_manager --provider kiro_cli`; without it the response reports the sidecar as `refused`.
 

@@ -90,3 +90,10 @@ cd "${APP_DIR}"
 env -u TMUX -u TMUX_PANE TMUX_TMPDIR="${SCRATCH}/tmux" \
     CAO_E2E_BASE="${BASE}" CAO_E2E_TMUX_SOCKET="${SOCKET}" CAO_E2E_WORKDIR="${SCRATCH}/work" \
     node --experimental-strip-types --experimental-eventsource --no-warnings e2e/e2e.ts
+
+# Browser evidence: the session timeline panel, saved as e2e/artifacts/timeline-panel.png.
+# It runs against the same private server, after the e2e above, and fails if the panel
+# does not render. --no-install: the browser is put in place by the CI step (or
+# `npm run playwright:install`); this script never installs one.
+env -u TMUX -u TMUX_PANE CAO_E2E_BASE="${BASE}" \
+    npx --no-install playwright test -c playwright.config.ts

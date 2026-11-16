@@ -13,7 +13,7 @@ The other CAO providers (`claude_code`, `kiro_cli`, `codex`, `kimi_cli`, `copilo
 
 Two components:
 
-**1. `test/providers/fixtures/bin/mock_cli`** — a ~60-line bash REPL.
+**1. `test/providers/fixtures/bin/mock_cli`** — a ~110-line bash REPL.
 
 - Prints a banner (`MockCli ready.`), prints the prompt char `❯ `, reads stdin.
 - On each input line: sleeps `--delay-ms` (default 50ms), echoes `> MOCK: <input>`, reprints the prompt.
@@ -21,6 +21,7 @@ Two components:
   - `/exit` or `/quit` → clean exit with `goodbye`
   - `__mock_error__` → emit `ERROR: mock failure injected` (drives state to ERROR)
   - `__mock_sleep_<N>` → sleep N seconds (lets tests exercise long-PROCESSING paths)
+  - `__mock_approval__ <text>` → print `APPROVAL_REQUIRED: <text>` as the last line, with no prompt after it, and block until a non-empty answer line arrives (empty lines are skipped, because CAO's bracketed paste can deliver one first). Only `y` and `n` are accepted: the binary prints `> MOCK: answered <y|n>`, or `> MOCK: unexpected answer <x>` for anything else, then the prompt. With `CAO_MOCK_CLI_SCRIPTED_PROMPTS=1` the provider reports `WAITING_USER_ANSWER` while the prompt is open, so CAO's approval bridge raises an `approval_card` interrupt for it. This is what the keyless CAO Dojo trace check (`examples/ag-ui/cao-dojo/tools/record_trace.py --mock`) answers.
 - Not on PATH outside pytest. `test/conftest.py` prepends the fixture bin dir to `PATH` at module-load time so `shlex.join(["mock_cli", ...])` resolves.
 
 **2. `src/cli_agent_orchestrator/providers/mock_cli.py`** — a ~95-line provider.

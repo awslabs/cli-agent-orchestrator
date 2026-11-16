@@ -76,7 +76,11 @@ from cli_agent_orchestrator.services import (
 )
 from cli_agent_orchestrator.services.script_runner import ScriptRunRecord
 from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
-from cli_agent_orchestrator.services.step_result import serialise_envelope
+from cli_agent_orchestrator.services.step_result import (
+    build_envelope,
+    parse_envelope,
+    serialise_envelope,
+)
 
 # Captured at import, before any fixture can patch it — see the services file's rationale.
 _PRODUCTION_DATABASE_FILE = Path(constants.DATABASE_FILE)
@@ -543,9 +547,15 @@ class TestSequentialYamlWorkflowsKeepWorking:
     @pytest.mark.asyncio
     async def test_the_durable_journal_of_a_yaml_run_is_unchanged_in_shape(self, _isolated_journal):
         """The write-through half of "keep working": the run and its steps settle exactly as
-        they did before #583, and the two columns this issue added stay NULL — the YAML tier
-        writes neither, so a row that suddenly carried a fingerprint would mean the script
-        tier's writers had leaked into it."""
+        they did before #583, and no step row carries a call fingerprint. The YAML tier
+        writes none, so a row that suddenly carried one would mean the script tier's writers
+        had leaked into it, and only a fingerprinted row can ever replay.
+
+        ``result_json`` is the YAML tier's OWN write since the run view: each settled step
+        stores its final answer there for the Output tab, through ``build_envelope``. That
+        cannot make the row replayable: with no fingerprint, ``step_replay.decide`` halts
+        before it would serve an envelope, and the run-step route consults the gate for
+        script-tier runs only (``test_the_yaml_drive_never_calls_the_gate...`` below)."""
         _assert_tmp_db(_isolated_journal)
         spy = _ProviderSpy()
         with _terminal_layer(spy):
@@ -562,7 +572,10 @@ class TestSequentialYamlWorkflowsKeepWorking:
             assert row.state == StepState.COMPLETED.value
             assert row.attempts == 1
             assert row.call_fingerprint is None
-            assert row.result_json is None
+            assert row.terminal_id == "rvg-fresh-terminal"
+            assert parse_envelope(row.result_json) == build_envelope(
+                "a fresh answer", "completed", "rvg-fresh-terminal"
+            )
 
     @pytest.mark.asyncio
     async def test_the_yaml_drive_never_calls_the_gate_and_performs_no_replay_read(

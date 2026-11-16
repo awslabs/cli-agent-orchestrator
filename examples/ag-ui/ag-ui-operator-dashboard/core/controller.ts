@@ -26,6 +26,7 @@ import {
   type Board,
 } from "./interrupts.ts";
 import { approvalHintProps, emptyPanel, reduceFrame, type Panel } from "./genui.ts";
+import { emptyFleet, reduceFleet, type Fleet } from "./fleet.ts";
 import { emptyTimeline, markReconnect, reduceTimeline, type Timeline } from "./timeline.ts";
 
 export interface ControllerOptions {
@@ -34,7 +35,7 @@ export interface ControllerOptions {
   token?: string;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
-  onChange?: (board: Board, panel: Panel, timeline: Timeline) => void;
+  onChange?: (board: Board, panel: Panel, timeline: Timeline, fleet: Fleet) => void;
   newRunId?: () => string;
 }
 
@@ -43,6 +44,8 @@ export interface Controller {
   readonly panel: Panel;
   /** The session timeline built from `TOOL_CALL_*` frames. */
   readonly timeline: Timeline;
+  /** The sessions and terminals folded from `STATE_SNAPSHOT` / `STATE_DELTA`, grouped by the view. */
+  readonly fleet: Fleet;
   /** True while a run is in flight. */
   readonly busy: boolean;
   /**
@@ -72,12 +75,13 @@ export function createController(opts: ControllerOptions): Controller {
   let board = emptyBoard();
   let panel = emptyPanel();
   let timeline = emptyTimeline();
+  let fleet = emptyFleet();
   let busy = false;
   let refreshWanted = false;
   let counter = 0;
   const sent: string[][] = [];
   const newRunId = opts.newRunId ?? (() => `run-${Date.now()}-${++counter}`);
-  const changed = () => opts.onChange?.(board, panel, timeline);
+  const changed = () => opts.onChange?.(board, panel, timeline, fleet);
 
   const run = (resume?: ResumeEntry[]) =>
     runOnce({
@@ -194,6 +198,9 @@ export function createController(opts: ControllerOptions): Controller {
     get timeline() {
       return timeline;
     },
+    get fleet() {
+      return fleet;
+    },
     get busy() {
       return busy;
     },
@@ -219,6 +226,7 @@ export function createController(opts: ControllerOptions): Controller {
     async ambient(frame) {
       panel = reduceFrame(panel, frame);
       timeline = reduceTimeline(timeline, frame);
+      fleet = reduceFleet(fleet, frame);
       const props = approvalHintProps(frame);
       let wantRefresh = false;
       if (props) {

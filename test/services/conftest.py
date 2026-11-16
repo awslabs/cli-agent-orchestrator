@@ -1,6 +1,7 @@
 """Deterministic Kiro probe fixture for terminal-service unit lifecycles."""
 
 import ast
+from test._support.host_sampler_stub import no_real_host_sampler  # noqa: F401
 from typing import List, Optional
 
 import pytest

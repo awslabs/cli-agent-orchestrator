@@ -106,9 +106,9 @@ assignment when the worker is created, and once the task has been delivered it w
 - Any message from the worker to the supervisor counts as the reply and closes the wait, including a
   progress note or a question. If the worker then goes idle without a final reply, nothing more is
   forwarded.
-- A worker whose profile has no `cao-mcp-server` cannot call `send_message`. The assign result says
-  so, the task text omits the reply instruction, and the last response is forwarded when the worker
-  goes idle.
+- A worker that has no `send_message` tool (no `cao-mcp-server` in any MCP config its CLI loads)
+  still gets the reply instruction in its task text; its last response is forwarded when it goes
+  idle.
 
 Pass `expect_callback=false` for a fire-and-forget worker. For a terminal you did not assign, pass
 `expect_reply=true` to `send_message` when you are waiting for its reply.

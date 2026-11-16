@@ -21,6 +21,11 @@ Snapshot shape (kept in sync with ``cao_mcp_apps/src/shared/types.ts``):
         "scopes":    [str, ...],           # granted scope set (default-off => full)
     }
 
+``TerminalView.runner_id`` is the remote execution unit a terminal runs on, or ``None``
+for a local terminal (the only kind a row without the key can be). The AG-UI snapshot
+additionally carries ``profiles`` (see :func:`build_profile_catalog`) and ``host`` (a list of
+zero or one local-host resource entries, see ``services.host_resources``).
+
 Diff granularity (per the design):
 
 * ``terminals`` / ``sessions`` are **whole-key replaced** — a single ``replace``
@@ -36,7 +41,7 @@ from typing import Any, Dict, List, Optional
 
 # Top-level snapshot keys whose value is replaced wholesale (never diffed
 # element-by-element) when anything inside them changes.
-_WHOLE_KEY_REPLACE = frozenset({"terminals", "sessions"})
+_WHOLE_KEY_REPLACE = frozenset({"terminals", "sessions", "profiles", "host"})
 
 
 def _escape_token(token: str) -> str:
@@ -91,6 +96,9 @@ def build_dashboard_snapshot(
             "window": t.get("tmux_window", t.get("name")),
             "status": t.get("status"),
             "last_active": _isoformat(t.get("last_active")),
+            # A label only. ``None`` is local; a row from a store that predates runners
+            # has no key at all, which is the same thing.
+            "runner_id": t.get("runner_id"),
         }
         for t in terminals
     ]
@@ -132,9 +140,37 @@ def build_agent_detail_snapshot(
         "agent_profile": terminal.get("agent_profile"),
         "status": terminal.get("status"),
         "last_active": _isoformat(terminal.get("last_active")),
+        "runner_id": terminal.get("runner_id"),
         "output_tail": output_tail or "",
         "scopes": list(scopes) if scopes else [],
     }
+
+
+def build_profile_catalog(profiles: Any) -> List[Dict[str, Any]]:
+    """Project installed-profile listing rows into the read-only catalog wire shape.
+
+    A fixed allow-list: ``name``, ``source`` (a label such as ``"built-in"``, never a
+    path), ``role`` and ``loadable``. Everything else a listing row carries, in
+    particular the operator-authored ``description``, the prompt, tools and MCP servers,
+    stays off the wire. Rows that are not mappings with a string ``name`` are dropped.
+    """
+
+    if not isinstance(profiles, (list, tuple)):
+        return []
+    catalog: List[Dict[str, Any]] = []
+    for row in profiles:
+        if not isinstance(row, dict) or not isinstance(row.get("name"), str):
+            continue
+        role = row.get("role")
+        catalog.append(
+            {
+                "name": row["name"],
+                "source": row.get("source") if isinstance(row.get("source"), str) else "",
+                "role": role if isinstance(role, str) else None,
+                "loadable": row.get("loadable") is True,
+            }
+        )
+    return catalog
 
 
 def diff_snapshot(prev: Dict[str, Any], curr: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -145,7 +181,7 @@ def diff_snapshot(prev: Dict[str, Any], curr: Dict[str, Any]) -> List[Dict[str, 
 
     Granularity:
 
-    * keys in ``_WHOLE_KEY_REPLACE`` (``terminals`` / ``sessions``) emit a single
+    * keys in ``_WHOLE_KEY_REPLACE`` (``terminals`` / ``sessions`` / ``profiles`` / ``host``) emit a single
       whole-value ``replace`` when changed;
     * nested dict keys (e.g. ``counts``) are diffed **per-key**;
     * other scalars emit a per-key ``replace``;
