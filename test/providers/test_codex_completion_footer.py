@@ -19,11 +19,14 @@ from cli_agent_orchestrator.providers.codex import (
     EXIT_CHECK_INTERVAL_S,
     CodexProvider,
     _banner_version,
+    _body_rows,
+    _compute_tui_footer_cutoff,
     _dispatched_echoes,
     _is_completion_footer,
 )
 
 STATUS_BAR = "  gpt-6 max · /tmp/project                       ⚠ 1 warning · f2 to view"
+SHORTCUTS_BAR = "  ← for agents · ? for shortcuts                       ⚠ 1 warning · f2 to view"
 COMPOSER = "› Ask Codex to do anything"
 BANNER = [
     "╭──────────────────────────────────────────╮",
@@ -49,6 +52,167 @@ def footer_provider(version=V0160) -> CodexProvider:
 
 def screen(*rows: str) -> list[str]:
     return [*rows, COMPOSER, STATUS_BAR]
+
+
+class TestSeparateShortcutsBar:
+    @pytest.mark.parametrize("separator", [[], [""]])
+    def test_completed_turn_and_extraction(self, separator):
+        frame = [
+            *TASK,
+            "• Mean 3.",
+            "  Worked for 2s • 4:19 PM",
+            "",
+            COMPOSER,
+            STATUS_BAR,
+            *separator,
+            SHORTCUTS_BAR,
+        ]
+        provider = footer_provider((0, 169, 0))
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script("\n".join(frame)) == "• Mean 3."
+        assert provider.extract_current_composer("\n".join(frame)) == ""
+
+    def test_active_turn_remains_processing(self):
+        frame = [*TASK, "• Working (12s • esc to interrupt)", COMPOSER, STATUS_BAR, SHORTCUTS_BAR]
+        assert footer_provider().get_status_from_screen(frame) == TerminalStatus.PROCESSING
+
+    def test_streaming_reply_with_quoted_footer_is_not_completed(self):
+        frame = [
+            *TASK,
+            "• Example:",
+            "  Worked for 2s • 4:19 PM",
+            "  More text follows",
+            COMPOSER,
+            STATUS_BAR,
+            SHORTCUTS_BAR,
+        ]
+        assert footer_provider().get_status_from_screen(frame) != TerminalStatus.COMPLETED
+
+    def test_quoted_footer_and_background_notice_match_visual_heuristic(self):
+        frame = [
+            *TASK,
+            "• Example:",
+            "  Worked for 2s • 4:19 PM",
+            "  1 background terminal running · /ps to view · /stop to close",
+            COMPOSER,
+            STATUS_BAR,
+            SHORTCUTS_BAR,
+        ]
+        assert footer_provider().get_status_from_screen(frame) == TerminalStatus.COMPLETED
+
+    def test_quoted_background_notice_is_preserved_in_response(self):
+        notice = "  1 background terminal running · /ps to view · /stop to close"
+        frame = [*TASK, "• Notice:", notice, COMPOSER, STATUS_BAR, SHORTCUTS_BAR]
+        provider = footer_provider((0, 169, 0))
+        assert provider.get_status_from_screen(frame) == TerminalStatus.PROCESSING
+        assert provider.extract_last_message_from_script("\n".join(frame)) == "• Notice:\n" + notice
+
+    def test_scrolled_user_message_does_not_include_composer_or_bars(self):
+        frame = ["• Mean 3.", "  Worked for 2s • 4:19 PM", COMPOSER, STATUS_BAR, SHORTCUTS_BAR]
+        assert footer_provider().extract_last_message_from_script("\n".join(frame)) == "Mean 3."
+
+    def test_draft_preserves_contiguous_status_lookalike(self):
+        frame = [
+            *TASK,
+            "• Mean 3.",
+            "  Worked for 2s • 4:19 PM",
+            "› draft message",
+            STATUS_BAR,
+            SHORTCUTS_BAR,
+        ]
+        # A contiguous status-looking row can be actual draft text.
+        assert footer_provider().extract_current_composer("\n".join(frame)) == (
+            "› draft message\n" + STATUS_BAR
+        )
+
+
+class TestComposerWithoutStatusBar:
+    @pytest.mark.parametrize("path", ["/tmp/x", "~/x"])
+    @pytest.mark.parametrize("status_rows", [[], [STATUS_BAR]])
+    @pytest.mark.parametrize("hints", ["  ? for shortcuts", SHORTCUTS_BAR])
+    @pytest.mark.parametrize("composer", ["› check foo · {path} and report", "›"])
+    @pytest.mark.parametrize("completed", [False, True])
+    def test_draft_is_not_a_status_row(self, path, status_rows, hints, composer, completed):
+        draft = composer.format(path=path)
+        frame = [
+            "› old task",
+            "• old reply",
+            "  Worked for 1s • 4:18 PM",
+            "› current task",
+            "• result",
+            *(["  Worked for 2s • 4:19 PM"] if completed else []),
+            "",
+            draft,
+            "",
+            *status_rows,
+            hints,
+        ]
+        provider = footer_provider((0, 169, 0))
+        pane = "\n".join(frame)
+        assert provider.extract_current_composer(pane) == ("" if draft == "›" else draft)
+        expected = TerminalStatus.COMPLETED if completed else TerminalStatus.PROCESSING
+        assert provider.get_status_from_screen(frame) == expected
+        assert provider.extract_last_message_from_script(pane) == "• result"
+
+    @pytest.mark.parametrize("path", ["/tmp/x", "~/x"])
+    @pytest.mark.parametrize("status_rows", [[], [STATUS_BAR]])
+    def test_multiline_draft_preserves_continuation(self, path, status_rows):
+        draft = [f"› check foo · {path}", "  and report"]
+        frame = ["› old task", "• old reply", *draft, "", *status_rows, SHORTCUTS_BAR]
+        assert footer_provider((0, 169, 0)).extract_current_composer("\n".join(frame)) == (
+            "\n".join(draft)
+        )
+
+
+class TestFooterBoundaries:
+    @pytest.mark.parametrize("path", ["/tmp/x", "~/x"])
+    def test_reply_without_tui_preserves_task_containing_path(self, path):
+        frame = [f"› check foo · {path} and report", "• result"]
+        provider = footer_provider((0, 169, 0))
+        pane = "\n".join(frame)
+        assert provider.get_status_from_screen(frame) == TerminalStatus.PROCESSING
+        assert provider.extract_last_message_from_script(pane) == "• result"
+        assert provider.extract_current_composer(pane) is None
+
+    @pytest.mark.parametrize("frame", [["  ? for shortcuts"], ["", "  ? for shortcuts"]])
+    def test_hints_without_composer_do_not_return_history(self, frame):
+        assert footer_provider((0, 169, 0)).extract_current_composer("\n".join(frame)) is None
+
+    def test_hint_separated_by_more_than_three_rows_preserves_draft(self):
+        frame = ["› old task", "• old reply", "› draft", "", "", "", "  ? for shortcuts"]
+        assert footer_provider((0, 169, 0)).extract_current_composer("\n".join(frame)) == "› draft"
+
+    def test_notice_without_preceding_row_is_not_completion(self):
+        frame = [BACKGROUND_NOTICE, "›", STATUS_BAR, SHORTCUTS_ROW]
+        provider = footer_provider((0, 169, 0))
+        assert provider.get_status_from_screen(frame) != TerminalStatus.COMPLETED
+        assert provider.extract_current_composer("\n".join(frame)) == ""
+        with pytest.raises(ValueError, match="No Codex response found"):
+            provider.extract_last_message_from_script("\n".join(frame))
+
+    @pytest.mark.parametrize("completed", [False, True])
+    def test_notice_after_blank_rows_requires_completion_footer(self, completed):
+        frame = [
+            "› task",
+            "• result",
+            *(["  Worked for 2s • 4:19 PM"] if completed else []),
+            "",
+            "",
+            BACKGROUND_NOTICE,
+            "",
+            "› draft",
+            STATUS_BAR,
+            SHORTCUTS_ROW,
+        ]
+        provider = footer_provider((0, 169, 0))
+        pane = "\n".join(frame)
+        assert provider.get_status_from_screen(frame) == (
+            TerminalStatus.COMPLETED if completed else TerminalStatus.PROCESSING
+        )
+        assert provider.extract_last_message_from_script(pane) == (
+            "• result" if completed else "• result\n\n\n" + BACKGROUND_NOTICE
+        )
+        assert provider.extract_current_composer(pane) == "› draft\n" + STATUS_BAR
 
 
 class TestCompletionFooterPattern:
@@ -756,3 +920,273 @@ class TestCaoToolsAreNotDeferred:
 
     def test_poller_recheck_reads_the_screen(self):
         assert CodexProvider.status_recheck_uses_screen is True
+
+
+BACKGROUND_NOTICE = "  1 background terminal running · /ps to view · /stop to close"
+SHORTCUTS_ROW = "  ? for shortcuts"
+OBSERVED_SHORTCUTS_ROW = "← for agents · ? for shortcuts · ⚠ 1 warning · f2 to view"
+
+
+def background_screen(*rows):
+    return [*rows, BACKGROUND_NOTICE, COMPOSER, STATUS_BAR, SHORTCUTS_ROW]
+
+
+def observed_background_screen(*rows):
+    return [*rows, "", BACKGROUND_NOTICE, "", "", COMPOSER, "", STATUS_BAR, OBSERVED_SHORTCUTS_ROW]
+
+
+class TestObservedBackgroundLayout:
+    def test_dispatched_turn_completes_and_extracts_response(self):
+        baseline = observed_background_screen("› old", "• old reply", "  Worked for 1s • 3:42 AM")
+        provider = TestEmptyDispatchedTurn()._dispatched_provider(
+            "1+1", baseline="\n".join(baseline)
+        )
+        provider._codex_version = (0, 169, 0)
+        frame = observed_background_screen(
+            "› old",
+            "• old reply",
+            "  Worked for 1s • 3:42 AM",
+            "› 1+1",
+            "• 2",
+            "  Worked for 1s • 3:43 AM",
+        )
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script("\n".join(frame)) == "• 2"
+        assert provider.extract_current_composer("\n".join(frame)) == ""
+
+    @pytest.mark.parametrize("activity", ["• 4", "• Working (3s • esc to interrupt)"])
+    def test_next_turn_remains_active_until_its_footer(self, activity):
+        previous = ["› 1+1", "• 2", "  Worked for 1s • 3:43 AM"]
+        baseline = observed_background_screen(*previous)
+        provider = TestEmptyDispatchedTurn()._dispatched_provider(
+            "2+2", baseline="\n".join(baseline)
+        )
+        provider._codex_version = (0, 169, 0)
+        frame = observed_background_screen(*previous, "› 2+2", activity)
+        assert provider.get_status_from_screen(frame) == TerminalStatus.PROCESSING
+        frame = observed_background_screen(*previous, "› 2+2", "• 4", "  Worked for 1s • 3:44 AM")
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script("\n".join(frame)) == "• 4"
+
+    def test_editable_composer_excludes_status_rows(self):
+        frame = observed_background_screen("› task", "• result", "  Worked for 1s • 3:43 AM")
+        frame[frame.index(COMPOSER)] = "› draft"
+        assert footer_provider().extract_current_composer("\n".join(frame)) == "› draft"
+
+    def test_activity_after_quoted_footer_stays_processing(self):
+        frame = observed_background_screen(
+            "› task",
+            "• Example:",
+            "  Worked for 1s • 3:43 AM",
+            "• Working (3s • esc to interrupt)",
+        )
+        assert (
+            footer_provider((0, 169, 0)).get_status_from_screen(frame) == TerminalStatus.PROCESSING
+        )
+
+    def test_spoofed_footer_and_notice_are_indistinguishable(self):
+        # Screen text cannot tell these quoted rows from Codex's own chrome.
+        frame = observed_background_screen("› quote", "• Example:", "  Worked for 1s • 3:43 AM")
+        assert (
+            footer_provider((0, 169, 0)).get_status_from_screen(frame) == TerminalStatus.COMPLETED
+        )
+
+
+class TestBackgroundTerminalChrome:
+    def test_completed_turn_and_extraction_share_body_cutoff(self):
+        body = ["› 1+1", "• 2", "  Worked for 1s • 4:19 PM"]
+        frame = background_screen(*body)
+        provider = footer_provider((0, 169, 0))
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script("\n".join(frame)) == "• 2"
+        assert _body_rows("\n".join(frame)) == body
+        assert _compute_tui_footer_cutoff(frame) == len("\n".join(body))
+
+    @pytest.mark.parametrize("activity", ["• 2", "• Working (3s • esc to interrupt)"])
+    def test_notice_does_not_end_active_turn(self, activity):
+        frame = background_screen("› 1+1", activity)
+        assert (
+            footer_provider((0, 169, 0)).get_status_from_screen(frame) == TerminalStatus.PROCESSING
+        )
+
+    def test_previous_footer_does_not_end_current_turn(self):
+        frame = background_screen("› 1+1", "• 2", "  Worked for 1s • 4:19 PM", "› 2+2", "• 4")
+        assert (
+            footer_provider((0, 169, 0)).get_status_from_screen(frame) == TerminalStatus.PROCESSING
+        )
+
+    def test_notice_in_answer_is_preserved(self):
+        frame = background_screen(
+            "› quote it",
+            "• Notice:",
+            BACKGROUND_NOTICE,
+            "  More text.",
+            "  Worked for 1s • 4:19 PM",
+        )
+        result = footer_provider((0, 169, 0)).extract_last_message_from_script("\n".join(frame))
+        assert BACKGROUND_NOTICE in result
+        assert "More text." in result
+
+    def test_partial_notice_and_redraw_are_not_completion_evidence(self):
+        provider = footer_provider((0, 169, 0))
+        partial = ["› task", "• output", "1 background terminal running", COMPOSER, STATUS_BAR]
+        assert provider.get_status_from_screen(partial) == TerminalStatus.PROCESSING
+        assert "1 background terminal running" in _body_rows("\n".join(partial))
+        redraw = ["› task", "• output", BACKGROUND_NOTICE, COMPOSER]
+        assert provider.get_status_from_screen(redraw) != TerminalStatus.COMPLETED
+
+    def test_fallback_and_editable_composer_exclude_chrome(self):
+        provider = footer_provider((0, 169, 0))
+        frame = background_screen("• 2", "  Worked for 1s • 4:19 PM")
+        assert provider.extract_last_message_from_script("\n".join(frame)) == "2"
+        editable = ["• earlier", BACKGROUND_NOTICE, "› draft text", STATUS_BAR, SHORTCUTS_ROW]
+        assert (
+            provider.extract_current_composer("\n".join(editable)) == "› draft text\n" + STATUS_BAR
+        )
+
+    def test_attribution_with_previous_background_notice(self):
+        baseline = background_screen("› old", "• old answer", "  Worked for 1s • 4:18 PM")
+        provider = TestEmptyDispatchedTurn()._dispatched_provider(
+            "new", baseline="\n".join(baseline)
+        )
+        provider._codex_version = (0, 169, 0)
+        current = background_screen(
+            "› old", "• old answer", "  Worked for 1s • 4:18 PM", "› new", "• new answer"
+        )
+        assert provider.get_status_from_screen(current) == TerminalStatus.PROCESSING
+        current.insert(5, "  Worked for 1s • 4:19 PM")
+        assert provider.get_status_from_screen(current) == TerminalStatus.COMPLETED
+
+    def test_empty_composer_does_not_extend_extraction_past_body(self):
+        frame = [
+            "› 1+1",
+            "• 2",
+            "  Worked for 1s • 4:19 PM",
+            BACKGROUND_NOTICE,
+            "›",
+            STATUS_BAR,
+            SHORTCUTS_ROW,
+        ]
+        provider = footer_provider((0, 169, 0))
+        assert provider.extract_last_message_from_script("\n".join(frame)) == "• 2"
+
+    def test_blank_between_status_rows_preserves_cutoff_and_composer(self):
+        body = ["› 1+1", "• 2", "  Worked for 1s • 4:19 PM"]
+        frame = [*body, BACKGROUND_NOTICE, COMPOSER, STATUS_BAR, "", SHORTCUTS_ROW]
+        provider = footer_provider((0, 169, 0))
+        assert _compute_tui_footer_cutoff(frame) == len("\n".join(body))
+        assert _body_rows("\n".join(frame)) == body
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script("\n".join(frame)) == "• 2"
+        editable = ["› draft", STATUS_BAR, "", SHORTCUTS_ROW]
+        assert provider.extract_current_composer("\n".join(editable)) == "› draft\n" + STATUS_BAR
+
+    @pytest.mark.parametrize("baseline_has_background", [False, True])
+    def test_empty_dispatch_with_background_transition(self, baseline_has_background):
+        previous = ["› old", "• old answer", "  Worked for 1s • 4:18 PM"]
+        baseline = background_screen(*previous) if baseline_has_background else screen(*previous)
+        provider = TestEmptyDispatchedTurn()._dispatched_provider(
+            "new", baseline="\n".join(baseline)
+        )
+        provider._codex_version = (0, 169, 0)
+        current_body = [*previous, "› new", "  Worked for 1s • 4:19 PM"]
+        current = (
+            screen(*current_body) if baseline_has_background else background_screen(*current_body)
+        )
+        assert provider.get_status_from_screen(current) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script("\n".join(current)) == ""
+
+    def test_scrolled_echo_with_background_requires_new_activity(self):
+        previous = background_screen("› old", "• old answer", "  Worked for 1s • 4:18 PM")
+        provider = TestEmptyDispatchedTurn()._dispatched_provider(
+            "a task whose echo scrolled away", baseline="\n".join(previous)
+        )
+        provider._codex_version = (0, 169, 0)
+        stale = background_screen("• old answer", "  Worked for 1s • 4:18 PM")
+        assert provider.get_status_from_screen(stale) != TerminalStatus.COMPLETED
+        current = background_screen("• new answer", "  Worked for 2s • 4:19 PM")
+        assert provider.get_status_from_screen(current) == TerminalStatus.COMPLETED
+
+    @pytest.mark.parametrize("previous_turn", [False, True])
+    def test_final_quoted_notice_without_footer_remains_in_answer(self, previous_turn):
+        history = ["› old", "• old answer", "  Worked for 1s • 4:18 PM"] if previous_turn else []
+        frame = [
+            *history,
+            "› quote it",
+            "• Notice:",
+            BACKGROUND_NOTICE,
+            COMPOSER,
+            STATUS_BAR,
+            SHORTCUTS_ROW,
+        ]
+        provider = footer_provider((0, 169, 0))
+        assert provider.get_status_from_screen(frame) == TerminalStatus.PROCESSING
+        assert provider.extract_last_message_from_script("\n".join(frame)) == (
+            "• Notice:\n" + BACKGROUND_NOTICE
+        )
+        assert BACKGROUND_NOTICE in _body_rows("\n".join(frame))
+
+
+class TestMultilineDraftFooter:
+    @pytest.mark.parametrize("path", ["/tmp/x", "~/x"])
+    @pytest.mark.parametrize("status_rows", [[], [STATUS_BAR]])
+    @pytest.mark.parametrize("completed", [False, True])
+    def test_draft_is_excluded_from_body(self, path, status_rows, completed):
+        body = ["› old task", "• old reply"]
+        if completed:
+            body.append("  Worked for 2s • 4:19 PM")
+        frame = [*body, "› check foo", f"  and report · {path}", *status_rows, "", SHORTCUTS_ROW]
+        provider = footer_provider((0, 169, 0))
+        # Preserve the whole ambiguous contiguous block, including a row that
+        # could be configurable status or additional draft text.
+        assert provider.extract_current_composer("\n".join(frame)) == "\n".join(
+            ["› check foo", f"  and report · {path}", *status_rows]
+        )
+        assert _body_rows("\n".join(frame)) == body
+        expected = TerminalStatus.COMPLETED if completed else TerminalStatus.PROCESSING
+        assert provider.get_status_from_screen(frame) == expected
+        assert provider.extract_last_message_from_script("\n".join(frame)) == "• old reply"
+
+    def test_multiline_draft_preserves_completion_notice(self):
+        body = ["› old task", "• old reply", "  Worked for 2s • 4:19 PM"]
+        frame = [*body, BACKGROUND_NOTICE, "› draft", "  continuation", STATUS_BAR, SHORTCUTS_ROW]
+        provider = footer_provider((0, 169, 0))
+        assert _body_rows("\n".join(frame)) == body
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script("\n".join(frame)) == "• old reply"
+
+
+class TestConservativeDraftBoundaries:
+    @pytest.mark.parametrize("path", ["/tmp/x", "~/x"])
+    @pytest.mark.parametrize("prefix", ["and  report", "gpt-custom", "codex", "o1", "my-model"])
+    @pytest.mark.parametrize("status_separator", [[], ["", "  my-model · /tmp/project"]])
+    def test_status_like_continuation_is_preserved(self, path, prefix, status_separator):
+        draft = ["› check foo", f"  {prefix} · {path}"]
+        frame = ["› task", "• result", *draft, *status_separator, "", SHORTCUTS_ROW]
+        provider = footer_provider((0, 169, 0))
+        assert provider.extract_current_composer("\n".join(frame)) == "\n".join(draft)
+
+    @pytest.mark.parametrize("path", ["/tmp/x", "~/x"])
+    def test_arbitrary_status_separated_from_draft_is_excluded(self, path):
+        frame = [
+            "› task",
+            "• result",
+            "› check foo",
+            "  and report",
+            "",
+            f"  my-model · {path}",
+            SHORTCUTS_ROW,
+        ]
+        assert footer_provider((0, 169, 0)).extract_current_composer("\n".join(frame)) == (
+            "› check foo\n  and report"
+        )
+
+    @pytest.mark.parametrize("trailing_blanks", [[], ["", ""]])
+    def test_redraw_without_composer_preserves_indented_reply(self, trailing_blanks):
+        body = ["› task", "• result", "", "  important detail"]
+        frame = [*body, *trailing_blanks, STATUS_BAR, SHORTCUTS_ROW]
+        pane = "\n".join(frame)
+        assert _body_rows(pane) == body
+        assert footer_provider((0, 169, 0)).extract_last_message_from_script(pane) == (
+            "• result\n\n  important detail"
+        )

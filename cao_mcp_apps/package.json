@@ -15,7 +15,7 @@
     "test:watch": "vitest",
     "test:dependencies": "node --test scripts/dependency-security.cjs",
     "test:e2e": "playwright test",
-    "test:e2e:install": "playwright install --with-deps chromium",
+    "test:e2e:install": "playwright install chromium",
     "build:dashboard": "vite build -c vite.config.dashboard.ts",
     "build:agent": "vite build -c vite.config.agent.ts",
     "build:events": "vite build -c vite.config.events.ts",
@@ -45,7 +45,7 @@
     "sigma": "^4.0.4"
   },
   "devDependencies": {
-    "@playwright/test": "^1.64.1",
+    "@playwright/test": "1.64.1",
     "@testing-library/dom": "^10.4.2",
     "@testing-library/react": "^16.3.3",
     "@types/node": "^26.6.6",
