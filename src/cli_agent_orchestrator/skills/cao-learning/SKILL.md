@@ -2,7 +2,7 @@
 name: cao-learning
 description: Report task outcomes and distill lessons so the team improves across
   runs — report_outcome after each unit of work, retrospector handoffs at natural
-  boundaries, and applying injected lessons. Use in workflows that run repeatedly
+  boundaries, and recalling stored lessons. Use in workflows that run repeatedly
   over similar work items. Requires memory.learning_enabled; degrade silently when
   the tools report disabled.
 ---
@@ -11,7 +11,7 @@ description: Report task outcomes and distill lessons so the team improves acros
 
 CAO workflows can improve as they repeat: outcomes you report feed a
 retrospector agent that distills durable lessons into memory, and those
-lessons reach future sessions automatically. Your job depends on your role.
+lessons are stored in memory for later sessions to recall. Your job depends on your role.
 
 All of this is opt-in infrastructure. **If `report_outcome` or a memory tool
 returns `disabled: true`, skip it silently and continue your task** — learning
@@ -66,17 +66,21 @@ your run log. If no retrospector profile is available, skip this step.
 
 ### Pass lessons downstream
 
-Your injected `<cao-memory>` block may contain lessons from previous runs.
-When a lesson's `Applies when:` clause matches the task you are delegating,
-include it in your handoff message — workers also receive their own
-agent-scope lessons, but your routing helps.
+Lessons are stored in agent scope, and the `<cao-memory>` block injected into
+a new session does not include agent scope, so it won't show them. If you
+`memory_recall` lessons from previous runs and a lesson's `Applies when:`
+clause matches the task you are delegating, include it in your handoff
+message — a worker only sees its own agent-scope lessons if it recalls them
+or has them promoted into its profile.
 
 ## If you are a WORKER
 
-1. **Apply injected lessons first.** Before working, scan your `<cao-memory>`
-   block and any `## Learned Patterns` section of your own instructions for
-   lessons whose `Applies when:` clause matches the current task. Apply them
-   before falling back to first principles.
+1. **Look up lessons first.** Lessons are not injected into your session.
+   Before working, run `memory_recall` for the task and scan your own
+   instructions for a `## Learned Patterns` section (present only after an
+   operator has promoted lessons), looking for lessons whose `Applies when:`
+   clause matches the current task. Apply them before falling back to first
+   principles.
 2. **Store new lessons immediately** when you discover something durable — a
    mapping that works, a trap that recurs, a tooling quirk:
 
@@ -110,10 +114,15 @@ and often correct answer.
 
 ## What happens to lessons afterwards
 
-- Lessons are ordinary agent-scope memories: injected into future sessions,
-  recalled on demand (each recall reinforces them), lint-checked for
-  contradictions, audited.
-- An operator may promote reinforced lessons into your profile's
-  `## Learned Patterns` block with `cao memory promote` — that block is
+- Lessons are ordinary agent-scope memories. They are not injected into new
+  sessions; an agent sees them by calling `memory_recall`. Each recall that
+  returns a lesson adds to its `access_count` (at most once a minute per
+  lesson). They are also lint-checked for contradictions and audited.
+  Lessons are filed under the profile name, so an ephemeral agent, whose name
+  is generated for each launch, will not find lessons stored for an earlier one.
+- Nothing is promoted on its own. Only when an operator runs
+  `cao memory promote <agent> --apply` (and has turned on
+  `instruction_promotion_enabled`) are lessons recalled at least 3 times copied
+  into your profile's `## Learned Patterns` block — that block is
   CAO-maintained; treat its contents as instructions, and don't edit it
   by hand.
