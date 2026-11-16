@@ -3,6 +3,7 @@
 import asyncio
 import os
 import threading
+import time
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -880,23 +881,39 @@ class TestCreateTerminal:
         mock_log_dir.__truediv__.return_value = mock_log_path
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
         memory_calls = []
+        heartbeat_ticks = 0
+        ticks_during_lookup = []
+
+        async def heartbeat():
+            nonlocal heartbeat_ticks
+            while not ticks_during_lookup:
+                heartbeat_ticks += 1
+                await asyncio.sleep(0)
+
+        def slow_memory_owner(terminal_id, task_description=""):
+            before = heartbeat_ticks
+            time.sleep(0.1)
+            ticks_during_lookup.append(heartbeat_ticks - before)
+            memory_calls.append((terminal_id, task_description))
+            return "<cao-memory>start memory</cao-memory>"
+
         monkeypatch.setattr(
             terminal_service,
             "memory_context_for_terminal",
-            lambda terminal_id, task_description="": memory_calls.append(
-                (terminal_id, task_description)
-            )
-            or "<cao-memory>start memory</cao-memory>",
+            slow_memory_owner,
         )
         terminal_service._memory_injected_terminals.discard("test1234")
 
         try:
+            heartbeat_task = asyncio.create_task(heartbeat())
+            await asyncio.sleep(0)
             await create_terminal(
                 provider_name,
                 "developer",
                 new_session=True,
                 inject_memory_at_start=True,
             )
+            await heartbeat_task
 
             skill_prompt = mock_provider._skill_prompt
             assert skill_prompt == (
@@ -910,6 +927,7 @@ class TestCreateTerminal:
                 "- **python-testing**: Pytest conventions"
             )
             assert memory_calls == [("test1234", "")]
+            assert ticks_during_lookup[0] > 0
             assert (
                 terminal_service.inject_memory_context("orchestrated task", "test1234")
                 == "orchestrated task"

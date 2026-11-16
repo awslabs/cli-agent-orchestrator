@@ -3411,7 +3411,9 @@ async def _create_terminal_unguarded(
             and provider in RUNTIME_SKILL_PROMPT_PROVIDERS
             and initial_message is None
         ):
-            provider_instance._skill_prompt = _memory_start_prompt(skill_prompt, terminal_id)
+            provider_instance._skill_prompt = await asyncio.to_thread(
+                _memory_start_prompt, skill_prompt, terminal_id
+            )
 
         # The provider owns the helper's home now: its cleanup removes it.
         ephemeral_state.kiro_home = None
