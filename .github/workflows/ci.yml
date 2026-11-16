@@ -324,6 +324,10 @@ jobs:
   cao-mcp-apps-e2e:
     name: CAO MCP Apps E2E (Playwright)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Playwright's pinned image (the @playwright/test version the job uses): the browsers
+    # and their system libraries are already in it, so no apt install runs here.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble
 
     # E2E tier budget (Requirement 20.3): 60s per test (enforced in
     # playwright.config.ts via `timeout: 60_000`).
@@ -335,15 +339,19 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node.js
+        timeout-minutes: 10
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
 
       - name: Install MCP-apps deps
+        timeout-minutes: 10
         run: npm ci
         working-directory: cao_mcp_apps
 
       - name: Install Playwright browser (chromium)
+        # The image has the browser; this only confirms it. No apt step.
+        timeout-minutes: 10
         run: npm run test:e2e:install
         working-directory: cao_mcp_apps
 
@@ -413,37 +421,48 @@ jobs:
   ag-ui-demo:
     name: AG-UI demo (shift-left recording)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Playwright's pinned image (the @playwright/test version the job uses): the browsers
+    # and their system libraries are already in it, so no apt install runs here.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
+        timeout-minutes: 10
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
       - name: Set up Python
+        timeout-minutes: 10
         run: uv python install 3.12
 
       - name: Install dependencies (cao-server for the live AG-UI surface)
+        timeout-minutes: 10
         run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js
+        timeout-minutes: 10
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
 
-      - name: Install ffmpeg (GIF export)
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
       - name: Install recorder deps
+        timeout-minutes: 10
+        # ffmpeg (GIF export) is the ffmpeg-static npm binary, so no apt install.
         run: npm ci
         working-directory: examples/ag-ui/ag-ui-eventsource-viewer/tools
 
       - name: Install Playwright browser (chromium)
+        timeout-minutes: 10
         run: npm run playwright:install
         working-directory: examples/ag-ui/ag-ui-eventsource-viewer/tools
+
+      - name: Remove the committed GIF (the upload must see only this run's GIF)
+        run: rm -f docs/media/ag-ui-eventsource-viewer-demo.gif
 
       - name: Record demo (renders the six components + refusal; gates on drift)
         # The recorder boots a CAO_AGUI_ENABLED cao-server + a static server,
@@ -454,45 +473,56 @@ jobs:
         working-directory: examples/ag-ui/ag-ui-eventsource-viewer/tools
 
       - name: Upload demo GIF artifact
+        # The recorder's exit code (CI=true) is the gate. The committed GIF is removed above,
+        # so the artifact is always this run's recording and a missing GIF fails here too.
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ag-ui-eventsource-viewer-demo
           path: docs/media/ag-ui-eventsource-viewer-demo.gif
-          if-no-files-found: warn
-        continue-on-error: true
+          if-no-files-found: error
 
   ag-ui-construct-demos:
     name: AG-UI construct demos (shift-left recordings)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Playwright's pinned image (the @playwright/test version the job uses): the browsers
+    # and their system libraries are already in it, so no apt install runs here.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
+        timeout-minutes: 10
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
       - name: Set up Python
+        timeout-minutes: 10
         run: uv python install 3.12
 
       - name: Install dependencies (constructs + examples run under uv)
+        timeout-minutes: 10
         run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js
+        timeout-minutes: 10
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
 
       - name: Install recorder deps
+        timeout-minutes: 10
         # ffmpeg is provided by the ffmpeg-static npm package (gif-capable), so
         # no apt install is needed here.
         run: npm ci
         working-directory: examples/ag-ui/ag-ui-construct-demos/tools
 
       - name: Install Playwright browser (chromium)
+        timeout-minutes: 10
         run: npm run playwright:install
         working-directory: examples/ag-ui/ag-ui-construct-demos/tools
 
@@ -516,34 +546,47 @@ jobs:
   agent-plugins-dogfood:
     name: Agent Plugins dog-food (shift-left recording)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Playwright's pinned image (the @playwright/test version the job uses): the browsers
+    # and their system libraries are already in it, so no apt install runs here.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble
+    env:
+      # run.sh's JSON assertions use this interpreter; uv sync above creates it.
+      CAO_DOGFOOD_PYTHON: ${{ github.workspace }}/.venv/bin/python
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
+        timeout-minutes: 10
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
       - name: Set up Python
+        timeout-minutes: 10
         run: uv python install 3.12
 
       - name: Install dependencies (cao runs the dog-food pipeline under uv)
+        timeout-minutes: 10
         run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js
+        timeout-minutes: 10
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
 
       - name: Install recorder deps
+        timeout-minutes: 10
         # ffmpeg is provided by the ffmpeg-static npm package (gif-capable), so
         # no apt install is needed here.
         run: npm ci
         working-directory: examples/agent-plugins/agent-plugins-dogfood/tools
 
       - name: Install Playwright browser (chromium)
+        timeout-minutes: 10
         run: npm run playwright:install
         working-directory: examples/agent-plugins/agent-plugins-dogfood/tools
 
@@ -597,7 +640,13 @@ jobs:
 
       - name: Install tmux (the CAO Dojo trace check launches mock_cli terminals)
         # Not assumed on the runner image: ubuntu-latest is moving to a new release.
-        run: command -v tmux || (sudo apt-get update && sudo apt-get install -y tmux)
+        # apt retries with a short per-request timeout; the step bound fails a stalled mirror fast.
+        timeout-minutes: 5
+        run: |
+          command -v tmux || {
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y --no-install-recommends tmux
+          }
 
       - name: Install the pinned @ag-ui/client from the lockfile
         # Before run.sh, so run.sh finds node_modules and skips its unlocked
@@ -647,6 +696,9 @@ jobs:
   ag-ui-operator-dashboard:
     name: AG-UI operator dashboard
     runs-on: ubuntu-latest
+    # Playwright's pinned image (the @playwright/test version the job uses): the browsers
+    # and their system libraries are already in it, so no apt install runs here.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble
     # Bounds a hung e2e: the job normally takes a few minutes.
     timeout-minutes: 15
     defaults:
@@ -656,26 +708,35 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # The keyless e2e drives real mock_cli terminals, which need tmux.
-      # Explicit, so the job does not depend on the runner image shipping tmux (ubuntu-latest, now ubuntu-26.04, does).
+      # The keyless e2e drives real mock_cli terminals, which need tmux. The Playwright
+      # image does not ship it, so the step below installs it (bounded, see its comment).
       - name: Install tmux
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
+        # apt runs as root (the image has no sudo), with retries and a short per-request
+        # timeout; the step has its own time bound, so a stalled mirror fails fast.
+        timeout-minutes: 5
+        run: |
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y --no-install-recommends tmux
 
       - name: Install uv
+        timeout-minutes: 10
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
       - name: Set up Python
+        timeout-minutes: 10
         run: uv python install 3.12
 
       - name: Install dependencies (cao-server + agui run plane)
+        timeout-minutes: 10
         working-directory: .
         run: uv sync --locked --all-extras --dev
 
       # Node 22: the e2e runs e2e/e2e.ts with --experimental-strip-types.
       - name: Set up Node.js
+        timeout-minutes: 10
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
@@ -683,6 +744,7 @@ jobs:
           cache-dependency-path: examples/ag-ui/ag-ui-operator-dashboard/package-lock.json
 
       - name: Install app dependencies (exact pins, install scripts off)
+        timeout-minutes: 10
         run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Dependency checks
@@ -710,6 +772,7 @@ jobs:
       # install scripts off, so the browser is an explicit step, as in the AG-UI
       # eventsource viewer's recorder job.
       - name: Install Playwright browser (chromium)
+        timeout-minutes: 10
         run: npm run playwright:install
 
       - name: Keyless e2e (cao-server + mock_cli terminals) and the timeline screenshot

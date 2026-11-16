@@ -30,3 +30,32 @@ tmux pipe-pane -o -t cao-omp-fixtures 'tee -a /tmp/cao-omp-fixtures/omp-raw.log'
 The saved copies replace account/model identity, local paths, token usage, and
 terminal title data with neutral values. They retain only UI markers, prompts,
 responses, and cursor-control sequences relevant to provider detection.
+
+## OMP 18.x captures
+
+`omp18_*.txt` were captured from a live `omp/18.20.0` interactive session on
+2026-11-15 with `tmux capture-pane -e -p` (160x48), using the same prompts as
+above plus a bash-tool prompt (`sleep 12`) for the tool-running state. OMP 18
+changed the TUI in three ways the provider has to tolerate alongside 17.x:
+
+- The working row leads with the Escape keycap and is followed by the verb or
+  the current tool intent: `⎋ Working…`, `⎋ Run requested delay` (17.x:
+  `Working… ⟨esc⟩`, `Running … ⟨esc⟩`). The spinner and elapsed time moved to
+  the status row.
+- The status row is `╭── π > … ╮` with `composer.shape: box`, and an unframed
+  ` π > … ` row over a bare `╰─` with the default `composer.shape: band`
+  (17.x: `╭── OMP session … ╮` over `╰─ … ─╯`).
+- The user-turn background comes from the theme: `48;2;15;18;22` under the
+  default `titanium` theme (17.2.10 capture: `48;2;5;5;5`).
+
+| Fixture | Captured state |
+| --- | --- |
+| `omp18_box_processing.txt` | Model generation, box composer |
+| `omp18_box_completed.txt` | Completed response, box composer |
+| `omp18_band_idle.txt` | Fresh session, default band composer |
+| `omp18_band_processing.txt` | Model generation, band composer |
+| `omp18_band_tool_running.txt` | Bash tool running, band composer |
+| `omp18_band_completed.txt` | Completed response, band composer |
+
+Scrubbing: the working directory is replaced with `/tmp/cao-omp-fixtures`, the
+model name with `Model`, and the subscription marker is removed.

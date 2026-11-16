@@ -2125,7 +2125,7 @@ async def memory_recall(
 
     Returns content from matching wiki files, ranked by ``sort_by`` (default
     recency). When no scope is specified, results follow scope precedence:
-    session > project > global.
+    session > project > global > agent > federated.
 
     Use this to check if relevant knowledge already exists before asking the user.
     """
@@ -2462,8 +2462,8 @@ async def store_lesson(
     target_agent_profile: str = Field(
         description=(
             "Agent profile the lesson is for (e.g. 'transformer'). The lesson is "
-            "stored in THAT profile's agent scope so it reaches that agent's "
-            "future sessions."
+            "stored in THAT profile's agent scope; that agent finds it by calling "
+            "memory_recall (it is not injected into its sessions)."
         )
     ),
     content: str = Field(

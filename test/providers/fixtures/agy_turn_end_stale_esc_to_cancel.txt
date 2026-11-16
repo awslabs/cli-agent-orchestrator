@@ -1,0 +1,2371 @@
+[H[K
+  [38;5;153mx xxxxxxxxxxx xx xxxx xx [38;5;111mxxxx-xxx-xxxxxx[38;5;153m (xxxxxxxx x xx xxx xxx xxxx xxxxx), xxxxxxxxx xxxxxxxx xxxx-xxxx xx xxxxxxxxxxx, xxx xx [6b[m[K
+  [38;5;153mxxxxxxxx xx xxx x xxxxxxxx xxxx.[103X[m
+[K
+[38;5;239m────────────────────────────────────────────────────────────[m[K
+[38;5;111;1m> <xxx-xxxxxx>[m[K
+[3`[38;5;111;1m## xxxxxxx xxxx xxx xxxxxx[m[K
+[3`[38;5;111;1m- [xxxxxxx] xxxx-xxxxxxxx-xxxxxx-xxxx: xx-xx xxxx x xxxxxxxx `xxxxxxxx` xxxxxxxx (`.xxxxxx/xxxxxxxxx/xxxxxxx-xxxxxxxx.xxx`): xxxxx xxxxxx[m
+[3`[38;5;111;1mxxx xxxxxxx xxxxx xx xxxxx xx `xxxxxxx/xxxxxxx-xxxxxxxx/xxxxxx.xxxx` (xxxxxx xx xxxxxxxxx), xx `xxxxxxx-xxxxxxxx:xxxx` xxxxx.[m
+[3`[38;5;111;1m`xxxxxx-xxxx-xxx.xx` xxx xxx xxx-xxxxxxx xxxxx xx xxx xxxxx xx. xxx `xxxx xx xxx xxxxxxx-xxxxxxxx:xxxx` xxxxxxx xxxx x xxxx xxxx xx xxxx;[m
+[3`[38;5;111;1mxxx xxxx xxxx xxxx xxxxxx xxx xxxxxx `xxxx xxxx`. xxx xxxx-xxxx `xxx-xx-xxx / xxxxxxx` xxxxxxx ("xxx xxx xxxxxxxxx xx xxxxxx/xx-xx") xx[m
+[3`[38;5;111;1mxxxxxxxxxxxxx xxx xxxxxxxx. xxxxxxx xxxx: xxxxxx xx xxxxxxxx x xxxxxx xxxxxxx xx xx-xx, xx xxxxxx xx xx-xx xx xxxxxx xxxx.[m[K
+[3`[38;5;111;1m- [xxxxxx] xxxxxx-xxxx-xxxxxxx-xxxxx-xxxxx-xxxx-xxxxxxxxx: xxx xx #xxxx xxxxx xxxx: xxx `xxxx/xxx_xxxxxx/xxxx_xxxx_xxxxxxx_xxxxx.xx`[m
+[3`[38;5;111;1mxxxxx-xxxx xxxxxxxxx xx xxxxxxxxx xxx xxx xxxx xx xxxx xxxxxxxx xx xxxxx, xxxxxxx #xxxx xxxxx xxxx xxxx. xxx xxxxxxx xxxxx xx xxxx: xxx[m
+[3`[38;5;111;1m`xx xx xxxxx xxxx --xxxx` xxx xxxx xxx xxx-xxxx xxxxxxxxxx (xxxxxxxx) xxxxxx xx-xxxxxxx xxxxxxxx. xxxxxxx xxxx: xx xxxxx xx #xxxx xxxxx[m
+[3`[38;5;111;1mxxx xxxxxx xxxx xxxxxxxx+.[m[K
+[3`[38;5;111;1m- [xxxxxx] xxx-xxxx-xxxx-xxxxx-xxx-xxxx: xx xxx xxxxx, "xxxx" xxxxx xxx xxx xxxx xxxx xx xxxxxxx xxxx xx xxx. x xxxx xxxx xxxxx xxxxxxx[m
+[3`[38;5;111;1mxxxxx xxxxxxxxxx, xxx xxx xxx'x xxxxxxx xxxxx xxxxxxxx xx xx; xxxx xxxx xxxxxxx x xxxx xxx xxxxx xx xxxxxxx. xxx xxxxxxxxxx xxx xxx[m
+[3`[38;5;111;1mxxxxxxxxx'x xxxxxxx xxxxx xxx xxxxxx xxxxxx xxx xxxx x xxxxxxx. xxxxxxx xxxx: xxxx xx xx xxxx, xx xxxxxxx xx xxxxxxxxx xx xx xxxx xxxxxxx[m
+[3`[38;5;111;1mxxxx xx xx.[m
+[3`[38;5;111;1m</xxx-xxxxxx>[m
+[3`[K
+[38;5;111;1mxxxx-xxx -> xxxx-xxx-xxxxxx. xxxxx x, xxxx xx. xxxx xxxx_xxxxx("xxx-xxxxxx-xxxxxxxxx") xxx xxxxxxx xxx xxxxxxx: xxxxx[m[K
+[3`[38;5;111;1mxxx-xxxxxx-xxxxxxxxx xx <xxx xxxxx xxxxxxx, xxxxxx xxxxxxx>.[m
+[38;5;111;1m  xxxxx: xxx xxxxx xxxx xx xxxx xxxxx xx xxxx-xxxx xxxxxxxx xxxxxxxxx xx xxxxxxxxx. xxxx xxxxx xxx xxxxx xx xxx xxx xxxxxxx xx.[m
+[38;5;111;1m  xxxxx xxxx xxxx_xxxxxxx (xx xxxxxxxx_xx). xxxx xxx xxxx xxxx xxx xx xxxxxxx xxxx: xx xxxxxxx, xx xxxxxxxx. xxxx xxxx xxxxxxx xxxx xx xxxx[m
+[38;5;111;1m  xxxxxx xx xxxxx xx xxxxxxx xxx xxxx xx x xxxx xxxxxx.[m
+[38;5;111;1m  [m[K
+[38;5;111;1m  [xxxxxxx xxxx xxxxxxxx xxxxxxxx. xxx xxxx_xxxxxxx xxx xxxx xxx xxx xxxxxx-xx xxxx.][m[K
+⡿  [38;5;110mxxxxxxx...[m[4B[38;5;110mesc to cancel[m[32;3H[?25h[?25l[2A [38;5;111mxx[38;5;110mx[m
+
+[3`[?25h[?25l[30;6H[38;5;111mxx[38;5;110mx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣾ 
+
+[?25h[?25l[2A⣷  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A [38;5;110mxxxx[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣯ 
+
+[?25h[?25l[2A⣟  [38;5;110mxxxxxxx..[m
+
+[3`[?25h[?25l[2A⡿ 
+
+[?25h[?25l[2A⢿  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxx[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;111mxx[m
+
+[?25h[?25l[2A⣯  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;111mx[m
+
+[?25h[?25l[2A⣻  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxx[38;5;111mx...[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣾  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣷ 
+
+[?25h[?25l[2A⣯  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⢿ 
+
+[?25h[?25l[2A⣻  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxx[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx..[m
+
+[3`[?25h[?25l[2A⣷ 
+
+[?25h[?25l[2A⣯  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxx[38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;111mxx[m
+
+[?25h[?25l[2A⣽  [38;5;110mxxx[38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;111mxx[m
+
+[?25h[?25l[2A⣟  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⡿  [38;5;110mxxxxxx[38;5;111mx...[m
+
+[3`[?25h[?25l[30;10H[38;5;110mx[38;5;111m.[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣻ 
+
+[?25h[?25l[2A⣽  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣯ 
+
+[?25h[?25l[2A⣟  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣻ 
+
+[?25h[?25l[2A⣽  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxx[38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxx[38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;111mxx[m
+
+[?25h[?25l[2A⣾  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[30;5H[38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;111mx[m
+
+[?25h[?25l[2A⡿  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣽ 
+
+[?25h[?25l[2A⣾  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣟ 
+
+[?25h[?25l[2A⡿  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxx[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣟ 
+
+[?25h[?25l[2A⡿  [38;5;111mxx[m
+
+[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[30;6H[38;5;111mxx[38;5;110mx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;111mx[m
+
+[?25h[?25l[2A⣷  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⡿ 
+
+[?25h[?25l[2A⢿  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣾ 
+
+[?25h[?25l[2A⣷  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxx[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxx[38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣷  [38;5;111mxx[m
+
+[?25h[?25l[2A⣯  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;111mx[m
+
+[?25h[?25l[2A⣻  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;111mx[m
+
+[?25h[?25l[2A⣯  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A [38;5;110mx'x xxxxxxxx xxxxxxx xxx x[38;5;111mx xxx[38;5;110mxxxxx xxxx....[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mx'x xxxxxxxx xxxxxxx xx[38;5;111mx xx [38;5;110mxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mx'x xxxxxxxx [38;5;111mxxxxx[38;5;110mxx xxx xx [m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mx'x[38;5;111m xxxx[38;5;110mxxxx xxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mx'x xxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mx[38;5;111m'x xx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mx'x xxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mx'x xxxxxxxx xxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[1;29r[29;1H[4S[;r[27;1H[38;5;110mx'x xxxxxxxx xxxxxxx[38;5;111m xxx [38;5;110mxx xxxxxxxx xxxx.[38;5;146m  (xxx)[m
+
+[38;5;179m●[m [38;5;179;1mxxxx[38;5;146;22m(~/.xxxxxx/xxxxxxxxxxx-xxx/xxx/xxx-xxx-xxxxxx-xxxxxxxx/xxxx_xxxxx.xxxx)[m [38;5;146m(xxxx+x xx xxxxxx)[m[30;26H[38;5;110mxx [38;5;111mxx xx[m
+
+[3`[?25h[?25l[30;29H[38;5;110mxx xx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mx'x xxxxxxxx xxxxxxx xxx xx xxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[30;36H[38;5;110mxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[30;38H[38;5;110mxx xxx[38;5;111mx....[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mx'x xxxxxxxx xxxxxxx xxx xx xxxxxxxx xxxx.[m
+
+[3`[?25h[?25l[3A[38;5;179m○[m [30;46H[38;5;110m..[38;5;111m.[m
+
+[3`[?25h[?25l[30;48H[38;5;110m.[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mx'x xxxxxxxx xxxxxxx xxx xx xxxxxxxx xxxx.[38;5;111m...[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[1;28r[28;1H
+[;r[26;21H[38;5;110m xxx [m
+
+[38;5;179m○[m [38;5;179;1mxxxx[38;5;146;22m(~/.xxxxxx/xxxxxxxxxxx-xxx/xxx/xxx-xxx-xxxxxx-xxxxxxxx/xxxx_xxxxx.xxxx)[m[29;62H[38;5;146mxxxx_xxxxxxx.xxxx)[m [38;5;146m(xxxx+x xx xxxxxx)[m[30;44H[38;5;111mx..[m
+
+[3`[?25h[?25l[30;38H[38;5;111mxx xx[38;5;110mxx....[m
+
+[3`[?25h[?25l[6A[38;5;111mx'x x[38;5;110mxxxxxxx xxxxxxx xxx xx xxxxxxxx xxxx.[38;5;146m  (xx[m[4B⢿  [38;5;110mx'x xxxxxxxx xxxxxxx xxx xx xxxxx[38;5;111mxxx x[38;5;110mx[m
+
+[3`[?25h[?25l[1;29r[29;1H
+[;r[28;81H[K
+[38;5;179m○[m [38;5;179;1mxxxx[38;5;146;22m(~/.xxxxxx/xxxxxxxxxxx-xxx/xxx/xxx-xxx-xxxxxx-xxxxxxxx/xxxx_xxxxx.xxxx)[m [38;5;146m(xxxx+x xx xxxxxx)[m[30;34H[38;5;111mxxxxx[38;5;110mx x[m
+
+[3`[?25h[?25l[1;25r[25;1H[2S[;r[25;28r[28;1H
+[;r[23;1H[38;5;146m▸ xxxxxxx xxx xxx, xxx xxxxxx[m[K
+[38;5;146m  x'x xxxxxxxx xxxxxxx xxx xx xxxxxxxx xxxx.[m[4B[38;5;179m○[m [38;5;179;1mxxxx[38;5;146;22m(~/.xxxxxx/xxxxxxxxxxx-xxx/xxx/xxx-xxx-xxxxxx-xxxxxxxx/xxxx_xxxxx.xxxx)[m[29;62H[38;5;146mxxxx_xxxxxxx.xxxx)[m [38;5;146m(xxxx+x xx xxxxxx)[m
+[4`[38;5;111mxxxxx[38;5;110mxx xxxx...[m[K
+
+[3`[?25h[?25l[2A⣻  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[6A[38;5;149m●[m 
+[38;5;179m●[m 
+[38;5;179m●[m 
+[38;5;179m●[m 
+[5`[38;5;110mxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[5A[38;5;149m●[m [30;11H[38;5;110m xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx[m
+
+[3`[?25h[?25l[4A[38;5;149m●[m [30;16H[38;5;110m...[m
+
+[3`[?25h[?25l[2A⣷ 
+
+[?25h[?25l[3A[38;5;149m●[m 
+
+
+[?25h[?25l[2A⣯  [38;5;111mx[m
+
+[?25h[?25l[2A⣟  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽ 
+
+[?25h[?25l[2A⣾  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx..[m
+
+[3`[?25h[?25l[2A⡿ 
+
+[?25h[?25l[2A⢿  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[30;17H[38;5;110m.[38;5;111m.[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣷  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;111mxx[m
+
+[?25h[?25l[2A⣾  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;111mx[m
+
+[?25h[?25l[2A⢿  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷ 
+
+[?25h[?25l[2A⣯  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⢿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣻ 
+
+[?25h[?25l[2A⣽  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;111mxx[m
+
+[?25h[?25l[2A⣯  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;111mx[m
+
+[?25h[?25l[2A⣽  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣷  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟ 
+
+[?25h[?25l[2A⡿  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣾ 
+
+[?25h[?25l[2A⣷  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;111mxx[m
+
+[?25h[?25l[2A⡿  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⢿  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;111mx[m
+
+[?25h[?25l[2A⣷  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿ 
+
+[?25h[?25l[2A⣻  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣯ 
+
+[?25h[?25l[2A⣟  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;111mxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣷  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;111mxx[m
+
+[?25h[?25l[2A⣻  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;111mx[m
+
+[?25h[?25l[2A [38;5;110mxxx xxxxxx xxxx xxxxxxxxxxx xxxxxxxx x xxxxxxxx xx xxxxxxxx. xxx xxxx xx xx xxxxxxxxx xxx xxxxxxx xxxxxxxx xx. xxxxxxxxx xxxxxxxxx xxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxx xxxxxx x[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxx xxxxxx xxxx xxxxxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxx xxxxxx xxxx xxxxxxxxxxx xxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxx xxxxxx xxxx xxxxxxxxxxx xxxxxxxx x xxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxx xxxxxx xxxx xxxxxxxxxxx xxxxxxxx x xxxxxxxx xx xx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxx xxxxxx xxxx xxxxxxxxxxx xxxxxxxx x xxxxxxxx xx xxxxxxxx. xx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A [38;5;110mxxxxxxx xxxxx xx xx xxxxxxxxxxx xxx xxxxxx xxxxxxxx xx, xxxxxxxxxx x xx[38;5;111mxxxxx[38;5;110mx xxxxxxx xxxxxxxxx xxxxxxxxxx. xxx xxxxxxxx xxxx xxx xx x[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxxx xx xx xxxxxxxxxxx xxx xxxxxx xxxxxxxx xx, xxxxxxxxxx x xxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxxx xx xx xxxxxxxxxxx xxx xxxxxx xxxxxxxx xx, xxxxxxxxxx x xxxxxxxx xxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxxx xx xx xxxxxxxxxxx xxx xxxxxx xxxxxxxx xx, xxxxxxxxxx x xxxxxxxx xxxxxxx xxxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[30;97H[38;5;110mxx xxxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxxx xx xx xxxxxxxxxxx xxx xxxxxx xxxxxxxx xx, xxxxxxxxxx x xxxxxxxx xxxxxxx xxxxxxxxx xxxxxx[38;5;111mxxxx.[m
+
+[3`[?25h[?25l[1;29r[29;1H[4S[;r[27;1H[38;5;110mxxxxxxx xxxxx xx xx x[38;5;111mxxxxx[38;5;110mxxxxx xxx xxxxxx xxxxxxxx xx, xxxxxxxxxx x xxxxxxxx xxxxxxx xxxxxxxxx xxxxxxxxxx. xxx xxxxxxxx xxxx xxx...[38;5;146m  (xxx)[m
+
+[38;5;179m○[m [38;5;179;1mxxxx[38;5;146;22m(~/.xxxxxx/xxxxxxxxxxx-xxx/xxx/xxx-xxx-xxxxxx-xxxxxxxx/xxxx_xxxxxxxx.xxxx)[m [38;5;146m(xxxx+x xx xxxxxx)[m
+[6C[38;5;110mxxxx. [38;5;111mxxx x[m
+
+[3`[?25h[?25l[30;112H[38;5;110mx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[1;26r[26;1H
+[;r[26;1H[38;5;146m▸ xxxxxxx xxx xxx, xxx xxxxxx[m
+[38;5;146m  xxxxxxx xxxxx xx xx xxxxxxxxxxx xxx xxxxxx xxxxxxxx xx, xxxxxxxxxx x xxxxxxxx xxxxxxx xxxxxxxxx xxxxxxxxxx. xxx xxxxxxxx xxxx xxx xx x...[m
+
+[38;5;179m●[m 
+⣻  [38;5;110mxxxxxxx xxxxx xx xx xxxxxxxxxxx xxx xxxxxx xxxxxxxx xx, xxxxxxxxxx x xxxxxxxx xxxxxxx xxxxxxxxx xxxxxxxxxx. xxx x[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[1;28r[28;1H
+[;r[28;1H[38;5;179m●[m [38;5;179;1mxxxx[38;5;146;22m(~/.xxxxxx/xxxxxxxxxxx-xxx/xxx/xxx-xxx-xxxxxx-xxxxxxxx/xxxx_xxxxxxxx.xxxx)[m[29;53H[38;5;146mxxxxxxxx[m
+[4`[38;5;110mxxxxx[38;5;111mxx xx[38;5;110mxx...[m[K
+
+[3`[?25h[?25l[30;9H[38;5;110mxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[4A[38;5;149m●[m [30;13H[38;5;110mx[38;5;111mxx...[m
+
+[3`[?25h[?25l[30;14H[38;5;110mxx[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx..[m
+
+[3`[?25h[?25l[3A[38;5;149m●[m [30;18H[38;5;110m.[m
+
+[3`[?25h[?25l[2A⣷ 
+
+[?25h[?25l[2A [38;5;111mx[38;5;110mx[m
+
+[?25h[?25l[2A⣯  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;111mxx[m
+
+[?25h[?25l[2A⣾  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;111mx[m
+
+[?25h[?25l[2A⢿  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣷ 
+
+[?25h[?25l[2A⣯  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣻ 
+
+[?25h[?25l[2A⣽  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;111mxx[m
+
+[?25h[?25l[2A⣯  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣻  [38;5;111mx[m
+
+[?25h[?25l[2A⣽  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟ 
+
+[?25h[?25l[2A⡿  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣾ 
+
+[?25h[?25l[2A⣷  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[30;12H[38;5;110mx[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣯  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;111mxx[m
+
+[?25h[?25l[2A⡿  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;111mx[m
+
+[?25h[?25l[2A⣷  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[30;10H[38;5;110mx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿ 
+
+[?25h[?25l[2A⣻  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣯ 
+
+[?25h[?25l[2A⣟  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[30;8H[38;5;110mx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣻  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[30;6H[38;5;110mx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;111mx[m
+
+[?25h[?25l[2A⣟  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;111mx[m
+
+[?25h[?25l[2A⣾  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A [38;5;110mxxxxxxxx xxx xxxxxxxxxxxxx xxxxx xxxxxxx xx `xxx-xxx-xxxxxx-`[38;5;111m xxxx[38;5;110mxx xxx xxxxxxxxxxx xxxxxxx. xxx xxxxxxx xxxxx xx xx xxxxxxxx `xxx_xx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxxx xxx xxxxxxxxxxxxx xxxxx xxxxxxx xx `xxx-xxx-xxxx[38;5;111mxx-` [38;5;110mxxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣯  [38;5;110mxxxxxxxx xxx xxxxxxxxxxxxx xxxxx xxxxxxx xx `xx[38;5;111mx-xxx[38;5;110m-xxxxxx-` [m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxxx xxx xxxxxxxxxxxxx xxxxx xxxx[38;5;111mxxx x[38;5;110mx `xxx-xxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxxx xxx xxxxxxxxxxxxx [38;5;111mxxxxx[38;5;110m xxxxxxx x[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxxx xxx xxx[38;5;111mxxxxx[38;5;110mxxxxx xxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxx xx[38;5;111mxx xx[38;5;110mxxxx xxxxxxxxxx xxx xxxxxxxx xxxx xxxx. xxxxxxx xxxx xxxx xxxx, xxxxx xxxx xxx `xxx_xxxxxx.xxxx` xxxxx xx xxx xxxx'x xxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;111mx[38;5;110mxx xxxx xx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxx xxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[30;12H[38;5;110m xxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxx xxxx xxxxxx xx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟
+
+[C[?25h[?25l[2A⡿  [38;5;110mxxx xxxx xxxxxx xxxxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[1;29r[29;1H[4S[;r[27;1H[38;5;110mxxx xxxx xxxxxx xxxxxxxxxx xxx xxxxxxxx xxxx xxxx. xxxxxxx[38;5;111m xxxx[38;5;110m xxxx xxxx, xxxxx xxxx xxx `xxx_xxxxxx.xxxx` xxxxx xx xxx xxxx'x x...[38;5;146m  (xxx)[m
+
+[38;5;179m●[m [38;5;179;1mxxxx[38;5;146;22m(/xxxxxxx/xxxxxxxxx/.xxx/xxxxx/xxxxxx/xxx-xxxx-xxxxx-xxxx-xxxx-xx-xx-xx.xx)[m [38;5;146m(xxxx+x xx xxxxxx)[m[30;32H[38;5;110mxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[30;34H[38;5;110m xxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxx xxxx xxxxxx xxxxxxxxxx xxx xxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[30;42H[38;5;110mx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[30;43H[38;5;110m xxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxx xxxx xxxxxx xxxxxxxxxx xxx xxxxxxxx xxxx xxxx[38;5;111m. xxx[m
+
+[3`[?25h[?25l[3A[38;5;179m○[m 
+
+
+[?25h[?25l[30;53H[38;5;110m. xxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[1;29r[29;1H
+[;r[26;32H[38;5;111mxxxxx[38;5;110mxxx xxxx xxxx. xxxxxxx xxxx[m[28;83H[K
+[38;5;179m○[m [38;5;179;1mxxxx[38;5;146;22m(/xxxxxxx/xxxxxxxxx/xxxx-xxxxxx/.xxxxxx/xxxxx/xxxxxx-xxxx-xx-xx/xxxxxxxxx-xxxxx.xx)[m [38;5;146m(xxxx+x xx xxxxxx)[m
+⣽  [38;5;110mxxx xxxx xxxxxx xxxxxxxxxx xxx xxxxxxxx xxxx xxxx. xxxxxxx [38;5;111mxxxx [m
+
+[3`[?25h[?25l[30;63H[38;5;110mxxxx [38;5;111mxxxx [m
+
+[3`[?25h[?25l[26;20H[38;5;111mxxxxx[38;5;110mxx xxx xxxxxxxx xxxx xxxx. xxxxxxx xxxx xxxx xxxx, xxxxx xxxx xxx `xxx_xxxxxx.xxxx` xxxxx xx xxx xxxx'x x...[38;5;146m  (xx[m[4B⣾  [38;5;110mxxx xxxx xxxxxx xxxxxxxxxx xxx xxxxxxxx xxxx xxxx. xxxxxxx xxxx xxxx [38;5;111mxxxx,[m
+
+[3`[?25h[?25l[1;29r[29;1H
+[;r[28;91H[K
+[38;5;179m○[m [38;5;179;1mxxxx[38;5;146;22m(~/.xxxxxx/xxxxxxxxxxx/xxx_xxxxxx.xxxx)[m [38;5;146m(xxxx+x xx xxxxxx)[m[30;73H[38;5;110mx[38;5;111mxxx, [m
+
+[3`[?25h[?25l[30;74H[38;5;110mx[38;5;111mxx, x[m
+
+[3`[?25h[?25l[1;24r[24;1H
+[;r[24;1H[38;5;146m▸ xxxxxxx xxx xxx, xxx xxxxxx[m
+[38;5;146m  xxx xxxx xxxxxx xxxxxxxxxx xxx xxxxxxxx xxxx xxxx. xxxxxxx xxxx xxxx xxxx, xxxxx xxxx xxx `xxx_xxxxxx.xxxx` xxxxx xx xxx xxxx'x xxxxxx...[m[30;75H[38;5;110mxx,[38;5;111m xxxx[m
+
+[3`[?25h[?25l[1;30r[30;1H
+[;r[28;47H[K
+[38;5;179m○[m [38;5;179;1mxxxx[38;5;146;22m(~/.xxxxxx/xxxxxxxxxxx-xxx/xxx_xxxxxx.xxxx)[m [38;5;146m(xxxx+x xx xxxxxx)[m[K
+⣾  [38;5;110mxx[38;5;111mxxxxx[38;5;110m xxxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[6A[38;5;149m●[m 
+[38;5;179m●[m 
+[38;5;179m●[m 
+[38;5;179m●[m 
+[7`[38;5;110mxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[30;17H[38;5;110m.[38;5;111m.[m
+
+[3`[?25h[?25l[5A[38;5;149m●[m [30;18H[38;5;110m.[m
+
+[3`[?25h[?25l[2A⡿ 
+
+[?25h[?25l[4A[38;5;149m●[m 
+[38;5;179m○[m 
+
+
+[?25h[?25l[2A⢿  [38;5;111mxx[m
+
+[?25h[?25l[3A[38;5;210m●[m 
+[6`[38;5;111mxx[38;5;110mx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣽  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;111mx[m
+
+[?25h[?25l[2A⣟  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽ 
+
+[?25h[?25l[2A⣾  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⡿ 
+
+[?25h[?25l[2A⢿  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;111mxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣟  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;111mxx[m
+
+[?25h[?25l[2A⣾  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;111mx[m
+
+[?25h[?25l[2A⢿  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷ 
+
+[?25h[?25l[2A⣯  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣻ 
+
+[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣽  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;111mxx[m
+
+[?25h[?25l[2A⣯  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;111mx[m
+
+[?25h[?25l[2A⣽  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣟ 
+
+[?25h[?25l[2A⡿  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣾ 
+
+[?25h[?25l[2A⣷  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx..[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣽  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;111mx[m
+
+[?25h[?25l[2A⣷  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;111mx[m
+
+[?25h[?25l[2A⣻  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣯ 
+
+[?25h[?25l[2A⣟  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A [38;5;110mxxx xxxxxxxxxxxxx xxxx xxxxxxx x xxxxxxx xxxxxxxxx xxxx xxxxxxxxx xxxxxx[38;5;111mxxx. [38;5;110mxxxxxxxxx xxx xxxxxxxxx xxxxxxxx x xxxxxxx xxxxxxx xxxxxx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxx xxxxxxxxxxxxx xxxx xxxxxxx x xxxxxxx xxxxxxxxx xxxx xxxxxxxxx xxxx[38;5;111mxxxxx[38;5;110m. [m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxx xxxxxxxxxxxxx xxxx xxxxxxx x xxxxxxx xxxxxxxxx xxxx xxxx[38;5;111mxxxxx[38;5;110m xxxxxxxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxx xxxxxxxxxxxxx xxxx xxxxxxx x xxxxxxx xxxxxxxxx[38;5;111m xxxx[38;5;110m xxxxxxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxx xxxxxxxxxxxxx xxxx xxxxxxx x xxxxxxx[38;5;111m xxxx[38;5;110mxxxxx xxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxx xxxxxxxxxxxxx xxxx xxxxxxx[38;5;111m x xx[38;5;110mxxxxx xxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣟  [38;5;110mxxx xxxxxxxxxxxxx xx[38;5;111mxx xx[38;5;110mxxxxx x xx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxx xxxxxx[38;5;111mxxxxx[38;5;110mxx xxxx xx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;111mxxx x[38;5;110mxxxxxxxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxx x[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxx [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxx xxxxxxxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxx xxxxxxxxxxxxx xxxx x[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxx xxxxxxxxxxxxx xxxx xxxxxxx x x[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxx xxxxxxxxxxxxx xxxx xxxxxxx x xxxxxxx xxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxx xxxxxxxxxxxxx xxxx xxxxxxx x xxxxxxx xxxxxxxxx xxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[30;8H[38;5;110mxxxxxxxx xx xxx xxx xxxxxx xxxxxxx xx xxx xxxxxxxxxxxxx x[38;5;111mx xxx[38;5;110mxxxxxxx, xxxxxxxxxx xxxxxxxxxxx xxx xxxxxxxx xxx xxx xxxxxxx. xxx xx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxx xxxxxxxx xx xxx xxx xxxxxx xxxxxxx xx xxx xxxxxxxxxxxxx xx x[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[30;68H[38;5;110mxxxxxxxxx[38;5;111m, xxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxx xxxxxxxx xx xxx xxx xxxxxx xxxxxxx xx xxx xxxxxxxxxxxxx xx xxxxxxxxxx,[38;5;111m xxxx[m
+
+[3`[?25h[?25l[1;29r[29;1H[5S[;r[26;1H[38;5;146m▸ xxxxxxx xxx xxx, xxx xxxxxx[m
+[38;5;146m  xxx xxxxxxxx xx xxx xxx xxxxxx xxxxxxx xx xxx xxxxxxxxxxxxx xx xxxxxxxxxx, xxxxxxxxxx xxxxxxxxxxx xxx xxxxxxxx xxx xxx xxxxxxx. xxx xx...[m
+
+[38;5;179m○[m [38;5;179;1mxxx-xxx-xxxxxx-xxxxxxxx/xxxx_xxxxx[38;5;146;22m({"xxxx":"xxx-xxxxxx-xxxxxxxxx"})[m [38;5;146m(xxxx+x xx xxxxxx)[m
+[4`[38;5;110mxxxxxxx xxx[38;5;111m xxxx[38;5;110m...[m[K
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[30;18H[38;5;110mxx[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[3A[38;5;179m●[m 
+⣷ 
+
+[?25h[?25l[2A [38;5;111mx[38;5;110mx[m
+
+[?25h[?25l[2A⣯  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣽ 
+
+[?25h[?25l[2A⣾  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿ 
+
+[?25h[?25l[2A⣻  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[3A[38;5;179m○[m 
+⣯  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟ 
+
+[?25h[?25l[3A[38;5;149m●[m 
+
+
+[?25h[?25l[2A⡿  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷ 
+
+[?25h[?25l[2A⣯  [38;5;111mxxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣟  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽ 
+
+[?25h[?25l[2A⣾  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿ 
+
+[?25h[?25l[2A⣻  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟ 
+
+[?25h[?25l[2A⡿  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣽  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷ 
+
+[?25h[?25l[2A⣯  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽ 
+
+[?25h[?25l[2A⣾  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿ 
+
+[?25h[?25l[2A⣻  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣟ 
+
+[?25h[?25l[2A⡿  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷ 
+
+[?25h[?25l[2A⣯  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽ 
+
+[?25h[?25l[2A⣾  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿ 
+
+[?25h[?25l[2A⣻  [38;5;111mxxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣽  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟ 
+
+[?25h[?25l[2A⡿  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷ 
+
+[?25h[?25l[2A⣯  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽ 
+
+[?25h[?25l[2A⣾  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣟  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿ 
+
+[?25h[?25l[2A⣻  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx x[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxx[38;5;111mxxxx [38;5;110mxxxxxxxxxxxx xx xxx xxxxxxxxxxxx xxxxxx xxx xxxxxx xxxxxxx xxx xxxx xxxxxxx x...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxxxxxxxxxxx [38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxxxxxxxxxxx xx xxx xx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxxxxxxxxxxx xx xxx xxxxxxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxxxxxxxxxxx xx xxx xxxxxxxxxxxx xxxxxx xx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxxxxxxxxxxx xx xxx xxxxxxxxxxxx xxxxxx xxx xxxxxx x[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxxxxxxxxxxx xx xxx xxxxxxxxxxxx xxxxxx xxx xxxxxx xxxxxxx xxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxxxxxxxxxxx xx xxx xxxxxxxxxxxx xxxxxx xxx xxxxxx xxxxxxx xxx xxxx xxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxxxxxxxxxxx xx xxx xxxxxxxxxxxx xxxxxx xxx xxxxxx xxxxxxx xxx xxxx xxxxxxx x[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxxxxxxxxxxx xx xxx xxxxxxxxxxxx xxxxxx xxx xxxxxx xxxxxxx xxx xxxx xxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxxxxxxxxxxx xx xxx xxxxxxxxxxxx xxxxxx xxx xxxxxx xxxxxxx xx[38;5;111mx xxx[38;5;110mx xxxxxxx [m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxxxxxxxxxxx xx xxx xxxxxxxxxxxx xxxxxx xxx xxxxxx [38;5;111mxxxxx[38;5;110mxx xxx xxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxxxxxxxxxxx xx xxx xxxxxxxxxxxx xxxxxx xx[38;5;111mx xxx[38;5;110mxxx xxxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣽  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxxxxxxxxxxx xx xxx xxxxxxxxxxxx[38;5;111m xxxx[38;5;110mxx xxx xxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxxxxxxxxxxx xx xxx xx[38;5;111mxxxxx[38;5;110mxxxxx xxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxxxxxxxxxxx[38;5;111m xx x[38;5;110mxx xxxxxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xx[38;5;111mxxxxx[38;5;110mxxxxx xx x[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x [38;5;111mxxxxx[38;5;110mxxx xxxxxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx x[38;5;111mxxxxx[38;5;110mxx x xxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx [38;5;111mxxx x[38;5;110mxxx xxxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxx xxxxxxxxxx xxx[38;5;111mxxxxx[38;5;110mx xx xxx x[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxx xxxx[38;5;111mxxxxx[38;5;110mx xxxxxxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;111mxxx [38;5;110mxxxxxxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxx [m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxx xx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxx xxxxxxxxxx x[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx x[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx [38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxxxxxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxx xxxxxxxxxx xxxxxxxxx xx xxx xxxx xxxxxxxx x xxxxxxxx xxxxxxxxxxxx xx xxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A [38;5;110mxxxxxxx xxxxxxxx xxxxxxxxx xxx xxxx xxxxxxxx x xxxxxxx xxxxxxxx xxxxxx, xxxxxxxxx x [38;5;111mxxxxx[38;5;110mxxx xxxxxx xxx xxxxx xxxxxxxxxx. xxx xxxxxxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxxxxxx xxxxxxxxx xxx xxxx xxxxxxxx x xxxxxxx xxxxxxxx xxxxxx, xxxxxxxxx x xx[38;5;111mxxxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣟  [38;5;110mxxxxxxx xxxxxxxx xxxxxxxxx xxx xxxx xxxxxxxx x xxxxxxx xxxxxxxx xxxxxx, xxxxxxxxx x xxxxxxxx xxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxxxxxx xxxxxxxxx xxx xxxx xxxxxxxx x xxxxxxx xxxxxxxx xxxxxx, xxxxxxxxx x xxxxxxxx xxxxxx xxx xx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxxxxxx xxxxxxxxx xxx xxxx xxxxxxxx x xxxxxxx xxxxxxxx xxxxxx, xxxxxxxxx x xxxxxxxx xxxxxx xxx xxxxx xxxxxx[38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxxxxxx xxxxxxxxx xxx xxxx xxxxxxxx x xxxxxxx xxxxxxxx xxxxxx, xxxxxxxxx x xxxxxxxx xxxxxx xxx xxxxx xxxxxxxxxx. xxx [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxxxxxx xxxxxxxxx xxx xxxx xxxxxxxx x xxxxxxx xxxxxxxx xxxxxx, xxxxxxxxx x xxxxxxxx xxxxxx xxx xxxxx xxxxxxxxxx. xxx xxxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxxxxxx xxxxxxxxx xxx xxxx xxxxxxxx x xxxxxxx xxxxxxxx xxxxxx, xxxxxxxxx x xxxxxxxx xxxxxx xxx xxxxx xxxxxxxxxx. xxx xxxxx[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxxxxxx xxxxxxxxx xxx xxxx xxxxxxxx x xxxxxxx xxxxxxxx xxxxxx, xxxxxxxxx x xxxxxxxx xxxxxx xxx xxxxx xxxxxxxxxx.[38;5;111m xxx [38;5;110mxxxxxxxx..[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxx xxxxxxxx xxxxxx xx xxxxxxxx xx `xxxx-xxxx`. xxx xxxxxxxxxxx xxxxxxxx xxxx xxxxxx xx xx xxx xxxx xxxxxxx xx [38;5;111mxxx x[38;5;110mxxxx xxxx xx xxx x[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxx xxxxxxxx xxxxxx xx xxxxxxxx xx `xxxx-xxxx`. xxx xxxxxxxxxxx xxxxxxxx xxxx xxxxxx xx xx xxx xxxx xx[38;5;111mxxxxx[38;5;110m xx xxx x[m
+
+[3`[?25h[?25l[30;105H[38;5;111mxxxxx[38;5;110mx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxx xxxxxxxx xxxxxx xx xxxxxxxx xx `xxxx-xxxx`. xxx xxxxxxxxxxx xxxxxxxx xxxx xxxxxx xx xx x[38;5;111mxx xx[38;5;110mxx xxxxxx[m
+
+[3`[?25h[?25l[30;95H[38;5;111mxxx x[38;5;110mx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxx xxxxxxxx xxxxxx xx xxxxxxxx xx `xxxx-xxxx`. xxx xxxxxxxxxxx xxxxxxxx xxxx xxxx[38;5;111mxx xx[38;5;110m xx xxx x[m
+
+[3`[?25h[?25l[1;29r[29;1H[4S[;r[27;1H[38;5;110mxxx xxxxxxxx xxxxxx xx xxxxxxxx xx `xxxx-xxxx`. xxx xxxxxxxxxxx xxxxxxxx xxxx xxxxxx xx xx xxx xxxx xxxxxxx xx xxx xxxxx xxxx xx...[38;5;146m  (xxx)[m
+
+[38;5;179m●[m [38;5;179;1mxxxx[38;5;146;22m(/xxxxxxx/xxxxxxxxx/xxxx-xxxxxx/.xxxxxx/xxxxx/xxxxxx-xxxx-xx-xx/xxxxxx-xxxxx.xx)[m [38;5;146m(xxxx+x xx xxxxxx)[m[30;81H[38;5;111m xxxx[38;5;110mxx xx[m
+
+[3`[?25h[?25l[30;77H[38;5;111mxxxx [38;5;110mxxxx[m
+
+[3`[?25h[?25l[1;28r[28;1H[2S[;r[25;1H[38;5;146m▸ xxxxxxx xxx xxx, xxx xxxxxx[m[K
+[38;5;146m  xxx xxxxxxxx xxxxxx xx xxxxxxxx xx `xxxx-xxxx`. xxx xxxxxxxxxxx xxxxxxxx xxxx xxxxxx xx xx xxx xxxx xxxxxxx xx xxx xxxxx xxxx xx xxx x...[m
+
+[38;5;179m●[m [38;5;179;1mxxxx[38;5;146;22m(/xxxxxxx/xxxxxxxxx/xxxx-xxxxxx/.xxxxxx/xxxxx/xxxxxx-xxxx-xx-xx/xxxxxx-xxxxx.xx)[m[29;53H[38;5;146mxxxx-xxxxx-xxxx-xx-xx/xxxxxx-xxxxxx.xx)[m [38;5;146m(xxxx+x xx xxxxxx)[m
+⣻  [38;5;110mxxxxxxx xxxx[38;5;111m...[m[K
+
+[3`[?25h[?25l[30;16H[38;5;110m..[38;5;111m.[m
+
+[3`[?25h[?25l[4A[38;5;149m●[m 
+
+⣽  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[3A[38;5;179m○[m 
+
+
+[?25h[?25l[3A[38;5;210m●[m 
+⣾  [38;5;111mx[m
+
+[?25h[?25l[30;5H[38;5;111mxx[38;5;110mx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[30;5H[38;5;110mxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿ 
+
+[?25h[?25l[2A⣻  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣾  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣯ 
+
+[?25h[?25l[2A⣟  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;111mxx[m
+
+[?25h[?25l[2A⣻  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;111mx[m
+
+[?25h[?25l[2A⣟  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⡿  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽ 
+
+[?25h[?25l[2A⣾  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⡿ 
+
+[?25h[?25l[2A⢿  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;111mxx[m
+
+[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣾  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;111mx[m
+
+[?25h[?25l[2A⢿  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[30;15H[38;5;110mx[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷ 
+
+[?25h[?25l[2A⣯  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣻ 
+
+[?25h[?25l[2A⣽  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⡿  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;111mxx[m
+
+[?25h[?25l[2A⣯  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;111mx[m
+
+[?25h[?25l[2A⣽  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟ 
+
+[?25h[?25l[2A⡿  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣾ 
+
+[?25h[?25l[2A⣷  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;111mxx[m
+
+[?25h[?25l[2A⡿  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;111mxx[m
+
+[?25h[?25l[2A⣷  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A [38;5;110mxxxxxxx xxxxxxxxxx xx xxxx xxxx xxxxxxx xxx xxx xxxxxxx xxxxxx xxx xxxxxxxxxx xxxxxx xxx xxxxxxxxx xxxx. xxxxxxx xxx xxxxxxxx[38;5;111m xx x[38;5;110mxx x...[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[30;129H[38;5;110m xx[38;5;111m xxx [m
+
+[3`[?25h[?25l[30;132H[38;5;110m [38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxxxxxxxx xx xxxx xxxx xxxxxxx xxx xxx xxxxxxx xxxxxx xxx xxxxxxxxxx xxxxxx xxx xxxxxxxxx xxxx. xxxxxxx xxx xxxxxxxx xx xx[38;5;111mx x..[m
+
+[3`[?25h[?25l[1;29r[29;1H[5S[;r[26;1H[38;5;146m▸ xxxxxxx xxx xxx, xx xxxxxx[m
+[38;5;146m  xxxxxxx xxxxxxxxxx xx xxxx xxxx xxxxxxx xxx xxx xxxxxxx xxxxxx xxx xxxxxxxxxx xxxxxx xxx xxxxxxxxx xxxx. xxxxxxx xxx xxxxxxxx xx xxx x...[m
+
+[38;5;179m○[m [38;5;179;1mxxxx[38;5;146;22m(/xxxxxxx/xxxxxxxxx/.xxx/xxxxx/xxxxxx/xxx-xxxx-xxxxx-xxxxxxx-xxxx-xx-xx-xx.xx)[m [38;5;146m(xxxx+x xx xxxxxx)[m
+[31C[38;5;110mx x.[38;5;111m..[m
+
+[3`[?25h[?25l[2A [38;5;110mxxxxxxx xxxx...[m[K
+
+[3`[?25h[?25l[2A⢿ 
+
+[?25h[?25l[2A [38;5;111mxx[38;5;110mx[m
+
+[3`[?25h[?25l[3A[38;5;149m●[m 
+[6`[38;5;111mx[38;5;110mx[m
+
+[3`[?25h[?25l[30;7H[38;5;111mxx[38;5;110mx[m
+
+[3`[?25h[?25l[2A⣻ 
+
+[?25h[?25l[2A [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[30;9H[38;5;110mxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[30;11H[38;5;110m xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣾ 
+
+[?25h[?25l[30;14H[38;5;110mxx[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣯ 
+
+[?25h[?25l[2A⣟  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣾  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;111mx[m
+
+[?25h[?25l[2A⣟  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;111mx[m
+
+[?25h[?25l[2A⣾  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⡿ 
+
+[?25h[?25l[2A⢿  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷ 
+
+[?25h[?25l[2A⣯  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⡿  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;111mx[m
+
+[?25h[?25l[2A⢿  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;111mx[m
+
+[?25h[?25l[2A⣯  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣻ 
+
+[?25h[?25l[2A⣽  [38;5;111mxxxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣾  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟ 
+
+[?25h[?25l[2A⡿  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;111mxx[m
+
+[?25h[?25l[2A⣽  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;111mx[m
+
+[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⡿  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣾ 
+
+[?25h[?25l[2A⣷  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿ 
+
+[?25h[?25l[2A⣻  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣾  [38;5;111mxx[m
+
+[?25h[?25l[2A⣷  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;111mx[m
+
+[?25h[?25l[2A⣻  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxx[38;5;111mx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣯ 
+
+[?25h[?25l[2A⣟  [38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxx[38;5;111mxx xx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xx[38;5;111mxx...[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽ 
+
+[?25h[?25l[2A⣾  [38;5;111mxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxx[38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⡿  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxxx...[m
+
+[3`[?25h[?25l[2A⣯  [38;5;111mxx[m
+
+[?25h[?25l[2A⣟  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[1;30r[30;1H
+[;r[29;4H[38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx xxx xxxxxxx xxx[38;5;111mxxx. [38;5;110mxxxxx x, xxxx xx xxxxxxxx xxx xxxxx xxxx xx xx "xxxx-xxxx" xxxxxxxx. xxx xxxxxxx...[m
+[38;5;110m└ xxx: xxx /xxxx xx xxxxxx xxx xxxxxxxxxxxx xxxx xx xxxxxxx xxxxx.[m
+
+[3`[?25h[?25l[3A⡿  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx xxx xxxx[38;5;111mxxx x[38;5;110mxxxxx. [m[32;3H[?25h[?25l[3A⢿  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxx[38;5;111mx xxx[38;5;110m xxxxxxx x[m[32;3H[?25h[?25l[3A⣻  [38;5;110mxxx xxxxxxx xxxxx xx x[38;5;111mx xxx[38;5;110mxxxxxx xxx[m[32;3H[?25h[?25l[3A⣽  [38;5;110mxxx xxxxxxx [38;5;111mxxxxx[38;5;110m xx xx xxx[m[32;3H[?25h[?25l[3A⣾  [38;5;110mx[38;5;111mxx xx[38;5;110mxxxxx xxxxx[m[32;3H[?25h[?25l[3A⣷  [38;5;110mxxx xx[m[32;3H[?25h[?25l[3A⣯  [38;5;110mxxx[38;5;111m xxxx[m[32;3H[?25h[?25l[3A⣟  [38;5;110mxxx xxxxxxx x[38;5;111mxxxx [m[32;3H[?25h[?25l[3A⡿  [38;5;110mxxx xxxxxxx xxxxx xx xx[38;5;111m xxxx[m[32;3H[?25h[?25l[3A⢿  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx[38;5;111m xxx [m[32;3H[?25h[?25l[3A⣻  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx xxx xxxx[38;5;111mxxx x[m[32;3H[?25h[?25l[3A⣽  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx xxx xxxxxxx xxxxxx[38;5;111m. xxx[m[32;3H[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[3A⣾  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx xxx xxxxxxx xxxxxx. xxxxx x,[38;5;111m xxxx[m[32;3H[?25h[?25l[3A⣷  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx xxx xxxxxxx xxxxxx. xxxxx x, xxxx xx xx[38;5;111mxxxxx[m[32;3H[?25h[?25l[3A⣯  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx xxx xxxxxxx xxxxxx. xxxxx x, xxxx xx xxxxxxxx xxx[38;5;111m xxxx[m[32;3H[?25h[?25l[3A⣟  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx xxx xxxxxxx xxxxxx. xxxxx x, xxxx xx xxxxxxxx xxx xxxxx xxx[38;5;111mx xx [m[32;3H[?25h[?25l[3A⡿  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx xxx xxxxxxx xxxxxx. xxxxx x, xxxx xx xxxxxxxx xxx xxxxx xxxx xx xx "x[38;5;111mxxx-x[m[32;3H[?25h[?25l[3A⢿  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx xxx xxxxxxx xxxxxx. xxxxx x, xxxx xx xxxxxxxx xxx xxxxx xxxx xx xx "xxxx-xxxx" [38;5;111mxxxxx[m[32;3H[?25h[?25l[3A⣻  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx xxx xxxxxxx xxxxxx. xxxxx x, xxxx xx xxxxxxxx xxx xxxxx xxxx xx xx "xxxx-xxxx" xxxxxxxx. [38;5;111mxxx x[m[32;3H[?25h[?25l[3A⣽  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx xxx xxxxxxx xxxxxx. xxxxx x, xxxx xx xxxxxxxx xxx xxxxx xxxx xx xx "xxxx-xxxx" xxxxxxxx. xxx xxxxxx[38;5;111mx...[m[32;3H[?25h[?25l[3A⣾  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx xxx xxxxxxx xxxxxx. xxxxx x, xxxx xx xxxxxxxx xxx xxxxx xxxx xx xx "xxxx-xxxx" xxxxxxxx. xxx xxxxxxx..[m[32;3H[?25h[?25l[3A⣷  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx xxx xxxxxxx xxxxxx. xxxxx x, xxxx xx xxxxxxxx xxx xxxxx xxxx xx xx "xxxx-xxxx" xxxxxxxx. xx[38;5;111mx xxx[38;5;110mxxxx...[m[32;3H[?25h[?25l[3A⣯  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx xxx xxxxxxx xxxxxx. xxxxx x, xxxx xx xxxxxxxx xxx xxxxx xxxx xx xx "xxxx-xxxx" xx[38;5;111mxxxxx[38;5;110mx. xxx xxx[m[32;3H[?25h[?25l[3A⣟  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx xxx xxxxxxx xxxxxx. xxxxx x, xxxx xx xxxxxxxx xxx xxxxx xxxx xx xx "xxx[38;5;111mx-xxx[38;5;110mx" xxxxxxx[m[32;3H[?25h[?25l[3A⡿  [38;5;110mxxx xxxxxxx xxxxx xx xx xxxxxxxxx xxx xxxxxxx xxxxxx. xxxxx x, xxxx xx xxxxxxxx xxx xxxxx xxxx [38;5;111mxx xx[38;5;110m "xxxx-xxx[m[32;3H[?25h[?25l[29;8H[38;5;110mxxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxxxx'x xxxxxxxx xxxxxxx. [38;5;111mxxx x[38;5;110mxxxxxx xxxxxxxxxxxxxx xx xx xxxxxxx xxx x[m[32;3H[?25h[?25l[29;91H[38;5;111m xxx [38;5;110mx[m[32;3H[?25h[?25l[3A⢿  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxxxx'x xxxxxxxx xxxxxx[38;5;111mx. xx[38;5;110mx [m[32;3H[?25h[?25l[3A⣻  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxxxx'x xxxxx[38;5;111mxxx x[38;5;110mxxxxxx. xx[m[32;3H[?25h[?25l[3A⣽  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxx[38;5;111mxx'x [38;5;110mxxxxxxxx x[m[32;3H[?25h[?25l[3A⣾  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx [38;5;111mxxxx [38;5;110mx xxxxx'x [m[32;3H[?25h[?25l[3A⣷  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxx[38;5;111mxxx x[38;5;110mxxx xxxx [m[32;3H[?25h[?25l[29;46H[38;5;111mxxxxx[38;5;110mxx x[m[32;3H[?25h[?25l[3A⣯  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx[38;5;111m xxxx[38;5;110mx xxxxx[m[32;3H[?25h[?25l[3A⣟  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx[38;5;111m xxx [38;5;110mxxxxx xxxx[m[32;3H[?25h[?25l[3A⡿  [38;5;110mxxx xxxx xxxxxx[38;5;111mxx xx[38;5;110mxxxxx xxx [m[32;3H[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[3A⢿  [38;5;110mxxx x[38;5;111mxxx x[38;5;110mxxxxxxx xx[m[32;3H[?25h[?25l[3A⣻  [38;5;110mxxx xxxx x[m[32;3H[?25h[?25l[3A⣽  [38;5;111mxxx [m[32;3H[?25h[?25l[3A⣾  [38;5;110mxxx xxxx [38;5;111mxxxxx[m[32;3H[?25h[?25l[3A⣷  [38;5;110mxxx xxxx xxxxxxxx x[38;5;111mxxxxx[m[32;3H[?25h[?25l[3A⣯  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx[38;5;111m xxxx[m[32;3H[?25h[?25l[3A⣟  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxx[38;5;111mxx xx[m[32;3H[?25h[?25l[3A⡿  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx[38;5;111m xxxx[m[32;3H[?25h[?25l[3A⢿  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx[38;5;111m x xx[m[32;3H[?25h[?25l[3A⣻  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxxxx'x[38;5;111m xxxx[m[32;3H[?25h[?25l[3A⣽  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxxxx'x xxxxxxxx [38;5;111mxxxxx[m[32;3H[?25h[?25l[3A⣾  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxxxx'x xxxxxxxx xxxxxxx. x[38;5;111mxx xx[m[32;3H[?25h[?25l[3A⣷  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxxxx'x xxxxxxxx xxxxxxx. xxx xxxxxxx[38;5;111m xxxx[m[32;3H[?25h[?25l[3A⣯  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxxxx'x xxxxxxxx xxxxxxx. xxx xxxxxxx xxxxxxxxx[38;5;111mxxxxx[m[32;3H[?25h[?25l[3A⣟  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxxxx'x xxxxxxxx xxxxxxx. xxx xxxxxxx xxxxxxxxxxxxxx xx x[38;5;111mx xxx[m[32;3H[?25h[?25l[3A⡿  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxxxx'x xxxxxxxx xxxxxxx. xxx xxxxxxx xxxxxxxxxxxxxx xx xx xxxxxxx [38;5;111mxxx x[m[32;3H[?25h[?25l[3A⢿  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxxxx'x xxxxxxxx xxxxxxx. xxx xxxxxxx xxxxxxxxxxxxxx xx xx xxxxxxx xxx x[m[32;3H[?25h[?25l[3A⣻  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxxxx'x xxxxxxxx xxxxxxx. xxx xxxxxxx xxxxxxxxxxxxxx xx xx xxxxxxx [38;5;111mxxx x[m[32;3H[?25h[?25l[3A⣽  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxxxx'x xxxxxxxx xxxxxxx. xxx xxxxxxx xxxxxxxxxxxxxx xx x[38;5;111mx xxx[38;5;110mxxxx xxx x[m[32;3H[?25h[?25l[3A⣾  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxxxx'x xxxxxxxx xxxxxxx. xxx xxxxxxx xxxxxxxxx[38;5;111mxxxxx[38;5;110m xx xx xxx[m[32;3H[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[3A⣷  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxxxx'x xxxxxxxx xxxxxxx. xxx xxxxxxx[38;5;111m xxxx[38;5;110mxxxxxxxxxx[m[32;3H[?25h[?25l[3A⣯  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxxxx'x xxxxxxxx xxxxxxx. x[38;5;111mxx xx[38;5;110mxxxxx xxxx[m[32;3H[?25h[?25l[3A⣟  [38;5;110mxxx xxxx xxxxxxxx xxxxxxx xxx xxxxx xxxxx xxxxxxx xxxx xxxx x xxxxx'x xxxxxxxx [38;5;111mxxxxx[38;5;110mxx. xxx xx[m[32;3H[?25h[?25l[3A [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxxxxxxx xxxxx xxxx xx xxxxxx, xxxxxxx xx[38;5;111mxx xx[38;5;110mxx xxxxxxxx. x xxxxxxx, xxx-xxxx xxxx xx xxx xxxx'x [m[32;3H[?25h[?25l[3A⡿  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxxxxxxx xxxxx xxxx xx xxxxxx, xx[38;5;111mxxxxx[38;5;110m xxxx xx[m[32;3H[?25h[?25l[3A⢿  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxxxxxxx xxxxx xxxx xx [38;5;111mxxxxx[38;5;110mx, xxxxxxx[m[32;3H[?25h[?25l[3A⣻  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxxxxxxx xxxx[38;5;111mx xxx[38;5;110mx xx xxxxx[m[32;3H[?25h[?25l[3A⣽  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxx[38;5;111mxxxxx[38;5;110m xxxxx xxx[m[32;3H[?25h[?25l[3A⣾  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx[38;5;111m xxxx[38;5;110mx-xxxxxxxx[m[32;3H[?25h[?25l[3A⣷  [38;5;110mxxxxxx x xxxxxx (xx[38;5;111mxx) x[38;5;110mx xxx xxxx[m[32;3H[?25h[?25l[3A⣯  [38;5;110mxxxxxx x [38;5;111mxxxxx[38;5;110mx (xxxx) x[m[32;3H[?25h[?25l[3A⣟  [38;5;111mxxxx[38;5;110mxx x xxxxx[m[32;3H[?25h[?25l[3A⡿  [38;5;110mxxxx[m[32;3H[?25h[?25l[3A⢿  [38;5;110mxxxxx[38;5;111mx x x[m[32;3H[?25h[?25l[3A⣻  [38;5;110mxxxxxx x xxxxxx[38;5;111m (xxx[m[32;3H[?25h[?25l[3A⣽  [38;5;110mxxxxxx x xxxxxx (xxxx) xx[38;5;111m xxx [m[32;3H[?25h[?25l[3A⣾  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx[38;5;111m-xxxx[m[32;3H[?25h[?25l[3A⣷  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxxxxxxx [38;5;111mxxxxx[m[32;3H[?25h[?25l[3A⣯  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxxxxxxx xxxxx xxxx[38;5;111m xx x[m[32;3H[?25h[?25l[3A⣟  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxxxxxxx xxxxx xxxx xx xxxxxx[38;5;111m, xxx[m[32;3H[?25h[?25l[3A⡿  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxxxxxxx xxxxx xxxx xx xxxxxx, xxxxxxx [38;5;111mxxxx [m[32;3H[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[3A⢿  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxxxxxxx xxxxx xxxx xx xxxxxx, xxxxxxx xxxx xxxx [38;5;111mxxxxx[m[32;3H[?25h[?25l[3A⣻  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxxxxxxx xxxxx xxxx xx xxxxxx, xxxxxxx xxxx xxxx xxxxxxxx. [38;5;111mx xxx[m[32;3H[?25h[?25l[3A⣽  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxxxxxxx xxxxx xxxx xx xxxxxx, xxxxxxx xxxx xxxx xxxxxxxx. x xxxxxxx,[38;5;111m xxx-[m[32;3H[?25h[?25l[3A⣾  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxxxxxxx xxxxx xxxx xx xxxxxx, xxxxxxx xxxx xxxx xxxxxxxx. x xxxxxxx, xxx-xxxx [38;5;111mxxxx [m[32;3H[?25h[?25l[3A⣷  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxxxxxxx xxxxx xxxx xx xxxxxx, xxxxxxx xxxx xxxx xxxxxxxx. x xxxxxxx, xxx-xxxx xxxx xx xx[38;5;111mx xxx[m[32;3H[?25h[?25l[3A⣯  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxxxxxxx xxxxx xxxx xx xxxxxx, xxxxxxx xxxx xxxx xxxxxxxx. x xxxxxxx, xxx-xxxx xxxx xx xxx xxxx'x .[38;5;111m..[m[32;3H[?25h[?25l[3A⣟  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxxxxxxx xxxxx xxxx xx xxxxxx, xxxxxxx xxxx xxxx xxxxxxxx. x xxxxxxx, xxx-xxxx xxxx xx xxx xxxx'x[38;5;111m .[m[32;3H[?25h[?25l[3A⡿  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxxxxxxx xxxxx xxxx xx xxxxxx, xxxxxxx xxxx xxxx xxxxxxxx. x xxxxxxx, xxx-xxxx xxxx xx [38;5;111mxxx x[38;5;110mxxx'x ...[m[32;3H[?25h[?25l[3A⢿  [38;5;110mxxxxxx x xxxxxx (xxxx) xx xxx xxxxx-xxxxxxxx xxxxx xxxx xx xxxxxx, xxxxxxx xxxx xxxx xxxxxxxx. x xxxxxxx, xxx-xxx[38;5;111mx xxx[38;5;110mx xx xxx x[m[32;3H[?25h[?25l[1;30r[HM[;r[H[38;5;146m▸ xxxxxxx xxx xxx, xxx xxxxxx[m[30d⣻  [38;5;110mxxx xxxxx xxx xxxxxx xxxxxxxx, `xxx-xxx-xxxxxx-xxxxxxxx`, xx xxx xxxxxxx xxxxxx xx xx xx xxxxxxxxxx xxx[38;5;111mx xxx[38;5;110m xxxxxx xxxxxxxx xxx xxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxx xxxxx xxx xxxxxx xxxxxxxx, `xxx-xxx-xxxxxx-xxxxxxxx`, xx xxx xxxxxxx xxxxxx xx xx xx xxxx[38;5;111mxxxxx[38;5;110mx xxxx xxx[m
+
+[3`[?25h[?25l[30;89H[38;5;111m xx x[38;5;110mxxxxxxxx[m
+
+[3`[?25h[?25l[1;29r[29;1H[5S[;r[26;1H[38;5;146m▸ xxxxxxx xxx xxx, x.xx xxxxxx[m
+[38;5;146m  xxx xxxxx xxx xxxxxx xxxxxxxx, `xxx-xxx-xxxxxx-xxxxxxxx`, xx xxx xxxxxxx xxxxxx xx xx xx xxxxxxxxxx xxxx xxx xxxxxx xxxxxxxx xxx xxxx...[m
+
+[38;5;179m○[m [38;5;179;1mxxx-xxx-xxxxxx-xxxxxxxx/xxxx_xxxxxxx[38;5;146;22m({"xxxxxxx":"xxxx-xxxx\xxxxxx xxx-xxxxxx-xxxxxxxxx xx # xxx xxxxxx xxxxxxxxx\x...)[m [38;5;146m(xxxx+x xx xxxxxx)[m
+⣾  [38;5;110mxxxxxxx xxx xxxx...[m[K
+
+[3`[?25h[?25l[3A[38;5;179m●[m 
+
+
+[?25h[?25l[2A [38;5;111mx[38;5;110mx[m
+
+[?25h[?25l[2A⣷ 
+
+[?25h[?25l[30;5H[38;5;111mxx[38;5;110mx[m
+
+[3`[?25h[?25l[2A [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[30;6H[38;5;110mx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[30;7H[38;5;110mxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[3A[38;5;179m○[m [30;11H[38;5;110m [38;5;111mxxx x[m
+
+[3`[?25h[?25l[30;12H[38;5;110mxxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[30;20H[38;5;110m.[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;111mx[m
+
+[?25h[?25l[2A⣾  [38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣷  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;111mxx[m
+
+[?25h[?25l[2A⣻  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxx[38;5;111mx xxx[m
+
+[3`[?25h[?25l[30;10H[38;5;110mx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxx[38;5;111m xxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[30;20H[38;5;110m.[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;111mxx[m
+
+[?25h[?25l[2A⡿  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;111mx[m
+
+[?25h[?25l[30;5H[38;5;111mx[38;5;110mx[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⢿  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;111mxx[m
+
+[?25h[?25l[2A⣾  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxx xxxx[38;5;111m...[m
+
+[3`[?25h[?25l[30;20H[38;5;110m.[38;5;111m.[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[3A[38;5;149m●[m 
+
+
+[?25h[?25l[2A⢿  [38;5;111mxx[m
+
+[?25h[?25l[2A⣻  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;111mxx[m
+
+[?25h[?25l[2A⡿  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣷  [38;5;111mxx[m
+
+[?25h[?25l[2A⣯  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;111mxx[m
+
+[?25h[?25l[2A⣾  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;111mxx[m
+
+[?25h[?25l[2A⣻  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;111mxx[m
+
+[?25h[?25l[2A⡿  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⢿  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;111mxx[m
+
+[?25h[?25l[2A⣯  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[30;11H[38;5;110m [38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;111mxx[m
+
+[?25h[?25l[2A⣾  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;111mxx[m
+
+[?25h[?25l[2A⣻  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣷  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;111mxx[m
+
+[?25h[?25l[2A⡿  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;111mxx[m
+
+[?25h[?25l[2A⣯  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;111mxx[m
+
+[?25h[?25l[2A⣾  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⢿  [38;5;111mxx[m
+
+[?25h[?25l[2A⣻  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;111mxx[m
+
+[?25h[?25l[30;6H[38;5;111mx[38;5;110mx[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;111mxx[m
+
+[?25h[?25l[2A⣯  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx [38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[30;21H[38;5;110m.[38;5;111m.[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣽  [38;5;111mxx[m
+
+[?25h[?25l[2A⣾  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?2004h[?1002h[?1006h[>4;2m[?25l[2A⣷  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣟  [38;5;110mxxxxxxx xxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[2A⡿  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⢿  [38;5;111mxxx[m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxx[38;5;111mxxxx [m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[30;11H[38;5;110m [38;5;111mxxx x[m
+
+[3`[?25h[?25l[2A⣾  [38;5;110mxxxxxxx xxx [38;5;111mxxxx.[m
+
+[3`[?25h[?25l[2A⣷  [38;5;110mxxxxxxx xxx xxxx.[38;5;111m..[m
+
+[3`[?25h[?25l[2A⣯  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣟  [38;5;111mxx[m
+
+[?25h[?25l[2A⡿  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[2A⢿  [38;5;110mxxxxxxx[38;5;111m xxx [m
+
+[3`[?25h[?25l[2A⣻  [38;5;110mxxxxxxx xxx x[38;5;111mxxx..[m
+
+[3`[?25h[?25l[2A⣽  [38;5;110mxxxxxxx xxx xxxx..[38;5;111m.[m
+
+[3`[?25h[?25l[1;29r[29;1H[2S[;r[29;3H[38;5;153mxxxxx x xxxx[123X[m
+⣾  [38;5;110mxxxxxxx xxx xxxx...[m
+
+[3`[?25h[?25l[2A⣷  [38;5;111mxx[m
+
+[?25h[?25l[30;6H[38;5;111mx[38;5;110mx[m
+
+[3`[?25h[?25l[29;16H[38;5;153mxx xxxxx xxxx xx [38;5;111mxxxxxxxx[38;5;153m ([38;5;111mxxxxx[m
+[7`[38;5;111mxx[38;5;110mx[m
+
+[3`[?25h[?25l[29;48H[38;5;111mxx_xx: xxxx[38;5;153m); xxxxxx xx[m[32;3H[?25h[?25l[29;71H[38;5;153mxx xxx xxxxx[m
+[4`[38;5;110mx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[29;84H[38;5;153mxxxx.[m
+⣯  [38;5;110mxx[38;5;111mxxxxx[m
+
+[3`[?25h[?25l[30;6H[38;5;110mx[38;5;111mxxxx [m
+
+[3`[?25h]9;Antigravity CLI is ready for input[?25l[2A[K[4B[38;5;110m? for shortcuts[m[32;3H[?25h[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h[?1002h[?1006h[>4;2m[?2004h
