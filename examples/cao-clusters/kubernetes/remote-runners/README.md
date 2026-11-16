@@ -202,18 +202,19 @@ examples/cao-clusters/kubernetes/remote-runners/overlays/eks/deploy.sh cao-remot
   The EFS CSI driver has its own roles, for EFS only. Changing the model in
   `deploy.sh` rolls the runners; agents already running keep their model.
 - **Workspace:** the EFS access point pins every client to uid/gid 1000 under
-  `/cao-workspace`, and the file system policy makes it the only way in: it
-  allows nothing to clients without IAM, and denies every mount without an
-  access point, without TLS, or as root. The volume mounts with the `iam`
-  option, as the EFS CSI driver's node role (Pod Identity on
-  `efs-csi-node-sa`), which may mount and write only through the workspace
-  access point. Pod Identity gives a pod its credentials when it starts: on a
-  cluster whose driver ran before the node role existed, restart the driver's
-  node pods (`kubectl -n kube-system rollout restart daemonset efs-csi-node`)
-  before the next runner mounts the workspace. Any principal of the account
-  whose own IAM policies allow EFS client access can still mount through
-  another access point on the file system; creating one needs
-  `elasticfilesystem:CreateAccessPoint`.
+  `/cao-workspace`. The volume mounts with the `iam` option, as the EFS CSI
+  driver's node role (Pod Identity on `efs-csi-node-sa`), whose policy lets it
+  mount and write only through the workspace access point. The file system
+  policy denies every other principal, whatever its own IAM policies allow,
+  and clients without IAM, and denies every mount without an access point,
+  without TLS, or as root. So the workspace access point, as that role, is
+  the only way in; an administrator who needs another must change the file
+  system policy first. Whoever can run pods as `efs-csi-node-sa` in
+  `kube-system` (a cluster admin) can use the role. Pod Identity gives a pod
+  its credentials when it starts: on a cluster whose driver ran before the
+  node role existed, restart the driver's node pods
+  (`kubectl -n kube-system rollout restart daemonset efs-csi-node`) before
+  the next runner mounts the workspace.
 - **Auto Mode and NetworkPolicy:** cluster DNS runs on each node at the `.10`
   address of the service range, not in CoreDNS pods, and Pod Identity's agent
   answers on `169.254.170.23:80`. The overlay allows exactly those two, on top

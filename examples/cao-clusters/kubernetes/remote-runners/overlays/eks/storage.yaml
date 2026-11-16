@@ -30,9 +30,9 @@ spec:
     namespace: cao-remote
     name: cao-remote-workspace
   # iam: the driver's node pods mount as their Pod Identity role, the only
-  # principal the file system's policy lets in (through the access point in
-  # the handle); tls, which that policy requires (the driver adds it for an
-  # access point anyway).
+  # principal the file system's policy does not deny, and whose own policy
+  # allows only the access point in the handle; tls, which the file system
+  # policy requires (the driver adds it for an access point anyway).
   mountOptions: [tls, iam]
   csi:
     driver: efs.csi.aws.com
