@@ -55,7 +55,9 @@ LABEL_TAB_FROM = "migrated.tab_from"
 LABEL_SPACE_NAME = "migrated.space_name"
 LABEL_TAB_NAME = "migrated.tab_name"
 FROM_PREFIX = "herdr-tui:"
-HC_SCOPE_VARS = ("HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE")
+# Each would point hc at the caller's core; HC_SOCKET overrides the endpoint
+# outright (herdr-core docs/security.md).
+HC_SCOPE_VARS = ("HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE", "HC_SOCKET")
 
 # The wrapper the Herdr app itself uses for command terminals (copied from a
 # live app-created terminal): run the command in a login shell, then stay in
@@ -1106,16 +1108,19 @@ def self_test() -> int:
         fake.doc["spaces"][0]["tabs"][0]["name"] == "x" and fake.doc["spaces"][1]["name"] == "app"
     )
     # env scrub
-    saved = os.environ.get("HC_TERMINAL_ID")
-    os.environ["HC_TERMINAL_ID"] = "t1"
+    saved = {k: os.environ.get(k) for k in HC_SCOPE_VARS}
+    for k in HC_SCOPE_VARS:
+        os.environ[k] = "/run/user/default.sock"
     try:
         env = hc_env("mig")
     finally:
-        if saved is None:
-            del os.environ["HC_TERMINAL_ID"]
-        else:
-            os.environ["HC_TERMINAL_ID"] = saved
-    assert "HC_TERMINAL_ID" not in env and env["HC_SESSION"] == "mig"
+        for k, v in saved.items():
+            if v is None:
+                del os.environ[k]
+            else:
+                os.environ[k] = v
+    assert not set(HC_SCOPE_VARS) & set(env) and env["HC_SESSION"] == "mig", env
+    assert "HC_SOCKET" in HC_SCOPE_VARS
     print("self-test: all checks passed")
     return 0
 

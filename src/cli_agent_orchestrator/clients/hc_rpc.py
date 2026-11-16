@@ -34,8 +34,10 @@ REQUIRED_METHODS = frozenset(
         "events.subscribe",
     }
 )
-# Inherited from an app terminal, these would point hc at the caller's core.
-_STRIPPED_ENV = ("HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE")
+# Inherited from an app terminal (or set by the operator), these would point hc
+# at the caller's core instead of the session's: herdr-core docs/security.md,
+# "HC_SOCKET overrides the client endpoint".
+CALLER_CORE_ENV = ("HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE", "HC_SOCKET")
 _EOF = object()
 # Reaping an `hc connect` child we just SIGKILLed: it holds no state to flush,
 # so it exits at once; the bound only keeps a wedged kernel from hanging close().
@@ -69,7 +71,7 @@ def hc_binary() -> str:
 
 
 def hc_env(session: str) -> Dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k not in _STRIPPED_ENV}
+    env = {k: v for k, v in os.environ.items() if k not in CALLER_CORE_ENV}
     env["HC_SESSION"] = session
     return env
 
@@ -164,6 +166,7 @@ class HcRpcClient:
         done = subprocess.run(
             [hc_binary(), "server", "start", "--json"],
             env=env,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=SERVER_START_TIMEOUT_S,
@@ -233,9 +236,15 @@ class HcSubscription:
 
     def __init__(self, session: str, timeout: float = 10.0) -> None:
         self._conn = _Connection(session)
-        self._conn.write({"jsonrpc": "2.0", "id": 1, "method": "events.subscribe", "params": {}})
-        reply = self._conn.get(timeout)
-        self.snapshot: Dict[str, Any] = _result(reply)
+        try:
+            self._conn.write(
+                {"jsonrpc": "2.0", "id": 1, "method": "events.subscribe", "params": {}}
+            )
+            self.snapshot: Dict[str, Any] = _result(self._conn.get(timeout))
+        except BaseException:
+            # The caller never gets this object, so nobody else can reap the child.
+            self._conn.close()
+            raise
 
     def next_notification(self, timeout: float) -> Dict[str, Any]:
         """Next notification; raises TimeoutError when silent, EOFError when closed."""

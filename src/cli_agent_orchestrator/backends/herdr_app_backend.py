@@ -24,7 +24,14 @@ from cli_agent_orchestrator.backends.base import (
     TerminalCleanupResult,
     TerminalNotFoundError,
 )
-from cli_agent_orchestrator.clients.hc_rpc import HcProtocolError, HcRpcClient, HcRpcError
+from cli_agent_orchestrator.clients.hc_rpc import (
+    CALLER_CORE_ENV,
+    HcProtocolError,
+    HcRpcClient,
+    HcRpcError,
+    hc_binary,
+    hc_env,
+)
 from cli_agent_orchestrator.constants import HC_READ_MAX_LINES
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
@@ -510,16 +517,18 @@ class HerdrAppBackend(TerminalBackend):
         found = self._list(**{"cao.session": session_name})
         if not found:
             raise TerminalNotFoundError(session_name, "no live herdr-core terminal")
-        env = {**os.environ, "HC_SESSION": self._session}
-        for key in ("HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE"):
-            env.pop(key, None)
-        os.execvpe("hc", ["hc", "attach", str(found[0]["address"])], env)
+        hc = hc_binary()
+        os.execvpe(hc, [hc, "attach", str(found[0]["address"])], hc_env(self._session))
 
     def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
+        # The browser PTY inherits cao-server's environment (api/main.py), so
+        # the variables that would point hc at the caller's core are unset here.
+        unset = [arg for key in CALLER_CORE_ENV for arg in ("-u", key)]
         return [
             "env",
+            *unset,
             f"HC_SESSION={self._session}",
-            "hc",
+            hc_binary(),
             "attach",
             self._address(session_name, window_name),
         ]

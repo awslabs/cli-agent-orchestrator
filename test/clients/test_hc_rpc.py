@@ -31,10 +31,20 @@ def fake_hc(tmp_path, monkeypatch):
     return log
 
 
-def test_argv_and_environment(fake_hc, monkeypatch):
+CALLER_CORE_ENV = ("HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE", "HC_SOCKET")
+
+
+@pytest.fixture
+def inside_app_terminal(monkeypatch):
+    """The variables an app terminal hands its programs, all naming the user's core."""
     monkeypatch.setenv("HC_TERMINAL_ID", "t15")
     monkeypatch.setenv("HC_TERMINAL_SOCKET", "/run/x/default.sock")
     monkeypatch.setenv("HC_SCOPE", "s")
+    monkeypatch.setenv("HC_SOCKET", "/run/x/default.sock")
+    monkeypatch.setenv("HC_SESSION", "default")
+
+
+def test_argv_and_environment(fake_hc, inside_app_terminal):
     client = HcRpcClient("cao")
     assert client.call("ping", {"a": 1}) == {"echo": {"a": 1}}
     client.close()
@@ -42,8 +52,65 @@ def test_argv_and_environment(fake_hc, monkeypatch):
     assert entry["argv"] == ["connect", "--session", "cao"]
     env = entry["env"]
     assert env["HC_SESSION"] == "cao"
-    for key in ("HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE"):
+    for key in CALLER_CORE_ENV:
         assert key not in env
+
+
+def test_server_start_environment(fake_hc, inside_app_terminal):
+    HcRpcClient("cao").start_server(drop_env=lambda k: k == "CLAUDECODE")
+    entry = json.loads(fake_hc.read_text().splitlines()[0])
+    assert entry["argv"] == ["server", "start", "--json"]
+    assert entry["env"]["HC_SESSION"] == "cao"
+    for key in CALLER_CORE_ENV:
+        assert key not in entry["env"]
+
+
+def test_subscription_closes_its_connection_when_subscribe_fails(fake_hc, monkeypatch):
+    monkeypatch.setenv("FAKE_HC_MODE", "fail_subscribe")
+    made = []
+    real = hc_rpc._Connection
+
+    class Tracked(real):  # type: ignore[misc, valid-type]
+        def __init__(self, session):
+            super().__init__(session)
+            made.append(self)
+
+    monkeypatch.setattr(hc_rpc, "_Connection", Tracked)
+    with pytest.raises(HcRpcError):
+        HcSubscription("cao")
+    assert len(made) == 1 and not made[0].alive()
+
+
+def test_subscription_closes_its_connection_when_the_core_is_silent(fake_hc, monkeypatch):
+    made = []
+    real = hc_rpc._Connection
+
+    class Silent(real):  # type: ignore[misc, valid-type]
+        def __init__(self, session):
+            super().__init__(session)
+            made.append(self)
+
+        def get(self, timeout):
+            raise TimeoutError("silent")
+
+    monkeypatch.setattr(hc_rpc, "_Connection", Silent)
+    with pytest.raises(TimeoutError):
+        HcSubscription("cao")
+    assert len(made) == 1 and not made[0].alive()
+
+
+def test_subscribe_sends_no_filter(fake_hc, monkeypatch):
+    sent = []
+    real = hc_rpc._Connection
+
+    class Spy(real):  # type: ignore[misc, valid-type]
+        def write(self, message):
+            sent.append(message)
+            super().write(message)
+
+    monkeypatch.setattr(hc_rpc, "_Connection", Spy)
+    HcSubscription("cao").close()
+    assert [(m["method"], m["params"]) for m in sent] == [("events.subscribe", {})]
 
 
 def test_error_kind_raised(fake_hc):

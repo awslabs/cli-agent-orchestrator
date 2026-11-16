@@ -10,6 +10,15 @@ log = os.environ.get("FAKE_HC_LOG")
 if log:
     with open(log, "a") as fh:
         fh.write(json.dumps({"argv": sys.argv[1:], "env": dict(os.environ)}) + "\n")
+if sys.argv[1:2] == ["server"]:  # `hc server start --json`: report a running core
+    print(json.dumps({"running": True}))
+    sys.exit(0)
+if mode == "fail_subscribe":
+    for line in sys.stdin:  # answer events.subscribe with an error, then hang
+        rid = json.loads(line).get("id")
+        err = {"code": -32000, "message": "nope", "data": {"kind": "unavailable"}}
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "error": err}), flush=True)
+    sys.exit(0)
 
 for line in sys.stdin:
     req = json.loads(line)

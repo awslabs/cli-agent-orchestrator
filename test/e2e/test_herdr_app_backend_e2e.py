@@ -39,7 +39,7 @@ def core(monkeypatch):
         d = scratch / var.split("_")[1].lower()
         d.mkdir(mode=0o700)
         monkeypatch.setenv(var, str(d))
-    for var in ("HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE", "HC_SESSION"):
+    for var in ("HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE", "HC_SOCKET", "HC_SESSION"):
         monkeypatch.delenv(var, raising=False)
     session = f"cao-e2e-{secrets.token_hex(3)}"
     yield session

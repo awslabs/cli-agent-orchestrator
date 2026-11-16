@@ -69,4 +69,4 @@ python3 scripts/herdr_tui_to_app.py --rename-only                 # name spaces 
 - List the CAO core's terminals: `HC_SESSION=cao hc ls` (`--all` includes finished ones).
 - Check the core: `HC_SESSION=cao hc server status`.
 - On the app's machine, list the machines the app knows: `hc machine ls`.
-- If cao-server was started inside an app terminal, it ignores the inherited `HC_TERMINAL_ID`, `HC_TERMINAL_SOCKET`, and `HC_SCOPE`, so it always talks to its own session's core.
+- If cao-server was started inside an app terminal, it ignores the inherited `HC_TERMINAL_ID`, `HC_TERMINAL_SOCKET`, `HC_SCOPE`, and `HC_SOCKET`, so it always talks to its own session's core. That includes `cao attach` and the browser terminal.

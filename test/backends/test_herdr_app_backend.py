@@ -130,6 +130,8 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 HOME = cao_home_label()
 FOREIGN_HOME = "f" * 16
+# Variables an app terminal hands its programs; each points hc at the user's core.
+CALLER_CORE_ENV = ("HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE", "HC_SOCKET")
 
 
 def _labels(session, window, tid, home=HOME):
@@ -291,20 +293,65 @@ class TestStatusAndAttach:
         assert backend.supports_event_inbox() is True
         assert backend.get_pane_id("aaaa0002", "cao-a", "w1") == "t2"
 
-    def test_web_attach_argv(self, backend, two_windows):
+    def test_web_attach_argv(self, backend, two_windows, monkeypatch):
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.backends.herdr_app_backend.hc_binary", lambda: "/opt/bin/hc"
+        )
         assert backend.prepare_web_attach("cao-a", "w1") == [
             "env",
+            "-u",
+            "HC_TERMINAL_ID",
+            "-u",
+            "HC_TERMINAL_SOCKET",
+            "-u",
+            "HC_SCOPE",
+            "-u",
+            "HC_SOCKET",
             "HC_SESSION=cao",
-            "hc",
+            "/opt/bin/hc",
             "attach",
             "t2",
         ]
 
+    def test_web_attach_child_does_not_see_the_callers_core(
+        self, backend, two_windows, monkeypatch, tmp_path
+    ):
+        # The browser PTY inherits cao-server's environment (api/main.py
+        # _build_pty_env); run the argv with a stand-in hc that prints its env.
+        import subprocess
+
+        fake = tmp_path / "hc"
+        fake.write_text("#!/bin/sh\nenv\n")
+        fake.chmod(0o755)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.backends.herdr_app_backend.hc_binary", lambda: str(fake)
+        )
+        argv = backend.prepare_web_attach("cao-a", "w1")
+        inherited = {
+            "PATH": "/usr/bin:/bin",
+            "HC_SESSION": "default",
+            **{k: "/run/user/default.sock" for k in CALLER_CORE_ENV},
+        }
+        out = subprocess.run(argv, env=inherited, capture_output=True, text=True, check=True)
+        seen = dict(line.split("=", 1) for line in out.stdout.splitlines() if "=" in line)
+        assert seen["HC_SESSION"] == "cao"
+        assert not set(CALLER_CORE_ENV) & set(seen)
+
     def test_attach_session_execs_hc(self, backend, two_windows, monkeypatch):
+        for key in CALLER_CORE_ENV:
+            monkeypatch.setenv(key, "/run/user/default.sock")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.backends.herdr_app_backend.hc_binary", lambda: "/opt/bin/hc"
+        )
         seen = {}
-        monkeypatch.setattr("os.execvpe", lambda f, argv, env: seen.update(argv=argv, env=env))
+        monkeypatch.setattr(
+            "os.execvpe", lambda f, argv, env: seen.update(file=f, argv=argv, env=env)
+        )
         backend.attach_session("cao-a")
-        assert seen["argv"] == ["hc", "attach", "t1"] and seen["env"]["HC_SESSION"] == "cao"
+        assert seen["file"] == "/opt/bin/hc"
+        assert seen["argv"] == ["/opt/bin/hc", "attach", "t1"]
+        assert seen["env"]["HC_SESSION"] == "cao"
+        assert not set(CALLER_CORE_ENV) & set(seen["env"])
 
 
 class TestInputDeviations:
