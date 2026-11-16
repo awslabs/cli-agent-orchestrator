@@ -11,7 +11,7 @@ import queue
 import shutil
 import subprocess
 import threading
-from typing import Any, Dict, Optional, cast
+from typing import Any, Callable, Dict, Optional, cast
 
 from cli_agent_orchestrator.backends.base import TerminalBackendError
 
@@ -144,10 +144,19 @@ class HcRpcClient:
         self._conn: Optional[_Connection] = None
         self._ids = itertools.count(1)
 
-    def start_server(self) -> None:
+    def start_server(self, drop_env: Optional[Callable[[str], bool]] = None) -> None:
+        """Start the session's core if it is not running (idempotent).
+
+        ``drop_env`` names keys to keep out of the core's environment, which
+        every terminal it starts inherits. It only matters when this call is
+        the one that starts the core.
+        """
+        env = hc_env(self.session)
+        if drop_env is not None:
+            env = {k: v for k, v in env.items() if k == "HC_SESSION" or not drop_env(k)}
         done = subprocess.run(
             [hc_binary(), "server", "start", "--json"],
-            env=hc_env(self.session),
+            env=env,
             capture_output=True,
             text=True,
             timeout=30,

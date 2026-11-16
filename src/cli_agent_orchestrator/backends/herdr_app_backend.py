@@ -15,7 +15,13 @@ import secrets
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from cli_agent_orchestrator.backends.base import TerminalBackend, TerminalBackendError
+from cli_agent_orchestrator.backends.base import (
+    TerminalBackend,
+    TerminalBackendError,
+    TerminalCleanupOutcome,
+    TerminalCleanupResult,
+    TerminalNotFoundError,
+)
 from cli_agent_orchestrator.clients.hc_rpc import HcProtocolError, HcRpcClient, HcRpcError
 from cli_agent_orchestrator.constants import HC_READ_MAX_LINES
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -26,6 +32,12 @@ LAYOUT_DOC = "herdr-app"
 DOC_WRITE_ATTEMPTS = 5
 DOC_RETRY_DELAY_S = 0.1
 MANAGED = {"cao.managed": "1"}
+RPC_TIMEOUT_S = 10.0
+# terminal.send / terminal.keys wait for a person's unfinished draft (up to
+# ~60 s) and for output to settle before typing.
+INPUT_TIMEOUT_S = 90.0
+# hc key names for characters that are not their own name (hc 0.1.21).
+_CHAR_KEY_NAMES = {" ": "space"}
 
 HC_STATUS_TO_TERMINAL_STATUS: Dict[str, TerminalStatus] = {
     "working": TerminalStatus.PROCESSING,
@@ -52,6 +64,19 @@ def _terminals_in(node: Any) -> List[str]:
     return found
 
 
+def _is_provider_session_key(key: str) -> bool:
+    """Provider-session variables (``CLAUDECODE``, ``CODEX_*``...) of the process
+    that starts the core. Every terminal inherits the core's environment, and
+    these make an agent CLI think it is nested in another session. Same prefixes
+    and allowlist tmux keeps out of its sessions; the operator's own ``PATH`` and
+    friends stay."""
+    from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+    if key in TmuxClient._BLOCKED_PREFIX_ALLOWLIST:
+        return False
+    return key.startswith(TmuxClient._BLOCKED_ENV_PREFIXES)
+
+
 class HerdrAppBackend(TerminalBackend):
     """TerminalBackend for the Herdr app (herdr-core)."""
 
@@ -67,7 +92,7 @@ class HerdrAppBackend(TerminalBackend):
 
         if self._client is None:
             self._client = HcRpcClient(self._session)
-            self._client.start_server()
+            self._client.start_server(drop_env=_is_provider_session_key)
         try:
             self._client.hello()
         except HcProtocolError as exc:
@@ -77,9 +102,9 @@ class HerdrAppBackend(TerminalBackend):
     def herdr_app_session(self) -> str:
         return self._session
 
-    def _call(self, method: str, **params: Any) -> Any:
+    def _call(self, method: str, _timeout: float = RPC_TIMEOUT_S, **params: Any) -> Any:
         assert self._client is not None
-        return self._client.call(method, params)
+        return self._client.call(method, params, timeout=_timeout)
 
     # --- Environment and creation ---
 
@@ -220,19 +245,124 @@ class HerdrAppBackend(TerminalBackend):
         except Exception as exc:  # noqa: BLE001 - naming must never fail a caller
             logger.warning("herdr-app: could not name spaces and tabs: %s", exc)
 
-    # --- Filled in by Task 4 ---
+    # --- Lookup ---
+
+    def _list(self, **labels: str) -> List[Dict[str, Any]]:
+        return list(self._call("terminal.list", labels={**MANAGED, **labels})["terminals"])
+
+    def _terminal(self, session_name: str, window_name: str) -> Dict[str, Any]:
+        found = self._list(**{"cao.session": session_name, "cao.window": window_name})
+        if not found:
+            raise TerminalNotFoundError(
+                f"{session_name}:{window_name}", "no live herdr-core terminal"
+            )
+        return found[0]
+
+    def _address(self, session_name: str, window_name: str) -> str:
+        return str(self._terminal(session_name, window_name)["address"])
+
+    def kill_address(self, address: str) -> None:
+        """Kill and remove one herdr-core terminal; a missing one is fine."""
+        for method in ("terminal.kill", "terminal.rm"):
+            try:
+                self._call(method, terminal=address)
+            except HcRpcError as exc:
+                if exc.kind != "not_found":
+                    raise
+
+    def list_managed(self) -> List[Dict[str, Any]]:
+        """Live CAO terminals in this core (used by the inbox service)."""
+        return self._list()
+
+    # --- Sessions and windows ---
 
     def session_exists(self, session_name: str) -> bool:
-        raise NotImplementedError
+        try:
+            return self.session_exists_strict(session_name)
+        except TerminalBackendError:
+            return False
+
+    def session_exists_strict(self, session_name: str) -> bool:
+        return bool(self._list(**{"cao.session": session_name}))
 
     def list_sessions(self) -> List[Dict[str, str]]:
-        raise NotImplementedError
-
-    def kill_session(self, session_name: str) -> bool:
-        raise NotImplementedError
+        try:
+            names = sorted({t["labels"]["cao.session"] for t in self._list()})
+        except TerminalBackendError:
+            return []
+        return [{"id": n, "name": n, "status": "active"} for n in names]
 
     def kill_window(self, session_name: str, window_name: str) -> bool:
-        raise NotImplementedError
+        try:
+            address = self._address(session_name, window_name)
+        except TerminalNotFoundError:
+            return False
+        self.kill_address(address)
+        return True
+
+    def kill_session(self, session_name: str) -> bool:
+        terminals = self._list(**{"cao.session": session_name})
+        if not terminals:
+            return False
+        for t in terminals:
+            self.kill_address(t["address"])
+        if self._list(**{"cao.session": session_name}):
+            return False
+        sp = space_id_for(session_name)
+
+        def drop_space(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            kept = [s for s in doc["spaces"] if not (isinstance(s, dict) and s.get("id") == sp)]
+            if len(kept) == len(doc["spaces"]):
+                return None
+            doc["spaces"] = kept
+            return doc
+
+        try:
+            self.update_layout(drop_space)
+        except Exception as exc:  # noqa: BLE001 - the session is gone either way
+            logger.warning("herdr-app: could not remove space for %s: %s", session_name, exc)
+        return True
+
+    def cleanup_terminal_exact(
+        self,
+        terminal_id: str,
+        session_name: Optional[str] = None,
+        window_name: Optional[str] = None,
+        *,
+        close: bool = True,
+    ) -> TerminalCleanupResult:
+        try:
+            found = self._list(**{"cao.terminal_id": terminal_id})
+        except TerminalBackendError as exc:
+            return TerminalCleanupResult(TerminalCleanupOutcome.UNKNOWN, f"lookup failed: {exc}")
+        if not found:
+            return TerminalCleanupResult(TerminalCleanupOutcome.ABSENT)
+        if len(found) > 1:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN, f"{len(found)} terminals carry {terminal_id}"
+            )
+        if not close:
+            return TerminalCleanupResult(TerminalCleanupOutcome.STILL_PRESENT)
+        try:
+            self.kill_address(found[0]["address"])
+            gone = not self._list(**{"cao.terminal_id": terminal_id})
+        except TerminalBackendError as exc:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN, f"close not confirmed: {exc}"
+            )
+        return TerminalCleanupResult(
+            TerminalCleanupOutcome.DELETED if gone else TerminalCleanupOutcome.STILL_PRESENT
+        )
+
+    # --- Input ---
+
+    _KEY_NAMES = {
+        "enter": "enter",
+        "escape": "esc",
+        "c-c": "ctrl+c",
+        "c-d": "ctrl+d",
+        "c-u": "ctrl+u",
+    }
 
     def send_keys(
         self,
@@ -243,10 +373,35 @@ class HerdrAppBackend(TerminalBackend):
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
     ) -> None:
-        raise NotImplementedError
+        address = self._address(session_name, window_name)
+        if enter_count <= 0:
+            # hc has no paste-without-Enter; short menu answers go key by key.
+            if len(keys) > 64 or not keys.isprintable():
+                raise TerminalBackendError(
+                    "herdr-app can only type up to 64 printable characters without Enter"
+                )
+            if keys:
+                # hc rejects shifted punctuation as key names (invalid_params,
+                # nothing typed), which surfaces as a TerminalBackendError.
+                names = [_CHAR_KEY_NAMES.get(ch, ch) for ch in keys]
+                self._call("terminal.keys", INPUT_TIMEOUT_S, terminal=address, keys=names)
+            return
+        # force: CAO's own delivery gates decide when to type, as on tmux.
+        self._call("terminal.send", INPUT_TIMEOUT_S, terminal=address, text=keys, force=True)
+        for _ in range(enter_count - 1):
+            self._call("terminal.keys", INPUT_TIMEOUT_S, terminal=address, keys=["enter"])
 
     def send_special_key(self, session_name: str, window_name: str, key: str) -> None:
-        raise NotImplementedError
+        lowered = (key or "enter").lower()
+        name = self._KEY_NAMES.get(lowered, lowered)
+        address = self._address(session_name, window_name)
+        self._call("terminal.keys", INPUT_TIMEOUT_S, terminal=address, keys=[name])
+
+    # --- Output ---
+
+    @property
+    def max_history_lines(self) -> int:
+        return HC_READ_MAX_LINES
 
     def get_history(
         self,
@@ -258,23 +413,65 @@ class HerdrAppBackend(TerminalBackend):
         visible_only: bool = False,
         join_wrapped: bool = False,
     ) -> str:
-        raise NotImplementedError
-
-    @property
-    def max_history_lines(self) -> int:
-        return HC_READ_MAX_LINES
+        """terminal.read returns plain text (screen plus ``lines`` of history)."""
+        if visible_only:
+            lines = 0
+        elif full_history:
+            lines = HC_READ_MAX_LINES
+        else:
+            lines = min(tail_lines or 500, HC_READ_MAX_LINES)
+        result = self._call(
+            "terminal.read", terminal=self._address(session_name, window_name), lines=lines
+        )
+        return str(result.get("text", ""))
 
     def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
-        raise NotImplementedError
+        t = self._terminal(session_name, window_name)
+        return (t.get("foreground") or {}).get("cwd") or t.get("cwd")
 
     def get_pane_current_command(self, session_name: str, window_name: str) -> Optional[str]:
-        raise NotImplementedError
+        return (self._terminal(session_name, window_name).get("foreground") or {}).get("name")
+
+    # --- Status ---
+
+    def supports_event_inbox(self) -> bool:
+        return True
+
+    def get_native_status(self, session_name: str, window_name: str) -> Optional[TerminalStatus]:
+        try:
+            status = self._terminal(session_name, window_name).get("status")
+        except TerminalBackendError:
+            return None
+        state = status.get("state") if isinstance(status, dict) else None
+        return HC_STATUS_TO_TERMINAL_STATUS.get(state) if isinstance(state, str) else None
+
+    def get_pane_id(self, terminal_id: str, session_name: str = "", window_name: str = "") -> str:
+        found = self._list(**{"cao.terminal_id": terminal_id})
+        if not found:
+            raise TerminalNotFoundError(terminal_id, "no live herdr-core terminal")
+        return str(found[0]["address"])
+
+    # --- Attach ---
 
     def attach_session(self, session_name: str) -> None:
-        raise NotImplementedError
+        found = self._list(**{"cao.session": session_name})
+        if not found:
+            raise TerminalNotFoundError(session_name, "no live herdr-core terminal")
+        env = {**os.environ, "HC_SESSION": self._session}
+        for key in ("HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE"):
+            env.pop(key, None)
+        os.execvpe("hc", ["hc", "attach", str(found[0]["address"])], env)
 
     def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
-        raise NotImplementedError
+        return [
+            "env",
+            f"HC_SESSION={self._session}",
+            "hc",
+            "attach",
+            self._address(session_name, window_name),
+        ]
+
+    # --- Pipe-pane: event inbox instead ---
 
     def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
         return None

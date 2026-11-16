@@ -113,3 +113,241 @@ def test_persistent_conflict_does_not_fail_creation(backend, hc, tmp_path, caplo
     assert backend.create_session("cao-a", "sup", "aaaa0001", str(tmp_path)) == "sup"
     assert len(hc.calls_to("doc.set")) == 5
     assert "could not name" in caplog.text
+
+
+from cli_agent_orchestrator.backends.base import (
+    TerminalBackendError,
+    TerminalCleanupOutcome,
+    TerminalNotFoundError,
+)
+from cli_agent_orchestrator.constants import HC_READ_MAX_LINES
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+
+def _labels(session, window, tid):
+    return {
+        "cao.managed": "1",
+        "cao.session": session,
+        "cao.window": window,
+        "cao.terminal_id": tid,
+        "herdr.space": space_id_for(session),
+        "herdr.tab": "tb1",
+    }
+
+
+@pytest.fixture
+def two_windows(hc):
+    a = hc.add_terminal(_labels("cao-a", "sup", "aaaa0001"), name="cao-aaaa0001")
+    b = hc.add_terminal(_labels("cao-a", "w1", "aaaa0002"), name="cao-aaaa0002")
+    return a, b
+
+
+class TestInput:
+    def test_send_with_enter(self, backend, hc, two_windows):
+        backend.send_keys("cao-a", "w1", "hello")
+        assert hc.calls_to("terminal.send") == [{"terminal": "t2", "text": "hello", "force": True}]
+        assert hc.calls_to("terminal.keys") == []
+
+    def test_send_with_two_enters(self, backend, hc, two_windows):
+        backend.send_keys("cao-a", "w1", "hello", enter_count=2)
+        assert hc.calls_to("terminal.keys") == [{"terminal": "t2", "keys": ["enter"]}]
+
+    def test_send_without_enter_presses_keys(self, backend, hc, two_windows):
+        backend.send_keys("cao-a", "w1", "3", enter_count=0)
+        assert hc.calls_to("terminal.keys") == [{"terminal": "t2", "keys": ["3"]}]
+        assert hc.calls_to("terminal.send") == []
+
+    def test_send_without_enter_rejects_long_text(self, backend, two_windows):
+        with pytest.raises(TerminalBackendError):
+            backend.send_keys("cao-a", "w1", "x" * 65, enter_count=0)
+
+    @pytest.mark.parametrize(
+        "key,expected",
+        [
+            ("Enter", "enter"),
+            ("Escape", "esc"),
+            ("C-c", "ctrl+c"),
+            ("C-d", "ctrl+d"),
+            ("C-u", "ctrl+u"),
+            ("Down", "down"),
+        ],
+    )
+    def test_special_keys(self, backend, hc, two_windows, key, expected):
+        backend.send_special_key("cao-a", "w1", key)
+        assert hc.calls_to("terminal.keys")[-1] == {"terminal": "t2", "keys": [expected]}
+
+    def test_unknown_window(self, backend, two_windows):
+        with pytest.raises(TerminalNotFoundError):
+            backend.send_keys("cao-a", "nope", "x")
+
+
+class TestOutput:
+    def test_history_caps_lines(self, backend, hc, two_windows):
+        two_windows[1]["text"] = "hi"
+        assert backend.get_history("cao-a", "w1", tail_lines=200) == "hi"
+        backend.get_history("cao-a", "w1", tail_lines=10**6)
+        backend.get_history("cao-a", "w1", full_history=True)
+        backend.get_history("cao-a", "w1", visible_only=True)
+        lines = [c["lines"] for c in hc.calls_to("terminal.read")]
+        assert lines == [200, HC_READ_MAX_LINES, HC_READ_MAX_LINES, 0]
+
+    def test_cwd_and_command_from_foreground(self, backend, two_windows):
+        two_windows[1]["foreground"] = {"name": "kiro-cli", "cwd": "/repo", "argv": ["kiro-cli"]}
+        assert backend.get_pane_working_directory("cao-a", "w1") == "/repo"
+        assert backend.get_pane_current_command("cao-a", "w1") == "kiro-cli"
+
+    def test_cwd_falls_back_to_launch_cwd(self, backend, two_windows):
+        two_windows[1]["foreground"] = None
+        assert backend.get_pane_working_directory("cao-a", "w1") == "/tmp"
+
+    def test_pipe_pane_is_a_noop(self, backend, hc, two_windows):
+        before = len(hc.calls)
+        backend.pipe_pane("cao-a", "w1", "/tmp/x")
+        backend.stop_pipe_pane("cao-a", "w1")
+        assert len(hc.calls) == before
+
+
+class TestLifecycle:
+    def test_session_exists_and_list(self, backend, two_windows):
+        assert backend.session_exists("cao-a") is True
+        assert backend.session_exists("cao-b") is False
+        assert backend.list_sessions() == [{"id": "cao-a", "name": "cao-a", "status": "active"}]
+
+    def test_strict_raises_on_failure(self, backend, hc):
+        hc.fail_methods.add("terminal.list")
+        assert backend.session_exists("cao-a") is False
+        with pytest.raises(TerminalBackendError):
+            backend.session_exists_strict("cao-a")
+
+    def test_kill_window(self, backend, hc, two_windows):
+        assert backend.kill_window("cao-a", "w1") is True
+        assert "t2" not in hc.terminals
+        assert backend.kill_window("cao-a", "w1") is False
+
+    def test_kill_session_removes_space(self, backend, hc, two_windows):
+        sp = space_id_for("cao-a")
+        doc = layout_with(sp, [("tbA", "sup", "t1")], "cao-a")
+        doc["spaces"].append({"id": "spOther", "name": "mine", "tabs": []})
+        hc.set_doc("herdr-app", doc)
+        assert backend.kill_session("cao-a") is True
+        assert hc.terminals == {}
+        assert [s["id"] for s in hc.docs["herdr-app"]["value"]["spaces"]] == ["spOther"]
+
+    def test_kill_missing_session(self, backend):
+        assert backend.kill_session("cao-x") is False
+
+
+class TestExactCleanup:
+    def test_one_match_deleted(self, backend, hc, two_windows):
+        r = backend.cleanup_terminal_exact("aaaa0002")
+        assert r.outcome == TerminalCleanupOutcome.DELETED and "t2" not in hc.terminals
+
+    def test_absent(self, backend, two_windows):
+        assert backend.cleanup_terminal_exact("ffff0000").outcome == TerminalCleanupOutcome.ABSENT
+
+    def test_ambiguous_is_unknown(self, backend, hc, two_windows):
+        hc.add_terminal(_labels("cao-a", "w9", "aaaa0002"))
+        assert backend.cleanup_terminal_exact("aaaa0002").outcome == TerminalCleanupOutcome.UNKNOWN
+        assert len(hc.calls_to("terminal.kill")) == 0
+
+    def test_prove_only(self, backend, hc, two_windows):
+        r = backend.cleanup_terminal_exact("aaaa0002", close=False)
+        assert r.outcome == TerminalCleanupOutcome.STILL_PRESENT and "t2" in hc.terminals
+
+    def test_lookup_failure_is_unknown(self, backend, hc):
+        hc.fail_methods.add("terminal.list")
+        assert backend.cleanup_terminal_exact("aaaa0002").outcome == TerminalCleanupOutcome.UNKNOWN
+
+
+class TestStatusAndAttach:
+    @pytest.mark.parametrize(
+        "state,expected",
+        [
+            ("working", TerminalStatus.PROCESSING),
+            ("blocked", TerminalStatus.WAITING_USER_ANSWER),
+            ("done", TerminalStatus.COMPLETED),
+            ("idle", TerminalStatus.IDLE),
+            ("error", TerminalStatus.ERROR),
+            ("thinking", None),
+        ],
+    )
+    def test_native_status(self, backend, two_windows, state, expected):
+        two_windows[1]["status"] = {"app": "kiro-cli", "state": state}
+        assert backend.get_native_status("cao-a", "w1") == expected
+
+    def test_no_report_is_none(self, backend, two_windows):
+        assert backend.get_native_status("cao-a", "w1") is None
+
+    def test_event_inbox_and_pane_id(self, backend, two_windows):
+        assert backend.supports_event_inbox() is True
+        assert backend.get_pane_id("aaaa0002", "cao-a", "w1") == "t2"
+
+    def test_web_attach_argv(self, backend, two_windows):
+        assert backend.prepare_web_attach("cao-a", "w1") == [
+            "env",
+            "HC_SESSION=cao",
+            "hc",
+            "attach",
+            "t2",
+        ]
+
+    def test_attach_session_execs_hc(self, backend, two_windows, monkeypatch):
+        seen = {}
+        monkeypatch.setattr("os.execvpe", lambda f, argv, env: seen.update(argv=argv, env=env))
+        backend.attach_session("cao-a")
+        assert seen["argv"] == ["hc", "attach", "t1"] and seen["env"]["HC_SESSION"] == "cao"
+
+
+class TestInputDeviations:
+    """Behavior measured live on hc 0.1.21 that the plan did not cover."""
+
+    def test_space_is_named_space(self, backend, hc, two_windows):
+        # hc rejects " " as a key name; it calls it "space".
+        backend.send_keys("cao-a", "w1", "a b", enter_count=0)
+        assert hc.calls_to("terminal.keys") == [{"terminal": "t2", "keys": ["a", "space", "b"]}]
+
+    def test_empty_text_without_enter_sends_nothing(self, backend, hc, two_windows):
+        backend.send_keys("cao-a", "w1", "", enter_count=0)
+        assert hc.calls_to("terminal.keys") == []
+
+    def test_input_calls_allow_a_draft_wait(self, backend, hc, two_windows, monkeypatch):
+        # terminal.send / terminal.keys wait for a person's draft (up to ~60 s),
+        # so they must not use the 10 s default request timeout.
+        timeouts = {}
+        real_call = hc.call
+
+        def spy(method, params=None, timeout=10.0):
+            timeouts[method] = timeout
+            return real_call(method, params, timeout)
+
+        monkeypatch.setattr(hc, "call", spy)
+        backend.send_keys("cao-a", "w1", "hello", enter_count=2)
+        backend.send_special_key("cao-a", "w1", "Escape")
+        assert timeouts["terminal.send"] > 60 and timeouts["terminal.keys"] > 60
+        assert timeouts["terminal.list"] == 10.0
+
+
+def test_server_env_drops_blocked_keys(monkeypatch):
+    """CAO-started cores do not hand provider-session vars to agent terminals."""
+    from cli_agent_orchestrator.backends import herdr_app_backend as mod
+
+    seen = {}
+
+    class _Client:
+        def __init__(self, session):
+            pass
+
+        def start_server(self, drop_env=None):
+            seen["drop"] = drop_env
+
+        def hello(self):
+            return {}
+
+    monkeypatch.setattr(mod, "HcRpcClient", _Client)
+    HerdrAppBackend("cao")
+    assert seen["drop"]("CLAUDECODE") is True
+    assert seen["drop"]("CODEX_HOME") is True
+    assert seen["drop"]("CLAUDE_CODE_USE_BEDROCK") is False
+    # The core's own environment is the operator's: PATH etc. stay.
+    assert seen["drop"]("PATH") is False
+    assert seen["drop"]("AWS_PROFILE") is False
