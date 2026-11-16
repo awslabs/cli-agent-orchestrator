@@ -37,6 +37,13 @@ REQUIRED_METHODS = frozenset(
 # Inherited from an app terminal, these would point hc at the caller's core.
 _STRIPPED_ENV = ("HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE")
 _EOF = object()
+# Reaping an `hc connect` child we just SIGKILLed: it holds no state to flush,
+# so it exits at once; the bound only keeps a wedged kernel from hanging close().
+CONNECT_REAP_TIMEOUT_S = 5
+# `hc server start` returns once the core's socket accepts connections (hc
+# 0.1.21 reports uptime_ms in single digits); 30 s covers a cold start on a
+# loaded host and matches the e2e suite's `hc server stop` bound.
+SERVER_START_TIMEOUT_S = 30
 
 
 class HcRpcError(TerminalBackendError):
@@ -118,7 +125,7 @@ class _Connection:
     def close(self) -> None:
         if self.alive():
             self._proc.kill()
-        self._proc.wait(timeout=5)
+        self._proc.wait(timeout=CONNECT_REAP_TIMEOUT_S)
         if self._proc.stdin is not None:
             try:
                 self._proc.stdin.close()
@@ -159,7 +166,7 @@ class HcRpcClient:
             env=env,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=SERVER_START_TIMEOUT_S,
             check=False,
         )
         if done.returncode != 0:
