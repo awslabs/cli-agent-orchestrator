@@ -48,12 +48,15 @@ INPUT_TIMEOUT_S = 90.0
 # hc key names for characters that are not their own name (hc 0.1.21).
 _CHAR_KEY_NAMES = {" ": "space"}
 
+# No "error": herdr-core keeps a terminal at `error` after a failed turn while
+# the agent is back at its prompt (seen live with kiro-cli 3.3.0), and ERROR
+# makes terminal_service refuse every later input. Unmapped, the provider's
+# screen analysis decides, as on the herdr TUI backend.
 HC_STATUS_TO_TERMINAL_STATUS: Dict[str, TerminalStatus] = {
     "working": TerminalStatus.PROCESSING,
     "blocked": TerminalStatus.WAITING_USER_ANSWER,
     "done": TerminalStatus.COMPLETED,
     "idle": TerminalStatus.IDLE,
-    "error": TerminalStatus.ERROR,
 }
 
 

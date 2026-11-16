@@ -44,6 +44,8 @@ Use your `terminal.herdr_app_session` value in place of `cao` if you changed it.
 ## Behavior to know about
 
 - **Kept terminals.** The app sets `keep` on terminals it shows. When an agent is lost, herdr-core replaces it with a shell, and CAO then closes that shell.
+- **Native `error` is ignored.** herdr-core keeps a terminal's status at `error` after a failed turn, even once the agent is back at its prompt. CAO doesn't treat that as an error: it reads the agent's screen, as it does when no status is reported, so the terminal keeps taking input. Inbox messages aren't delivered on `error`; they go out on the next `idle` or `done`.
+- **Inbox delivery waits about 10 seconds after a turn ends.** When an agent reports `idle` or `done`, CAO first waits for its output to settle (the same 10-second completion wait as on the other backends) and reports the terminal as processing meanwhile. So a queued message reaches it about 10 seconds after the turn ends, not at once.
 - **Sends wait.** Typing into a terminal waits for about 3 seconds of output quiet, and for a person's unfinished draft in that terminal to be sent or cleared.
 - **Keys without Enter.** Text sent without Enter (for example, a short menu answer) is typed key by key through `terminal.keys`. It's limited to 64 printable characters that `terminal.keys` accepts as key names: letters in either case, digits, and unshifted punctuation such as `-`, `/`, `.`, and `=`. A space is sent as the `space` key. Shifted punctuation such as `?`, `!`, `_`, or `:` is rejected, and nothing is typed.
 - **History depth.** CAO reads at most 2000 lines of history per terminal. herdr-core 0.1.21 returns about 3000 screen rows, and a line wider than the terminal takes more than one row.

@@ -182,6 +182,19 @@ def test_same_state_recorded_once(env):
     assert len(recorded) == 1
 
 
+def test_native_error_is_neither_recorded_nor_delivered(env):
+    # herdr-core keeps `error` after a failed turn while the agent waits at its
+    # prompt again; the provider's screen analysis is the judge, not this word.
+    svc, _, deliver, _, recorded, _ = env
+    run(svc, status(1, "t1", "working"), status(2, "t1", "error"))
+    assert recorded == [("aaaa0001", TerminalStatus.PROCESSING)]
+    assert not deliver.called
+    # The next real idle after the error still records and delivers.
+    run(svc, status(3, "t1", "idle"))
+    assert recorded[-1] == ("aaaa0001", TerminalStatus.IDLE)
+    assert deliver.called
+
+
 def test_cleared_status_records_nothing(env):
     svc, _, deliver, _, recorded, _ = env
     run(svc, status(1, "t1", None))

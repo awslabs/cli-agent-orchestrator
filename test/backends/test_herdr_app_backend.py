@@ -278,7 +278,10 @@ class TestStatusAndAttach:
             ("blocked", TerminalStatus.WAITING_USER_ANSWER),
             ("done", TerminalStatus.COMPLETED),
             ("idle", TerminalStatus.IDLE),
-            ("error", TerminalStatus.ERROR),
+            # herdr-core keeps `error` after a failed turn while the agent is
+            # back at its prompt; ERROR would refuse all input, so the
+            # provider's screen analysis decides instead.
+            ("error", None),
             ("thinking", None),
         ],
     )
