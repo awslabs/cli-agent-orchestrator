@@ -491,10 +491,23 @@ _BACKGROUND_TERMINALS_RE = re.compile(
 )
 
 
+class _ComposerWithAmbiguousTail(str):
+    """Preserve the display text while identifying the portion safe to match."""
+
+    certain_prefix: str
+
+    def __new__(cls, text: str, certain_prefix: str) -> "_ComposerWithAmbiguousTail":
+        result = super().__new__(cls, text)
+        result.certain_prefix = certain_prefix
+        return result
+
+
 def _tui_status_bar_start(lines: list[str]) -> Optional[int]:
     bottom = max(len(lines) - IDLE_PROMPT_TAIL_LINES, 0)
     for index in range(len(lines) - 1, bottom - 1, -1):
-        if not re.search(TUI_FOOTER_PATTERN, lines[index]):
+        if re.match(rf"^\s*{IDLE_PROMPT_PATTERN}", lines[index]) or not re.search(
+            TUI_FOOTER_PATTERN, lines[index]
+        ):
             continue
         previous = index - 1
         while previous >= bottom and index - previous <= 3 and not lines[previous].strip():
@@ -502,18 +515,19 @@ def _tui_status_bar_start(lines: list[str]) -> Optional[int]:
         if (
             previous >= bottom
             and index - previous <= 3
-            and (
-                (
-                    re.search(r"\?\s+for shortcuts", lines[index])
-                    and re.search(r"·\s+[~/]", lines[previous])
-                )
-                or (
-                    re.search(r"·\s+[~/]", lines[index])
-                    and re.fullmatch(r"\s*\?\s+for shortcuts\s*", lines[previous])
-                )
-            )
+            and not re.match(rf"^\s*{IDLE_PROMPT_PATTERN}", lines[previous])
+            and re.search(r"\?\s+for shortcuts", lines[index])
+            and re.search(r"·\s+[~/]", lines[previous])
         ):
-            return previous
+            # Text alone cannot distinguish a configurable status row from a
+            # contiguous draft continuation. Preserve that entire draft; a
+            # blank boundary before the candidate permits recognizing status
+            # without depending on model names or spacing within the row.
+            start = previous - 1
+            while start >= 0 and lines[start].startswith("  ") and lines[start].strip():
+                start -= 1
+            if start < 0 or not re.match(rf"^\s*{IDLE_PROMPT_PATTERN}", lines[start]):
+                return previous
         return index
     return None
 
@@ -536,10 +550,12 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
 
     # Scan upward from the status bar to include blank lines and the
     # suggestion hint (› with text) that are part of the TUI footer chrome.
-    for j in range(footer_start_idx - 1, max(footer_start_idx - 4, -1), -1):
+    crossed_continuation = False
+    for j in range(footer_start_idx - 1, -1, -1):
         line = all_lines[j]
         if not line.strip():
-            footer_start_idx = j
+            if not crossed_continuation:
+                footer_start_idx = j
         elif re.match(rf"\s*{IDLE_PROMPT_PATTERN}", line):
             footer_start_idx = j
             # A notice without a preceding completion footer could be reply text.
@@ -557,6 +573,12 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
                 ):
                     footer_start_idx = notice_idx
             break
+        elif line.startswith("  "):
+            # Explore provisionally: these may be response rows during a
+            # redraw. Only a prompt confirms that the intervening rows belong
+            # to the composer; until then retain their original cutoff.
+            crossed_continuation = True
+            continue
         else:
             break
 
@@ -2927,7 +2949,12 @@ class CodexProvider(BaseProvider):
         return self._get_status(frame, rendered=True) == TerminalStatus.PROCESSING
 
     def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
-        """Return Codex's bottom composer without admitting transcript prompts."""
+        """Return Codex's bottom composer without admitting transcript prompts.
+
+        A status-looking row contiguous with a draft is visually ambiguous and
+        is preserved. A blank separator is needed to exclude arbitrary status
+        copy; this text capture cannot prove the exact boundary otherwise.
+        """
         lines = rendered_pane.splitlines()
         footer_index = _tui_status_bar_start(lines)
         if footer_index is None:
@@ -2952,7 +2979,16 @@ class CodexProvider(BaseProvider):
             STARTUP_IDLE_PLACEHOLDER_PATTERN, first_composer_line
         ):
             return ""
-        return "\n".join(composer_lines).rstrip()
+        composer = "\n".join(composer_lines).rstrip()
+        rows = composer.splitlines()
+        if (
+            len(rows) > 1
+            and re.search(r"·\s+[~/]", rows[-1])
+            and re.search(r"\?\s+for shortcuts", lines[footer_index])
+        ):
+            # This last row can be either a status bar or draft continuation.
+            return _ComposerWithAmbiguousTail(composer, "\n".join(rows[:-1]))
+        return composer
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Codex's final response from terminal output.

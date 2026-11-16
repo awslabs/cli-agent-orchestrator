@@ -2006,6 +2006,147 @@ class TestSwallowedEnterRecoveryOnRealComposers:
         assert pane.composer == ""
 
 
+class TestCodexNoStatusSubmitRecovery:
+    def test_contiguous_status_path_does_not_submit_unrelated_draft(self):
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        message = "/tmp/project"
+        provider = CodexProvider("term-1", "s", "w")
+        pane = MagicMock()
+        pane.get_history.return_value = (
+            "› pending unrelated task\n"
+            "  gpt-6 max · /tmp/project                       ⚠ 1 warning · f2 to view\n"
+            "  ? for shortcuts\n"
+        )
+        with (
+            patch.object(ts, "get_backend", return_value=pane),
+            patch.object(
+                ts, "get_terminal_metadata", return_value={"tmux_session": "s", "tmux_window": "w"}
+            ),
+            patch.object(ts.provider_manager, "get_provider", return_value=provider),
+            patch.object(ts, "send_special_key") as send_key,
+            patch.object(ts, "dispatch_input") as dispatch,
+        ):
+            assert ts._message_in_composer("term-1", message) is None
+            assert ts.redeliver_dropped_message_with_boundary(
+                "term-1",
+                message,
+                1,
+                provider=provider,
+                full_resend_requires_composer_evidence=True,
+            ) == (False, None)
+        send_key.assert_not_called()
+        dispatch.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("message", "expected"),
+        [
+            ("pending unrelated task", True),
+            ("unrelated task gpt-6 max", None),
+            ("missing content", False),
+        ],
+    )
+    def test_match_only_in_certain_composer_text(self, message, expected):
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        pane = MagicMock()
+        pane.get_history.return_value = (
+            "› pending unrelated task\n" "  gpt-6 max · /tmp/project\n" "  ? for shortcuts\n"
+        )
+        with (
+            patch.object(ts, "get_backend", return_value=pane),
+            patch.object(
+                ts, "get_terminal_metadata", return_value={"tmux_session": "s", "tmux_window": "w"}
+            ),
+            patch.object(
+                ts.provider_manager, "get_provider", return_value=CodexProvider("term-1", "s", "w")
+            ),
+        ):
+            assert ts._message_in_composer("term-1", message) is expected
+
+    @pytest.mark.parametrize("path", ["/tmp/x", "~/x"])
+    @pytest.mark.parametrize("execution_observed", [False, True])
+    @pytest.mark.parametrize("multiline", [False, True])
+    @pytest.mark.parametrize("prefix", ["and report", "and  report", "gpt-custom", "codex"])
+    def test_swallowed_enter_recovers_without_repeating_paste(
+        self, path, execution_observed, multiline, prefix
+    ):
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+        from cli_agent_orchestrator.services import terminal_service as ts
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        message = f"check foo\n  {prefix} {path}" if multiline else f"check foo · {path} and report"
+        screen = (
+            "› Earlier request\n"
+            "Previous response\n"
+            "  Worked for 2s • 7:46 AM\n"
+            f"› {message}\n\n"
+            "  ? for shortcuts\n"
+        )
+        provider = CodexProvider("term-1", "s", "w")
+        pane = MagicMock()
+        pane.get_history.return_value = screen
+        sm = MagicMock()
+        sm.get_status.return_value = TerminalStatus.IDLE
+        sm.output_generation.return_value = 7
+        entered = []
+        sm.status_observation.side_effect = lambda tid: (
+            StatusObservation(TerminalStatus.PROCESSING, 8)
+            if entered and execution_observed
+            else StatusObservation(TerminalStatus.IDLE, 7)
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRM_TIMEOUT", 0.0
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_MAX_RESUBMITS", 1),
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", sm),
+            patch.object(ts, "status_monitor", sm),
+            patch.object(ts, "get_backend", return_value=pane),
+            patch.object(
+                ts, "get_terminal_metadata", return_value={"tmux_session": "s", "tmux_window": "w"}
+            ),
+            patch.object(ts.provider_manager, "get_provider", return_value=provider),
+            patch.object(ts, "dispatch_input", return_value=7) as dispatch,
+            patch.object(
+                ts, "send_special_key", side_effect=lambda tid, key: entered.append((tid, key))
+            ),
+        ):
+            # The initial dispatch succeeds, but its Enter is absorbed by the TUI.
+            boundary = dispatch("term-1", message)
+            assert ts._message_in_composer("term-1", message) is True
+            confirmed = InboxService()._confirm_submitted(
+                "term-1", message, boundary, registry=None, sender_id="sender-1"
+            )
+
+        dispatch.assert_called_once_with("term-1", message)
+        assert entered == [("term-1", "Enter")]
+        assert confirmed is execution_observed
+
+    def test_previous_message_in_history_is_not_in_empty_composer(self):
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        message = "check foo · /tmp/x and report"
+        pane = MagicMock()
+        pane.get_history.return_value = (
+            f"› {message}\nPrevious response\n  Worked for 2s • 7:46 AM\n"
+            "› Ask Codex to do anything\n\n  ? for shortcuts\n"
+        )
+        with (
+            patch.object(ts, "get_backend", return_value=pane),
+            patch.object(
+                ts, "get_terminal_metadata", return_value={"tmux_session": "s", "tmux_window": "w"}
+            ),
+            patch.object(
+                ts.provider_manager, "get_provider", return_value=CodexProvider("term-1", "s", "w")
+            ),
+        ):
+            assert ts._message_in_composer("term-1", message) is False
+
+
 class TestInboxRecoveryCoverageByProvider:
     """Which providers can recover a swallowed inbox submit, enumerated.
 
