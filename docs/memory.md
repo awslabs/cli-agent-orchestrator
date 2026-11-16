@@ -551,6 +551,11 @@ CAO injects relevant memories into a new session through its first message:
 
 1. **First-message block** — when an agent receives its first message in a session,
    CAO prepends a `<cao-memory>` block containing relevant memories.
+
+Exactly-once tracking is in-process. If `cao-server` restarts while a provider
+session survives, the next CAO-delivered message can prepend the memory block
+again; no durable marker is written to the provider session.
+
 Provider project-file writes are disabled by default because `.claude/CLAUDE.md`,
 `AGENTS.md`, and Kiro steering files can be tracked and accidentally committed.
 Set `memory.injection.write_project_files=true` to restore the legacy writes.
