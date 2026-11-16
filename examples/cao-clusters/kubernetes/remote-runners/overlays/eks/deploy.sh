@@ -153,10 +153,13 @@ fi
 #    The certificate and key go to the cao-hub-tls Secret (server only), the
 #    CA certificate to the cao-hub-ca ConfigMap (runners). The CA key is used
 #    once and discarded. What is in the cluster is checked on every run: if
-#    either object is missing, the certificate does not verify against the CA,
-#    or it expires within 30 days, both are issued anew. Delete cao-hub-tls to
-#    rotate. A hash of both goes into the server and runner pod templates
-#    (step 6), so new material rolls them, also on a run after one that failed.
+#    either object is missing, the certificate does not verify against the CA
+#    under strict X.509 rules for a TLS server named cao-server.<ns>.svc (as
+#    Python 3.13+ clients verify by default; material from before the CA had
+#    keyUsage fails this), or it expires within 30 days, both are issued
+#    anew. Delete cao-hub-tls to rotate. A hash of both goes into the server
+#    and runner pod templates (step 6), so new material rolls them, also on a
+#    run after one that failed.
 live() {  # live <kind> <name> <jsonpath key>: the value, empty if absent
   k -n "${NS}" get "$1" "$2" --ignore-not-found -o "jsonpath={.data.${3//./\\.}}"
 }
@@ -165,16 +168,24 @@ ca_pem="$(live configmap cao-hub-ca ca.crt)"
 printf '%s' "${tls_b64}" | base64 -d > "${CTX}/tls.crt"
 printf '%s\n' "${ca_pem}" > "${CTX}/ca.crt"
 if [ -z "${tls_b64}" ] || [ -z "${ca_pem}" ] \
-  || ! openssl verify -CAfile "${CTX}/ca.crt" "${CTX}/tls.crt" >/dev/null 2>&1 \
+  || ! openssl verify -x509_strict -purpose sslserver -verify_hostname "cao-server.${NS}.svc" \
+    -CAfile "${CTX}/ca.crt" "${CTX}/tls.crt" >/dev/null 2>&1 \
   || ! openssl x509 -checkend 2592000 -noout -in "${CTX}/tls.crt" >/dev/null 2>&1; then
   (
     cd "${CTX}"
     openssl req -x509 -new -nodes -newkey rsa:3072 -sha256 -days 365 \
-      -subj "/CN=cao-remote hub CA" -keyout ca.key -out ca.crt 2>/dev/null
+      -subj "/CN=cao-remote hub CA" -addext "keyUsage=critical,keyCertSign,cRLSign" \
+      -keyout ca.key -out ca.crt 2>/dev/null
     openssl req -new -nodes -newkey rsa:3072 -sha256 \
       -subj "/CN=cao-server.${NS}.svc" -keyout tls.key -out tls.csr 2>/dev/null
-    printf 'subjectAltName=DNS:cao-server.%s.svc,DNS:cao-server.%s,DNS:cao-server\nextendedKeyUsage=serverAuth\n' \
-      "${NS}" "${NS}" > ext.cnf
+    # Every extension spelled out, not left to the openssl version's defaults.
+    {
+      printf 'subjectAltName=DNS:cao-server.%s.svc,DNS:cao-server.%s,DNS:cao-server\n' "${NS}" "${NS}"
+      printf 'basicConstraints=critical,CA:FALSE\n'
+      printf 'keyUsage=critical,digitalSignature,keyEncipherment\n'
+      printf 'extendedKeyUsage=serverAuth\n'
+      printf 'subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n'
+    } > ext.cnf
     openssl x509 -req -in tls.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 365 -sha256 \
       -extfile ext.cnf -out tls.crt 2>/dev/null
     rm -f ca.key ca.srl tls.csr ext.cnf

@@ -172,9 +172,12 @@ examples/cao-clusters/kubernetes/remote-runners/overlays/eks/deploy.sh cao-remot
 - **Transport:** `deploy.sh` makes a CA for this purpose, signs the hub's
   certificate with it and discards the CA key. The server gets the certificate
   and key (`cao-hub-tls` Secret), the runners only the CA certificate
-  (`cao-hub-ca` ConfigMap). Each run checks what is in the cluster and issues
-  both anew if either is missing, the certificate does not verify against the
-  CA, or it expires within 30 days. A hash of both is in the server and runner
+  (`cao-hub-ca` ConfigMap). The CA has keyUsage and the certificate names
+  `cao-server.cao-remote.svc`, as the strict X.509 checks of Python 3.13 and
+  later require. Each run checks what is in the cluster and issues both anew
+  if either is missing, the certificate does not pass those checks against the
+  CA (material from an earlier `deploy.sh` whose CA had no keyUsage does not),
+  or it expires within 30 days. A hash of both is in the server and runner
   pod templates, so new material rolls them, also on the run after a failed
   one. To rotate, delete `cao-hub-tls` and run `deploy.sh` again.
 - **Image updates:** the default tag is the commit plus a digest of the files

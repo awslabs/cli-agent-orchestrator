@@ -668,11 +668,22 @@ def test_a_second_deploy_reissues_nothing_and_changes_no_pod_template(deploy):
     assert _argv(deploy.state, "docker") == ""  # the image is already pushed
 
 
-def _other_ca_cert(deploy, tmp_path, days=365):
-    """A CA and a certificate it signed, as PEM text, not the deploy's own."""
+_HUB_NAMES = ("cao-server.cao-remote.svc", "cao-server.cao-remote", "cao-server")
+
+
+def _other_ca_cert(
+    deploy, tmp_path, days=365, ca_key_usage=True, names=_HUB_NAMES, eku="serverAuth"
+):
+    """A CA and a server certificate it signed, as PEM text, not the deploy's own.
+
+    By default both pass the strict check deploy.sh makes, so a test that
+    changes one property (``days``) fails that check for that reason only.
+    ``ca_key_usage=False`` gives the CA deploy.sh made before it set keyUsage.
+    """
     run = lambda *a: subprocess.run(
         [deploy.openssl, *a], cwd=tmp_path, check=True, capture_output=True
     )
+    ca_ext = ["-addext", "keyUsage=critical,keyCertSign,cRLSign"] if ca_key_usage else []
     run(
         "req",
         "-x509",
@@ -684,6 +695,7 @@ def _other_ca_cert(deploy, tmp_path, days=365):
         str(days),
         "-subj",
         "/CN=other",
+        *ca_ext,
         "-keyout",
         "o-ca.key",
         "-out",
@@ -702,6 +714,13 @@ def _other_ca_cert(deploy, tmp_path, days=365):
         "-out",
         "o.csr",
     )
+    (tmp_path / "o.cnf").write_text(
+        "subjectAltName=" + ",".join(f"DNS:{n}" for n in names) + "\n"
+        "basicConstraints=critical,CA:FALSE\n"
+        "keyUsage=critical,digitalSignature,keyEncipherment\n"
+        f"extendedKeyUsage={eku}\n"
+        "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n"
+    )
     run(
         "x509",
         "-req",
@@ -714,10 +733,102 @@ def _other_ca_cert(deploy, tmp_path, days=365):
         "-CAcreateserial",
         "-days",
         str(days),
+        "-extfile",
+        "o.cnf",
         "-out",
         "o.crt",
     )
     return (tmp_path / "o-ca.crt").read_text(), (tmp_path / "o.crt").read_bytes()
+
+
+def _strict_verify(deploy, tmp_path, ca_pem, cert_pem):
+    """``openssl verify`` as Python 3.13+ clients check the hub (VERIFY_X509_STRICT)."""
+    (tmp_path / "v-ca.crt").write_text(ca_pem)
+    (tmp_path / "v-tls.crt").write_bytes(cert_pem)
+    return subprocess.run(
+        [
+            deploy.openssl,
+            "verify",
+            "-x509_strict",
+            "-purpose",
+            "sslserver",
+            "-verify_hostname",
+            "cao-server.cao-remote.svc",
+            "-CAfile",
+            str(tmp_path / "v-ca.crt"),
+            str(tmp_path / "v-tls.crt"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+
+def _live_tls(state):
+    secret = yaml.safe_load((state / "obj-cao-hub-tls").read_text())
+    ca = yaml.safe_load((state / "obj-cao-hub-ca").read_text())
+    return ca["data"]["ca.crt"], base64.b64decode(secret["data"]["tls.crt"])
+
+
+def test_the_issued_tls_material_passes_strict_verification(deploy, tmp_path):
+    assert deploy().returncode == 0
+    ca, cert = _live_tls(deploy.state)
+    done = _strict_verify(deploy, tmp_path, ca, cert)
+    assert done.returncode == 0, done.stdout + done.stderr
+    (tmp_path / "issued.crt").write_bytes(cert)
+    (tmp_path / "issued-ca.crt").write_text(ca)
+    text = lambda path, ext: subprocess.run(
+        [deploy.openssl, "x509", "-noout", "-ext", ext, "-in", str(path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    names = re.findall(r"DNS:([^,\s]+)", text(tmp_path / "issued.crt", "subjectAltName"))
+    assert names == list(_HUB_NAMES)
+    assert "Certificate Sign, CRL Sign" in text(tmp_path / "issued-ca.crt", "keyUsage")
+    leaf = text(tmp_path / "issued.crt", "basicConstraints,keyUsage,extendedKeyUsage")
+    assert "CA:FALSE" in leaf and "Digital Signature, Key Encipherment" in leaf
+    assert "TLS Web Server Authentication" in leaf
+
+
+def test_material_from_a_ca_without_key_usage_is_issued_again(deploy, tmp_path):
+    """What deploy.sh issued before its CA had keyUsage: Python 3.13+ rejects it."""
+    assert deploy().returncode == 0
+    ca, cert = _other_ca_cert(deploy, tmp_path, ca_key_usage=False)
+    assert _strict_verify(deploy, tmp_path, ca, cert).returncode != 0
+    _put(deploy.state, "cao-hub-ca", {"ca.crt": ca})
+    _put(deploy.state, "cao-hub-tls", {"tls.crt": base64.b64encode(cert).decode()})
+    _fresh_argv(deploy.state)
+    assert deploy().returncode == 0
+    assert _issued(deploy.state)
+    assert _strict_verify(deploy, tmp_path, *_live_tls(deploy.state)).returncode == 0
+
+
+@pytest.mark.parametrize(
+    "kind", [{"names": ("cao-server.other.svc", "cao-server")}, {"eku": "clientAuth"}]
+)
+def test_a_certificate_the_runners_would_not_accept_is_issued_again(deploy, tmp_path, kind):
+    """Another name than the runners dial, or not a TLS server certificate."""
+    assert deploy().returncode == 0
+    ca, cert = _other_ca_cert(deploy, tmp_path, **kind)
+    assert _strict_verify(deploy, tmp_path, ca, cert).returncode != 0
+    _put(deploy.state, "cao-hub-ca", {"ca.crt": ca})
+    _put(deploy.state, "cao-hub-tls", {"tls.crt": base64.b64encode(cert).decode()})
+    _fresh_argv(deploy.state)
+    assert deploy().returncode == 0
+    assert _issued(deploy.state)
+
+
+def test_valid_material_from_elsewhere_is_kept(deploy, tmp_path):
+    """The reuse check accepts material that passes it, so the other tests that
+    replace the material fail it for their own reason only."""
+    assert deploy().returncode == 0
+    ca, cert = _other_ca_cert(deploy, tmp_path)
+    assert _strict_verify(deploy, tmp_path, ca, cert).returncode == 0
+    _put(deploy.state, "cao-hub-ca", {"ca.crt": ca})
+    _put(deploy.state, "cao-hub-tls", {"tls.crt": base64.b64encode(cert).decode()})
+    _fresh_argv(deploy.state)
+    assert deploy().returncode == 0
+    assert not _issued(deploy.state)
 
 
 def _put(state, name, data):
