@@ -523,7 +523,14 @@ class OmpProvider(BaseProvider):
         # Keep an OSC sequence split across FIFO reads for the next chunk.
         start = data.rfind(_OSC_START)
         unterminated = start != -1 and not re.search(r"\x07|\x1b\\", data[start + 2 :])
-        self._osc_carry = data[start:][-_OSC_CARRY_MAX:] if unterminated else ""
+        if unterminated:
+            self._osc_carry = data[start:][-_OSC_CARRY_MAX:]
+        elif data.endswith("\x1b"):
+            # A chunk can end on the ESC that opens the next report. OMP does not
+            # repeat a report, so dropping that ESC would lose it for good.
+            self._osc_carry = "\x1b"
+        else:
+            self._osc_carry = ""
 
     def record_dispatched_message(self, message: str) -> None:
         super().record_dispatched_message(message)

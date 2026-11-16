@@ -403,11 +403,17 @@ def _osc7501(state: str) -> str:
     return f"\x1b]7501;state={state}:app=omp\x1b\\"
 
 
-def _replay(provider: OmpProvider, stream: str, size: int) -> list[TerminalStatus]:
-    """Feed ``stream`` as the monitor does: per chunk, then classify the cropped buffer."""
+def _replay(
+    provider: OmpProvider, stream: str, size: int, edges: tuple[int, ...] = ()
+) -> list[TerminalStatus]:
+    """Feed ``stream`` as the monitor does: per chunk, then classify the cropped buffer.
+
+    Chunks are ``size`` bytes, also cut at each offset in ``edges``.
+    """
     statuses, buffer = [], ""
-    for start in range(0, len(stream), size):
-        chunk = stream[start : start + size]
+    cuts = sorted({*range(0, len(stream), size), *edges, len(stream)} - {0})
+    for start, end in zip([0, *cuts], cuts):
+        chunk = stream[start:end]
         provider.record_status_chunk(chunk, epoch=1)
         buffer = (buffer + chunk)[-32768:]
         status = provider.get_status(buffer)
@@ -454,6 +460,48 @@ def test_report_split_across_chunks_is_read_once_complete():
     assert provider._program_status is None
     provider.record_status_chunk(report[-1:], epoch=1)
     assert provider.get_status(load_fixture("omp18_band_idle.txt")) == TerminalStatus.PROCESSING
+
+
+def test_report_split_right_after_its_esc_is_read():
+    """A FIFO read can end on the ESC that opens a report; OMP never repeats it."""
+    provider = make_provider()
+    _dispatch(provider)
+    report = _osc7501("working")
+
+    provider.record_status_chunk("output" + report[:1], epoch=1)
+    provider.record_status_chunk(report[1:], epoch=1)
+    assert provider._program_status == "working"
+    assert provider.get_status(load_fixture("omp18_band_idle.txt")) == TerminalStatus.PROCESSING
+
+
+def _recorded_turn_report_edges() -> list[int]:
+    raw = load_fixture("omp18_tool_turn.raw.txt")
+    dispatch = raw.index(TOOL_TURN_PROMPT) - 150
+    stream = raw[dispatch:]
+    return [i for i in range(len(stream)) if stream.startswith("\x1b]7501;", i)]
+
+
+_REPORT_EDGE_CASES = [(i,) for i in range(len(_recorded_turn_report_edges()))] + [
+    tuple(range(len(_recorded_turn_report_edges())))
+]
+
+
+@pytest.mark.parametrize("size", [37, 4096])
+@pytest.mark.parametrize("reports", _REPORT_EDGE_CASES)
+def test_recorded_tool_turn_survives_an_edge_after_each_report_esc(reports, size):
+    raw = load_fixture("omp18_tool_turn.raw.txt")
+    dispatch = raw.index(TOOL_TURN_PROMPT) - 150
+    stream = raw[dispatch:]
+    offsets = _recorded_turn_report_edges()
+    edges = tuple(offsets[i] + 1 for i in reports)
+    provider = make_provider()
+    provider.record_status_chunk(raw[:dispatch], epoch=0)
+    _dispatch(provider, TOOL_TURN_PROMPT)
+
+    assert _replay(provider, stream, size, edges=edges) == [
+        TerminalStatus.PROCESSING,
+        TerminalStatus.COMPLETED,
+    ]
 
 
 def test_working_report_beats_a_ready_looking_screen():

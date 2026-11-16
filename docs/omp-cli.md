@@ -6,7 +6,8 @@ OMP, then adds only CAO's role context and profile MCP servers.
 
 ## Prerequisites
 
-- OMP 17.2.10 on `PATH` (`omp --version`)
+- OMP 17.2.10 or 18.x on `PATH` (`omp --version`); 18.x is verified on
+  18.20.0 and 18.20.2
 - An authenticated OMP model account; run `omp` directly and use its normal
   authentication flow before launching through CAO
 - tmux, required by CAO's terminal backend
@@ -36,8 +37,16 @@ configuration.
 ## Native configuration is preserved
 
 The launch command intentionally omits OMP flags that replace or narrow native
-behaviour: `--profile`, `--config`, `--tools`, `--no-tools`, `--no-skills`,
-`--no-rules`, `--no-extensions`, `--auto-approve`, and `--approval-mode`.
+behaviour: `--profile`, `--tools`, `--no-tools`, `--no-skills`, `--no-rules`,
+`--no-extensions`, `--auto-approve`, and `--approval-mode`.
+
+It adds one `--config $CAO_HOME_DIR/tmp/omp/<terminal-id>/cao-input.yml`
+overlay (mode `0600`). OMP reads `--config` after the global and project
+settings, so they stay in effect; the overlay sets only
+`paste.largeMenuThreshold: 0`. From OMP 18.3.1 a paste of 100 lines or more
+otherwise opens a "Pasted N lines" menu, and the Enter that CAO sends to submit
+a task would pick the menu's first entry and leave the task in the composer.
+Large pastes still collapse to an attachment chip and submit normally.
 
 OMP continues to discover its normal project and user configuration, including
 `.omp/` and `~/.omp/agent/` roots. CAO writes a per-terminal context file under
@@ -89,14 +98,35 @@ OMP terminal using its normal approve/deny controls.
 
 ## Status and output
 
-OMP 17.2.10 fixtures cover these terminal markers:
+On OMP 18.x, CAO first reads OSC 7501 Program Status reports
+(`ESC ] 7501 ; state=… ST`). OMP writes one on every state change when stdout is
+a TTY, so the reports reach the tmux pipe. CAO reads them from each raw output
+chunk, before escape stripping, and keeps a sequence split across reads. The
+latest report wins over the screen markers below, except that a drawn
+`Allow tool:` dialog still reads as `WAITING_USER_ANSWER`:
 
-| CAO state | OMP evidence |
+| OSC 7501 `state` | CAO state |
 | --- | --- |
-| `PROCESSING` | `Working… ⟨esc⟩` or a running-tool indicator |
-| `WAITING_USER_ANSWER` | `Allow tool: <name>` |
-| `ERROR` | active OMP runtime/provider error frame |
-| `IDLE` / `COMPLETED` | ready frame; CAO uses dispatch history to distinguish the first ready state from a finished turn |
+| `working` | `PROCESSING` |
+| `blocked` | `WAITING_USER_ANSWER` |
+| `idle` / `done` | `IDLE` / `COMPLETED` |
+| `error` | `ERROR` |
+| `clear` or an unknown state | no verdict; the screen decides |
+
+After CAO dispatches a task, a ready verdict counts as that turn's completion
+only once the turn was seen running (a `working` report or a spinner status
+row). OMP reports `idle` once more as it accepts the paste, the tail of the
+previous screen can still look ready, and an earlier turn's `done` or `error`
+is no verdict for the new one.
+
+Screen markers, from OMP 17.2.10 and 18.x fixtures:
+
+| CAO state | OMP 17.2.10 | OMP 18.x |
+| --- | --- | --- |
+| `PROCESSING` | `Working… ⟨esc⟩` or a running-tool indicator | `⎋ Working…` / `⎋ <tool intent>` row, or a spinner status row (`╭── ⠹ 3s > …`, or ` ⠹ 3s > …` with the band composer) |
+| `WAITING_USER_ANSWER` | `Allow tool: <name>` | `Allow tool: <name>` |
+| `ERROR` | active OMP runtime/provider error frame | same |
+| `IDLE` / `COMPLETED` | ready frame; CAO uses dispatch history to distinguish the first ready state from a finished turn | `π >` status row with a `╰─ … ─╯` (box) or bare `╰─` (band) ready frame |
 
 A later OMP ready status line (`in: … out: … t: … tok/s: …`) makes an older
 waiting, error, or processing marker stale. Response extraction uses the final
@@ -138,6 +168,12 @@ the generated per-terminal extension root before terminal cleanup. Do not add
 CAO entries to `.omp` or `~/.omp/agent/` manually.
 
 **Status remains processing** — inspect the live terminal for an active
-`Working…` / tool frame or an approval dialog. Captured fixtures and regexes
-target OMP 17.2.10; recapture terminal fixtures before changing markers for a
-new OMP release.
+`Working…` / tool frame or an approval dialog. On OMP 18.x the OSC 7501 report
+decides; a terminal that shows a ready frame but reads processing usually
+missed the last report. Captured fixtures and regexes target OMP 17.2.10 and
+18.20.0 (`test/providers/fixtures/OMP_FIXTURES.md`); recapture terminal
+fixtures before changing markers for a new OMP release.
+
+**A dispatched task stays in the composer as an attachment chip** — the OMP
+large-paste menu caught CAO's Enter. Check that the launch command carries the
+`--config …/cao-input.yml` overlay.
