@@ -6,7 +6,7 @@
   "description": "Dev/CI tooling: per-feature shift-left demo recorder for the AG-UI L2 construct library. Runs each construct's asserting example and exports a gated proof-of-work GIF to docs/media/. Not required to use the constructs.",
   "scripts": {
     "record": "node record-construct-demos.mjs",
-    "playwright:install": "playwright install --with-deps chromium"
+    "playwright:install": "playwright install chromium"
   },
   "devDependencies": {
     "@playwright/test": "1.64.1",
