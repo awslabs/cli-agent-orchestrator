@@ -139,9 +139,14 @@ daylight saving):
    - It refuses to run from any branch but `main`, or on a commit whose `ci.yml` run is
      not green.
    - `release.yml` bumps `pyproject.toml`, `uv.lock` and the devcontainer feature, runs
-     `git-cliff` to update `CHANGELOG.md`, checks the result the way
-     `verify-release-version` will, then commits, tags `v<version>`, pushes both in one
-     atomic push, and creates a GitHub Release.
+     the same version check `verify-release-version` will, then commits, tags
+     `v<version>`, pushes both in one atomic push, and creates a GitHub Release.
+   - The changelog is not generated from commit subjects. The bump renames the single
+     hand-written `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD` and inserts a
+     fresh empty `## [Unreleased]` above it, preserving all notes and older sections
+     byte-for-byte. A missing or duplicate heading refuses the release. An empty
+     Unreleased section is allowed because the release policy derives whether to release
+     from commits, and changelog entries are not a preflight requirement.
    - If `uv lock` would change anything in `uv.lock` beyond this project's own version
      line, the bump refuses: the release commit goes to `main` without a PR, so it may
      carry the bump and nothing else. Relock `main` in a reviewed PR first.

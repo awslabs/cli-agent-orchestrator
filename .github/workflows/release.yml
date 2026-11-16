@@ -95,11 +95,6 @@ jobs:
           fetch-depth: 0
           ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
-      - name: Install git-cliff
-        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
-        with:
-          tool: git-cliff
-
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -115,7 +110,6 @@ jobs:
       - name: Bump version and generate changelog
         id: bump
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Validated by the preflight for both events: one of patch, minor, major.
           BUMP: ${{ needs.preflight.outputs.bump }}
         run: |

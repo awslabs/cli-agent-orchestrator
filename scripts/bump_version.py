@@ -2,7 +2,8 @@
 """Version bump script for cli-agent-orchestrator.
 
 Bumps every place that carries the version, together: ``pyproject.toml``, ``uv.lock`` (the
-project's own entry) and the devcontainer feature, then regenerates ``CHANGELOG.md``.
+project's own entry) and the devcontainer feature, then promotes the hand-written
+``CHANGELOG.md`` Unreleased section.
 ``publish-to-pypi.yml``'s ``verify-release-version`` job refuses a tag unless all three
 agree (``scripts/assert_release_version.py``). ``release.yml`` used to skip ``uv.lock``,
 which is why 2.5.3 and 2.5.4 had to be bumped by hand in a PR (#899, #946).
@@ -13,7 +14,7 @@ import os
 import re
 import subprocess
 import sys
-import time
+from datetime import date
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -21,15 +22,21 @@ ROOT = Path(__file__).parent.parent
 PYPROJECT = ROOT / "pyproject.toml"
 UV_LOCK = ROOT / "uv.lock"
 DEVCONTAINER_FEATURE = ROOT / ".devcontainer" / "features" / "cao" / "devcontainer-feature.json"
+CHANGELOG = ROOT / "CHANGELOG.md"
 PACKAGE = "cli-agent-orchestrator"
 
 REVISION_LINE = re.compile(r"(?m)^revision = \d+$")
+UNRELEASED_HEADING = re.compile(rb"(?m)^## \[Unreleased\](?P<newline>\r?\n|$)")
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
 
 class LockDrift(RuntimeError):
     """``uv lock`` changed more than the project's own version."""
+
+
+class ChangelogError(RuntimeError):
+    """The hand-written changelog cannot be promoted safely."""
 
 
 def get_version() -> str:
@@ -129,30 +136,25 @@ def update_uv_lock(old_version: str, new_version: str, run: Optional[Runner] = N
         raise
 
 
+def _release_date() -> str:
+    return date.today().isoformat()
+
+
 def generate_changelog(new_version: str) -> None:
-    # git-cliff calls the GitHub API when [remote.github] is configured in
-    # cliff.toml. Transient 502s / rate-limit bumps bubble up as non-zero
-    # exit. Retry 3x with 10s backoff to ride through transient hiccups;
-    # authenticated requests (via GITHUB_TOKEN env in CI) make this rare.
-    last_err: subprocess.CalledProcessError | None = None
-    for attempt in range(3):
-        try:
-            subprocess.run(
-                ["git-cliff", "--tag", f"v{new_version}", "-o", "CHANGELOG.md"],
-                cwd=ROOT,
-                check=True,
-            )
-            return
-        except subprocess.CalledProcessError as e:
-            last_err = e
-            if attempt < 2:
-                print(
-                    f"git-cliff attempt {attempt + 1} failed; retrying in 10s...",
-                    file=sys.stderr,
-                )
-                time.sleep(10)
-    assert last_err is not None
-    raise last_err
+    """Promote the single hand-written Unreleased section without rewriting its contents."""
+    before = CHANGELOG.read_bytes()
+    matches = list(UNRELEASED_HEADING.finditer(before))
+    if len(matches) != 1:
+        raise ChangelogError(
+            "CHANGELOG.md must contain exactly one '## [Unreleased]' heading; "
+            f"found {len(matches)}"
+        )
+
+    match = matches[0]
+    newline = match.group("newline") or b"\n"
+    released = f"## [{new_version}] - {_release_date()}".encode("ascii")
+    replacement = b"## [Unreleased]" + newline + newline + released + match.group("newline")
+    CHANGELOG.write_bytes(before[: match.start()] + replacement + before[match.end() :])
 
 
 def main() -> None:

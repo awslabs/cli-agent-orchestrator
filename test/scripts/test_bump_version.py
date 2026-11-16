@@ -41,19 +41,24 @@ bv = _load("bump_version")
 arv = _load("assert_release_version")
 
 FEATURE = Path(".devcontainer") / "features" / "cao" / "devcontainer-feature.json"
+RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
 
 
 @pytest.fixture
 def tree(tmp_path: Path, monkeypatch) -> Path:
-    """A copy of this repo's three real version carriers, with the module pointed at it."""
+    """A copy of the version carriers plus a safe changelog, with the module pointed at it."""
     root = tmp_path / "tree"
     (root / FEATURE).parent.mkdir(parents=True)
     for rel in (Path("pyproject.toml"), Path("uv.lock"), FEATURE):
         shutil.copyfile(REPO_ROOT / rel, root / rel)
+    (root / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## [Unreleased]\n\n- Hand-written release note.\n", encoding="utf-8"
+    )
     monkeypatch.setattr(bv, "ROOT", root)
     monkeypatch.setattr(bv, "PYPROJECT", root / "pyproject.toml")
     monkeypatch.setattr(bv, "UV_LOCK", root / "uv.lock")
     monkeypatch.setattr(bv, "DEVCONTAINER_FEATURE", root / FEATURE)
+    monkeypatch.setattr(bv, "CHANGELOG", root / "CHANGELOG.md")
     return root
 
 
@@ -105,6 +110,80 @@ def _moves_version(to: str) -> Callable[[str], str]:
 
 def _current(tree: Path) -> str:
     return arv.pyproject_version(tree / "pyproject.toml")
+
+
+class TestGenerateChangelog:
+    def _generate(
+        self, tmp_path: Path, monkeypatch, content: bytes, version: str = "1.2.3"
+    ) -> bytes:
+        changelog = tmp_path / "CHANGELOG.md"
+        changelog.write_bytes(content)
+        monkeypatch.setattr(bv, "ROOT", tmp_path)
+        monkeypatch.setattr(bv, "CHANGELOG", changelog, raising=False)
+        monkeypatch.setattr(bv, "_release_date", lambda: "2030-04-05", raising=False)
+        bv.generate_changelog(version)
+        return changelog.read_bytes()
+
+    def test_promotes_the_hand_written_section_without_rewriting_any_other_bytes(
+        self, tmp_path, monkeypatch
+    ):
+        before = (
+            b"# Changelog\r\n"
+            b"\r\n"
+            b"## [Unreleased]\r\n"
+            b"\r\n"
+            b"### Fixed\r\n"
+            b"- A hand-written explanation that is not a commit subject (#1).\r\n"
+            b"\r\n"
+            b"## [1.2.2] - 2029-12-31\r\n"
+            b"\r\n"
+            b"- Older release text stays byte-for-byte.\r\n"
+        )
+        assert self._generate(tmp_path, monkeypatch, before) == (
+            b"# Changelog\r\n"
+            b"\r\n"
+            b"## [Unreleased]\r\n"
+            b"\r\n"
+            b"## [1.2.3] - 2030-04-05\r\n"
+            b"\r\n"
+            b"### Fixed\r\n"
+            b"- A hand-written explanation that is not a commit subject (#1).\r\n"
+            b"\r\n"
+            b"## [1.2.2] - 2029-12-31\r\n"
+            b"\r\n"
+            b"- Older release text stays byte-for-byte.\r\n"
+        )
+
+    def test_missing_unreleased_heading_refuses(self, tmp_path, monkeypatch):
+        with pytest.raises(bv.ChangelogError, match="exactly one.*found 0"):
+            self._generate(
+                tmp_path,
+                monkeypatch,
+                b"# Changelog\n\n## [1.2.2] - 2029-12-31\n\n- Existing notes.\n",
+            )
+
+    def test_two_unreleased_headings_refuse(self, tmp_path, monkeypatch):
+        with pytest.raises(bv.ChangelogError, match="exactly one.*found 2"):
+            self._generate(
+                tmp_path,
+                monkeypatch,
+                b"# Changelog\n\n## [Unreleased]\n\nText\n\n## [Unreleased]\n",
+            )
+
+    def test_empty_unreleased_section_is_allowed(self, tmp_path, monkeypatch):
+        before = b"# Changelog\n\n## [Unreleased]\n\n## [1.2.2] - 2029-12-31\n\n- Old.\n"
+        assert self._generate(tmp_path, monkeypatch, before) == (
+            b"# Changelog\n\n"
+            b"## [Unreleased]\n\n"
+            b"## [1.2.3] - 2030-04-05\n\n"
+            b"## [1.2.2] - 2029-12-31\n\n"
+            b"- Old.\n"
+        )
+
+    def test_release_workflow_has_no_git_cliff_install_or_call(self):
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        assert "git-cliff" not in workflow
+        assert "taiki-e/install-action" not in workflow
 
 
 class TestUpdateUvLock:
@@ -178,7 +257,6 @@ class TestUpdateUvLock:
 
 class TestTheBumpPassesThePublishCheck:
     def _bump(self, tree: Path, monkeypatch, part: str, uv: FakeUv) -> int:
-        monkeypatch.setattr(bv, "generate_changelog", lambda version: None)
         real = bv.update_uv_lock
         monkeypatch.setattr(bv, "update_uv_lock", lambda old, new: real(old, new, run=uv))
         monkeypatch.setattr(sys, "argv", ["bump_version.py", part])
@@ -266,7 +344,6 @@ class TestMainRestoresOnAnyException:
             rel: (tree / rel).read_text("utf-8") for rel in ("pyproject.toml", "uv.lock", FEATURE)
         }
         runner = _RaisingRunner(exc)
-        monkeypatch.setattr(bv, "generate_changelog", lambda version: None)
         real = bv.update_uv_lock
         monkeypatch.setattr(bv, "update_uv_lock", lambda old, new: real(old, new, run=runner))
         monkeypatch.setattr(sys, "argv", ["bump_version.py", "patch"])
