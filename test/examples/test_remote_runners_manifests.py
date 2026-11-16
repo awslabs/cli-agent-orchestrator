@@ -507,9 +507,25 @@ def test_the_rendered_eks_overlay_serves_wss_and_changes_only_what_eks_needs():
     assert runner["spec"]["template"]["spec"]["serviceAccountName"] == "cao-runner"
     assert "serviceAccountName" not in server["spec"]["template"]["spec"]
     server_env = _env(_container(server, "cao-server"))
+    assert server_env["CAO_RUNNER_TLS_CERT"]["value"] == "/var/run/cao-hub-tls/tls.crt"
     assert server_env["CAO_RUNNER_TLS_KEY"]["value"] == "/var/run/cao-hub-tls/tls.key"
+    mounts = {m["name"]: m for m in _container(server, "cao-server")["volumeMounts"]}
+    assert mounts["hub-tls"] == {
+        "name": "hub-tls",
+        "mountPath": "/var/run/cao-hub-tls",
+        "readOnly": True,
+    }
     server_volumes = {v["name"]: v for v in server["spec"]["template"]["spec"]["volumes"]}
-    assert server_volumes["hub-tls"]["secret"]["secretName"] == "cao-hub-tls"
+    # The key file is readable by the server's user and group only.
+    assert server_volumes["hub-tls"]["secret"] == {
+        "secretName": "cao-hub-tls",
+        "defaultMode": 0o440,
+    }
+    # The image is built for amd64 only.
+    for workload in (server, runner):
+        assert workload["spec"]["template"]["spec"]["nodeSelector"] == {
+            "kubernetes.io/arch": "amd64"
+        }, workload["metadata"]["name"]
     assert not [n for n in server_env if n.startswith(("AWS_", "ANTHROPIC_", "CLAUDE_"))]
     (state,) = server["spec"]["volumeClaimTemplates"]
     assert state["spec"]["storageClassName"] == "cao-gp3"
@@ -632,8 +648,13 @@ def test_deploy_renders_everything_and_keeps_secrets_off_command_lines(deploy):
     assert done.returncode == 0, done.stderr
     state = deploy.state
     applied = (state / "applied.yaml").read_text()
-    # NetworkPolicy enforcement is the first thing applied.
-    assert "enable-network-policy-controller" in applied.split("\n---\n")[0]
+    # NetworkPolicy enforcement is the first thing applied, and turned on.
+    first = yaml.safe_load(applied.split("\n---\n")[0])
+    assert (first["kind"], first["metadata"]) == (
+        "ConfigMap",
+        {"name": "amazon-vpc-cni", "namespace": "kube-system"},
+    )
+    assert first["data"] == {"enable-network-policy-controller": "true"}
     for placeholder in (
         "<server-repository-uri>",
         "<image-tag>",
@@ -656,6 +677,11 @@ def test_deploy_renders_everything_and_keeps_secrets_off_command_lines(deploy):
     (login,) = [ln for ln in _argv(state, "docker").splitlines() if ln.startswith("login")]
     config_dir = login.split("DOCKER_CONFIG=")[1]
     assert config_dir and not Path(config_dir).exists()
+    # The push uses that login, not the user's config; the build needs none.
+    (push,) = [ln for ln in _argv(state, "docker").splitlines() if ln.startswith("push")]
+    assert push.split("DOCKER_CONFIG=")[1] == config_dir
+    (build,) = [ln for ln in _argv(state, "docker").splitlines() if ln.startswith("build")]
+    assert build.endswith("DOCKER_CONFIG=")
     assert not (deploy.home / ".docker").exists()
     # TLS: the server's Secret and the runners' CA, no CA key kept, and both
     # workloads carry the hash of what is in the cluster.
@@ -683,6 +709,48 @@ def test_a_second_deploy_reissues_nothing_and_changes_no_pod_template(deploy):
 
 
 _HUB_NAMES = ("cao-server.cao-remote.svc", "cao-server.cao-remote", "cao-server")
+
+
+def test_an_unrendered_placeholder_stops_the_deploy_before_the_overlay_is_applied(deploy):
+    stray = "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: stray}\ndata: {x: <not-rendered>}"
+    done = deploy(STUB_KUSTOMIZE_APPEND=stray)
+    assert done.returncode == 1
+    assert "unrendered placeholder" in done.stderr and "<not-rendered>" in done.stdout
+    applied = (deploy.state / "applied.yaml").read_text()
+    assert "kind: StatefulSet" not in applied and "stray" not in applied
+    assert "rollout status" not in _argv(deploy.state, "kubectl")
+
+
+def _provider_hashes(state):
+    hashes = {}
+    for doc in yaml.safe_load_all(state.joinpath("applied.yaml").read_text()):
+        if doc and doc["kind"] in ("StatefulSet", "Deployment"):
+            annotations = doc["spec"]["template"]["metadata"]["annotations"]
+            hashes[doc["metadata"]["name"]] = annotations.get("cao.awslabs.com/provider-env")
+    return hashes
+
+
+def test_a_model_change_rolls_the_runners_and_only_them(deploy):
+    assert deploy().returncode == 0
+    before = _provider_hashes(deploy.state)
+    assert before["cao-server"] is None and before["cao-runner"]
+    assert deploy().returncode == 0
+    assert _provider_hashes(deploy.state) == before  # the same settings, no roll
+    done = deploy(CAO_BEDROCK_MODEL="global.anthropic.claude-opus-4-6-v1")
+    assert done.returncode == 0, done.stderr
+    after = _provider_hashes(deploy.state)
+    assert after["cao-server"] is None
+    assert after["cao-runner"] != before["cao-runner"]
+    env = yaml.safe_load((deploy.state / "obj-cao-provider-env").read_text())["data"]
+    assert env == {
+        "CLAUDE_CODE_USE_BEDROCK": "1",
+        "AWS_REGION": "ap-southeast-2",
+        "ANTHROPIC_MODEL": "global.anthropic.claude-opus-4-6-v1",
+    }
+    # The region is a provider setting too.
+    moved = deploy(CAO_BEDROCK_MODEL="global.anthropic.claude-opus-4-6-v1", AWS_REGION="us-east-1")
+    assert moved.returncode == 0, moved.stderr
+    assert _provider_hashes(deploy.state)["cao-runner"] != after["cao-runner"]
 
 
 def _other_ca_cert(
@@ -1013,12 +1081,50 @@ def test_the_context_digest_follows_content_and_skips_bytecode(tmp_path):
     second = digest()
     assert second != first
     (root / "src/pkg/new.py").chmod(0o755)
-    assert digest() != second
+    third = digest()
+    assert third != second
+    # An edit that keeps the path and the mode (the usual uncommitted change).
+    (root / "src/pkg/mod.py").write_text("src/pkg/mod.py, edited")
+    fourth = digest()
+    assert fourth != third
+    # A rename that keeps the content.
+    (root / "src/pkg/mod.py").rename(root / "src/pkg/moved.py")
+    assert digest() != fourth
+    # A change to the Dockerfile itself, or to a file it copies outside src/.
+    fifth = digest()
+    (root / "examples/cao-clusters/kubernetes/eks/Dockerfile").write_text("FROM other")
+    sixth = digest()
+    assert sixth != fifth
+    (root / "test/providers/fixtures/bin/mock_cli").write_text("edited")
+    assert digest() != sixth
     (root / "LICENSE").unlink()
     assert (
         subprocess.run([sys.executable, str(script), str(root)], capture_output=True).returncode
         != 0
     )
+
+
+def test_the_context_digest_covers_exactly_what_the_dockerfile_copies():
+    """PATHS must follow the Dockerfile: a source missing from it would not change the tag."""
+    import runpy
+
+    paths = set(runpy.run_path(str(EKS / "context-digest.py"))["PATHS"])
+    dockerfile = REPO / "examples/cao-clusters/kubernetes/eks/Dockerfile"
+    sources = set()
+    for line in dockerfile.read_text().splitlines():
+        words = line.split()
+        if words[:1] != ["COPY"] or any(w.startswith("--from") for w in words):
+            continue
+        sources.update(w.rstrip("/") for w in words[1:-1] if not w.startswith("--"))
+    assert sources, "no COPY from the build context found"
+    covered = lambda src: any(src == p or src.startswith(p + "/") for p in paths)
+    assert {s for s in sources if not covered(s)} == set()
+    # Nothing extra, except the Dockerfile's own directory (the Dockerfile,
+    # and entrypoint.sh, which it copies).
+    eks_dir = dockerfile.parent.relative_to(REPO).as_posix()
+    assert paths - sources == {eks_dir}
+    for path in paths:
+        assert (REPO / path).exists(), path
 
 
 def test_an_image_lookup_error_stops_the_deploy_before_any_build(deploy):
@@ -1042,6 +1148,15 @@ def test_deploy_refuses_a_cluster_whose_api_endpoint_is_open(deploy):
     assert done.returncode == 1
     assert "0.0.0.0/0" in done.stderr
     assert not (deploy.state / "kubectl.argv").exists()  # nothing was applied
+
+
+@pytest.mark.parametrize("answer", ["None", "true", "false", "False False"])
+def test_deploy_refuses_an_endpoint_answer_other_than_false(deploy, answer):
+    """Fail closed: only the exact answer False lets the deploy go on."""
+    done = deploy(STUB_ENDPOINT_ANSWER=answer)
+    assert done.returncode == 1, answer
+    assert "0.0.0.0/0" in done.stderr
+    assert not (deploy.state / "kubectl.argv").exists()
 
 
 def test_deploy_stops_when_the_endpoint_cannot_be_read(deploy):

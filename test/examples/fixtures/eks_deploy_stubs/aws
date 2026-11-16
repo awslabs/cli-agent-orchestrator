@@ -19,7 +19,10 @@ case "$*" in
       echo "An error occurred (AccessDeniedException) when calling the DescribeCluster operation" >&2
       exit 254
     fi
-    if [ -n "${STUB_OPEN_ENDPOINT:-}" ]; then echo True; else echo False; fi ;;
+    # STUB_ENDPOINT_ANSWER: any other answer, e.g. None for a cluster whose
+    # endpoint settings the query cannot read.
+    if [ -n "${STUB_ENDPOINT_ANSWER:-}" ]; then echo "$STUB_ENDPOINT_ANSWER"
+    elif [ -n "${STUB_OPEN_ENDPOINT:-}" ]; then echo True; else echo False; fi ;;
   "eks update-kubeconfig --name cao-test --kubeconfig "*) : ;;
   "ecr describe-images --repository-name cao-test/cao-server --image-ids imageTag="*)
     if [ -n "${STUB_ECR_FAILS:-}" ]; then

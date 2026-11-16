@@ -1,14 +1,18 @@
 #!/bin/sh
 # Stub docker for the EKS deploy.sh test: records each call and its
-# DOCKER_CONFIG; a login writes a config there, as docker does; a push records
-# the tag pushed ($STATE/image is the last one, $STATE/images keeps each, as
-# the registry does).
+# DOCKER_CONFIG; a login writes a config there, as docker does; a push needs
+# that config and records the tag pushed ($STATE/image is the last one,
+# $STATE/images keeps each, as the registry does).
 printf '%s DOCKER_CONFIG=%s\n' "$*" "${DOCKER_CONFIG:-}" >> "$STATE/docker.argv"
 case "$1" in
   login)
     cat > /dev/null
     if [ -n "${DOCKER_CONFIG:-}" ]; then echo '{"auths":{"r":{"auth":"x"}}}' > "$DOCKER_CONFIG/config.json"; fi ;;
   push)
+    # As docker does, a push to the registry needs the login's config.
+    if [ ! -s "${DOCKER_CONFIG:-$HOME/.docker}/config.json" ]; then
+      echo "stub docker: no basic auth credentials" >&2; exit 1
+    fi
     for a in "$@"; do last="$a"; done
     printf '%s' "${last##*:}" > "$STATE/image"
     printf '%s\n' "${last##*:}" >> "$STATE/images" ;;

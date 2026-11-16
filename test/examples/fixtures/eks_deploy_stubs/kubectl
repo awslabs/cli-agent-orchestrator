@@ -5,7 +5,13 @@
 # $STATE/obj-<name> (its YAML).
 printf '%s\n' "$*" >> "$STATE/kubectl.argv"
 case "$*" in
-  kustomize*|*--dry-run=client*) exec "$REAL_KUBECTL" "$@" ;;
+  # STUB_KUSTOMIZE_APPEND: text added to the rendered overlay, e.g. an object
+  # with a placeholder deploy.sh does not know.
+  kustomize*)
+    "$REAL_KUBECTL" "$@" || exit
+    if [ -n "${STUB_KUSTOMIZE_APPEND:-}" ]; then printf -- '---\n%s\n' "$STUB_KUSTOMIZE_APPEND"; fi
+    exit 0 ;;
+  *--dry-run=client*) exec "$REAL_KUBECTL" "$@" ;;
 esac
 file=""; prev=""; name=""; jsonpath=""
 for a in "$@"; do
