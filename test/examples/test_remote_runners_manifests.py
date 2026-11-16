@@ -430,13 +430,26 @@ def test_only_the_runner_service_account_gets_bedrock_and_only_for_the_allowed_m
     assert all(r.endswith("${BedrockModelPattern}") for r in invoke["Resource"])
     catalogue = statements["ReadModelCatalogue"]["Action"]
     assert all(a.startswith(("bedrock:List", "bedrock:Get")) for a in catalogue)
-    # The only other Pod Identity role is the EFS driver's, for EFS only.
+    # The only other Pod Identity roles are the EFS driver's, for EFS only.
     (addon,) = _resources("AWS::EKS::Addon").values()
     assert addon["Properties"]["AddonName"] == "aws-efs-csi-driver"
-    (efs_identity,) = addon["Properties"]["PodIdentityAssociations"]
-    efs_role = _cfn()["Resources"][efs_identity["RoleArn"].split(".")[0]]
-    policies = [p.rsplit("/", 1)[-1] for p in efs_role["Properties"]["ManagedPolicyArns"]]
+    roles = {
+        a["ServiceAccount"]: _cfn()["Resources"][a["RoleArn"].split(".")[0]]
+        for a in addon["Properties"]["PodIdentityAssociations"]
+    }
+    assert set(roles) == {"efs-csi-controller-sa", "efs-csi-node-sa"}
+    controller = roles["efs-csi-controller-sa"]["Properties"]
+    policies = [p.rsplit("/", 1)[-1] for p in controller["ManagedPolicyArns"]]
     assert policies == ["AmazonEFSCSIDriverPolicy"]
+    node = roles["efs-csi-node-sa"]["Properties"]
+    assert "ManagedPolicyArns" not in node
+    actions = {
+        a
+        for p in node["Policies"]
+        for st in p["PolicyDocument"]["Statement"]
+        for a in ([st["Action"]] if isinstance(st["Action"], str) else st["Action"])
+    }
+    assert all(a.startswith(("elasticfilesystem:", "ec2:Describe")) for a in actions)
 
 
 def test_the_default_model_is_a_global_profile_the_runner_policy_allows():
@@ -504,6 +517,76 @@ def test_the_eks_workspace_and_registry_are_private():
     assert "RepositoryPolicyText" not in props
 
 
+_EFS_CLIENT = {
+    "elasticfilesystem:ClientMount",
+    "elasticfilesystem:ClientWrite",
+    "elasticfilesystem:ClientRootAccess",
+}
+
+
+def _as_set(value):
+    return {value} if isinstance(value, str) else set(value)
+
+
+def test_the_workspace_is_mounted_only_through_its_access_point():
+    """The access point pins uid/gid 1000; the file system policy makes it the only way in."""
+    resources = _cfn()["Resources"]
+    (filesystem,) = _resources("AWS::EFS::FileSystem").values()
+    policy = filesystem["Properties"]["FileSystemPolicy"]
+    statements = {st["Sid"]: st for st in policy["Statement"]}
+    # Nothing in the file system policy allows: clients without IAM get nothing,
+    # IAM clients only what their identity policy allows.
+    assert {st["Effect"] for st in statements.values()} == {"Deny"}
+    for st in statements.values():
+        assert st["Principal"] == {"AWS": "*"} and st["Resource"] == "*"
+    no_ap = statements["DenyWithoutAnAccessPoint"]
+    assert _as_set(no_ap["Action"]) == _EFS_CLIENT
+    assert no_ap["Condition"] == {"Null": {"elasticfilesystem:AccessPointArn": "true"}}
+    no_tls = statements["DenyWithoutTls"]
+    assert _as_set(no_tls["Action"]) == _EFS_CLIENT
+    assert no_tls["Condition"] == {"Bool": {"aws:SecureTransport": "false"}}
+    root = statements["DenyRoot"]
+    assert _as_set(root["Action"]) == {"elasticfilesystem:ClientRootAccess"}
+    assert "Condition" not in root
+    # Who may mount: the driver's node role, through the workspace access point.
+    grants = [
+        (name, st)
+        for name, r in resources.items()
+        if r["Type"] == "AWS::IAM::Role"
+        for p in r["Properties"].get("Policies", [])
+        for st in p["PolicyDocument"]["Statement"]
+        if _as_set(st["Action"]) & _EFS_CLIENT
+    ]
+    ((role, grant),) = grants
+    (addon,) = _resources("AWS::EKS::Addon").values()
+    (node,) = [
+        a for a in addon["Properties"]["PodIdentityAssociations"] if a["RoleArn"] == f"{role}.Arn"
+    ]
+    assert node["ServiceAccount"] == "efs-csi-node-sa"
+    assert _as_set(grant["Action"]) == {
+        "elasticfilesystem:ClientMount",
+        "elasticfilesystem:ClientWrite",
+    }
+    (fs_name,) = _resources("AWS::EFS::FileSystem")
+    (ap_name,) = _resources("AWS::EFS::AccessPoint")
+    assert grant["Resource"] == f"{fs_name}.Arn"
+    assert grant["Condition"] == {
+        "StringEquals": {"elasticfilesystem:AccessPointArn": f"{ap_name}.Arn"},
+        "Bool": {"elasticfilesystem:AccessedViaMountTarget": "true"},
+    }
+    # The node's instance profile has no EFS access, so a mount without the
+    # node role's credentials fails rather than falling back to it.
+    node_role = _cfn()["Resources"]["NodeRole"]["Properties"]
+    assert "Policies" not in node_role
+    assert not [p for p in node_role["ManagedPolicyArns"] if "EFS" in p or "FileSystem" in p]
+    # The volume mounts as that role (iam), over TLS, through the access point.
+    (volume,) = [d for d in _docs([EKS / "storage.yaml"]) if d["kind"] == "PersistentVolume"]
+    assert set(volume["spec"]["mountOptions"]) == {"tls", "iam"}
+    assert volume["spec"]["csi"]["volumeHandle"] == "<workspace-volume-handle>"
+    handle = _cfn()["Outputs"]["WorkspaceVolumeHandle"]["Value"]
+    assert handle == f"${{{fs_name}}}::${{{ap_name}}}"
+
+
 def test_the_eks_deploy_script_turns_on_network_policy_first_and_keeps_secrets_out():
     script = EKS / "deploy.sh"
     subprocess.run(["bash", "-n", str(script)], check=True)
@@ -568,6 +651,7 @@ def test_the_rendered_eks_overlay_serves_wss_and_changes_only_what_eks_needs():
     assert state["spec"]["storageClassName"] == "cao-gp3"
     volume = _one(docs, "PersistentVolume", "cao-remote-workspace")
     assert volume["spec"]["csi"]["driver"] == "efs.csi.aws.com"
+    assert set(volume["spec"]["mountOptions"]) == {"tls", "iam"}
     assert volume["spec"]["claimRef"] == {"namespace": "cao-remote", "name": "cao-remote-workspace"}
     account = _one(docs, "ServiceAccount", "cao-runner")
     assert account["automountServiceAccountToken"] is False
