@@ -891,7 +891,12 @@ class TestCreateTerminal:
         terminal_service._memory_injected_terminals.discard("test1234")
 
         try:
-            await create_terminal(provider_name, "developer", new_session=True)
+            await create_terminal(
+                provider_name,
+                "developer",
+                new_session=True,
+                inject_memory_at_start=True,
+            )
 
             skill_prompt = mock_provider._skill_prompt
             assert skill_prompt == (
@@ -927,7 +932,15 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog")
     @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
-    async def test_create_terminal_without_skills_is_unchanged(
+    @pytest.mark.parametrize("provider_name", ["claude_code", "codex"])
+    @pytest.mark.parametrize(
+        ("frozen_memory", "expected"),
+        [
+            ("<cao-memory>FROZEN</cao-memory>", "<cao-memory>FROZEN</cao-memory>\n\ntask"),
+            ("", "task"),
+        ],
+    )
+    async def test_orchestrated_create_preserves_frozen_first_message(
         self,
         mock_load_profile,
         mock_build_skill_catalog,
@@ -942,8 +955,12 @@ class TestCreateTerminal:
         mock_fifo_manager,
         mock_status_monitor,
         mock_delete_terminals_by_session,
+        provider_name,
+        frozen_memory,
+        expected,
+        monkeypatch,
     ):
-        """Providers should receive an empty skill prompt when no skills are installed."""
+        """Workflow and handoff creates keep memory on the frozen first-message route."""
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
@@ -961,13 +978,40 @@ class TestCreateTerminal:
         mock_log_path = MagicMock()
         mock_log_dir.__truediv__.return_value = mock_log_path
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+        memory_calls = []
+        monkeypatch.setattr(
+            terminal_service,
+            "memory_context_for_terminal",
+            lambda terminal_id, task_description="": memory_calls.append(
+                (terminal_id, task_description)
+            )
+            or "<cao-memory>LIVE</cao-memory>",
+        )
+        terminal_service._memory_injected_terminals.discard("test1234")
 
-        await create_terminal("codex", "developer", new_session=True)
+        try:
+            await create_terminal(provider_name, "developer", new_session=True)
 
-        skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
-        assert skill_prompt == ""
-        # No `skills` field on the profile → catalog built with no filter (None).
-        mock_build_skill_catalog.assert_called_once_with(None)
+            skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
+            assert skill_prompt == ""
+            assert memory_calls == []
+            assert (
+                terminal_service.inject_memory_context(
+                    "task", "test1234", frozen_memory=frozen_memory
+                )
+                == expected
+            )
+            assert (
+                terminal_service.inject_memory_context(
+                    "second task", "test1234", frozen_memory=frozen_memory
+                )
+                == "second task"
+            )
+            assert memory_calls == []
+            # No `skills` field on the profile → catalog built with no filter (None).
+            mock_build_skill_catalog.assert_called_once_with(None)
+        finally:
+            terminal_service._memory_injected_terminals.discard("test1234")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("provider_name", ["kiro_cli", "copilot_cli"])
@@ -2195,6 +2239,7 @@ class TestIdempotencyKeyRequestFingerprint:
             # was discarded with no conflict and no delivery.
             ("initial_message", "a different task"),
             ("initial_message_orchestration_type", OrchestrationType.HANDOFF),
+            ("inject_memory_at_start", True),
         ],
     )
     @pytest.mark.asyncio

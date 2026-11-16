@@ -1406,6 +1406,7 @@ def _request_fingerprint(
     description: Optional[str] = None,
     caller_ceiling: Optional[List[str]] = None,
     delegating_terminal_id: Optional[str] = None,
+    inject_memory_at_start: bool = False,
 ) -> str:
     """Fingerprint the create-terminal request an idempotency key stands for.
 
@@ -1613,6 +1614,8 @@ def _request_fingerprint(
         )
     if delegating_terminal_id is not None:
         parts.extend(["delegating_terminal_id", delegating_terminal_id])
+    if inject_memory_at_start:
+        parts.extend(["inject_memory_at_start", "1"])
     return hashlib.sha256(
         "\x00".join(_fingerprint_component(part) for part in parts).encode("utf-8")
     ).hexdigest()
@@ -1946,6 +1949,8 @@ async def create_terminal(
     launch_plan: "LaunchPlan | None" = None,
     delegating_terminal_id: Optional[str] = None,
     caller_ceiling: Optional[list[str]] = None,
+    *,
+    inject_memory_at_start: bool = False,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -2058,12 +2063,14 @@ async def create_terminal(
             hashed or excluded-with-a-reason. Adding a parameter to either
             endpoint means classifying it here.
 
-            HASHED (11) -- these determine what the terminal IS, or what
+            HASHED (14) -- these determine what the terminal IS, or what
             privileges and context it launches with:
             ``provider``, ``agent_profile``, ``session_name``,
             ``working_directory``, ``caller_id``, ``model``, ``use_worktree``,
             ``engine``, ``allowed_tools``, ``env_vars``,
-            ``resume_session_id``.
+            ``resume_session_id``, ``initial_message``,
+            ``initial_message_orchestration_type``,
+            ``inject_memory_at_start``.
 
             EXCLUDED, each for a checked reason:
 
@@ -2074,10 +2081,6 @@ async def create_terminal(
               the ``update_metadata`` MCP tool, so a create-time key is not
               their integrity boundary -- a caller who cares about their value
               cannot rely on creation to fix it anyway.
-            - ``initial_message`` and ``initial_message_orchestration_type``.
-              The delivered payload and its routing, not the terminal: neither
-              is persisted on the row, and a genuine retry re-sends the same
-              message. These create endpoints do not own the prompt.
             - ``delegation_message`` and ``delegation_kind``. These never reach
               this function: the handler converts them into a launch plan that
               selects a decision, not the terminal's identity. A genuine retry
@@ -2228,6 +2231,7 @@ async def create_terminal(
             launch_plan=launch_plan,
             delegating_terminal_id=delegating_terminal_id,
             caller_ceiling=caller_ceiling,
+            inject_memory_at_start=inject_memory_at_start,
             ephemeral_state=state,
         )
     except BaseException as exc:
@@ -2271,6 +2275,7 @@ async def _create_terminal_unguarded(
     delegating_terminal_id: Optional[str] = None,
     caller_ceiling: Optional[list[str]] = None,
     *,
+    inject_memory_at_start: bool = False,
     ephemeral_state: _EphemeralLaunchState,
 ) -> Terminal:
     """Create body; the caller compensates an unbound claim or a cancelled bind."""
@@ -2307,6 +2312,7 @@ async def _create_terminal_unguarded(
             description,
             caller_ceiling=caller_ceiling,
             delegating_terminal_id=delegating_terminal_id,
+            inject_memory_at_start=inject_memory_at_start,
         )
         # Issue #944: look up, store and delete under the fingerprint-scoped
         # key, never the bare one. A different request under the same key
@@ -3400,7 +3406,11 @@ async def _create_terminal_unguarded(
         # has not started yet, so updating the prompt here still precedes command
         # construction. Immediate orchestrated launches retain the task-aware
         # first-message path (and workflow frozen-memory semantics).
-        if provider in RUNTIME_SKILL_PROMPT_PROVIDERS and initial_message is None:
+        if (
+            inject_memory_at_start
+            and provider in RUNTIME_SKILL_PROMPT_PROVIDERS
+            and initial_message is None
+        ):
             provider_instance._skill_prompt = _memory_start_prompt(skill_prompt, terminal_id)
 
         # The provider owns the helper's home now: its cleanup removes it.
