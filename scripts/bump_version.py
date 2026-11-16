@@ -140,21 +140,25 @@ def _release_date() -> str:
     return date.today().isoformat()
 
 
-def generate_changelog(new_version: str) -> None:
-    """Promote the single hand-written Unreleased section without rewriting its contents."""
+def promoted_changelog(new_version: str) -> bytes:
+    """Return the promoted hand-written Unreleased section without rewriting its contents."""
     before = CHANGELOG.read_bytes()
     matches = list(UNRELEASED_HEADING.finditer(before))
     if len(matches) != 1:
         raise ChangelogError(
-            "CHANGELOG.md must contain exactly one '## [Unreleased]' heading; "
-            f"found {len(matches)}"
+            f"CHANGELOG.md must contain exactly one '## [Unreleased]' heading; found {len(matches)}"
         )
 
     match = matches[0]
     newline = match.group("newline") or b"\n"
     released = f"## [{new_version}] - {_release_date()}".encode("ascii")
     replacement = b"## [Unreleased]" + newline + newline + released + match.group("newline")
-    CHANGELOG.write_bytes(before[: match.start()] + replacement + before[match.end() :])
+    return before[: match.start()] + replacement + before[match.end() :]
+
+
+def generate_changelog(new_version: str) -> None:
+    """Promote the single hand-written Unreleased section without rewriting its contents."""
+    CHANGELOG.write_bytes(promoted_changelog(new_version))
 
 
 def main() -> None:
@@ -165,15 +169,19 @@ def main() -> None:
 
     old = get_version()
     new = bump(sys.argv[1], old)
+    new_changelog = promoted_changelog(new)
+    old_changelog = CHANGELOG.read_bytes()
 
     originals = {path: path.read_text() for path in (PYPROJECT, DEVCONTAINER_FEATURE)}
     update_pyproject(new)
     update_devcontainer_feature(new)
     try:
         update_uv_lock(old, new)
+        CHANGELOG.write_bytes(new_changelog)
     except LockDrift as exc:
         for path, text in originals.items():
             path.write_text(text)
+        CHANGELOG.write_bytes(old_changelog)
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
     except BaseException:
@@ -182,14 +190,13 @@ def main() -> None:
         # files it does not touch so a re-run starts from an unbumped tree, not a split one.
         for path, text in originals.items():
             path.write_text(text)
+        CHANGELOG.write_bytes(old_changelog)
         raise
-    generate_changelog(new)
 
     print(f"Bumped {old} -> {new}")
     print("\nNext steps:")
     print(
-        f"  1. git add pyproject.toml uv.lock CHANGELOG.md "
-        f"{DEVCONTAINER_FEATURE.relative_to(ROOT)}"
+        f"  1. git add pyproject.toml uv.lock CHANGELOG.md {DEVCONTAINER_FEATURE.relative_to(ROOT)}"
     )
     print(f"  2. git commit -m 'chore: release v{new}'")
     print(f"  3. git tag v{new}")

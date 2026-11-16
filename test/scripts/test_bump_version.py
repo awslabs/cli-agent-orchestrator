@@ -352,3 +352,32 @@ class TestMainRestoresOnAnyException:
         for rel, text in originals.items():
             assert (tree / rel).read_text("utf-8") == text, rel
         assert runner.calls == [["uv", "lock"]], "the second uv call never runs"
+
+
+class TestMainRefusesInvalidChangelogBeforeWriting:
+    @pytest.mark.parametrize(
+        "changelog",
+        [
+            "# Changelog\n\n## [1.2.2] - 2029-12-31\n\n- Existing notes.\n",
+            "# Changelog\n\n## [Unreleased]\n\nText\n\n## [Unreleased]\n",
+        ],
+        ids=["missing-unreleased", "two-unreleased"],
+    )
+    def test_no_version_carrier_changes_when_changelog_is_invalid(
+        self, tree, monkeypatch, changelog
+    ):
+        (tree / "CHANGELOG.md").write_text(changelog, encoding="utf-8")
+        originals = {
+            rel: (tree / rel).read_bytes()
+            for rel in ("pyproject.toml", FEATURE, "uv.lock", "CHANGELOG.md")
+        }
+        uv = FakeUv(tree / "uv.lock", _moves_version(bv.bump("patch", _current(tree))))
+        real = bv.update_uv_lock
+        monkeypatch.setattr(bv, "update_uv_lock", lambda old, new: real(old, new, run=uv))
+        monkeypatch.setattr(sys, "argv", ["bump_version.py", "patch"])
+
+        with pytest.raises(bv.ChangelogError, match="exactly one"):
+            bv.main()
+
+        for rel, before in originals.items():
+            assert (tree / rel).read_bytes() == before, rel
