@@ -81,11 +81,16 @@ class RankingConfig(BaseModel):
     default_sort: Literal["recency", "bm25"] = "recency"
 
 
+class RelationshipsConfig(BaseModel):
+    content_links: bool = True
+
+
 class MemoryConfig(BaseModel):
     enabled: bool = True
     explain_enabled: bool = True
     non_accessing_inspection: bool = True
     parser: MemoryParserConfig = Field(default_factory=MemoryParserConfig)
+    relationships: RelationshipsConfig = Field(default_factory=RelationshipsConfig)
     lifecycle: LifecycleConfig = Field(default_factory=LifecycleConfig)
     injection: InjectionConfig = Field(default_factory=InjectionConfig)
     ranking: RankingConfig = Field(default_factory=RankingConfig)
@@ -497,6 +502,8 @@ def _get_owned_section(path: str, default: Any) -> Any:
                 if isinstance(injection, dict)
                 else injection_default
             )
+        if key == "relationships.content_links":
+            return settings_service.is_memory_content_links_enabled()
         if key == "ranking.default_sort":
             ranking = settings_service.get_memory_settings().get("ranking", {})
             return ranking.get("default_sort", default) if isinstance(ranking, dict) else default
@@ -678,6 +685,7 @@ _ALL_PATHS = sorted(
         "memory.flush_threshold",
         "memory.compile_timeout_s",
         "memory.parser.lenient",
+        "memory.relationships.content_links",
         "memory.ranking.default_sort",
         "memory.vault",
         "terminal.keep_finished.enabled",
@@ -767,6 +775,9 @@ class ConfigService:
                 explain_enabled=settings_service.is_memory_explain_enabled(),
                 non_accessing_inspection=settings_service.is_non_accessing_inspection_enabled(),
                 parser=MemoryParserConfig(lenient=settings_service.is_memory_parser_lenient()),
+                relationships=RelationshipsConfig(
+                    content_links=settings_service.is_memory_content_links_enabled()
+                ),
                 lifecycle=LifecycleConfig(enabled=settings_service.is_memory_lifecycle_enabled()),
                 injection=InjectionConfig(
                     **{

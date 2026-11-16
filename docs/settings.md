@@ -12,4 +12,7 @@ For the on-demand memory ranking diagnostic, see [Memory explain](memory.md#on-d
 
 `memory.ranking.default_sort` defaults to `recency`; set it to `bm25` to opt query recall into BM25-first results. No-query listings remain recency ordered.
 
+`memory.relationships.content_links` defaults to `true`; set it to `false` to
+stop store and repair from producing relationships from authored memory links.
+
 `memory.non_accessing_inspection` defaults to `true`; see [Operator inspection](memory.md#non-accessing-operator-inspection). `CAO_MEMORY_NON_ACCESSING_INSPECTION` overrides the file value.

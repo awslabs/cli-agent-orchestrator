@@ -1158,6 +1158,7 @@ class MemoryService:
                     token_estimate=len(content) // 4,
                     last_compiled_at=last_compiled_at,
                 )
+                self._sync_content_link_edges(key, scope, scope_id, new_content)
             except Exception as e:
                 logger.error(
                     "Memory metadata SQLite upsert failed after durable writes "
@@ -2026,6 +2027,44 @@ class MemoryService:
         rendered = "\n".join(out).rstrip() + "\n"
         return rendered
 
+    def _sync_content_link_edges(
+        self,
+        key: str,
+        scope: str,
+        scope_id: Optional[str],
+        file_content: str,
+    ) -> None:
+        """Replace this topic's content-link edge set after metadata is durable."""
+        from cli_agent_orchestrator.services.memory_content_links import (
+            extract_content_link_targets,
+        )
+        from cli_agent_orchestrator.services.memory_relationship_service import (
+            EdgeInput,
+            MemoryRelationshipService,
+        )
+        from cli_agent_orchestrator.services.settings_service import (
+            is_memory_content_links_enabled,
+        )
+
+        if not is_memory_content_links_enabled():
+            return
+        targets = extract_content_link_targets(file_content, self._sanitize_key)
+        audits: list[Callable[[], None]] = []
+        with self._get_db_session() as db:
+            MemoryRelationshipService().replace_set(
+                scope,
+                scope_id,
+                key,
+                "content_link",
+                "relates_to",
+                [EdgeInput(target) for target in targets],
+                db=db,
+                audit_sink=audits,
+            )
+            db.commit()
+        for emit_audit in audits:
+            emit_audit()
+
     def _related_keys_lookup(
         self, keys: list, scope: str, scope_id: Optional[str], *, source_kind: str = "native"
     ) -> dict:
@@ -2851,6 +2890,142 @@ class MemoryService:
             scan_all=scan_all,
             policy=recall_policy,
         )
+
+    async def related(
+        self,
+        key: str,
+        *,
+        scope: Optional[str] = None,
+        depth: int = 1,
+        types: Optional[list[str]] = None,
+        direction: str = "both",
+        limit: int = 20,
+        terminal_context: Optional[dict] = None,
+    ) -> dict[str, Any]:
+        """Return policy-filtered relationship edges and one-line neighbour hooks."""
+        if not _is_memory_enabled():
+            return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
+        if scope is not None:
+            MemoryScope(scope)
+        if limit < 1 or limit > 100:
+            raise ValueError("limit must be between 1 and 100")
+        canonical = self._sanitize_key(key)
+        available = await self.recall(
+            scope=scope,
+            limit=10000,
+            terminal_context=terminal_context,
+            record_access=False,
+        )
+        eligibility = memory_eligibility.begin_check(
+            memory_eligibility.EligibilityRequest.from_context("curated_recall", terminal_context)
+        )
+        if eligibility is not None:
+            reasons = eligibility.reasons(
+                [
+                    memory_eligibility.MemoryIdentity(
+                        memory.key,
+                        memory.scope,
+                        self._effective_scope_id(memory),
+                        memory.source_kind,
+                    )
+                    for memory in available
+                ]
+            )
+            available = [
+                memory
+                for memory in available
+                if memory_eligibility.MemoryIdentity(
+                    memory.key,
+                    memory.scope,
+                    self._effective_scope_id(memory),
+                    memory.source_kind,
+                )
+                not in reasons
+            ]
+        matches = [memory for memory in available if memory.key == canonical]
+        if not matches:
+            return {
+                "success": False,
+                "error_kind": "not_found",
+                "error": f"memory not found: {canonical}",
+            }
+        identities = {(memory.scope, self._effective_scope_id(memory)) for memory in matches}
+        if scope is None and len(identities) > 1:
+            scopes = list(dict.fromkeys(memory.scope for memory in matches))
+            return {
+                "success": False,
+                "error_kind": "ambiguous_scope",
+                "error": f"memory key is present in multiple scopes: {canonical}",
+                "scopes": scopes,
+            }
+
+        source = matches[0]
+        source_scope_id = self._effective_scope_id(source)
+        from cli_agent_orchestrator.services.memory_relationship_service import (
+            MemoryRelationshipService,
+        )
+
+        walked = MemoryRelationshipService(self._db_session_factory).neighbours(
+            source.scope,
+            source_scope_id,
+            [canonical],
+            direction=direction,
+            types=types,
+            depth=depth,
+            limit=limit,
+        )
+        available_by_key = {
+            memory.key: memory
+            for memory in available
+            if memory.scope == source.scope and self._effective_scope_id(memory) == source_scope_id
+        }
+        reached = {canonical}
+        edges: list[dict[str, Any]] = []
+        neighbours: list[dict[str, Any]] = []
+        emitted_neighbours: set[str] = set()
+        for walked_edge in walked:
+            relationship = walked_edge.relationship
+            current_key = (
+                relationship.source_key
+                if walked_edge.direction == "out"
+                else relationship.target_key
+            )
+            neighbour = available_by_key.get(walked_edge.neighbour_key)
+            if current_key not in reached or neighbour is None:
+                continue
+            reached.add(neighbour.key)
+            edges.append(
+                {
+                    "source_key": relationship.source_key,
+                    "target_key": relationship.target_key,
+                    "type": relationship.type,
+                    "origin": relationship.origin,
+                    "status": relationship.status,
+                    "confidence": relationship.confidence,
+                    "direction": walked_edge.direction,
+                    "depth": walked_edge.depth,
+                }
+            )
+            hook = re.sub(r"\s+", " ", neighbour.content).strip()
+            if neighbour.key not in emitted_neighbours:
+                neighbours.append(
+                    {
+                        "key": neighbour.key,
+                        "kind": neighbour.memory_type,
+                        "hook": hook[:160],
+                        "status": neighbour.lifecycle_status or "active",
+                    }
+                )
+                emitted_neighbours.add(neighbour.key)
+        return {
+            "success": True,
+            "key": source.key,
+            "scope": source.scope,
+            "scope_id": source_scope_id,
+            "depth": min(max(int(depth), 1), 2),
+            "edges": edges,
+            "neighbours": neighbours,
+        }
 
     async def recall_explain(
         self,

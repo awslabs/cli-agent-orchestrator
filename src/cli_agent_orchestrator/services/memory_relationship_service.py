@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, cast
 
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 
 from cli_agent_orchestrator.clients.database import (
@@ -124,6 +125,16 @@ class RelationshipDTO:
         }
 
 
+@dataclass(frozen=True)
+class NeighbourEdgeDTO:
+    """One traversal edge, directed relative to the node being walked."""
+
+    relationship: RelationshipDTO
+    neighbour_key: str
+    direction: str
+    depth: int
+
+
 @dataclass
 class ReplaceReport:
     """Result of a producer-scoped ``replace_set`` (content-free)."""
@@ -196,10 +207,11 @@ def _rank_then_created(row: Any) -> tuple:
 class MemoryRelationshipService:
     """Sole reader/writer of the ``memory_relationships`` table."""
 
-    def __init__(self) -> None:
+    def __init__(self, db_session_factory: Any = None) -> None:
         # Reuse MemoryService's static sanitizers; no instance state shared.
         self._sanitize_key = MemoryService._sanitize_key
         self._sanitize_scope_id = MemoryService._sanitize_scope_id
+        self._session_factory = db_session_factory or SessionLocal
 
     # ------------------------------------------------------------------ #
     # scope_id normalisation (sentinel is scoped to memory_relationships)
@@ -397,7 +409,7 @@ class MemoryRelationshipService:
         src, tgt = self._sanitize_endpoints(source_key, target_key)
         sentinel = self._to_sentinel(scope_id)
 
-        with SessionLocal() as db:
+        with self._session_factory() as db:
             self._assert_endpoint_exists(db, scope, scope_id, src)
             self._assert_endpoint_exists(db, scope, scope_id, tgt)
             existing = self._find_existing(db, scope, sentinel, src, tgt, type, origin)
@@ -530,7 +542,7 @@ class MemoryRelationshipService:
         # Validate + resolve the incoming set first (fail-closed); collect valid
         # targets, report the rest (FR-1.5-style) without aborting the whole op.
         valid: Dict[str, EdgeInput] = {}
-        with SessionLocal() if owns_session else nullcontext(db) as db:
+        with self._session_factory() if owns_session else nullcontext(db) as db:
             for edge in edges:
                 try:
                     tgt = self._sanitize_key(edge.target_key)
@@ -680,7 +692,7 @@ class MemoryRelationshipService:
         sentinel = self._to_sentinel(scope_id)
         report = ReplaceReport()
         owns_session = db is None
-        session = SessionLocal() if owns_session else db
+        session = self._session_factory() if owns_session else db
         try:
             rows = (
                 session.query(MemoryRelationshipModel)
@@ -781,7 +793,7 @@ class MemoryRelationshipService:
         a future dedicated call; #511 has no clear-to-null API requirement)."""
         if status is not None:
             self._validate_status(status)
-        with SessionLocal() as db:
+        with self._session_factory() as db:
             row = self._get_row(db, id)
             if status is not None:
                 row.status = status
@@ -808,7 +820,7 @@ class MemoryRelationshipService:
         if require_status is not None:
             self._validate_status(require_status)
         owns_session = db is None
-        session = SessionLocal() if owns_session else db
+        session = self._session_factory() if owns_session else db
         try:
             rows = (
                 session.query(MemoryRelationshipModel)
@@ -857,7 +869,7 @@ class MemoryRelationshipService:
             self._validate_status(status)
         self._validate_status(require_status)
         owns_session = db is None
-        session = SessionLocal() if owns_session else db
+        session = self._session_factory() if owns_session else db
         deferred: List[Callable[[], None]] = []
         try:
             reasons = self.preflight_edge_identities(
@@ -911,7 +923,7 @@ class MemoryRelationshipService:
         if set(edge_ids) != set(expect):
             raise ValueError("supersede ids and edge snapshot ids must match")
         owns_session = db is None
-        session = SessionLocal() if owns_session else db
+        session = self._session_factory() if owns_session else db
         deferred: List[Callable[[], None]] = []
         try:
             reasons = self.preflight_edge_identities(expect, db=session)
@@ -948,7 +960,7 @@ class MemoryRelationshipService:
 
     def promote(self, id: str) -> RelationshipDTO:
         """proposal -> active (FR-2.2)."""
-        with SessionLocal() as db:
+        with self._session_factory() as db:
             row = self._get_row(db, id)
             if row.status in ("rejected", "deleted"):
                 raise ValueError(f"cannot promote a {row.status} relationship; re-create it")
@@ -961,7 +973,7 @@ class MemoryRelationshipService:
 
     def reject(self, id: str) -> RelationshipDTO:
         """-> rejected (FR-2.2)."""
-        with SessionLocal() as db:
+        with self._session_factory() as db:
             row = self._get_row(db, id)
             row.status = "rejected"
             row.updated_at = _utcnow()
@@ -972,7 +984,7 @@ class MemoryRelationshipService:
 
     def soft_delete(self, id: str) -> RelationshipDTO:
         """-> deleted (auditable soft-delete; row retained, FR-2.4)."""
-        with SessionLocal() as db:
+        with self._session_factory() as db:
             row = self._get_row(db, id)
             row.status = "deleted"
             row.updated_at = _utcnow()
@@ -1026,7 +1038,7 @@ class MemoryRelationshipService:
         k = self._sanitize_key(key)
         sentinel = self._to_sentinel(scope_id)
         owns_session = db is None
-        session = SessionLocal() if owns_session else db
+        session = self._session_factory() if owns_session else db
         try:
             filters = [
                 MemoryRelationshipModel.scope == scope,
@@ -1108,7 +1120,7 @@ class MemoryRelationshipService:
         legitimately point at a key outside the set).
         """
         sentinel = self._to_sentinel(scope_id)
-        with SessionLocal() as db:
+        with self._session_factory() as db:
             q = db.query(MemoryRelationshipModel).filter(
                 MemoryRelationshipModel.scope == scope,
                 MemoryRelationshipModel.scope_id == sentinel,
@@ -1143,21 +1155,35 @@ class MemoryRelationshipService:
             if types:
                 q = q.filter(MemoryRelationshipModel.type.in_(list(types)))
             rows = q.all()
-            src_map = self._source_updated_map(db, scope, scope_id, {r.source_key for r in rows})
-            dtos = [self._to_dto(r, src_map.get(r.source_key)) for r in rows]
+            src_map = self._source_updated_map(
+                db, scope, scope_id, {cast(str, r.source_key) for r in rows}
+            )
+            dtos = [
+                self._to_dto(
+                    cast(MemoryRelationshipModel, r),
+                    src_map.get(cast(str, r.source_key)),
+                )
+                for r in rows
+            ]
         if stale_only:
             dtos = [d for d in dtos if d.stale]
         return dtos
 
     def get(self, id: str) -> Optional[RelationshipDTO]:
-        with SessionLocal() as db:
+        with self._session_factory() as db:
             row = db.query(MemoryRelationshipModel).filter(MemoryRelationshipModel.id == id).first()
             if row is None:
                 return None
             src_map = self._source_updated_map(
-                db, row.scope, self._from_sentinel(row.scope_id), {row.source_key}
+                db,
+                cast(str, row.scope),
+                self._from_sentinel(cast(Optional[str], row.scope_id)),
+                {cast(str, row.source_key)},
             )
-            return self._to_dto(row, src_map.get(row.source_key))
+            return self._to_dto(
+                cast(MemoryRelationshipModel, row),
+                src_map.get(cast(str, row.source_key)),
+            )
 
     def active_targets(
         self,
@@ -1169,7 +1195,7 @@ class MemoryRelationshipService:
         """Active edge targets of ``type`` from the source, in (rank, created_at)
         order — the See-Also / recall projection helper (FR-4.1/4.2)."""
         sentinel = self._to_sentinel(scope_id)
-        with SessionLocal() as db:
+        with self._session_factory() as db:
             rows = (
                 db.query(MemoryRelationshipModel)
                 .filter(
@@ -1182,7 +1208,7 @@ class MemoryRelationshipService:
                 .all()
             )
         rows.sort(key=_rank_then_created)
-        return [r.target_key for r in rows]
+        return [cast(str, r.target_key) for r in rows]
 
     def active_targets_for(
         self,
@@ -1211,7 +1237,7 @@ class MemoryRelationshipService:
         # Map sanitized -> caller's original, as superseded_targets does. A dict
         # also collapses duplicate inputs, so the IN list carries no repeats.
         sanitized = {self._sanitize_key(k): k for k in source_keys}
-        with SessionLocal() as db:
+        with self._session_factory() as db:
             rows = (
                 db.query(MemoryRelationshipModel)
                 .filter(
@@ -1225,14 +1251,14 @@ class MemoryRelationshipService:
             )
         grouped: Dict[str, List[Any]] = {}
         for row in rows:
-            original = sanitized.get(row.source_key)
+            original = sanitized.get(cast(str, row.source_key))
             if original is None:  # pragma: no cover - IN filter makes this unreachable
                 continue
             grouped.setdefault(original, []).append(row)
         out: Dict[str, List[str]] = {}
         for original, group in grouped.items():
             group.sort(key=_rank_then_created)
-            out[original] = [r.target_key for r in group]
+            out[original] = [cast(str, r.target_key) for r in group]
         return out
 
     def is_superseded(self, scope: str, scope_id: Optional[str], key: str) -> bool:
@@ -1240,7 +1266,7 @@ class MemoryRelationshipService:
         input): some memory supersedes this one, so it must not outrank active
         guidance."""
         sentinel = self._to_sentinel(scope_id)
-        with SessionLocal() as db:
+        with self._session_factory() as db:
             hit = (
                 db.query(MemoryRelationshipModel)
                 .filter(
@@ -1263,7 +1289,7 @@ class MemoryRelationshipService:
             return set()
         sentinel = self._to_sentinel(scope_id)
         sanitized = {self._sanitize_key(k): k for k in keys}
-        with SessionLocal() as db:
+        with self._session_factory() as db:
             rows = (
                 db.query(MemoryRelationshipModel.target_key)
                 .filter(
@@ -1277,6 +1303,132 @@ class MemoryRelationshipService:
             )
         # Map sanitized targets back to the caller's original key strings.
         return {sanitized[r[0]] for r in rows if r[0] in sanitized}
+
+    def neighbours(
+        self,
+        scope: str,
+        scope_id: Optional[str],
+        keys: List[str],
+        *,
+        direction: str = "both",
+        types: Optional[List[str]] = None,
+        statuses: Sequence[str] = ("active",),
+        depth: int = 1,
+        limit: int = 20,
+    ) -> List[NeighbourEdgeDTO]:
+        """Walk relationship edges in either direction, capped at two hops."""
+        if direction not in {"in", "out", "both"}:
+            raise ValueError("direction must be one of: in, out, both")
+        selected_types = list(types) if types is not None else list(VALID_TYPES)
+        for type_ in selected_types:
+            self._validate_type(type_)
+        for status in statuses:
+            self._validate_status(status)
+        if limit < 1:
+            raise ValueError("limit must be positive")
+
+        max_depth = min(max(int(depth), 1), 2)
+        sentinel = self._to_sentinel(scope_id)
+        roots = {self._sanitize_key(key) for key in keys}
+        visited = set(roots)
+        frontier = set(roots)
+        walked: List[NeighbourEdgeDTO] = []
+        seen_edges: set[str] = set()
+
+        with self._session_factory() as db:
+            for hop in range(1, max_depth + 1):
+                if not frontier or len(walked) >= limit:
+                    break
+                endpoint_filters = []
+                if direction in {"out", "both"}:
+                    endpoint_filters.append(MemoryRelationshipModel.source_key.in_(frontier))
+                if direction in {"in", "both"}:
+                    endpoint_filters.append(MemoryRelationshipModel.target_key.in_(frontier))
+                rows = (
+                    db.query(MemoryRelationshipModel)
+                    .filter(
+                        MemoryRelationshipModel.scope == scope,
+                        MemoryRelationshipModel.scope_id == sentinel,
+                        MemoryRelationshipModel.type.in_(selected_types),
+                        MemoryRelationshipModel.status.in_(list(statuses)),
+                        or_(*endpoint_filters),
+                    )
+                    .all()
+                )
+                candidates: list[tuple[str, str, Any]] = []
+                for row in rows:
+                    if (
+                        direction in {"out", "both"}
+                        and row.source_key in frontier
+                        and row.target_key not in visited
+                    ):
+                        candidates.append(
+                            (
+                                cast(str, row.target_key),
+                                "out",
+                                cast(MemoryRelationshipModel, row),
+                            )
+                        )
+                    if (
+                        direction in {"in", "both"}
+                        and row.target_key in frontier
+                        and row.source_key not in visited
+                    ):
+                        candidates.append(
+                            (
+                                cast(str, row.source_key),
+                                "in",
+                                cast(MemoryRelationshipModel, row),
+                            )
+                        )
+                next_frontier: set[str] = set()
+                for neighbour_key, relative_direction, row in sorted(
+                    candidates, key=lambda item: (item[0], item[1], item[2].id)
+                ):
+                    if neighbour_key in visited or row.id in seen_edges:
+                        continue
+                    walked.append(
+                        NeighbourEdgeDTO(
+                            relationship=self._to_dto(row),
+                            neighbour_key=neighbour_key,
+                            direction=relative_direction,
+                            depth=hop,
+                        )
+                    )
+                    seen_edges.add(row.id)
+                    visited.add(neighbour_key)
+                    next_frontier.add(neighbour_key)
+                    if len(walked) >= limit:
+                        break
+                frontier = next_frontier
+        return walked
+
+    def producer_sources(self, origin: str, type: str) -> set[tuple[str, Optional[str], str]]:
+        """Return source identities currently owned by one producer/type."""
+        self._validate_origin(origin)
+        self._validate_type(type)
+        with self._session_factory() as db:
+            rows = (
+                db.query(
+                    MemoryRelationshipModel.scope,
+                    MemoryRelationshipModel.scope_id,
+                    MemoryRelationshipModel.source_key,
+                )
+                .filter(
+                    MemoryRelationshipModel.origin == origin,
+                    MemoryRelationshipModel.type == type,
+                )
+                .distinct()
+                .all()
+            )
+        return {
+            (
+                cast(str, row_scope),
+                self._from_sentinel(cast(Optional[str], row_scope_id)),
+                cast(str, source_key),
+            )
+            for row_scope, row_scope_id, source_key in rows
+        }
 
     def contradictions_for(
         self, scope: str, scope_id: Optional[str], key: str
@@ -1296,7 +1448,7 @@ class MemoryRelationshipService:
 
         sentinel = self._to_sentinel(scope_id)
         sk = self._sanitize_key(key)
-        with SessionLocal() as db:
+        with self._session_factory() as db:
             rows = (
                 db.query(MemoryRelationshipModel)
                 .filter(

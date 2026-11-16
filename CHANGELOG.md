@@ -33,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   update, and `cao workflow run` all refuse such a script before any step starts. A stored workflow
   written that way needs its ids changed. The fan-out example in the `cao-workflow` skill and in
   `docs/workflows.md` used this shape and now builds a valid id from each file name.
+
+- **Authored memory links now form navigable relationships** (#1329). With the
+  default-on `memory.relationships.content_links` setting, `memory_store` and
+  `cao memory repair --apply` turn same-scope `[[wikilinks]]` and `## See Also`
+  links into active `relates_to` edges with `content_link` provenance. Missing
+  and cross-scope targets remain unlinked and are reported by memory lint.
+  The new `memory_related` MCP tool follows active inbound, outbound, or both
+  directions to a maximum depth of two, applies recall visibility rules, and
+  returns hooks and edge metadata without returning memory bodies.
 - **Memory inspection and fixture hygiene are safer by default** (#1329).
   This resolves #861 Q3: CLI list/show and REST list/show no longer increment
   `access_count` unless `memory.non_accessing_inspection=false`; MCP recall

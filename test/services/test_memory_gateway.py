@@ -144,6 +144,48 @@ async def test_remote_recall_omits_none_fields(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_remote_related_has_gateway_parity(monkeypatch):
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner:9889")
+
+    async def run_inline(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(memory_gateway.asyncio, "to_thread", run_inline)
+    expected = {
+        "success": True,
+        "key": "source",
+        "scope": "global",
+        "edges": [],
+        "neighbours": [],
+    }
+    post = Mock(return_value=expected)
+    monkeypatch.setattr(memory_gateway, "_post", post)
+
+    result = await memory_gateway.related_memory(
+        key="source",
+        scope=None,
+        depth=2,
+        types=["relates_to"],
+        direction="both",
+        limit=20,
+        terminal_context={"terminal_id": "fixture-terminal"},
+    )
+
+    assert result == expected
+    assert post.call_args.args == (
+        "/internal/memory/related",
+        {
+            "key": "source",
+            "depth": 2,
+            "types": ["relates_to"],
+            "direction": "both",
+            "limit": 20,
+            "terminal_context": {"terminal_id": "fixture-terminal"},
+        },
+    )
+
+
+@pytest.mark.asyncio
 async def test_remote_store_reconstructs_partial_write_error(monkeypatch):
     monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner:9889")
 

@@ -11316,6 +11316,16 @@ class InternalMemoryRecallRequest(BaseModel):
     record_access: bool = True
 
 
+class InternalMemoryRelatedRequest(BaseModel):
+    key: LenientMemoryKey
+    scope: Optional[MemoryScope] = None
+    depth: int = Field(default=1, ge=1)
+    types: Optional[List[str]] = None
+    direction: str = "both"
+    limit: int = Field(default=20, ge=1, le=100)
+    terminal_context: Optional[InternalMemoryContext] = None
+
+
 class InternalMemoryForgetRequest(BaseModel):
     key: LenientMemoryKey  # see InternalMemoryStoreRequest.key
     scope: MemoryScope = MemoryScope.PROJECT
@@ -11380,6 +11390,31 @@ async def internal_memory_recall(
     # One serializer for both recall surfaces (this route and the MCP
     # memory_recall tool); see models/memory.py.
     return {"memories": [recall_wire_dict(memory) for memory in memories]}
+
+
+@app.post("/internal/memory/related")
+async def internal_memory_related(
+    body: InternalMemoryRelatedRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Return relationship neighbours using context resolved by a remote worker."""
+    _require_memory_enabled()
+    return cast(
+        Dict[str, Any],
+        await _get_memory_service().related(
+            body.key,
+            scope=body.scope.value if body.scope else None,
+            depth=body.depth,
+            types=body.types,
+            direction=body.direction,
+            limit=body.limit,
+            terminal_context=(
+                body.terminal_context.model_dump(exclude_none=True)
+                if body.terminal_context
+                else None
+            ),
+        ),
+    )
 
 
 @app.post("/internal/memory/forget")

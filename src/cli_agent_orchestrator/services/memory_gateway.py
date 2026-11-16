@@ -153,6 +153,42 @@ async def recall_memory(
     return [Memory.model_validate(item) for item in payload["memories"]]
 
 
+async def related_memory(
+    *,
+    key: str,
+    scope: Optional[str],
+    depth: int,
+    types: Optional[list[str]],
+    direction: str,
+    limit: int,
+    terminal_context: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    if not remote_memory_url():
+        return await MemoryService().related(
+            key,
+            scope=scope,
+            depth=depth,
+            types=types,
+            direction=direction,
+            limit=limit,
+            terminal_context=terminal_context,
+        )
+    body = {
+        name: value
+        for name, value in {
+            "key": key,
+            "scope": scope,
+            "depth": depth,
+            "types": types,
+            "direction": direction,
+            "limit": limit,
+            "terminal_context": terminal_context,
+        }.items()
+        if value is not None
+    }
+    return await asyncio.to_thread(_post, "/internal/memory/related", body)
+
+
 async def forget_memory(
     *,
     key: str,

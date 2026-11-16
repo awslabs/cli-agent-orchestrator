@@ -6,7 +6,8 @@ CAO's memory system gives agents persistent, cross-session storage. Agents store
 ## Capabilities
 
 - **Five scopes** (`global`, `project`, `session`, `agent`, `federated`) and four type labels.
-- **Store** via the `memory_store` MCP tool; **recall / forget** via MCP tools or the `cao memory` CLI.
+- **Store** via the `memory_store` MCP tool; **recall / related / forget** via
+  MCP tools or the `cao memory` CLI.
 - **Markdown wiki storage** with a SQLite metadata index.
 - **Search**: keyword (BM25), recency, or hybrid; results ranked by recency, a
   composite 3-factor score (BM25 + recency + usage), or usage.
@@ -262,6 +263,31 @@ the existing same-scope relationship predicate. `memory.lifecycle.enabled`
 does not undo this lexical-mode demotion. Explicit recall does not
 exclude superseded memories. Default recall and injection are unchanged.
 An older remote memory owner may reject the new sort value; upgrade both nodes.
+
+### `memory_related`
+
+Traverse active, same-scope relationships around one memory without returning
+memory bodies.
+
+```
+memory_related(
+  key="testing-framework",
+  scope="project",                 # optional; omission must resolve unambiguously
+  depth=1,                         # optional: 1 or 2
+  types=["relates_to"],            # optional relationship-type filter
+  direction="both",                # "in", "out", or "both"
+  limit=20                         # optional, total returned edge limit
+)
+```
+
+The result contains deterministic `edges` plus deduplicated `neighbours`.
+Neighbour records carry identity, type, status, and a short content-derived
+`hook`; full memory content is deliberately omitted. Traversal applies the
+same recall visibility and eligibility rules at every hop, so a hidden memory
+cannot appear or bridge two visible memories. Only active edges participate;
+proposals are neither followed nor returned. An omitted scope returns
+`ambiguous_scope` when more than one visible memory has the key, and an absent
+key returns `not_found`.
 
 ### `memory_forget`
 
@@ -570,7 +596,16 @@ shift. A later memory-v2 phase adds BM25 as the default ranking mode.
 Memories are linked by typed, provenance-tagged edges (`relates_to`,
 `contradiction`, `supersedes`) held in a durable store rather than inferred at
 read time. Each edge records its `origin` — `compiler`, `wiki_lint`, `human`,
-`legacy_related_keys`, `external_import`, or `vault` — and a `status`.
+`legacy_related_keys`, `external_import`, `vault`, or `content_link` — and a
+`status`.
+
+With `memory.relationships.content_links=true` (the default), native topic
+content is also a relationship producer. On store and repair, same-scope
+`[[wikilinks]]` and links under `## See Also` become active `relates_to` edges
+with `content_link` origin. Missing and cross-scope targets do not create an
+edge; `cao memory lint` reports them as stale claims. Recomputing content links
+replaces only that source/type/origin set and preserves human and other
+producer edges. Set the option to `false` to disable this producer.
 
 Writes are **producer-scoped**: when the compiler or linter recomputes its edges
 for a source memory, it replaces only rows carrying its own origin and type, so a
