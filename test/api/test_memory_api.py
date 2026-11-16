@@ -116,6 +116,7 @@ def mock_service():
     svc = MagicMock()
     svc.base_dir = MEMORY_BASE
     svc.recall = AsyncMock(return_value=[])
+    svc.read_exact_key = AsyncMock(return_value=None)
     svc.forget = AsyncMock(return_value=True)
     with patch(FACTORY_TARGET, return_value=svc):
         yield svc
@@ -347,9 +348,9 @@ class TestGetMemory:
     """Tests for GET /memory/{key}."""
 
     def test_get_success(self, client, mock_service):
-        mock_service.recall.return_value = [
-            _make_memory(key="my-key", content="Full content here.")
-        ]
+        mock_service.read_exact_key.return_value = _make_memory(
+            key="my-key", content="Full content here."
+        )
         response = client.get("/memory/my-key")
 
         assert response.status_code == 200
@@ -357,31 +358,29 @@ class TestGetMemory:
         assert data["key"] == "my-key"
         assert data["content"] == "Full content here."
         assert "file_path" not in data
-        mock_service.recall.assert_awaited_once_with(
-            query="my-key",
+        mock_service.read_exact_key.assert_awaited_once_with(
+            "my-key",
             scope=None,
-            limit=1000,
+            scope_id=None,
             scan_all=True,
-            search_mode="metadata",
             record_access=True,
         )
 
-    def test_get_exact_match_only(self, client, mock_service):
-        """Substring recall hits that aren't exact key matches are skipped."""
-        mock_service.recall.return_value = [_make_memory(key="my-key-extended")]
-        response = client.get("/memory/my-key")
-        assert response.status_code == 404
-        assert "Memory 'my-key' not found" in response.json()["detail"]
-
     def test_get_narrows_by_scope_id(self, client, mock_service):
-        mock_service.recall.return_value = [
-            _make_memory(key="dup", scope="project", project_dir="proj-other"),
-            _make_memory(key="dup", scope="project", project_dir="proj-mine"),
-        ]
+        mock_service.read_exact_key.return_value = _make_memory(
+            key="dup", scope="project", project_dir="proj-mine"
+        )
         response = client.get("/memory/dup?scope=project&scope_id=proj-mine")
 
         assert response.status_code == 200
         assert response.json()["scope_id"] == "proj-mine"
+        mock_service.read_exact_key.assert_awaited_once_with(
+            "dup",
+            scope="project",
+            scope_id="proj-mine",
+            scan_all=True,
+            record_access=True,
+        )
 
     def test_get_not_found(self, client, mock_service):
         response = client.get("/memory/missing-key")
@@ -397,7 +396,7 @@ class TestGetMemory:
         # not from our not-found path) — the property that matters is that
         # the service is never reached
         assert client.get("/memory/%2E%2E%2Fetc").status_code == 404
-        mock_service.recall.assert_not_awaited()
+        mock_service.read_exact_key.assert_not_awaited()
 
     def test_get_disabled_returns_404(self, client, mock_service):
         with patch(ENABLED_TARGET, return_value=False):
@@ -406,7 +405,7 @@ class TestGetMemory:
         assert "disabled" in response.json()["detail"]
 
     def test_get_server_error_returns_500(self, client, mock_service):
-        mock_service.recall.side_effect = Exception("boom")
+        mock_service.read_exact_key.side_effect = Exception("boom")
         response = client.get("/memory/my-key")
         assert response.status_code == 500
         assert "Failed to get memory" in response.json()["detail"]

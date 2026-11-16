@@ -11462,22 +11462,17 @@ async def get_memory_endpoint(
     _require_memory_enabled()
     svc = _get_memory_service()
     try:
-        memories = await svc.recall(
-            query=key,
+        memory = await svc.read_exact_key(
+            key,
             scope=scope.value if scope else None,
-            limit=1000,
+            scope_id=scope_id,
             scan_all=True,
-            search_mode="metadata",
             record_access=not is_non_accessing_inspection_enabled(),
         )
-        for mem in memories:
-            if mem.key != key:
-                continue
-            if scope_id is not None and not _memory_matches_scope_id(mem, scope_id, svc.base_dir):
-                continue
+        if memory is not None:
             return MemoryDetail(
-                content=mem.content,
-                **_to_memory_summary(mem, svc.base_dir).model_dump(),
+                content=memory.content,
+                **_to_memory_summary(memory, svc.base_dir).model_dump(),
             )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"Memory '{key}' not found"

@@ -2447,6 +2447,159 @@ class MemoryService:
     # Recall
     # -------------------------------------------------------------------------
 
+    async def read_exact_key(
+        self,
+        key: str,
+        scope: Optional[str] = None,
+        scope_id: Optional[str] = None,
+        terminal_context: Optional[dict] = None,
+        scan_all: bool = False,
+        *,
+        record_access: bool = True,
+    ) -> Optional[Memory]:
+        """Read one exact key without routing the lookup through ranked search."""
+        if not _is_memory_enabled():
+            return None
+
+        key = self._sanitize_key(key)
+        terminal_id = (terminal_context or {}).get("terminal_id")
+        policy = _resolve_injection_policy(
+            False,
+            consumer="explicit_recall",
+            terminal_id=terminal_id,
+        )
+        selected_scope_id = scope_id
+
+        if scope is not None and scope_id is not None:
+            try:
+                from cli_agent_orchestrator.services.settings_service import get_vault_config
+                from cli_agent_orchestrator.services.vault.binding import resolve
+
+                vault_config = get_vault_config()
+                binding = resolve(scope, scope_id, vault_config=vault_config)
+            except Exception as exc:
+                logger.warning("vault exact-key source unavailable; returning no content: %s", exc)
+                return None
+            if isinstance(binding, VaultBinding):
+                search_dirs: list[Path] = []
+                vault_bindings = [binding]
+            else:
+                project_dir = self._get_project_dir(scope, binding.scope_id)
+                search_dirs = [project_dir] if project_dir.exists() else []
+                vault_bindings = []
+            selected_scope_id = binding.scope_id
+        else:
+            search_dirs, vault_bindings, _max_body_chars, vault_config = self._resolve_sources(
+                scope,
+                terminal_context,
+                scan_all=scan_all,
+            )
+
+        results: list[Memory] = []
+        private_scope_ids = self._private_recall_scope_ids(terminal_context, scan_all)
+        for project_dir in search_dirs:
+            index_path = project_dir / "wiki" / "index.md"
+            if not index_path.exists():
+                continue
+            for entry in self._parse_index(index_path):
+                entry = dict(entry)
+                if entry["scope"] == MemoryScope.PROJECT.value:
+                    entry["scope_id"] = (
+                        project_dir.name
+                        if project_dir.name not in {"global", "federated"}
+                        else None
+                    )
+                if entry["key"] != key or (scope and entry["scope"] != scope):
+                    continue
+                entry_scope_id = entry.get("scope_id")
+                if selected_scope_id is not None and entry_scope_id != selected_scope_id:
+                    continue
+                if self._native_entry_is_vault_mapped(entry["scope"], entry_scope_id, vault_config):
+                    continue
+                if not self._private_scope_is_visible(
+                    entry["scope"], entry_scope_id, private_scope_ids
+                ):
+                    continue
+                memory = self._load_related_memory(key, entry["scope"], entry_scope_id)
+                if memory is not None:
+                    results.append(memory)
+
+        for binding in vault_bindings:
+            memory = self._load_related_vault_memory(
+                key,
+                scope=binding.scope,
+                scope_id=binding.scope_id,
+                require_injectable=False,
+                terminal_id=terminal_id,
+                consumer="explicit_recall",
+                policy=policy,
+            )
+            if memory is not None and (
+                selected_scope_id is None or self._effective_scope_id(memory) == selected_scope_id
+            ):
+                results.append(memory)
+
+        results.sort(key=lambda memory: memory.updated_at, reverse=True)
+        if not scope:
+            precedence = {
+                MemoryScope.SESSION.value: 0,
+                MemoryScope.PROJECT.value: 1,
+                MemoryScope.GLOBAL.value: 2,
+                MemoryScope.AGENT.value: 3,
+                MemoryScope.FEDERATED.value: 4,
+            }
+            results.sort(
+                key=lambda memory: (
+                    precedence.get(memory.scope, 99),
+                    -memory.updated_at.timestamp(),
+                )
+            )
+
+        from cli_agent_orchestrator.services.settings_service import is_memory_lifecycle_enabled
+
+        lifecycle_on = is_memory_lifecycle_enabled()
+        superseded = self._superseded_keys(results) if lifecycle_on else None
+        self._order_candidates(
+            results,
+            scope,
+            "recency",
+            lifecycle_on=lifecycle_on,
+            superseded_snapshot=superseded,
+        )
+
+        check = None
+        if (
+            policy.is_curator
+            or (terminal_context or {}).get("agent_profile") == MEMORY_MANAGER_PROFILE
+        ):
+            check = memory_eligibility.begin_check(
+                memory_eligibility.EligibilityRequest.from_context(
+                    "curated_recall", terminal_context
+                )
+            )
+        if check is not None:
+            results = list(
+                islice(
+                    check.eligible_in_order(
+                        results,
+                        lambda memory: memory_eligibility.MemoryIdentity(*self._identity(memory)),
+                        1,
+                    ),
+                    1,
+                )
+            )
+
+        finished = self._finish_recall(
+            results,
+            scope,
+            1,
+            eligibility=check,
+            lifecycle_on=lifecycle_on,
+            record_access=record_access,
+            superseded_snapshot=superseded,
+        )
+        return finished[0] if finished else None
+
     def _bm25_scope_id(
         self, scope: Optional[str], terminal_context: Optional[dict]
     ) -> Optional[str]:
