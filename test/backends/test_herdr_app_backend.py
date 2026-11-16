@@ -472,6 +472,14 @@ class TestServerIdentity:
         assert backend.get_pane_id("aaaa0002") == "t2"
         assert backend.cleanup_terminal_exact("zzzz0001").outcome == TerminalCleanupOutcome.ABSENT
 
+    def test_list_managed_can_include_finished_records(self, backend, hc, mixed):
+        hc.terminals["t2"]["state"] = "finished"
+        assert {t["address"] for t in backend.list_managed()} == {"t1"}
+        found = backend.list_managed(include_finished=True)
+        assert {t["address"] for t in found} == {"t1", "t2"}
+        assert hc.calls_to("terminal.list")[-1]["all"] is True
+        assert "all" not in hc.calls_to("terminal.list")[-2]
+
     def test_exact_cleanup_is_not_ambiguous_across_homes(self, backend, hc, mixed):
         r = backend.cleanup_terminal_exact("aaaa0002")
         assert r.outcome == TerminalCleanupOutcome.DELETED

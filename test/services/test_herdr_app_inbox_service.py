@@ -352,10 +352,23 @@ def test_connect_loads_snapshot_reconciles_and_names(env, monkeypatch):
     deliver.assert_called_once_with("aaaa0006")  # seq 5 is not above the snapshot
 
 
+def finished(address, tid, **labels):
+    return {**rec(address, tid, **labels), "state": "finished"}
+
+
+def core_with(backend, *records):
+    """list_managed() returns the live records; include_finished=True returns all."""
+
+    def list_managed(include_finished=False):
+        return [r for r in records if include_finished or r["state"] == "live"]
+
+    backend.list_managed.side_effect = list_managed
+
+
 class TestReconcile:
-    def test_drops_ghost_rows_and_kills_orphans(self, env, monkeypatch):
+    def test_drops_finished_rows_and_kills_orphans(self, env, monkeypatch):
         svc, backend, _, deleted, _, _ = env
-        backend.list_managed.return_value = [rec("t1", "aaaa0001"), rec("t5", "orphan01")]
+        core_with(backend, rec("t1", "aaaa0001"), rec("t5", "orphan01"), finished("t6", "ghost001"))
         rows = [
             {"id": "aaaa0001", "tmux_session": "cao-a"},
             {"id": "ghost001", "tmux_session": "cao-a"},
@@ -368,8 +381,9 @@ class TestReconcile:
         assert ghosts == ["ghost001"]
         backend.kill_address.assert_called_once_with("t5")
 
-    def test_session_with_no_live_terminal(self, env, monkeypatch):
+    def test_session_with_only_finished_terminals(self, env, monkeypatch):
         svc, backend, *_ = env
+        core_with(backend, finished("t7", "ghost002", **{"cao.session": "cao-gone"}))
         rows = [{"id": "ghost002", "tmux_session": "cao-gone"}]
         monkeypatch.setattr(mod, "_rows_by_session", lambda: {"cao-gone": rows})
         monkeypatch.setattr(mod, "_rows_for", lambda s: rows if s == "cao-gone" else [])
@@ -378,6 +392,75 @@ class TestReconcile:
         svc._reconcile()
         assert ghosts == ["ghost002"]
         backend.kill_address.assert_not_called()
+
+    def test_rows_from_another_backend_are_untouched(self, env, monkeypatch):
+        # Switching from tmux or the herdr TUI: the core has never heard of
+        # these terminals, so their rows are not ours to drop.
+        svc, backend, *_ = env
+        core_with(backend, rec("t1", "aaaa0001"))
+        rows = [
+            {"id": "aaaa0001", "tmux_session": "cao-a"},
+            {"id": "tmux0001", "tmux_session": "cao-a"},
+        ]
+        tui = [{"id": "tui00001", "tmux_session": "cao-tui"}]
+        by_session = {"cao-a": rows, "cao-tui": tui}
+        monkeypatch.setattr(mod, "_rows_by_session", lambda: by_session)
+        monkeypatch.setattr(mod, "_rows_for", lambda s: by_session.get(s, []))
+        ghosts = []
+        monkeypatch.setattr(mod, "_drop_ghost_row", lambda tid: ghosts.append(tid))
+        svc._reconcile()
+        assert ghosts == []
+        backend.kill_address.assert_not_called()
+
+    def test_finished_record_of_another_home_does_not_count(self, env, monkeypatch):
+        svc, backend, *_ = env
+        core_with(backend, finished("t8", "ghost003", **{"cao.home": FOREIGN}))
+        rows = [{"id": "ghost003", "tmux_session": "cao-a"}]
+        monkeypatch.setattr(mod, "_rows_by_session", lambda: {"cao-a": rows})
+        monkeypatch.setattr(mod, "_rows_for", lambda s: rows)
+        ghosts = []
+        monkeypatch.setattr(mod, "_drop_ghost_row", lambda tid: ghosts.append(tid))
+        svc._reconcile()
+        assert ghosts == []
+
+    def test_row_with_a_live_record_among_finished_ones_stays(self, env, monkeypatch):
+        svc, backend, *_ = env
+        core_with(backend, finished("t2", "aaaa0001"), rec("t3", "aaaa0001"))
+        rows = [{"id": "aaaa0001", "tmux_session": "cao-a"}]
+        monkeypatch.setattr(mod, "_rows_by_session", lambda: {"cao-a": rows})
+        monkeypatch.setattr(mod, "_rows_for", lambda s: rows)
+        ghosts = []
+        monkeypatch.setattr(mod, "_drop_ghost_row", lambda tid: ghosts.append(tid))
+        svc._reconcile()
+        assert ghosts == []
+
+    def test_record_in_an_unknown_state_is_not_finished(self, env, monkeypatch):
+        svc, backend, *_ = env
+        core_with(backend, {**rec("t2", "aaaa0001"), "state": "parked"})
+        rows = [{"id": "aaaa0001", "tmux_session": "cao-a"}]
+        monkeypatch.setattr(mod, "_rows_by_session", lambda: {"cao-a": rows})
+        monkeypatch.setattr(mod, "_rows_for", lambda s: rows)
+        ghosts = []
+        monkeypatch.setattr(mod, "_drop_ghost_row", lambda tid: ghosts.append(tid))
+        svc._reconcile()
+        assert ghosts == []
+
+    def test_finished_lookup_failure_drops_nothing(self, env, monkeypatch):
+        svc, backend, *_ = env
+
+        def list_managed(include_finished=False):
+            if include_finished:
+                raise RuntimeError("down")
+            return [rec("t5", "orphan01")]
+
+        backend.list_managed.side_effect = list_managed
+        rows = [{"id": "ghost001", "tmux_session": "cao-a"}]
+        monkeypatch.setattr(mod, "_rows_by_session", lambda: {"cao-a": rows})
+        monkeypatch.setattr(mod, "_rows_for", lambda s: rows)
+        ghosts = []
+        monkeypatch.setattr(mod, "_drop_ghost_row", lambda tid: ghosts.append(tid))
+        svc._reconcile()
+        assert ghosts == [] and not backend.kill_address.called
 
     def test_holds_the_session_lock(self, env, monkeypatch):
         svc, backend, *_ = env

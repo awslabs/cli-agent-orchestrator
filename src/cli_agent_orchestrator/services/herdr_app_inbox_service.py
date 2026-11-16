@@ -243,7 +243,13 @@ class HerdrAppInboxService:
             await asyncio.gather(*list(self._delivering.values()), return_exceptions=True)
 
     def _reconcile(self) -> None:
-        """Drop CAO rows without a live terminal and kill our live terminals without a row."""
+        """Drop CAO rows whose terminal finished here and kill our live terminals without a row.
+
+        A row is dropped only when the core has a record for its terminal id
+        under this server's ``cao.home`` and every such record is finished.
+        Rows the core has never heard of (made by the tmux or herdr TUI
+        backend, or by another core) are not ours and stay.
+        """
         from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
 
         try:
@@ -265,17 +271,27 @@ class HerdrAppInboxService:
                         for t in self._backend.list_managed()
                         if self._managed_id(t) and t["labels"].get("cao.session") == session
                     ]
+                    states: Dict[str, List[Any]] = {}
+                    for t in self._backend.list_managed(include_finished=True):
+                        tid = self._managed_id(t)
+                        if tid:
+                            states.setdefault(tid, []).append(t.get("state"))
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("herdr-app reconcile skipped %s: %s", session, exc)
                     continue
                 live_ids = {self._managed_id(t) for t in live}
                 row_ids = {str(r["id"]) for r in rows}
                 for row in rows:
-                    if str(row["id"]) not in live_ids:
-                        try:
-                            _drop_ghost_row(str(row["id"]))
-                        except Exception as exc:  # noqa: BLE001
-                            logger.warning("herdr-app: could not drop row %s: %s", row["id"], exc)
+                    rid = str(row["id"])
+                    known = states.get(rid)
+                    # No record: not a terminal of this core. Any record not
+                    # plainly finished (live, or a state we don't know) keeps it.
+                    if rid in live_ids or not known or any(s != "finished" for s in known):
+                        continue
+                    try:
+                        _drop_ghost_row(rid)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("herdr-app: could not drop row %s: %s", rid, exc)
                 for t in live:
                     if self._managed_id(t) not in row_ids:
                         try:

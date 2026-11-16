@@ -286,8 +286,11 @@ class HerdrAppBackend(TerminalBackend):
 
     # --- Lookup ---
 
-    def _list(self, **labels: str) -> List[Dict[str, Any]]:
-        return list(self._call("terminal.list", labels={**self._managed, **labels})["terminals"])
+    def _list(self, _include_finished: bool = False, **labels: str) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"labels": {**self._managed, **labels}}
+        if _include_finished:
+            params["all"] = True
+        return list(self._call("terminal.list", **params)["terminals"])
 
     def _terminal(self, session_name: str, window_name: str) -> Dict[str, Any]:
         found = self._list(**{"cao.session": session_name, "cao.window": window_name})
@@ -309,9 +312,13 @@ class HerdrAppBackend(TerminalBackend):
                 if exc.kind != "not_found":
                     raise
 
-    def list_managed(self) -> List[Dict[str, Any]]:
-        """Live CAO terminals in this core (used by the inbox service)."""
-        return self._list()
+    def list_managed(self, include_finished: bool = False) -> List[Dict[str, Any]]:
+        """This server's CAO terminals in this core (used by the inbox service).
+
+        Live ones only, unless ``include_finished``: then also the records the
+        core keeps for finished terminals (``terminal.list`` with ``all``).
+        """
+        return self._list(_include_finished=include_finished)
 
     # --- Sessions and windows ---
 
