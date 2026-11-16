@@ -12,7 +12,7 @@ ours; another cao-server sharing the core owns the rest.
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from cli_agent_orchestrator.backends.herdr_app_backend import (
     HC_STATUS_TO_TERMINAL_STATUS,
@@ -88,6 +88,10 @@ class HerdrAppInboxService:
         self._by_address: Dict[str, str] = {}
         self._last_state: Dict[str, TerminalStatus] = {}
         self._floor_seq = -1
+        # One delivery in flight per terminal, off the event stream: delivery
+        # types through terminal.send, which can wait ~60 s for a person's draft.
+        self._delivering: Dict[str, "asyncio.Task[None]"] = {}
+        self._deliver_again: Set[str] = set()
 
     def _managed_id(self, record: Any) -> Optional[str]:
         """CAO terminal id of one of this server's terminals, else None."""
@@ -137,6 +141,10 @@ class HerdrAppInboxService:
                 logger.warning("herdr-app event stream ended (%r); reconnecting", exc)
             except Exception as exc:  # noqa: BLE001 - keep delivering after any failure
                 logger.warning("herdr-app event stream failed: %s; reconnecting", exc)
+            except asyncio.CancelledError:
+                for task in list(self._delivering.values()):
+                    task.cancel()
+                raise
             finally:
                 if sub is not None:
                     try:
@@ -208,10 +216,31 @@ class HerdrAppInboxService:
             self._last_state[tid] = mapped
             await asyncio.to_thread(_record_status, tid, mapped)
         if state in ("idle", "done"):
-            try:
-                await asyncio.to_thread(self._deliver, tid)
-            except Exception as exc:  # noqa: BLE001 - one failed delivery must not stop the stream
-                logger.error("Delivery failed for terminal %s: %s", tid, exc)
+            self._schedule_delivery(tid)
+
+    def _schedule_delivery(self, tid: str) -> None:
+        if tid in self._delivering:
+            self._deliver_again.add(tid)  # rerun once the current one ends
+            return
+        self._delivering[tid] = asyncio.create_task(self._delivery(tid))
+
+    async def _delivery(self, tid: str) -> None:
+        try:
+            while True:
+                try:
+                    await asyncio.to_thread(self._deliver, tid)
+                except Exception as exc:  # noqa: BLE001 - one failed delivery must not stop others
+                    logger.error("Delivery failed for terminal %s: %s", tid, exc)
+                if tid not in self._deliver_again:
+                    return
+                self._deliver_again.discard(tid)
+        finally:
+            self._delivering.pop(tid, None)
+
+    async def drain(self) -> None:
+        """Wait for every delivery in flight (tests; reruns included)."""
+        while self._delivering:
+            await asyncio.gather(*list(self._delivering.values()), return_exceptions=True)
 
     def _reconcile(self) -> None:
         """Drop CAO rows without a live terminal and kill our live terminals without a row."""

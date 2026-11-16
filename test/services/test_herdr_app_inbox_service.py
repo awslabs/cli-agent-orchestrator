@@ -66,6 +66,7 @@ def run(svc, *messages):
     async def go():
         for m in messages:
             await svc.handle(m)
+        await svc.drain()
 
     asyncio.run(go())
 
@@ -84,6 +85,33 @@ def test_idle_and_done_deliver(env):
         ("aaaa0001", TerminalStatus.COMPLETED),
         ("aaaa0001", TerminalStatus.IDLE),
     ]
+
+
+def test_slow_delivery_does_not_hold_up_other_events(env):
+    import threading
+
+    svc, _, deliver, deleted, _, _ = env
+    release = threading.Event()
+    seen = []
+
+    def slow(tid):
+        seen.append(tid)
+        assert release.wait(5)
+
+    deliver.side_effect = slow
+
+    async def go():
+        await svc.handle(ev(1, "created", "t2", **rec("t2", "aaaa0002")))
+        await svc.handle(status(2, "t1", "idle"))  # blocks in terminal.send
+        await svc.handle(ev(3, "finished", "t2"))
+        assert deleted == [("aaaa0002", "terminal_finished")]
+        await svc.handle(status(4, "t1", "idle"))  # coalesced behind the first
+        await svc.handle(status(5, "t1", "done"))
+        release.set()
+        await svc.drain()
+
+    asyncio.run(go())
+    assert seen == ["aaaa0001", "aaaa0001"]  # one in flight, one rerun
 
 
 def test_working_and_blocked_note_activity(env):
