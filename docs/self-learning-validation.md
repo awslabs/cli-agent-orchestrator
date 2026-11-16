@@ -198,8 +198,9 @@ they map directly onto the judge's recurring control-arm complaints.
 2. **Real pipeline run:** the glue-factory experiment
    (`glue-factory-engine/cao-agents/ab-compare/`) with objective
    validation and iterations-to-pass as the metric.
-3. **Latency mitigation:** curated per-task lesson injection
-   (`memory_manager` pattern) instead of injecting all lessons every time.
+3. **Latency mitigation:** don't inject all lessons every time. Have the
+   worker `memory_recall` only the lessons that match its task, or promote
+   the proven ones into its profile's `## Learned Patterns` block.
 
 ## 8. Artifacts
 

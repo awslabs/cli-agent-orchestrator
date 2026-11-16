@@ -53,6 +53,8 @@ def _seed(svc):
         ("orchid-strong", "orchid orchid orchid orchid reference"),
         ("orchid-new", "orchid status note"),
         ("other", "unrelated reference"),
+        ("other-two", "separate archival note"),
+        ("other-three", "independent historical memo"),
     ):
         _run(
             svc.store(
@@ -88,8 +90,11 @@ def test_bm25_default_sort_matches_explicit_bm25_query_recall(svc, monkeypatch):
     )
 
     configured = _keys(svc, query="orchid")
+    recency = _keys(svc, query="orchid", search_mode="hybrid", sort_by="recency")
+    assert configured == ["orchid-strong", "orchid-new"]
     assert configured == _keys(svc, query="orchid", search_mode="bm25")
-    assert configured != _keys(svc, query="orchid", search_mode="hybrid", sort_by="recency")
+    assert configured != recency
+    assert recency == ["orchid-new", "orchid-strong"]
 
 
 def test_bm25_default_sort_keeps_no_query_listing_recency(svc, monkeypatch):

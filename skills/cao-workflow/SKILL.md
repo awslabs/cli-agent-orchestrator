@@ -2,8 +2,10 @@
 name: cao-workflow
 description: Author and run CAO Python workflow scripts — multi-step, parameterized, fan-out
   orchestrations executed by `cao workflow run`. Use when the user wants a repeatable multi-step
-  job (e.g. data analysis over many files, a review pipeline, a parameterized batch). Authoring
-  ends at a validated script file; running it is a separate, user-approved step.
+  job (e.g. data analysis over many files, a review pipeline, a parameterized batch). Also use
+  when the user says "write a CAO workflow script" or "fan this out over every file", or asks why
+  a resumed run halted with a 409. Authoring ends at a validated script file; running it is a
+  separate, user-approved step.
 ---
 
 # CAO Workflows
@@ -411,7 +413,7 @@ file, per-unit fault tolerance, and results written to disk:
 import os
 from concurrent.futures import ThreadPoolExecutor
 
-from cao_workflow import step, emit_output, get_inputs, ShimError
+from cao_workflow import step, emit_output, get_inputs, ShimError, ShimHTTPError
 
 # Parameterized: author once, invoke with different inputs.
 INPUTS = {
@@ -449,6 +451,10 @@ def summarize(filename: str):
         )
         return filename, handle.output
     except ShimError as exc:
+        # A halt or divergence arrives as ShimHTTPError with status 409 and needs a human
+        # decision, so never absorb it (see Resolving a halt).
+        if isinstance(exc, ShimHTTPError) and exc.status == 409:
+            raise
         # Per-unit tolerance (R4): one timeout degrades to a survivor, not a 504.
         return filename, f"ERROR: {exc}"
 
