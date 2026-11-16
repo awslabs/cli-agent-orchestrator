@@ -809,6 +809,30 @@ def _reset_backend_registry():
 
 
 @pytest.fixture(autouse=True)
+def _restore_cors_origins():
+    """No test's change to the live ``CORS_ORIGINS`` list crosses a test boundary.
+
+    ``api.main.main()`` calls ``add_local_cors_origins(host, port)``, which
+    appends to the module-level list IN PLACE (the installed ``CORSMiddleware``
+    holds that same list object). Tests that drive ``main()`` with ``uvicorn.run``
+    patched therefore left ``http://localhost:9889`` in the allowlist for the rest
+    of the process, and ``test/security/test_origin_matrix.py`` then saw an
+    ``http`` Origin accepted on an ``https``/``wss`` request (422 instead of 403,
+    an accepted handshake instead of 4403) whenever it ran later in the same
+    process. Which process that is depends on the run order and on the xdist
+    split, so the failure came and went.
+
+    Restored in place, not rebound, for the same reason the production code
+    mutates in place: the middleware and ``api.main`` hold the list object.
+    """
+    from cli_agent_orchestrator import constants
+
+    before = list(constants.CORS_ORIGINS)
+    yield
+    constants.CORS_ORIGINS[:] = before
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_cao_env(monkeypatch, tmp_path):
     """Keep tests independent of CAO runtime identity and persisted settings.
 
