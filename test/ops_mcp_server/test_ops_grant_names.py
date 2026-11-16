@@ -304,6 +304,19 @@ class TestARoleDefaultProfile:
         _assert_refused(_denial(recorded))
 
     @pytest.mark.parametrize("role", [None, "supervisor", "reviewer"])
+    def test_the_kiro_tools_field_is_not_the_explicit_list(self, role):
+        """``tools:`` is a Kiro pass-through; only ``allowedTools`` stops the append.
+
+        The docs say "pin ``allowedTools:``", not "pin ``tools:``", because of this:
+        an operator who narrows ``tools:`` alone still holds the grant.
+        """
+        profile = _profile(role=role).model_copy(update={"tools": ["fs_read"]})
+        assert profile.allowedTools is None
+        recorded = _recorded(profile)
+        assert GRANT in recorded
+        assert _denial(recorded) is None
+
+    @pytest.mark.parametrize("role", [None, "supervisor", "reviewer"])
     def test_a_profile_that_does_not_list_the_server_does_not_hold_the_grant(self, role):
         recorded = _recorded(_profile(key=None, role=role))
         assert GRANT not in recorded

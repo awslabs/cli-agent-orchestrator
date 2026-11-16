@@ -1680,7 +1680,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`cao-ops-mcp-server` is gated on the caller's `tools:` allowlist** (#1062). #972 gated every
   `cao-mcp-server` tool on that allowlist and recorded the operations control plane as knowingly
   ungated. The gap: `CAO_TERMINAL_ID` is forwarded into **every** server in a profile's
-  `mcpServers` map, so a bound terminal whose profile merely listed `cao-ops-mcp-server` reached all
+  `mcpServers` map, so a bound terminal whose profile listed `cao-ops-mcp-server` reached all
   18 ops tools — `launch_session`, `install_profile`, `shutdown_session`, `send_session_message`,
   the session/terminal readers and the seven `decisions_*` controls — with its allowlist
   unconsulted, and could lift an operator's `cao decisions off` by setting a point back to `shadow`
@@ -1719,22 +1719,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   issue until #1062. `UNGATED_SURFACES` is now empty, and both surfaces are enumerated by
   introspection in the per-tool coverage test, so a new ops tool is gated by default rather than by
   someone remembering.
-  **Who holds the grant.** The #772 rule is unchanged: a profile with no explicit
-  `tools:`/`allowedTools:` list still gets `@<server>` appended for each server it declares, so a
-  role-default profile (developer, `supervisor`, `reviewer`) that declares the server under the key
-  `cao-ops-mcp-server` holds the grant and reaches every ops tool. Only an explicit list withholds
-  it; to declare the server and withhold the control plane, pin a list that omits the grant. The gate
-  reads the fixed selector, not the key the server is declared under.
+  **Who holds the grant.** The #772 rule is unchanged: a profile with no explicit `allowedTools:`
+  (and no `--allowed-tools` at launch) still gets `@<server>` appended for each server it declares,
+  so a role-default profile (developer, `supervisor`, `reviewer`) that declares the server under the
+  key `cao-ops-mcp-server` holds the grant and reaches every ops tool, short of lifting a halt. Only
+  an explicit `allowedTools:` withholds it (the Kiro `tools:` field does not); to declare the server
+  and withhold the control plane, pin `allowedTools:` without the grant. The gate reads the fixed
+  selector, not the key the server is declared under.
   **Migration:** inside a CAO terminal, (1) a profile that lists `cao-ops-mcp-server` in
-  `mcpServers` and pins an explicit `tools:`/`allowedTools:` list must add `@cao-ops-mcp-server` to
-  it; (2) a profile that reaches the server under **another key** must name `@cao-ops-mcp-server` as
-  well, or one glob covering both names. This includes the operator agent-plugin delivered through
-  `cao install`, whose server key is `cao-ops`: `allowedTools: [..., "@cao-ops"]` becomes
-  `[..., "@cao-ops", "@cao-ops-mcp-server"]` or `[..., "@cao-ops*"]`, and `@cao-ops` alone is now
-  refused on every tool except `decisions_off` (`docs/agent-plugins.md`). A role-default profile
-  that declares the server under another key is refused the same way, because the entry appended
-  for it is `@<that key>`. Profiles granting `*`, and operator MCP hosts outside CAO (no
-  `CAO_TERMINAL_ID`, which is how a client runs the plugin itself), need no change.
+  `mcpServers` and pins an explicit `allowedTools:` must add `@cao-ops-mcp-server` to it; (2) a
+  profile that reaches the server under **another key** must name `@cao-ops-mcp-server` as well.
+  This includes the operator agent-plugin delivered through `cao install`, whose server key is
+  `cao-ops`: `allowedTools: [..., "@cao-ops"]` becomes `[..., "@cao-ops", "@cao-ops-mcp-server"]`,
+  and `@cao-ops` alone is now refused on every tool except `decisions_off`
+  (`docs/agent-plugins.md`). A role-default profile that declares the server itself under another
+  key is refused the same way, because the entry appended for it is `@<that key>`. Profiles
+  granting `*`, and operator MCP hosts outside CAO (no `CAO_TERMINAL_ID`, which is how a client runs
+  the agent plugin itself), need no change.
 
 - **Vault `secret_gate: "warn"` no longer forwards raw secret matches to a model** (#644 AC10).
   Under `warn` a secret-bearing note is still indexed and recallable, but every match is replaced by

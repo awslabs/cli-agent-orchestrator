@@ -91,10 +91,12 @@ def ops_tool_denied_reason(tool_name: str, arguments: Mapping[str, Any]) -> Opti
     that context: the terminal is bound, so it is gated here. The grant is the
     fixed :data:`CAO_OPS_MCP_SERVER_SELECTOR`, never ``@<key>`` for whatever key
     the profile declares this server under -- this process cannot see that key.
-    A profile that names only ``@cao-ops`` is therefore refused, and so is a
-    role-default profile whose #772 auto-append produced ``@cao-ops``; a
-    role-default profile that declares the key ``cao-ops-mcp-server`` is
-    appended the selector itself and is granted. Both are pinned by
+    A profile that names only ``@cao-ops`` is therefore refused. So is a
+    role-default profile that declares this server ITSELF under another key:
+    the #772 auto-append gives it ``@<that key>`` (a plugin-provided server is
+    never appended at all). A role-default profile that declares the key
+    ``cao-ops-mcp-server`` is appended the selector itself and is granted;
+    only an explicit ``allowedTools`` withholds it. All of this is pinned by
     ``test/ops_mcp_server/test_ops_grant_names.py``.
     """
     if not caller_is_bound():

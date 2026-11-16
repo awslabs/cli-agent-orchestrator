@@ -658,8 +658,10 @@ declared under, which is how CAO and the provider decide whether the agent may
 see its tools. `@cao-ops-mcp-server` is the grant the operations server itself
 requires of a bound terminal on every tool except `decisions_off`; that gate
 reads the fixed selector, not the key, so `@cao-ops` alone is refused with
-`the calling terminal's allowed tools do not include '@cao-ops-mcp-server'`. One
-entry that covers both names also works: `"@cao-ops*"`, or `"*"`. See
+`the calling terminal's allowed tools do not include '@cao-ops-mcp-server'`. `"*"`
+covers both. A glob that covers both names, such as `"@cao-ops*"`, satisfies the
+gate and CAO's own server selection, but CAO passes the entry to the provider as
+written, so the two explicit entries are the form to rely on. See
 [Tool Restrictions](tool-restrictions.md#cao-ops-mcp-server-gates-the-operations-control-plane-separately).
 A client that runs the plugin **outside** CAO has no `CAO_TERMINAL_ID`, is an
 operator context, and needs neither.

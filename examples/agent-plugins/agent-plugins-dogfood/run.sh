@@ -314,6 +314,9 @@ allowed = d.get("allowedTools", [])
 assert "@cao-ops" in allowed, (
     f"removal deleted the operator's own allowedTools entry: {allowed!r}"
 )
+assert "@cao-ops-mcp-server" in allowed, (
+    f"removal deleted the operator's own operations-gate grant: {allowed!r}"
+)
 PY
 ok "Kiro (opt-in): cao-ops ABSENT; the operator's own \"@cao-ops\" entry PRESERVED"
 ok "               (CAO withdraws what it configured, never what the operator wrote)"
