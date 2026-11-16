@@ -222,8 +222,10 @@ async def test_the_terminal_id_is_on_the_row_and_in_the_inspection_while_the_ste
 
     async def _fake(**kwargs: Any) -> AgentStepResult:
         kwargs["on_step_terminal_ready"]("cc33dd44", "v2:" + "0" * 64)
-        for _ in range(200):  # the recording is a task on this loop; let it land
-            if workflow_journal.get_step("run-live", "s1").terminal_id:
+        for _ in range(200):  # both durable writes are a task on this loop; let them land
+            row = workflow_journal.get_step("run-live", "s1")
+            types = [e.event_type for e in _events("run-live")]
+            if row.terminal_id and types[-1:] == ["terminal.created"]:
                 break
             await asyncio.sleep(0.005)
         seen["row"] = workflow_journal.get_step("run-live", "s1")
