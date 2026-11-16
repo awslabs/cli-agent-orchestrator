@@ -11,7 +11,12 @@
 #
 # Optional:
 #   CAO_BEDROCK_MODEL  model or inference profile for claude_code (default
-#                      au.anthropic.claude-sonnet-4-6; pick one your region serves)
+#                      global.anthropic.claude-sonnet-4-6, the global
+#                      cross-Region profile, which any region that has it
+#                      serves and which may route requests to any commercial
+#                      region; set a geographic profile such as
+#                      us.anthropic.claude-sonnet-4-6 to keep requests in one
+#                      geography)
 #   CAO_IMAGE_TAG      tag to push (default: the checkout's short commit id and
 #                      a digest of the files the image is built from)
 #   CAO_IMAGE_REBUILD  1 to build and push a new image even if the content has
@@ -33,7 +38,7 @@ STACK="$1"
 NS=cao-remote
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "${HERE}/../../../../../.." && pwd)"
-MODEL="${CAO_BEDROCK_MODEL:-au.anthropic.claude-sonnet-4-6}"
+MODEL="${CAO_BEDROCK_MODEL:-global.anthropic.claude-sonnet-4-6}"
 
 output() {
   local value

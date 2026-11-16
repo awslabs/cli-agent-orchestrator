@@ -439,6 +439,43 @@ def test_only_the_runner_service_account_gets_bedrock_and_only_for_the_allowed_m
     assert policies == ["AmazonEFSCSIDriverPolicy"]
 
 
+def test_the_default_model_is_a_global_profile_the_runner_policy_allows():
+    """A geographic profile (au., us., eu.) works only in its own regions."""
+    import fnmatch
+
+    text = (EKS / "deploy.sh").read_text()
+    (model,) = re.findall(r'MODEL="\$\{CAO_BEDROCK_MODEL:-([^}]+)\}"', text)
+    assert model.startswith("global.anthropic.")
+    template = _cfn()
+    pattern = template["Parameters"]["BedrockModelPattern"]["Default"]
+    (policy,) = _resources("AWS::IAM::ManagedPolicy").values()
+    (invoke,) = [
+        s
+        for s in policy["Properties"]["PolicyDocument"]["Statement"]
+        if s["Sid"] == "InvokeAllowedModels"
+    ]
+    resources = [
+        r.replace("${BedrockModelPattern}", pattern)
+        .replace("${AWS::Partition}", "aws")
+        .replace("${AWS::Region}", "ap-southeast-2")
+        .replace("${AWS::AccountId}", "111122223333")
+        for r in invoke["Resource"]
+    ]
+    allowed = lambda arn: any(fnmatch.fnmatchcase(arn, r) for r in resources)
+    foundation = model.split(".", 1)[1]
+    # The three ARNs Bedrock authorizes for a global profile (the Bedrock user
+    # guide, "Global cross-Region inference", IAM policy requirements).
+    for arn in (
+        f"arn:aws:bedrock:ap-southeast-2:111122223333:inference-profile/{model}",
+        f"arn:aws:bedrock:ap-southeast-2::foundation-model/{foundation}",
+        f"arn:aws:bedrock:::foundation-model/{foundation}",
+    ):
+        assert allowed(arn), arn
+    # Not another account's profile, nor other providers' models.
+    assert not allowed(f"arn:aws:bedrock:ap-southeast-2:444455556666:inference-profile/{model}")
+    assert not allowed("arn:aws:bedrock:::foundation-model/amazon.nova-pro-v1:0")
+
+
 def test_the_stack_refuses_an_open_api_endpoint_and_names_that_do_not_fit():
     import re
 

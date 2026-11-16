@@ -191,7 +191,10 @@ examples/cao-clusters/kubernetes/remote-runners/overlays/eks/deploy.sh cao-remot
   before the rebuild; a change to the files builds a new image as usual. To
   run a different pushed image, set `CAO_IMAGE_TAG` to its tag.
 - **Model:** `claude_code` on Bedrock, model `CAO_BEDROCK_MODEL` (default
-  `au.anthropic.claude-sonnet-4-6`; choose one your region serves). Of the CAO
+  `global.anthropic.claude-sonnet-4-6`, the global cross-Region inference
+  profile: the region you deploy in serves it, and Bedrock may process
+  requests in any commercial region; for data residency set a geographic
+  profile such as `us.`, `eu.` or `au.anthropic.claude-sonnet-4-6`). Of the CAO
   pods, only the runners get AWS credentials, and those allow only invoking the
   models `BedrockModelPattern` names (default Anthropic Claude) and reading the
   model catalogue. Activate model access for the account once, as an
