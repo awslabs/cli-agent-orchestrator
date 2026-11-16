@@ -756,3 +756,50 @@ async def test_resume_corrupt_is_valueerror_subclass(_patched_journal):
     # No contract break: both resume subtypes are ValueError subclasses.
     assert issubclass(ws.ResumeCorruptError, ValueError)
     assert issubclass(ws.ResumeNotAllowedError, ValueError)
+
+
+@pytest.mark.asyncio
+async def test_a_run_journaled_before_call_and_params_existed_rebuilds_and_resumes(
+    monkeypatch, _patched_journal
+):
+    """A snapshot written before ``WorkflowStep`` gained ``call``/``params`` has neither key.
+
+    It must still rebuild, resume, and send each re-run step the prompt it would have got
+    before the change: no params block, run as a handoff.
+    """
+    import json
+
+    spec = _spec(step_ids=("s1", "s2"))
+    snapshot = json.loads(spec.model_dump_json())
+    for step in snapshot["steps"]:
+        del step["call"]
+        del step["params"]
+    old_snapshot = json.dumps(snapshot, separators=(",", ":"))
+    assert '"call"' not in old_snapshot and '"params"' not in old_snapshot
+
+    workflow_journal.insert_run(
+        "runOld", spec.name, old_snapshot, "{}", RunState.FAILED.value, "2026-01-01T00:00:00Z"
+    )
+    workflow_journal.insert_steps(
+        "runOld", [(s.id, StepState.PENDING.value) for s in spec.steps], "2026-01-01T00:00:00Z"
+    )
+    workflow_journal.update_step("runOld", "s1", StepState.COMPLETED.value, 1, "t")
+    workflow_journal.update_step("runOld", "s2", StepState.FAILED.value, 4, "t", error="boom")
+    workflow_journal.update_run_state("runOld", RunState.FAILED.value, "2026-01-01T00:00:05Z")
+
+    rebuilt = ws._rebuild_record_from_journal("runOld")
+    assert rebuilt is not None
+    assert [(s.call, s.params) for s in rebuilt.spec.steps] == [(None, None), (None, None)]
+
+    sent: List[tuple] = []
+
+    async def _side(**kwargs):
+        sent.append((kwargs["env_vars"]["CAO_WORKFLOW_STEP_ID"], kwargs["prompt"]))
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    res = await ws.resume_from_last_completed("runOld")
+
+    assert res.state == RunState.COMPLETED
+    assert sent == [("s2", "go")], "the re-run step gets the prompt it got before params existed"
+    assert workflow_journal.get_run("runOld").spec_snapshot == old_snapshot

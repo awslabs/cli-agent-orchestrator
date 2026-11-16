@@ -429,7 +429,11 @@ def test_get_shows_the_hash_for_a_script_spec(monkeypatch):
 
 
 def test_get_omits_the_hash_for_yaml(monkeypatch):
-    """The other half of the pair: a YAML spec carries no hash, so the line must be absent."""
+    """The other half of the pair: a body without a hash must not print the line.
+
+    The server now sends ``content_hash`` for YAML specs as well, so this pins the guard on a
+    body that lacks one (an older server), not a claim that YAML specs have no hash.
+    """
     monkeypatch.setattr(
         "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
         lambda url, headers=None, timeout=None: _resp(
@@ -443,6 +447,30 @@ def test_get_omits_the_hash_for_yaml(monkeypatch):
     assert (
         "Hash:" not in result.output
     ), "printing 'Hash: None' on every YAML spec would be noise that reads like a defect"
+
+
+def test_get_shows_the_hash_of_a_yaml_spec(monkeypatch):
+    """A YAML body now carries ``content_hash``, which a YAML ``PUT`` needs as ``expected_hash``."""
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
+        lambda url, headers=None, timeout=None: _resp(
+            200,
+            {
+                "name": "y",
+                "mode": "sequential",
+                "steps": [],
+                "path": "/x/y.yaml",
+                "source": "name: y\n",
+                "content_hash": "ab" * 32,
+            },
+        ),
+    )
+
+    result = CliRunner().invoke(workflow, ["get", "y"])
+
+    assert result.exit_code == 0, result.output
+    assert f"Hash:        {'ab' * 32}" in result.output
+    assert "Mode:        sequential" in result.output, "source in the body must not read as script"
 
 
 @pytest.mark.parametrize("tool_name", ("workflow_create", "workflow_update", "workflow_get"))

@@ -1,0 +1,40 @@
+data: {"type":"RUN_STARTED","metadata":{"cao":{"stream":"ambient"}},"threadId":"cao-fleet-0213bbf4-5c04-47a7-ab6c-fe6ab2795a4c","runId":"0976151f-f1a2-4669-893a-d1008eafa039","protocolVersion":"1.0"}
+
+data: {"type":"STATE_SNAPSHOT","snapshot":{"sessions":[],"terminals":[],"counts":{"sessions":0,"terminals":0},"scopes":["cao:read","cao:write","cao:admin"]}}
+
+id: ffd733f1-08cd-47f3-9523-f431e806c5b1.0
+data: {"type":"SUBAGENT_STARTED","timestamp":1794361074180,"metadata":{"cao":{"sessionName":"cao-supersede"}},"subagentRunId":"session:75398a13800a5097","name":"cao-supersede"}
+
+id: ffd733f1-08cd-47f3-9523-f431e806c5b1
+data: {"type":"SUBAGENT_STARTED","timestamp":1794361074180,"metadata":{"cao":{"eventId":"ffd733f1-08cd-47f3-9523-f431e806c5b1","terminalId":"81a513af","sessionName":"cao-supersede","provider":"mock_cli"}},"subagentRunId":"terminal:81a513af","name":"dojo-approver","parentSubagentRunId":"session:75398a13800a5097"}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/counts/sessions","value":1},{"op":"replace","path":"/counts/terminals","value":1},{"op":"replace","path":"/sessions","value":[{"id":"cao-supersede","name":"cao-supersede","status":"detached"}]},{"op":"replace","path":"/terminals","value":[{"id":"81a513af","session_name":"cao-supersede","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-6589","status":null,"last_active":"2026-11-11T01:37:50.377523+00:00"}]}]}
+
+id: 9ed5774c-3f6e-42b9-a0d3-65efcf243977
+data: {"type":"SUBAGENT_STARTED","timestamp":1794361076297,"metadata":{"cao":{"eventId":"9ed5774c-3f6e-42b9-a0d3-65efcf243977","terminalId":"c0156f46","sessionName":"cao-supersede","provider":"mock_cli"}},"subagentRunId":"terminal:c0156f46","name":"dojo-approver","parentSubagentRunId":"session:75398a13800a5097"}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/counts/terminals","value":2},{"op":"replace","path":"/terminals","value":[{"id":"81a513af","session_name":"cao-supersede","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-6589","status":null,"last_active":"2026-11-11T01:37:50.377523+00:00"},{"id":"c0156f46","session_name":"cao-supersede","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-3f82","status":null,"last_active":"2026-11-11T01:37:56.246217+00:00"}]}]}
+
+id: 467ab527-8a17-469e-82d7-b5852dc1816b
+data: {"type":"TOOL_CALL_START","timestamp":1794361081024,"metadata":{"cao":{"eventId":"467ab527-8a17-469e-82d7-b5852dc1816b","terminalId":"c0156f46","sessionName":"cao-supersede","sender":"81a513af","receiver":"c0156f46","orchestrationType":"assign"}},"subagentRunId":"terminal:81a513af","toolCallId":"467ab527-8a17-469e-82d7-b5852dc1816b","toolCallName":"OrchestrationType.ASSIGN"}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/terminals","value":[{"id":"81a513af","session_name":"cao-supersede","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-6589","status":null,"last_active":"2026-11-11T01:37:50.377523+00:00"},{"id":"c0156f46","session_name":"cao-supersede","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-3f82","status":null,"last_active":"2026-11-11T01:38:01.023336+00:00"}]}]}
+
+id: 6fe02547-86b1-4fd5-8276-05f0333e84e8.0
+data: {"type":"TOOL_CALL_END","timestamp":1794361086262,"metadata":{"cao":{"closedBy":"superseded"}},"subagentRunId":"terminal:81a513af","toolCallId":"467ab527-8a17-469e-82d7-b5852dc1816b"}
+
+id: 6fe02547-86b1-4fd5-8276-05f0333e84e8
+data: {"type":"TOOL_CALL_START","timestamp":1794361086262,"metadata":{"cao":{"eventId":"6fe02547-86b1-4fd5-8276-05f0333e84e8","terminalId":"c0156f46","sessionName":"cao-supersede","sender":"81a513af","receiver":"c0156f46","orchestrationType":"assign"}},"subagentRunId":"terminal:81a513af","toolCallId":"6fe02547-86b1-4fd5-8276-05f0333e84e8","toolCallName":"OrchestrationType.ASSIGN"}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/terminals","value":[{"id":"81a513af","session_name":"cao-supersede","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-6589","status":null,"last_active":"2026-11-11T01:37:50.377523+00:00"},{"id":"c0156f46","session_name":"cao-supersede","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-3f82","status":null,"last_active":"2026-11-11T01:38:06.260800+00:00"}]}]}
+
+id: 50258d16-bd19-4368-bb72-148f6fe082e0.0
+data: {"type":"TOOL_CALL_END","timestamp":1794361094415,"metadata":{"cao":{"closedBy":"completion"}},"subagentRunId":"terminal:81a513af","toolCallId":"6fe02547-86b1-4fd5-8276-05f0333e84e8"}
+
+id: 50258d16-bd19-4368-bb72-148f6fe082e0
+data: {"type":"SUBAGENT_FINISHED","timestamp":1794361094415,"metadata":{"cao":{"eventId":"50258d16-bd19-4368-bb72-148f6fe082e0","terminalId":"c0156f46","sessionName":"cao-supersede","endReason":"killed"}},"subagentRunId":"terminal:c0156f46"}
+
+data: {"type":"STATE_DELTA","delta":[{"op":"replace","path":"/counts/terminals","value":1},{"op":"replace","path":"/terminals","value":[{"id":"81a513af","session_name":"cao-supersede","provider":"mock_cli","agent_profile":"dojo-approver","window":"dojo-approver-6589","status":null,"last_active":"2026-11-11T01:37:50.377523+00:00"}]}]}
+
+:keep-alive
+

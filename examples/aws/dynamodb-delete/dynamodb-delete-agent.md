@@ -18,6 +18,35 @@ mcpServers:
     type: stdio
     command: cao-mcp-server
     args: []
+params:
+  profile:
+    description: "AWS CLI profile name"
+    required: true
+  region:
+    description: "AWS region"
+    required: true
+  table_name:
+    description: "DynamoDB table name"
+    required: true
+  partition_key_name:
+    description: "Partition key attribute name"
+    required: true
+  partition_key_value:
+    description: "Value to match for deletion"
+    required: true
+  partition_key_type:
+    description: "DynamoDB type"
+    required: true
+    enum: ["S", "N", "B"]
+  sort_key_name:
+    description: "Sort key attribute name (empty for PK-only tables)"
+  sort_key_type:
+    description: "Sort key DynamoDB type"
+    enum: ["S", "N", "B"]
+  max_delete:
+    description: "Safety cap: abort if more items match"
+    type: int
+    default: 100
 ---
 
 # DynamoDB Delete Agent
@@ -43,6 +72,19 @@ Install this agent with your values via `cao install --env`:
 
 See `config.json` in this folder for a reference of all values.
 
+In a workflow, a step that uses this profile sets these params instead. Each
+one fills the placeholder named next to it:
+
+- `profile` fills `${AWS_PROFILE}`
+- `region` fills `${AWS_REGION}`
+- `table_name` fills `${TABLE_NAME}`
+- `partition_key_name` fills `${PARTITION_KEY_NAME}`
+- `partition_key_value` fills `${PARTITION_KEY_VALUE}`
+- `partition_key_type` fills `${PARTITION_KEY_TYPE}`
+- `sort_key_name` fills `${SORT_KEY_NAME}`
+- `sort_key_type` fills `${SORT_KEY_TYPE}`
+- `max_delete` fills `${MAX_DELETE}`
+
 ## Message Input
 
 The partition key value to delete can come from either:
@@ -54,6 +96,11 @@ key value comes from a runtime message, the agent must validate it against
 `^[a-zA-Z0-9_.:-]+$` before use.
 
 ## Instructions
+
+When the message has a "Parameters for this step" list, it comes from a workflow
+step. Use each value there in place of the `${...}` placeholder that its param
+fills, as listed under Configuration. Outside a workflow, the placeholders work
+as before.
 
 When you receive a message, query for matching items, enforce the safety cap,
 require confirmation, then delete each item.

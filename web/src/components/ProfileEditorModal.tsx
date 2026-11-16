@@ -3,7 +3,38 @@ import { useStore } from '../store'
 import { api, ApiError, ProfileValidationMessage } from '../api'
 import { rewriteFrontmatterName } from './ProfileCreateModal'
 import { ValidationFindings } from './ValidationFindings'
+import { ProfileParamsEditor } from './ProfileParamsEditor'
+import {
+  TEXT_ONLY_REASONS,
+  bodyAfterFrontmatter,
+  hasParamRowErrors,
+  readParamsState,
+  sameParamRows,
+  spliceParamsBlock,
+  type ParamRow,
+  type TextOnlyReason,
+} from './profileParams'
+import { useGeneration } from '../hooks/useGeneration'
 import { AlertTriangle, FilePen, Loader2, X } from 'lucide-react'
+
+/** How long the text must be still before the Params section reads it again. */
+export const PARAMS_READ_DEBOUNCE_MS = 500
+
+/**
+ * What the Params section can do with the text.
+ *
+ * - `reading`: a read is pending. The rows are disabled.
+ * - `editable`: the rows are the text's params block, or none when it has none.
+ * - `text-only`: the text has a params block the form can't change safely.
+ * - `cant-read`: the read failed (400 or network).
+ */
+type ParamsView =
+  | { kind: 'reading' }
+  | { kind: 'editable' }
+  | { kind: 'text-only'; reason: TextOnlyReason; findings: ProfileValidationMessage[] }
+  | { kind: 'cant-read' }
+
+const PARAMS_NOTE = 'Changing a param here rewrites the params block in the text below. Comments inside that block are not kept.'
 
 interface ProfileEditorModalProps {
   open: boolean
@@ -29,6 +60,12 @@ const inputClass =
  * (placeholders intact, key order preserved, comments untouched), which a
  * parse-and-regenerate form cannot guarantee. Authoring-by-form is the create
  * modal's job; editing is the document's.
+ *
+ * The Params section above the text is the one exception, and it is bounded:
+ * it reads the params through POST /agents/profiles/validate, and a row change
+ * rewrites only the params block (spliceParamsBlock). Every other byte stays
+ * as stored. If the rows are never touched, Save sends the text exactly as
+ * loaded or typed.
  */
 export function ProfileEditorModal({ open, mode, name, onClose, onSaved }: ProfileEditorModalProps) {
   const [content, setContent] = useState('')
@@ -36,6 +73,69 @@ export function ProfileEditorModal({ open, mode, name, onClose, onSaved }: Profi
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
+
+  // The Params section. The text stays the source of truth: each read is of
+  // one exact text, and it applies only if the text has not changed since the
+  // read began. readBase is the text and rows of the last read that applied, so
+  // a row change splices into exactly the text that was read, and putting the
+  // rows back as they were restores that text byte for byte.
+  const [paramsView, setParamsView] = useState<ParamsView>({ kind: 'reading' })
+  const [paramRows, setParamRows] = useState<ParamRow[]>([])
+  const readBase = useRef<{ text: string; rows: ParamRow[] } | null>(null)
+  const contentRef = useRef('')
+  const readGen = useGeneration()
+  const readTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const updateContent = (text: string) => {
+    contentRef.current = text
+    setContent(text)
+  }
+
+  const cancelRead = () => {
+    readGen.invalidate()
+    if (readTimer.current) {
+      clearTimeout(readTimer.current)
+      readTimer.current = null
+    }
+  }
+  useEffect(() => cancelRead, [])
+
+  const readParams = (text: string) => {
+    cancelRead()
+    const token = readGen.begin()
+    setParamsView({ kind: 'reading' })
+    api.validateProfile(text)
+      .then(res => {
+        if (!token.isCurrent() || contentRef.current !== text) return
+        const state = readParamsState(text, res)
+        if (state.kind === 'editable') {
+          readBase.current = { text, rows: state.rows }
+          setParamRows(state.rows)
+          setParamsView({ kind: 'editable' })
+        } else {
+          readBase.current = null
+          setParamRows([])
+          setParamsView(state)
+        }
+      })
+      .catch(() => {
+        if (!token.isCurrent() || contentRef.current !== text) return
+        readBase.current = null
+        setParamRows([])
+        setParamsView({ kind: 'cant-read' })
+      })
+  }
+
+  // Typing in the text makes the rows stale at once. The text is read again
+  // once it has been still for PARAMS_READ_DEBOUNCE_MS.
+  const scheduleRead = (text: string) => {
+    cancelRead()
+    setParamsView({ kind: 'reading' })
+    readTimer.current = setTimeout(() => {
+      readTimer.current = null
+      readParams(text)
+    }, PARAMS_READ_DEBOUNCE_MS)
+  }
 
   // Hold the app-level navigation lock for exactly the lifetime of a save
   // (covers the deferred pre-save validation too, since `saving` is set
@@ -57,14 +157,21 @@ export function ProfileEditorModal({ open, mode, name, onClose, onSaved }: Profi
 
   useEffect(() => {
     if (!open) return
-    setContent('')
+    updateContent('')
     setCloneName(mode === 'clone' ? `${name}-copy` : '')
     setLoading(true)
     setLoadError(null)
     setSaveError(null)
     setFindings([])
+    cancelRead()
+    readBase.current = null
+    setParamRows([])
+    setParamsView({ kind: 'reading' })
     api.getProfileSource(name)
-      .then(res => setContent(res.content))
+      .then(res => {
+        updateContent(res.content)
+        readParams(res.content)
+      })
       .catch((e: ApiError) => setLoadError(e?.detail || e?.message || 'Failed to load profile source'))
       .finally(() => setLoading(false))
   }, [open, mode, name])
@@ -72,7 +179,49 @@ export function ProfileEditorModal({ open, mode, name, onClose, onSaved }: Profi
   if (!open) return null
 
   const targetName = mode === 'edit' ? name : cloneName.trim()
-  const canSave = !saving && !loading && !loadError && content.trim() !== '' && targetName !== ''
+  const rowsBlockSave = paramsView.kind === 'editable' && hasParamRowErrors(paramRows)
+  const canSave = !saving && !loading && !loadError && content.trim() !== '' && targetName !== '' && !rowsBlockSave
+
+  // A row change rewrites only the params block, in the text the last read
+  // applied to. It starts no read. While a row has an error the text keeps its
+  // last good block, and Save is blocked.
+  const changeParamRows = (rows: ParamRow[]) => {
+    const base = readBase.current
+    if (paramsView.kind !== 'editable' || !base) return
+    setParamRows(rows)
+    if (hasParamRowErrors(rows)) return
+    const next = sameParamRows(rows, base.rows) ? { ok: true as const, text: base.text } : spliceParamsBlock(base.text, rows)
+    if (!next.ok) {
+      readBase.current = null
+      setParamRows([])
+      setParamsView({ kind: 'text-only', reason: next.reason, findings: [] })
+      return
+    }
+    if (next.text === contentRef.current) return
+    updateContent(next.text)
+    // The document changed, so feedback about the previous one is stale.
+    if (findings.length > 0) setFindings([])
+    if (saveError) setSaveError(null)
+  }
+
+  const paramsStatus = (() => {
+    const line = (text: string) => <p className="text-xs text-gray-500" data-testid="params-status">{text}</p>
+    switch (paramsView.kind) {
+      case 'reading':
+        return line('Reading the params from the text...')
+      case 'editable':
+        return line(PARAMS_NOTE)
+      case 'cant-read':
+        return line('Fix the frontmatter to edit params here.')
+      case 'text-only':
+        return (
+          <>
+            {line(`Text only. ${TEXT_ONLY_REASONS[paramsView.reason]} Edit the params in the text below.`)}
+            <ValidationFindings findings={paramsView.findings} />
+          </>
+        )
+    }
+  })()
 
   const handleSave = async () => {
     // Ref-based guard: two synchronous clicks before the re-render both
@@ -190,16 +339,28 @@ export function ProfileEditorModal({ open, mode, name, onClose, onSaved }: Profi
           )}
 
           {!loading && !loadError && (
+            <ProfileParamsEditor
+              rows={paramRows}
+              onChange={changeParamRows}
+              suggestFrom={bodyAfterFrontmatter(content)}
+              disabled={paramsView.kind === 'reading'}
+              hideRows={paramsView.kind === 'text-only' || paramsView.kind === 'cant-read'}
+              status={paramsStatus}
+            />
+          )}
+
+          {!loading && !loadError && (
             <textarea
               aria-label="Profile source"
               value={content}
               onChange={e => {
-                setContent(e.target.value)
+                updateContent(e.target.value)
                 // Stale feedback: findings and the red boundary describe the
                 // PREVIOUS document; keeping them while the user edits is
                 // misleading (#692 review). The next save re-validates.
                 if (findings.length > 0) setFindings([])
                 if (saveError) setSaveError(null)
+                scheduleRead(e.target.value)
               }}
               rows={18}
               spellCheck={false}

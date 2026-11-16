@@ -50,7 +50,7 @@ to use.
 | `src/cao_workflow/` | Standalone workflow authoring/runtime package shipped by the project |
 | `web/` | React browser UI source and build configuration |
 | `cao_mcp_apps/` | MCP App React views and build tooling |
-| `agent-plugin/` | CAO's own Agent Plugins 1.0.0 packages (`cao`, `cao-contributor`, `cao-agent-plugin-lifecycle`), generated and checked by `make check-agent-plugin` |
+| `agent-plugin/` | CAO's own Agent Plugins 1.0.0 packages (`cao`, `cao-contributor`, `cao-agent-plugin-lifecycle`, `cao-ag-ui-builder`), generated and checked by `make check-agent-plugin` |
 | `test/` | Unit, API, CLI, documentation, and integration tests |
 
 ## Request and service flow

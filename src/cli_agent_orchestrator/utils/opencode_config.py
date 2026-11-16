@@ -282,7 +282,7 @@ def read_grant_record() -> Dict[str, Any]:
     return loaded
 
 
-def _write_grant_record(record: Dict[str, Any]) -> None:
+def _write_grant_record(record: Dict[str, Any], *, lost: str) -> bool:
     """Persist the grant sidecar atomically (temp file + ``replace``).
 
     Same discipline as ``InstalledPluginStore.write_record``: a torn write here
@@ -290,13 +290,27 @@ def _write_grant_record(record: Dict[str, Any]) -> None:
     to plugin-store-only ownership, leaking grants.
 
     Best effort, symmetrically with :func:`read_grant_record`. By the time this
-    runs ``opencode.json`` has already been updated, so raising would report the
-    install as *failed* after the user-visible half succeeded. A lost sidecar
-    costs CAO the record: plugin servers' grants fall back to the containment
-    proof, the pre-sidecar behaviour, and a profile server's grant it wrote has
-    no proof left, so it stays if the profile drops that server before the agent
-    is next installed with a writable sidecar. An unwritable sidecar must not be
-    worse than an absent one.
+    runs ``opencode.json`` has usually been updated already (a withdrawal is recorded
+    BEFORE it; see below), so raising would report the install as *failed* after the
+    user-visible half succeeded. A failed write
+    keeps the OLD record, so the change this write would have made goes
+    unrecorded, and *lost* is the caller's account of that. For an ADDITION, the
+    new entry has no proof (a grant the old record already has keeps its). A
+    WITHDRAWAL is recorded BEFORE the key is removed (#1289): when this returns
+    False, :func:`_reconcile_agent_grants` leaves the key in ``opencode.json``, so
+    the record never lists a key CAO already removed (a key containment also proves
+    is held back the same way, #1294). (Before that, a failed write
+    left the old row listing a removed key, and EVERY later install removed a key
+    of that name, even one the user had added by hand, until one could write the
+    record: #1285 review, Note 1, and #1290 review, P3-1.) The two callers lose
+    different things (an agent's grant row from :func:`_record_grants`, an
+    ``"mcp"`` fingerprint from :func:`record_mcp_entry`), and one message cannot be
+    true of both. *lost* is required, with no default, so a new caller cannot
+    inherit the wrong one.
+
+    Returns whether the record was written, so that a caller that must not act
+    until the record says so (a withdrawal, in :func:`_reconcile_agent_grants`)
+    can tell.
     """
     path = _grant_record_path()
     temp_path = path.with_name(f".{path.name}.tmp")
@@ -307,14 +321,9 @@ def _write_grant_record(record: Dict[str, Any]) -> None:
     except OSError as exc:
         # Not GRANT_RECORD_REPAIR_HINT: the file is not damaged, it could not be
         # written (a read-only directory, a full disk), so there is nothing to repair.
-        logger.warning(
-            "Could not record OpenCode tool grants at %s (%s). A plugin server's grant "
-            "is still withdrawn by plugin-store containment; a profile server's grant "
-            "written now has no proof left and stays if the profile drops that server "
-            "before the agent is next installed with a writable sidecar.",
-            path,
-            exc,
-        )
+        logger.warning("Could not write the OpenCode grant record at %s (%s). %s", path, exc, lost)
+        return False
+    return True
 
 
 def _recorded_grants(agent_name: str) -> Set[str]:
@@ -326,16 +335,25 @@ def _recorded_grants(agent_name: str) -> Set[str]:
     return {key for key in recorded if isinstance(key, str)}
 
 
-def _record_grants(agent_name: str, keys: Iterable[str]) -> None:
+def _record_grants(agent_name: str, keys: Iterable[str], *, lost: str) -> bool:
     """Set (or clear) the sidecar row for *agent_name*, writing only on change.
+
+    Returns whether the sidecar now says what was asked: True when it was written
+    or already said so, False when it could not be (an unreadable sidecar, or a
+    write that failed). :func:`_reconcile_agent_grants` needs the answer to a
+    withdrawal, which it must not carry out unless the record can follow (#1289).
+
+    *lost* is the caller's account of what a failed WRITE costs, for the same
+    reason ``_write_grant_record`` takes one: recording a withdrawal and recording
+    additions lose different things. It is required, with no default.
 
     Fails closed, like :func:`record_mcp_entry` (#1271, GH #737). A sidecar that
     exists but cannot be read as a grant record is left exactly as it is, with a
     warning naming it, and this agent's row goes unrecorded. Starting from the
     empty default instead would publish it over the damaged file and drop every
-    other agent's row. The install still completes: ``opencode.json`` has been
-    written by then. A plugin server's grant is still withdrawn by plugin-store
-    containment. A reinstall after the sidecar is repaired records the servers
+    other agent's row. The install still completes: ``opencode.json`` has usually
+    been written by then (not for a withdrawal, which is recorded first). A
+    plugin server's grant is still withdrawn by plugin-store containment. A reinstall after the sidecar is repaired records the servers
     the profile then names, so a profile server's grant (``cao-mcp-server*``,
     say) that was added while the sidecar was damaged, and that the profile no
     longer names, has no proof left and stays until it is removed by hand
@@ -349,14 +367,14 @@ def _record_grants(agent_name: str, keys: Iterable[str]) -> None:
         agents = record["agents"]
         if desired:
             if agents.get(agent_name) == desired:
-                return
+                return True
             agents[agent_name] = desired
         else:
             if agent_name not in agents:
-                return
+                return True
             agents.pop(agent_name)
         record["version"] = 1
-        _write_grant_record(record)
+        return _write_grant_record(record, lost=lost)
     except GrantRecordUnreadableError as exc:
         logger.warning(
             "opencode grant record is unreadable (%s); leaving it as it is and not "
@@ -367,6 +385,7 @@ def _record_grants(agent_name: str, keys: Iterable[str]) -> None:
             agent_name,
             GRANT_RECORD_REPAIR_HINT,
         )
+        return False
 
 
 def mcp_entry_fingerprint(config: Mapping[str, Any]) -> str:
@@ -434,7 +453,10 @@ def record_mcp_entry(name: str, config: Mapping[str, Any]) -> None:
 
     Fails closed: a sidecar that is present but unreadable is left as it is and
     this entry goes unrecorded, so CAO falls back to the containment proof for
-    it. An install is never failed for this.
+    it. The same holds when the sidecar cannot be written. That proof does not
+    survive a ``CAO_HOME_DIR`` move, where the fingerprint is the only proof the
+    entry is CAO's, and the write-failure warning says so. An install is never
+    failed for this.
     """
     digest = mcp_entry_fingerprint(config)
     try:
@@ -447,7 +469,13 @@ def record_mcp_entry(name: str, config: Mapping[str, Any]) -> None:
         entries[name] = digest
         record["mcp"] = entries
         record["version"] = 1
-        _write_grant_record(record)
+        _write_grant_record(
+            record,
+            lost=(
+                f"mcp.{name} goes unrecorded, so CAO falls back to the containment proof for it; "
+                "after a CAO_HOME_DIR move CAO cannot prove the entry is its own."
+            ),
+        )
     except GrantRecordUnreadableError as exc:
         logger.warning(
             "opencode grant record is unreadable (%s); not recording mcp.%s. %s",
@@ -511,6 +539,17 @@ def _reconcile_agent_grants(
       pre-sidecar install, or one whose sidecar was lost, still cleanable).
 
     Everything else in ``tools`` is the user's and is copied through untouched.
+
+    Order matters for a withdrawal (#1289). The record is what lets a LATER install
+    take a key away, so a key the record lists is not removed from ``opencode.json``
+    until the record no longer lists it: the row is written first, then the key goes.
+    That holds whether or not plugin-store containment also proves the key. If the
+    row cannot be written the key is left where it is and the warning names it (fail
+    closed: a grant that stays is mild; a row that still lists a removed key makes
+    every later install delete a key of that name, even one the user added by hand).
+    If ``opencode.json`` then cannot be written, the old row is put back, so the two
+    agree and the next install tries again. A key that containment proves but that
+    no row lists has nothing to disagree with, so it is withdrawn either way.
     """
     roots = list(plugin_store_roots)
     owned_now = {f"{name}*": True for name in mcp_names}
@@ -518,18 +557,21 @@ def _reconcile_agent_grants(
     data = read_config()
     before = json.dumps(data, sort_keys=True)
 
-    owned_before: Set[str] = _recorded_grants(agent_name)
+    recorded: Set[str] = _recorded_grants(agent_name)
+    owned_before: Set[str] = set(recorded)
     if not owned_now and not owned_before and _agent_entry_absent(data, agent_name):
         # Nothing to grant, nothing recorded to withdraw, and no entry to prune.
         # Returning here keeps the removal path a *true* no-op: the reconcile below
         # would otherwise materialise an empty `"agent": {}` section into a config
         # that never had one, which the pre-fix `remove_agent_tools` did not do.
         return
+    contained: Set[str] = set()
     servers = data.get("mcp")
     if isinstance(servers, dict):
         for server_name, entry in servers.items():
             if isinstance(entry, Mapping) and entry_within_roots(entry, roots):
-                owned_before.add(f"{server_name}*")
+                contained.add(f"{server_name}*")
+    owned_before |= contained
 
     agents_section = data.get("agent")
     if not isinstance(agents_section, dict):
@@ -545,8 +587,28 @@ def _reconcile_agent_grants(
     else:
         tools = dict(tools)
 
-    for withdrawn in owned_before - set(owned_now):
-        tools.pop(withdrawn, None)
+    withdrawn = owned_before - set(owned_now)
+    # Every withdrawal the record lists is recorded FIRST, and its key is kept if that fails (#1289). That includes a
+    # grant containment also proves: the row is what a later install trusts, so the row and the key must agree.
+    # A contained key the record does not list has no row to disagree with, so it is withdrawn either way.
+    vouched = recorded & withdrawn
+    held_back: Set[str] = set()
+    withdrawal_recorded = False
+    if vouched:
+        withdrawal_recorded = _record_grants(
+            agent_name,
+            recorded - withdrawn,
+            lost=(
+                f"Agent {agent_name}'s grants that the profile no longer names were left in "
+                f"opencode.json ({', '.join(sorted(vouched))}): a grant is not removed while the record "
+                "would still list it, because a later install would then remove a key of that name even "
+                "if it was added by hand. The next install tries again."
+            ),
+        )
+        if not withdrawal_recorded:
+            held_back = vouched
+    for key in withdrawn - held_back:
+        tools.pop(key, None)
     tools.update(owned_now)
     agent_entry["tools"] = tools
 
@@ -557,8 +619,33 @@ def _reconcile_agent_grants(
         agents_section.pop(agent_name, None)
 
     if json.dumps(data, sort_keys=True) != before:
-        write_config(data)
-    _record_grants(agent_name, owned_now)
+        try:
+            write_config(data)
+        except BaseException:
+            # BaseException, not Exception: a Ctrl-C during the write must still put the row back (#1294 P3-1).
+            if withdrawal_recorded:
+                # The record already says the withdrawal happened, and the keys are still there: put the old
+                # row back (best effort) so the two agree and the next install tries again.
+                _record_grants(
+                    agent_name,
+                    recorded,
+                    lost=(
+                        f"Agent {agent_name}'s grants that opencode.json could not be updated to withdraw "
+                        "could not be put back in the record, so they stay in opencode.json with no row "
+                        "until removed by hand."
+                    ),
+                )
+            raise
+    _record_grants(
+        agent_name,
+        set(owned_now) | held_back,
+        lost=(
+            f"Agent {agent_name}'s recorded grants keep their old value: a profile server's grant "
+            "added now stays if the profile drops that server before the agent is next installed "
+            "with a writable sidecar. A plugin server's grant that the record does not list is still "
+            "withdrawn by plugin-store containment."
+        ),
+    )
 
 
 def upsert_agent_tools(

@@ -6,7 +6,7 @@ hex IDs rather than short names.
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from cli_agent_orchestrator.models.delegation import EdgeReason, EdgeSource
+from cli_agent_orchestrator.models.delegation import EdgeSource
 from cli_agent_orchestrator.models.terminal import Terminal
 
 MAIN = "cli_agent_orchestrator.api.main"
@@ -35,29 +35,7 @@ def test_create_terminal_with_expect_callback_opens_edge(client):
                 "expect_callback": "true",
             },
         )
-    create_edge.assert_called_once_with(CALLER, WORKER, EdgeSource.ASSIGN, EdgeReason.NO_CALLBACK)
-
-
-def test_create_terminal_worker_cannot_reply_sets_reason(client):
-    terminal = _terminal()
-    with (
-        patch(f"{MAIN}.terminal_service.create_terminal", new=AsyncMock(return_value=terminal)),
-        patch(f"{MAIN}.create_delegation_edge") as create_edge,
-        patch(f"{MAIN}.find_any_edge", return_value=None),
-    ):
-        client.post(
-            "/sessions/cao-s/terminals",
-            params={
-                "agent_profile": "developer",
-                "provider": "claude_code",
-                "caller_id": CALLER,
-                "expect_callback": "true",
-                "worker_can_reply": "false",
-            },
-        )
-    create_edge.assert_called_once_with(
-        CALLER, WORKER, EdgeSource.ASSIGN, EdgeReason.NO_SEND_MESSAGE_TOOL
-    )
+    create_edge.assert_called_once_with(CALLER, WORKER, EdgeSource.ASSIGN)
 
 
 def test_create_terminal_default_opens_no_edge(client):

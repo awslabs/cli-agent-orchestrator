@@ -3044,3 +3044,95 @@ def test_admission_capture_failure_preserves_gate_precedence(
     assert str(tmp_path) not in response.text
     assert workflow_journal.get_run("capture-failed") is None
     assert "capture-failed" not in workflow_service.run_registry
+
+
+# ---------------------------------------------------------------------------
+# Reserved step call types: 501 on both run routes, before any journal row
+# ---------------------------------------------------------------------------
+def _reserved_call_spec(call: str) -> WorkflowSpec:
+    return WorkflowSpec(
+        name="wf",
+        steps=[
+            WorkflowStep(id="s1", provider="claude_code", agent="dev", prompt="go", call="handoff"),
+            WorkflowStep(id="s2", provider="claude_code", agent="dev", prompt="go", call=call),
+        ],
+    )
+
+
+@pytest.fixture
+def reserved_call_env(monkeypatch, tmp_path):
+    """A real journal and the REAL engine entry, with terminals and the background drive stubbed."""
+    from cli_agent_orchestrator.clients.database import (
+        _migrate_workflow_run,
+        _migrate_workflow_run_step,
+    )
+
+    db_path = tmp_path / "wf.db"
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
+    _migrate_workflow_run()
+    _migrate_workflow_run_step()
+    workflow_service.run_registry.clear()
+    workflow_service._active_drives.clear()
+
+    reached = {"step": 0, "prepared": 0}
+
+    async def _no_terminal(**kwargs):
+        reached["step"] += 1
+        raise AssertionError("a reserved call must be refused before any step runs")
+
+    async def _no_drive(record):
+        reached["prepared"] += 1
+
+    monkeypatch.setattr(workflow_service, "run_agent_step", _no_terminal)
+    monkeypatch.setattr(workflow_service, "start_run_prepared", _no_drive)
+
+    def _use(call: str) -> None:
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.workflow_spec_service.get_workflow",
+            lambda name_or_path, scan_dir=None: _reserved_call_spec(call),
+        )
+
+    yield SimpleNamespace(use=_use, reached=reached)
+    workflow_service.run_registry.clear()
+    workflow_service._active_drives.clear()
+
+
+@pytest.mark.parametrize("route", ["/workflows/runs", "/workflows/runs:submit"])
+@pytest.mark.parametrize("call", ["assign", "send_message"])
+def test_a_reserved_call_is_501_before_any_journal_row(client, reserved_call_env, route, call):
+    reserved_call_env.use(call)
+    run_id = f"reserved-{call.replace('_', '-')}"
+
+    resp = client.post(route, json={"name_or_path": "wf", "inputs": {}, "run_id": run_id})
+
+    assert resp.status_code == 501, resp.text
+    assert resp.json()["detail"] == (
+        f"step 's2' uses call '{call}', which is reserved (not built yet)"
+    )
+    assert workflow_journal.get_run(run_id) is None, "no durable row for a refused run"
+    assert run_id not in workflow_service.run_registry
+    assert reserved_call_env.reached == {"step": 0, "prepared": 0}
+
+
+@pytest.mark.parametrize("route", ["/workflows/runs", "/workflows/runs:submit"])
+def test_a_handoff_call_still_reaches_the_drive(client, reserved_call_env, route, monkeypatch):
+    """The guard refuses only reserved calls: an explicit handoff spec is admitted."""
+    spec = WorkflowSpec(
+        name="wf",
+        steps=[
+            WorkflowStep(id="s1", provider="claude_code", agent="dev", prompt="go", call="handoff")
+        ],
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.workflow_spec_service.get_workflow",
+        lambda name_or_path, scan_dir=None: spec,
+    )
+
+    async def _fake_start(spec, inputs, run_id):
+        return _result()
+
+    monkeypatch.setattr(workflow_service, "start_run", _fake_start)
+
+    resp = client.post(route, json={"name_or_path": "wf", "inputs": {}, "run_id": "handoff-ok"})
+
+    assert resp.status_code in (200, 202), resp.text

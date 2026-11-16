@@ -15,9 +15,13 @@ from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.providers.kiro_v3_schema import (
+    SUPPORTED_KIRO_CLI_VERSIONS,
+    KiroV3ObservedRefusal,
     KiroV3Refusal,
     KiroV3UnsupportedVersionError,
+    KiroV3UnverifiedVersionError,
     kiro_v3_schema_for_cli_version,
+    observed_kiro_v3_entry,
 )
 
 ProbeRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -338,8 +342,12 @@ def probe_kiro_capabilities(
     runner: ProbeRunner = subprocess.run,
     executable: str = "kiro-cli",
     env: Optional[Mapping[str, str]] = None,
+    allow_observed: bool = False,
 ) -> KiroCapabilities:
     """Probe the selected engine mechanism and each requested wrapper feature.
+
+    ``allow_observed`` is supplied only by the sealed-home helper launch path;
+    all other callers retain strict admission even when the operator opts in.
 
     Released wrappers keep chat-specific options out of root help. Chat help
     receives a closed stdin so the probe cannot enter interactive mode, and its
@@ -401,6 +409,22 @@ def probe_kiro_capabilities(
                 capability=flag,
                 version=version,
             )
+    from cli_agent_orchestrator.services.settings_service import (
+        kiro_v3_allow_unverified_versions,
+        kiro_v3_observed_admission,
+    )
+
+    observed = (
+        allow_observed
+        and engine == KiroEngine.V3
+        and version not in SUPPORTED_KIRO_CLI_VERSIONS
+        and kiro_v3_observed_admission()
+    )
+    if observed and "v3" not in agent_engines:
+        refusal = KiroV3ObservedRefusal(version, "--agent-engine does not advertise v3")
+        raise KiroCapabilityError(
+            refusal.code, engine, str(refusal), capability="--agent-engine=v3", version=version
+        ) from refusal
     if not agent_engines:
         detail = f" Detected wrapper version: {version}." if version else ""
         raise KiroCapabilityError(
@@ -424,14 +448,23 @@ def probe_kiro_capabilities(
             version=version,
         )
     if engine == KiroEngine.V3:
-        # v3 runs only on an allow-listed kiro-cli version, whose engine
-        # schema CAO has pinned. Checked on every v3 create, never cached;
+        # Strict mode requires a pinned row; observed mode must select an
+        # eligible same-major schema. Checked on every create, never cached;
         # v2 is never affected.
         try:
-            kiro_v3_schema_for_cli_version(version)
-        except KiroV3UnsupportedVersionError as exc:
+            if observed:
+                observed_kiro_v3_entry(
+                    version, allow_unverified=kiro_v3_allow_unverified_versions()
+                )
+            else:
+                kiro_v3_schema_for_cli_version(version)
+        except (
+            KiroV3UnsupportedVersionError,
+            KiroV3ObservedRefusal,
+            KiroV3UnverifiedVersionError,
+        ) as exc:
             raise KiroCapabilityError(
-                KiroV3UnsupportedVersionError.code,
+                exc.code,
                 engine,
                 str(exc),
                 capability="--version",

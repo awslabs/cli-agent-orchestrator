@@ -146,8 +146,103 @@ fresh CAO home (so the profile install never reaches your own store) and a priva
 server, and removes both on exit. `E2E_SHOT_DIR`, `E2E_VIDEO_DIR`, `E2E_CAPTION` and
 `E2E_HOLD_MS` record screenshots and video.
 
+## Recorded trace and drift checks
+
+`tools/record_trace.py` records what this page sees on the wire for three
+captures, each produced by construction against its own isolated `cao-server`
+(a fresh `CAO_HOME_DIR`, a private tmux server, loopback only):
+
+| Capture | What happens | Run 1 | Run 2 |
+|---|---|---|---|
+| `none` | nothing is pending | `RUN_FINISHED` success | none |
+| `approve` | an agent raises a permission prompt and the card appears | `RUN_FINISHED` interrupt | resume `approved: true`, `RUN_FINISHED` success |
+| `reject` | the same, in a fresh session | `RUN_FINISHED` interrupt | resume `approved: false`, `RUN_FINISHED` success |
+
+The recording is normalised by `tools/trace_scrub.py` (ids become `id-N`,
+`terminal-N`, `session-N`, `profile-N` and `window-N`; timestamps come from a
+synthetic clock), then checked by the typed leak rule in `tools/trace_leaks.py`
+before anything is written. Run 2 must end clean: a `result.skippedResume`
+fails the recording as the approval bridge's expiry race, never as drift.
+
+| Mode | Agent | Credentials | Where it runs |
+|---|---|---|---|
+| `--live` | Claude Code, `dojo-approver.md` | a logged-in `claude` | local only; writes the published trace |
+| `--mock` | `mock_cli`, `tools/dojo-trace-mock.md`, answering the scripted `__mock_approval__` prompt | none | CI (`AG-UI stock-client live (AC3)`), and locally |
+| `--offline` | none: CAO's own producers, in-process, no server and no tmux | none | the unit tests |
+
+| Gate | Where | Command |
+|---|---|---|
+| Leak rule (L1-L17: a mutation case and a near miss for each) | pre-commit, and the Unit Tests job | `uv run pytest test/examples/test_cao_dojo_trace_leaks.py` |
+| Replay, tier 1 (SDK models, closed shape, lifecycle, cross-plane, upstream controls) | pre-push, and the Unit Tests job | `uv run pytest test/examples/test_cao_dojo_trace_replay.py test/examples/test_cao_dojo_trace_recorder.py` |
+| Replay, tier 1 with upstream `enforceEvents` and `verifyEvents` | CI | `node examples/ag-ui/ag-ui-stock-client-live/verify-trace.mjs <trace.ndjson>...` |
+| Keyless approve/reject/none e2e and tier 2 drift | CI | `uv run python examples/ag-ui/cao-dojo/tools/record_trace.py --mock --check` |
+| Re-record debt | warns on PRs; blocks the release path | `make check-agui-trace-release` |
+
+`make check-agui-trace` runs the offline gates in one command. Tier 2 compares
+a recording with `trace/cao-dojo-trace.shape.json`, which carries no
+provider-specific value, so a contributor without Claude Code credentials can
+clear a deliberate frame change by regenerating it:
+
+```bash
+uv run python examples/ag-ui/cao-dojo/tools/record_trace.py --mock --write-shape
+```
+
+The published trace records the hash of the shape it was recorded against
+(`_meta.shape_sha256`). When the shape moves on, the published trace is stale:
+PRs get a warning and the release path is blocked until someone with Claude Code
+runs `make record-agui-trace`. See [`trace/README.md`](trace/README.md) for the
+current state of the published trace.
+
+The recorder refuses port 9889 and any busy port; pass `--port` (default 19899).
+It removes its isolated directories on success and keeps them, with the server
+log, on failure. It runs tmux only against its own server, named with `-S`, and
+never passes on `TMUX` or `TMUX_PANE`: inside tmux, `TMUX` overrides
+`TMUX_TMPDIR`, so a bare `tmux kill-server` would end the caller's own tmux
+server.
+
+These tools live beside the page they record rather than in `scripts/`. The
+release path depends on one of them, `record_trace.py --check-debt`, which needs
+only the standard library and two committed files. The tests in `test/examples/`
+exercise the tools; the mypy ratchet covers `src/` only, so it does not
+type-check them.
+
 ## Not in this page yet
 
 - A replay mode from a recorded trace, and a docs-site build.
-- A CI gate.
+- A browser test of either page in CI. Neither this page nor the
+  [raw event inspector](#raw-event-inspector-inspectorhtml) has one: CI checks the trace the
+  page receives (see the gates above), not the pages themselves. The inspector's browser test
+  runs locally and wherever Playwright is installed.
 - The "edit" option. CAO offers it, but this page sends only approve and reject.
+
+## Raw event inspector (`inspector.html`)
+
+A second single-file page, [`inspector.html`](inspector.html), lists every record of a
+recorded `/agui/v1` trace in file order: capture, plane, direction, sequence, type, and
+the frame `timestamp` (epoch milliseconds and UTC) with the record's JSON one click away.
+It reads the committed [`trace/cao-dojo-trace.ndjson`](trace/cao-dojo-trace.ndjson) by
+default, or a trace you pick from disk.
+
+It is a reader of a file, not a client of CAO: no `cao-server`, no `CAO_AGUI_ENABLED`, no
+route, no stream, no token, nothing written. Serve this directory and open it:
+
+```bash
+cd examples/ag-ui/cao-dojo
+python3 -m http.server 8790 --bind 127.0.0.1
+# http://localhost:8790/inspector.html?trace=trace/cao-dojo-trace.ndjson
+```
+
+Only the `CUSTOM` approval cards carry a frame `timestamp` in the published trace; every
+other record shows `—` rather than an invented time. A request record (the
+`RunAgentInput` the recorder posted) has no frame and shows the type `REQUEST`.
+
+The `?trace=` path is resolved against the page and must stay on the page's origin and
+under its directory: a backslash, any whitespace or control character, a scheme, a
+protocol-relative `//host` or a `..` that climbs out is refused with a message and nothing
+is fetched. The browser test tries eight such paths, including `\\evil.example/x` and
+`ht<TAB>tp://evil.example/x`, and fails on any request to another origin.
+
+`pytest test/examples/test_cao_dojo_inspector.py` checks the page statically (no
+dependency, `textContent` only, no write path) and, with Playwright and a Chromium installed, opens it on
+the published trace and compares every row with the `.ndjson`. Without Playwright the
+browser test skips and the static check still runs.

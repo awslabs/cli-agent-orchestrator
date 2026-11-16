@@ -2,9 +2,11 @@
 
 import os
 import subprocess
+from typing import Optional
 
 import click
 
+from cli_agent_orchestrator.clients.tmux import WEB_VIEW_OWNER_OPTION, web_view_owner
 from cli_agent_orchestrator.constants import (
     DATABASE_FILE,
     SERVER_HOST,
@@ -12,6 +14,20 @@ from cli_agent_orchestrator.constants import (
     SESSION_PREFIX,
 )
 from cli_agent_orchestrator.utils import api_http
+
+
+def _read_view_owner(view_name: str) -> Optional[str]:
+    """The agent session a browser view session belongs to, from its owner tag."""
+    try:
+        result = subprocess.run(
+            ["tmux", "show-options", "-v", "-t", f"={view_name}", WEB_VIEW_OWNER_OPTION],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return result.stdout.strip() or None
 
 
 @click.command()
@@ -37,6 +53,9 @@ def info():
                 session_name = result.stdout.strip()
             except (subprocess.CalledProcessError, FileNotFoundError):
                 pass
+            # While a browser terminal shows this agent, '#S' can name its
+            # private view session (caoweb-*), which links the agent's window.
+            session_name = web_view_owner(session_name, _read_view_owner)
 
         if session_name and session_name.startswith(SESSION_PREFIX):
             try:

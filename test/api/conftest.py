@@ -1,5 +1,6 @@
 """Shared fixtures for API tests."""
 
+from test._support.host_sampler_stub import no_real_host_sampler  # noqa: F401
 from test.fixtures.decision_runtime import default_decision_runtime  # noqa: F401
 
 import pytest

@@ -48,9 +48,6 @@ logger = logging.getLogger(__name__)
 
 _REASON_TEXT = {
     EdgeReason.NO_CALLBACK: "did not call send_message",
-    EdgeReason.NO_SEND_MESSAGE_TOOL: (
-        "has no send_message tool (cao-mcp-server is not in its profile)"
-    ),
 }
 _UNREADABLE = "(last response could not be read)"
 _DONE_STATES = (  # subset-ok: only IDLE/COMPLETED end a turn; ERROR is handled apart

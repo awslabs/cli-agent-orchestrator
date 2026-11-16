@@ -22,7 +22,7 @@ export CAO_HOME_DIR="$HOME/.cli-agent-orchestrator"
 
 Every derived path resolves from this value, so one override moves everything — with two exceptions noted below. `CAO_HOME_DIR` is read once, when CAO's `constants` module is first imported (the same convention as `CAO_AGENTS_DIR`), so export it **before** starting `cao-server`, the MCP servers, or any `cao` command. All CAO processes must resolve the same location. Exactly one `cao-server` may run per `CAO_HOME_DIR`: the server holds an exclusive `flock` on `server.lock` inside it for its lifetime, and a second server started against the same directory, even on a different port, refuses to start and names the process that owns it (#406, #709); run a second server only with its own `CAO_HOME_DIR` and `--port`. Empty or whitespace-only values are treated as unset, and tilde (`~`) is expanded.
 
-**When to use it.** Some environments restrict or sandbox access to `~/.aws` at the OS level to protect AWS credentials. Because CAO otherwise stores its data there, including the agent profiles it reads during a `handoff`, a locked-down `~/.aws` can leave CAO unable to read its own data (a handoff then fails with `Permission denied`). Relocating `CAO_HOME_DIR` outside `~/.aws` keeps CAO working while leaving those credential protections in place.
+**When to use it.** Some environments restrict or sandbox access to `~/.aws` at the OS level to protect AWS credentials. Because CAO otherwise stores its data there, including the agent profiles it reads during a `handoff`, a locked-down `~/.aws` can leave CAO unable to read its own data (a handoff then fails with `Permission denied`). Relocating `CAO_HOME_DIR` outside `~/.aws` keeps CAO working while leaving those credential protections in place. When only the *client* side is locked down (an agent CLI that sandboxes its MCP servers, while `cao-server` runs normally), `assign` and `handoff` fetch the agent profiles they need from `cao-server` automatically, so no relocation is needed for that case.
 
 **Security note.** When relocating outside `~/.aws`, choose a dedicated directory that is not world-readable or shared with other users. CAO creates its base directory and log/FIFO subdirectories with owner-only permissions (mode `0700`), and applies a best-effort `chmod` to an existing base directory, but the chosen parent path should also be private since terminal logs can capture secrets and tokens.
 
@@ -189,7 +189,9 @@ Operator-only, read straight from `settings.json` (no environment override). Pro
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `v3_allow_unverified_versions` | `false` | Only JSON `true` lets a Kiro v3 launch run on a kiro-cli version still *pending operator verification*, so an operator can run the live checklist on it. It admits nothing else: an unlisted version still refuses, and every other v3 check still applies. Each admitted launch logs a warning and carries a `launch_notes` entry. Keep it off otherwise. |
+| `v3_allow_unverified_versions` | `false` | Only JSON `true` lets a Kiro v3 launch run on a kiro-cli version still *pending operator verification*, so an operator can run the live checklist on it. By itself it never admits an unlisted version, and every other v3 check still applies. Each admitted launch logs a warning and carries a `launch_notes` entry. Keep it off otherwise. |
+
+Only `kiro.v3_admission: "observed"` enables [observed admission](kiro-cli.md#observed-admission-operator-only) for eligible unlisted versions on the sealed-home helper path; installed-agent launches and every other setting value keep strict admission.
 
 See [Kiro v3 (preview)](kiro-cli.md#pending-versions-operator-only).
 
@@ -210,7 +212,7 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 |---------|---------|--------------|
 | `mcp_request_timeout` | `30` | Seconds to wait for HTTP calls between the MCP server process and the CAO API. Does not apply to a create the server answers only after provider init (`cao launch` without `--headless`, `cao agent handoff`, the `launch_agent` app gesture, `cao-ops` `launch_session` without a message); those waits are sized from `provider_init_timeout` instead. |
 | `event_bus_max_queue_size` | `1024` | Max events buffered per subscriber queue in the internal event bus. |
-| `provider_init_timeout` | `60` | Seconds to wait for a CLI agent to reach IDLE. On Kiro v3 it also sizes the wait for MCP servers to finish loading before the first task — see [How long CAO waits for MCP servers](kiro-cli.md#how-long-cao-waits-for-mcp-servers). Also the hard outer cap on total time a startup-prompt handler (Claude Code, Kimi, Antigravity, Codex) may run; Codex fails initialisation if a trust or update dialog (or a startup modal still mid-redraw after a short ride-out) is on screen when the cap is reached or after the readiness wait. Overridable per-profile via `provider_init_timeout` in the agent profile — see [Agent Profile Format](agent-profile.md#optional-fields). Client processes also read this value to size how long they wait for a synchronous create, so set it where the client runs too (not only in `cao-server`'s environment) when the two differ, for example a client pointed at another host through `CAO_API_HOST`; `GET /health` reports the value the server is using. |
+| `provider_init_timeout` | `60` | Seconds to wait for a CLI agent to reach IDLE. On Kiro v3 it also sizes the wait for MCP servers to finish loading before the first task — see [How long CAO waits for MCP servers](kiro-cli.md#how-long-cao-waits-for-mcp-servers). Also the hard outer cap on total time a startup-prompt handler (Claude Code, Kimi, Antigravity, Codex) may run; Codex fails initialisation if a trust or update dialog (or a startup modal still mid-redraw after a short ride-out) is on screen when the cap is reached or after the readiness wait. Overridable per-profile via `provider_init_timeout` in the agent profile — see [Agent Profile Format](agent-profile.md#optional-fields). Client processes also read this value to size how long they wait for a synchronous create, so set it where the client runs too (not only in `cao-server`'s environment) when the two differ, for example a client pointed at another host through `CAO_API_HOST`; `GET /health` reports the value the server is using. When a launch fails this way, CAO keeps any other agents already running in its session ([When a launch fails while it starts](terminal-lifecycle.md#when-a-launch-fails-while-it-starts)). |
 | `startup_prompt_handler_timeout` | `20` | Idle gap, in seconds, between consecutive startup prompts (e.g. workspace trust / bypass dialogs, Kimi's upgrade dialog, Antigravity's trust/survey dialogs, Codex's trust and update dialogs). The handler polls and resets this timer each time it answers a prompt; it only starts counting once the FIRST prompt has been handled, so a first dialog arriving later than this value (e.g. a cold/containerized start) is still caught — before any prompt is seen, only `provider_init_timeout` bounds the wait. Once at least one prompt has been handled, the handler exits after this many seconds pass with no further prompt. |
 | `state_buffer_max` | `32768` | Bytes of raw terminal output `StatusMonitor` keeps per terminal for raw-path status detection and `GET /terminals/{id}/output` (`mode=full`). Not unbounded scrollback — a long, chatty session is truncated to this trailing window; raise it if a still-pending prompt is getting evicted before it's read back. |
 
@@ -221,6 +223,7 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 | `enabled` | `true` | Master switch for the memory subsystem. |
 | `compile_mode` | `"llm"` | `llm` or `append`. `append` skips the LLM wiki-compiler entirely. |
 | `lifecycle.enabled` | `false` | Opt-in active supersedes exclusion for injection plus recall demotion/labels. Nested under `memory.lifecycle`; env override `CAO_MEMORY_LIFECYCLE_ENABLED`. Read/validation errors leave it off. |
+| `ranking.default_sort` | `"recency"` | Default query recall ranking: `recency` preserves hybrid recall, while `bm25` opts into BM25-first results. No-query listings remain recency ordered. Nested under `memory.ranking`. |
 | `non_accessing_inspection` | `false` | CLI list/show and HTTP GET memory views skip access counters when on. MCP/internal recall still counts. Env override: `CAO_MEMORY_NON_ACCESSING_INSPECTION`; read errors leave it off. |
 | `explain_enabled` | `true` | On-demand `cao memory list --query Q --explain` diagnostic. Env override: `CAO_MEMORY_EXPLAIN_ENABLED` (env > file > default). Does not alter recall defaults or gate `sort_by="relevance"`. |
 | `flush_threshold` | `0.85` | Context-usage fraction that triggers a memory flush. |
@@ -239,8 +242,10 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 > `workflow_run_step` projection persists each step's full `output_json` and `error`
 > text on every state transition, unconditionally, because the resume path and
 > `{{steps.<id>.output.<field>}}` templating read them back — gating them would
-> break both. The flag governs only the event-log output digest and the diagnostics
-> bundle's excerpts.
+> break both. Each settled step also stores its final answer in `result_json`, for
+> both script and YAML steps, after secret redaction and capped at 32 KiB; the web
+> UI's Output tab reads it. The flag governs only the event-log output digest and the
+> diagnostics bundle's excerpts.
 >
 > That retained text is served, in full, by `GET /workflows/runs/{run_id}`. Its only
 > protection is a scope requirement (`cao:read`/`cao:write`/`cao:admin`), and that
@@ -406,6 +411,54 @@ working directory, are reported rather than worked around.
 The name is a label, not an authenticated identity: anything that can reach the
 tmux socket can set the same mark. Agents are not isolated from each other here,
 so this is in line with the rest of the backend rather than a new exposure.
+
+#### Browser terminals in pane mode
+
+A web terminal (the Workspace tab, or the Agents tab overlay) on a pane-mode
+agent shows the **whole** `pane_window`, every agent's pane tiled, with that
+agent's pane selected. Two web terminals on agents of the same window therefore
+show the same tiled window, not one agent each; window mode gives each terminal
+its own window.
+
+**Keys** reach only the agent the terminal belongs to. tmux keeps one active
+pane per window, not per client, so cao-server selects the terminal's pane
+before every input it forwards and holds that window until tmux has read the
+input, so a paste in one terminal and a key in another cannot interleave. Input
+that ends in Escape, Alt+[, Alt+] or Alt+Shift+P holds the window a little
+longer: tmux keeps these as a partial key until its `escape-time` runs out (10
+ms by default since tmux 3.5, 500 ms before), in case more of an escape sequence
+follows, and only then delivers them to the pane that is active. (Alt+Shift+P is
+a partial key only in the first seconds after a terminal attaches, while tmux
+waits for the answer to one of its own terminal queries; it holds the window
+every time, which costs only the short wait below.) So after such a key, other
+web terminals on the same window wait before their next key, and a terminal
+opened on that window in that time selects its pane only afterwards. The wait
+lasts until `escape-time` has run out after the sending terminal's last such
+key, counted as at least 500 ms. So with an `escape-time` of 500 ms or less
+(tmux's defaults) it is about half a second after a single such key; with a
+longer `escape-time` it is that long. It is also longer while that terminal
+keeps sending such keys (Escape held down, for example). The sender's next key
+does not end the wait early: cao-server cannot tell whether that key completes
+the escape sequence or extends it, and tmux's timer keeps running from the first
+byte. The terminal that sent the key does not wait. Input whose pane cannot be
+selected is dropped rather than sent to whichever pane is active, and a terminal
+whose pane cannot be found is not attached.
+
+**The mouse** works as it does in tmux: a click or the wheel acts on the pane
+under the pointer, even another agent's tile. A click makes that pane the
+active one; your next key goes to your own agent again. The wheel goes to the
+program in the pane under the pointer if that program uses the mouse or (since
+tmux 3.6) is in the alternate screen, as full-screen agent CLIs usually are.
+Otherwise it puts that pane into copy mode, where it reads keys as copy-mode
+commands, so an agent scrolled that way does not see what is typed to it until
+copy mode ends: press `q` in that agent's terminal (or scroll back to the
+bottom).
+
+One case is outside cao-server's reach: selecting another pane by hand, from a
+real terminal attached to the same window, in the instant between cao-server's
+selection and tmux reading the input. Work in a different window, or in window
+mode, if you drive pane-mode agents from a real terminal while typing to them
+from the browser.
 
 ### MCP Apps (`apps`)
 

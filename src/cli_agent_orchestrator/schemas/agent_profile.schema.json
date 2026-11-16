@@ -150,6 +150,111 @@
       "minimum": 1,
       "description": "Per-profile override, in seconds, for provider initialization. Replaces the server-wide provider_init_timeout as the hard outer cap for this profile."
     },
+    "params": {
+      "type": "object",
+      "description": "CAO-native. The params a workflow step that uses this profile must fill, by name. Never passed to provider JSON. Step values are journaled in plaintext, so a param never holds a secret. The profile validator also checks that a default is one of the enum values, and that a string default or enum value has no {{...}} placeholder.",
+      "maxProperties": 32,
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,63}$",
+        "not": {"type": "string", "pattern": "[\\r\\n]"},
+        "description": "A param name starts with a letter and has at most 64 characters: letters, digits, '_', '.' and '-'."
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["string", "int", "bool"],
+            "default": "string",
+            "description": "The type of the step's value. The value is always written as a quoted string."
+          },
+          "required": {
+            "type": "boolean",
+            "default": false,
+            "description": "Whether every step that uses this profile must set the param."
+          },
+          "default": {
+            "description": "The value the workflow builder fills in: a string, a whole number or a boolean, matching type. It is one of the enum values when enum is set."
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 200,
+            "not": {"type": "string", "pattern": "[\\r\\n]"},
+            "description": "A param description is one line of at most 200 characters."
+          },
+          "enum": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 32,
+            "description": "The values a step may use: 1 to 32 distinct values of the declared type."
+          }
+        },
+        "allOf": [
+          {
+            "if": {"type": "object", "properties": {"type": {"const": "string"}}},
+            "then": {
+              "properties": {
+                "default": {
+                  "type": "string",
+                  "maxLength": 512,
+                  "not": {"type": "string", "pattern": "[\\r\\n]"},
+                  "description": "A string value is one line of at most 512 characters."
+                },
+                "enum": {
+                  "items": {
+                    "type": "string",
+                    "maxLength": 512,
+                    "not": {"type": "string", "pattern": "[\\r\\n]"},
+                    "description": "A string value is one line of at most 512 characters."
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {"type": "object", "properties": {"type": {"const": "int"}}, "required": ["type"]},
+            "then": {
+              "properties": {
+                "default": {
+                  "type": "integer",
+                  "minimum": -999999999999999999,
+                  "maximum": 999999999999999999
+                },
+                "enum": {
+                  "items": {
+                    "type": "integer",
+                    "minimum": -999999999999999999,
+                    "maximum": 999999999999999999
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {"type": "object", "properties": {"type": {"const": "bool"}}, "required": ["type"]},
+            "then": {
+              "properties": {"default": {"type": "boolean"}},
+              "not": {"required": ["enum"]},
+              "description": "A bool param cannot have an enum."
+            }
+          },
+          {
+            "if": {"type": "object", "properties": {"required": {"const": true}}, "required": ["required"]},
+            "then": {
+              "not": {"required": ["default"]},
+              "description": "A required param cannot have a default."
+            }
+          },
+          {
+            "$comment": "uniqueItems runs only on an enum within maxItems. jsonschema compares items it cannot sort pair by pair, so an unbounded list would cost quadratic time.",
+            "if": {"type": "object", "properties": {"enum": {"type": "array", "maxItems": 32}}, "required": ["enum"]},
+            "then": {"properties": {"enum": {"uniqueItems": true}}}
+          }
+        ]
+      }
+    },
     "prompt": {
       "type": "string"
     },

@@ -301,6 +301,39 @@ class TestTheGatesAreUnchanged:
 
 
 # --------------------------------------------------------------------------------------
+# The CAO Dojo trace gate (#1116): only the release chain runs it, and release.yml runs
+# the same command before it tags, so a stale trace never becomes a tag and a Release
+# --------------------------------------------------------------------------------------
+
+TRACE_GATE = "make check-agui-trace-release AGUI_PY=python"
+
+
+def _trace_steps(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [s for s in steps if "check-agui-trace-release" in s.get("run", "")]
+
+
+class TestTheTraceGate:
+    @pytest.mark.parametrize("scenario", SCENARIOS, ids=list(SCENARIOS))
+    def test_only_the_release_chain_runs_the_trace_gate(self, scenario):
+        """The testpypi and pypi dispatches stay usable without a Claude Code re-record."""
+        (event, environment), _ = SCENARIOS[scenario]
+        evaluate = Evaluator(publish_context(event, environment), {"success": True})
+        (step,) = _trace_steps(PUBLISH["jobs"]["verify-release-version"]["steps"])
+        assert step["run"].strip() == TRACE_GATE
+        runs = evaluate(step["if"]) if "if" in step else True
+        assert runs == (environment in (None, "release")), scenario
+
+    def test_release_yml_runs_the_same_trace_gate_before_it_tags(self):
+        steps = RELEASE["jobs"]["release"]["steps"]
+        (step,) = _trace_steps(steps)
+        assert step["run"].strip() == TRACE_GATE
+        assert "if" not in step, "the pre-tag gate must run on every release run"
+        names = [s.get("name", "") for s in steps]
+        tag = next(i for i, n in enumerate(names) if n.startswith("Commit, tag and push"))
+        assert steps.index(step) < tag
+
+
+# --------------------------------------------------------------------------------------
 # release.yml stops at the GitHub Release; nothing in it can start a workflow
 # --------------------------------------------------------------------------------------
 

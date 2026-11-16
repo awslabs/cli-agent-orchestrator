@@ -62,6 +62,44 @@ runtime.
 cao launch --agents sqs-monitor-agent --provider claude_code
 ```
 
+## Use in a Workflow
+
+Each profile declares the values it needs as `params` in its frontmatter, so a
+YAML workflow step that uses it can set them. The param names are the
+`config.json` keys. The declarations come from the matching template schema in
+`src/cli_agent_orchestrator/templates/aws/<name>/schema.json`: the required
+list, the descriptions, the enums and the defaults.
+
+A copy installed before these examples declared params has no `params` block.
+Reinstall it with `cao install examples/aws/<name>/<name>-agent.md --provider <provider>`.
+
+```yaml
+steps:
+  - id: read-orders
+    provider: claude_code
+    agent: dynamodb-query-agent
+    params:
+      profile: "my-aws-profile"
+      region: "us-east-1"
+      table_name: "orders"
+      partition_key_name: "pk"
+      partition_key_value: "customer-42"
+      partition_key_type: "S"
+      limit: "1"
+    prompt: "Read the newest order for this customer."
+```
+
+The engine adds the values to the step prompt under "Parameters for this
+step:", and the profile's instructions tell the agent to use them in place of
+the `${...}` placeholders. Outside a workflow, the placeholders work as before.
+Validation and run start check the values against the declarations: a required
+param must be set, `limit` must be a whole number, and `partition_key_type`
+must be `S`, `N` or `B`. See
+[Params a profile declares](../../docs/workflows.md#params-a-profile-declares).
+
+Param values are journaled in plaintext. Pass the name of an AWS profile, never
+a credential.
+
 ## Profile Discovery
 
 Each profile declares `tags` and `capabilities` in its frontmatter. These

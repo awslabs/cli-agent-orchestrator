@@ -533,9 +533,24 @@ def _mark_initial_delivery_pending(terminal_id: str) -> None:
 
 
 def _clear_initial_delivery_pending(terminal_id: str) -> None:
-    """Release the pending mark. Idempotent — every exit path may call it."""
+    """Release the pending mark. Idempotent — every exit path may call it.
+
+    Releasing it lifts the ``reported_status`` mask, so the status a client reads changes
+    (``unknown`` becomes the real idle/completed) without the monitor's status changing, and
+    so without a ``terminal.<id>.status`` event. The release is therefore announced on the
+    in-process bus (``terminal.<id>.delivery``, once, metadata only) so a live view can
+    refresh. Best effort: a bus that cannot publish never affects the release.
+    """
     with _pending_initial_delivery_lock:
+        was_pending = terminal_id in _pending_initial_delivery
         _pending_initial_delivery.discard(terminal_id)
+    if was_pending:
+        try:
+            from cli_agent_orchestrator.services.event_bus import bus
+
+            bus.publish(f"terminal.{terminal_id}.delivery", {"pending": False})
+        except Exception:  # noqa: BLE001
+            logger.debug("initial-delivery release of %s not announced", terminal_id)
 
 
 def initial_delivery_pending(terminal_id: str) -> bool:
@@ -800,11 +815,137 @@ def _resolve_working_directory(working_directory: Optional[str]) -> str:
     )
 
 
+def _peer_terminal_ids_locked(session_name: str, terminal_id: str) -> Optional[List[str]]:
+    """Other live rows in ``terminal_id``'s session incarnation. CALLER HOLDS the lock.
+
+    A peer is any other terminal row registered under ``session_name`` in the
+    CURRENT incarnation (the one the caller has already proven ``terminal_id``
+    owns), except a retained deferred-init failure tombstone, whose runtime is
+    already gone. Rows of an older incarnation of the same name are not peers:
+    their backend session no longer exists. Returns None when the registry
+    cannot be read, which the caller must treat as "there may be peers".
+    """
+    try:
+        incarnation = get_session_incarnation(session_name)
+        rows = list_terminals_by_session(session_name)
+    except Exception:
+        logger.exception(f"Rollback: could not list the terminals of {session_name}")
+        return None
+    return [
+        str(row["id"])
+        for row in rows
+        if str(row["id"]) != terminal_id
+        and row.get("session_incarnation_id") == incarnation
+        and not row.get("deferred_init_failure")
+    ]
+
+
+def _roll_back_creator_window_keeping_peers_locked(
+    session_name: str, window_name: str, peers: Optional[List[str]]
+) -> None:
+    """Remove only the failed creator's window; the session stays for its peers.
+
+    CALLER HOLDS the lifecycle lock. The forwarded env stays with the session,
+    which still serves later windows. If the backend reports the session gone
+    after the window kill (tmux drops a session with its last window, e.g. when
+    the only peer's pane had already exited), the env is cleared then, so a
+    secret never outlives the session it was forwarded to.
+
+    That decision uses ``session_exists_strict``, never the lenient probe: the
+    lenient one turns a lookup error into "absent", which would drop a live
+    session's env and leave its workers' later windows without it. A lookup
+    that raises keeps the env. On tmux the strict check raises on a lookup
+    error; on herdr it is the lenient check (``backends/base.py`` default), so
+    there a failed ``workspace list`` still reads as absent. Best-effort, never
+    raises.
+    """
+    logger.warning(
+        "Rollback: session %s has other terminals (%s); removing only the failed "
+        "creator's window %s and keeping the session (#1277)",
+        session_name,
+        ", ".join(peers) if peers else "the registry could not be read",
+        window_name or "<unknown>",
+    )
+    if window_name:
+        try:
+            if not get_backend().kill_window(session_name, window_name):
+                logger.warning(
+                    f"Rollback: kill_window({session_name}:{window_name}) did not confirm "
+                    "the kill; the window may still be live"
+                )
+        except Exception:
+            logger.exception(f"Rollback: failed to kill window {session_name}:{window_name}")
+    try:
+        session_gone = not get_backend().session_exists_strict(session_name)
+    except Exception:
+        logger.exception(
+            f"Rollback: could not check whether {session_name} still exists; "
+            "keeping its forwarded env"
+        )
+        return
+    if session_gone:
+        try:
+            clear_session_env(session_name)
+        except Exception:
+            logger.exception(f"Rollback: failed to clear session env for {session_name}")
+
+
+def _session_known_gone_locked(session_name: str, kill_confirmed: bool) -> bool:
+    """After a creator's ``kill_session``: is the session known to be gone?
+
+    True for a confirmed kill, or when ``session_exists_strict`` finds it absent
+    (a kill that reported False because the session was reaped in between). A
+    lookup that raises answers False: an unknown session may still hold a live
+    peer. CALLER HOLDS the lock. Never raises.
+    """
+    if kill_confirmed:
+        return True
+    try:
+        return not get_backend().session_exists_strict(session_name)
+    except Exception:
+        logger.exception(
+            f"Rollback: could not confirm {session_name} is gone; leaving its rows alone"
+        )
+        return False
+
+
+def _delete_rows_killed_with_session_locked(session_name: str, terminal_id: str) -> None:
+    """Record the rows a creator's ``kill_session`` took with it. CALLER HOLDS the lock.
+
+    The creator's rollback kills the whole session only after
+    ``_peer_terminal_ids_locked`` found no other row in it, so normally there is
+    nothing here. A row that is here anyway joined after that check without this
+    process's lifecycle lock (the cross-process gap documented on
+    ``list_terminals_by_session``), and its pane is now gone with the session.
+    Delete it with ``end_reason="creator_rollback"`` so its launch record names
+    the cause, instead of leaving it for herdr's ``workspace.closed`` to stamp
+    ``pane_closed`` or a sweep to stamp ``stale_cleanup``. The failed creator's
+    own row is left to the caller, which deletes it as ``launch_failed``.
+    The caller runs this only once the session is known to be gone (a confirmed
+    kill, or a strict lookup that finds it absent): with the kill unconfirmed
+    the peer may still be alive, and deleting its row would orphan it from CAO.
+    Best-effort, never raises.
+    """
+    peers = _peer_terminal_ids_locked(session_name, terminal_id)
+    for peer_id in peers or ():
+        logger.warning(
+            "Rollback: terminal %s joined %s after the peer check and was killed with "
+            "the session; recording end_reason=creator_rollback",
+            peer_id,
+            session_name,
+        )
+        try:
+            db_delete_terminal(peer_id, end_reason="creator_rollback")
+        except Exception:
+            logger.exception(f"Rollback: failed to delete killed peer row {peer_id}")
+
+
 def _roll_back_backend_create_locked(
     session_name: str,
     window_name: str,
     *,
     created_session: bool,
+    terminal_id: Optional[str] = None,
 ) -> None:
     """Undo the backend resource a create just made. CALLER MUST HOLD the
     lifecycle lock for ``session_name``.
@@ -816,7 +957,15 @@ def _roll_back_backend_create_locked(
 
     * ``created_session=True`` -- this call created the whole session, so kill the
       session and drop any forwarded env stashed for the name, so secrets don't
-      linger in memory or bleed into a future reuse of the name.
+      linger in memory or bleed into a future reuse of the name. EXCEPT when
+      other terminals have joined the session since (#1277): a supervisor's pane
+      is live during its own provider init and can ``assign`` workers into its
+      session, so when ``terminal_id`` (the failed creator's committed row) is
+      given and other rows share its incarnation, only the creator's window goes
+      (``_roll_back_creator_window_keeping_peers_locked``), for the same reason as
+      the window arm below. Killing the session there destroyed working peers.
+      With no ``terminal_id`` (the in-closure rollback, before the row exists, in
+      the same locked section that created the session) there can be no peers.
     * ``created_session=False`` -- this call only added a WINDOW to a session that
       already existed (``new_session=False``: every MCP spawn/assign-into-an-
       existing-session call). Kill ONLY that window, so the pre-existing session
@@ -834,6 +983,13 @@ def _roll_back_backend_create_locked(
     Best-effort and never raises: it runs while an exception is already in
     flight, and that original failure is the one the caller must see.
     """
+    if created_session and terminal_id is not None:
+        peers = _peer_terminal_ids_locked(session_name, terminal_id)
+        if peers is None or peers:
+            # An unreadable registry counts as "there may be peers": killing
+            # live work is the irreversible mistake, an empty session is not.
+            _roll_back_creator_window_keeping_peers_locked(session_name, window_name, peers)
+            return
     if created_session:
         # `finally`, not a following statement: the env mapping must be dropped
         # however the kill turns out -- including when it raises a BaseException
@@ -843,8 +999,10 @@ def _roll_back_backend_create_locked(
         # keyed to a session name that is gone and may later be reused.
         # `finally` still lets a BaseException propagate, which is what we want:
         # a Ctrl-C must not be swallowed here.
+        kill_confirmed = False
         try:
-            if not get_backend().kill_session(session_name):
+            kill_confirmed = bool(get_backend().kill_session(session_name))
+            if not kill_confirmed:
                 # Falsy means the backend could not confirm the kill (or found
                 # nothing to kill). Either way the name may still be live, so say
                 # so -- a silent branch here is how an orphan goes unnoticed.
@@ -859,6 +1017,8 @@ def _roll_back_backend_create_locked(
                 clear_session_env(session_name)
             except Exception:
                 logger.exception(f"Rollback: failed to clear session env for {session_name}")
+        if terminal_id is not None and _session_known_gone_locked(session_name, kill_confirmed):
+            _delete_rows_killed_with_session_locked(session_name, terminal_id)
     else:
         try:
             if not get_backend().kill_window(session_name, window_name):
@@ -931,7 +1091,10 @@ def _roll_back_cancelled_create(
     with session_lifecycle_lock(session_name):
         if _still_owns_incarnation(session_name, terminal_id):
             _roll_back_backend_create_locked(
-                session_name, window_name, created_session=created_session
+                session_name,
+                window_name,
+                created_session=created_session,
+                terminal_id=terminal_id,
             )
         try:
             db_delete_terminal(terminal_id, end_reason="launch_failed")
@@ -973,7 +1136,10 @@ def _roll_back_backend_create_if_still_ours(
         if not _still_owns_incarnation(session_name, terminal_id):
             return
         _roll_back_backend_create_locked(
-            session_name, window_name or "", created_session=created_session
+            session_name,
+            window_name or "",
+            created_session=created_session,
+            terminal_id=terminal_id,
         )
 
 
@@ -1028,7 +1194,10 @@ def _roll_back_failed_create(
        (``new_session=False``, every MCP spawn/assign-into-existing-session
        call) has no session-level teardown to fall back on, and without it a
        provider init timeout rolled back the row and stopped the reader but
-       left the pane running, invisible to list/tree, forever.
+       left the pane running, invisible to list/tree, forever. The session arm
+       kills the session only when no other terminal has joined it (#1277);
+       otherwise it removes just this terminal's window, so workers a
+       supervisor assigned during its own init keep running.
     3. Provider -- AFTER the process-owning session/window is stopped, because
        a provider releasing private on-disk state must not race a process
        still writing it (Grok's updater can still be writing ``$GROK_HOME``
@@ -1618,6 +1787,7 @@ def _prepare_kiro_launch(
     effort: Optional[str],
     version: Optional[str],
     schema: KiroV3EngineSchema,
+    borrowed_schema_version: Optional[str] = None,
 ) -> KiroLaunch:
     """Stage B of a Kiro helper launch, after bind and before the window (#1167 Phase 2).
 
@@ -1650,6 +1820,11 @@ def _prepare_kiro_launch(
             kiro_cli_target=kiro_cli.target,
             kiro_version=version,
             schema=schema.engine,
+            **(
+                {"admission": "observed", "borrowed_from": borrowed_schema_version}
+                if borrowed_schema_version is not None
+                else {}
+            ),
         )
     except KiroV3Refusal as exc:
         if prepared is not None:
@@ -2356,6 +2531,7 @@ async def _create_terminal_unguarded(
                     probe,
                     executable=resolved_cli.path,
                     env=kiro_launch_home.kiro_env(kiro_probe_home),
+                    allow_observed=True,
                 )
             try:
                 try:
@@ -2394,7 +2570,9 @@ async def _create_terminal_unguarded(
                 # (or pending, with the operator's opt-in), and the policy
                 # restricted.
                 try:
-                    kiro_v3_admission = require_kiro_v3_admissible(capabilities, allowed_tools)
+                    kiro_v3_admission = require_kiro_v3_admissible(
+                        capabilities, allowed_tools, allow_observed=helper
+                    )
                 except KiroV3Refusal as exc:
                     if not helper:
                         raise
@@ -2749,6 +2927,7 @@ async def _create_terminal_unguarded(
                 launch_effort,
                 capabilities.version,
                 kiro_v3_admission.schema,
+                borrowed_schema_version=kiro_v3_admission.borrowed_schema_version,
             )
             ephemeral_state.kiro_home = kiro_launch.home
         elif provider == ProviderType.KIRO_CLI.value:
@@ -3265,6 +3444,14 @@ async def _create_terminal_unguarded(
             description=description,
             deferred_init_failure=None,
             session_incarnation_id=session_incarnation_id,
+            # What the row holds when this returns (#1131): a synchronous Kiro
+            # create gets here only after its passed check was recorded; a
+            # deferred one was inserted False and is still being checked. Other
+            # providers store NULL. A deferred check that passes meanwhile shows
+            # on the next GET /terminals/{id}.
+            identity_verified=(
+                (not defer_init) if provider == ProviderType.KIRO_CLI.value else None
+            ),
             status=initial_status,
             last_active=datetime.now(timezone.utc),
             launch_notes=(
@@ -5613,6 +5800,50 @@ def callback_terminal_id_for_session(session_name: Optional[str]) -> Optional[st
         return None
 
 
+def live_status_of_row(row: Dict[str, Any]) -> Optional[str]:
+    """The last applied status of a listing row, read from memory only.
+
+    This is **not** a copy of what ``get_terminal`` reports; it is the cheap reading a
+    snapshot rebuilt on every event can afford: no re-detection, no pane capture, no file
+    or database read. It follows ``get_terminal`` where it can from memory:
+
+    - a durable deferred-init failure marker on the row is ``error`` (the marker is
+      authoritative, whatever the monitor last saw);
+    - otherwise the monitor's last applied status (``StatusMonitor.cached_status``), masked
+      by ``reported_status`` while the initial message is still undispatched;
+    - an external-owner ``error`` with no marker yet is published as ``unknown``, the
+      non-final verdict ``get_terminal`` gives in that window.
+
+    It differs from ``get_terminal`` in these ways:
+
+    - ``get_status`` flips a cached IDLE/COMPLETED to PROCESSING while a native swarm is
+      pending, and re-detects a cached PROCESSING/WAITING from the buffer (with the #558
+      ``capture-pane`` recovery). This does neither, so a stuck PROCESSING keeps its last
+      reading until something calls ``get_status``.
+    - A terminal never observed is ``None`` (a null in the snapshot) where ``get_terminal``
+      says ``unknown``. The dashboard shows both as unknown.
+    - It does not read the fallback failure sidecar (a file) or the retention override that
+      needs the row again, so those two edge cases read ``unknown`` here where
+      ``get_terminal`` may not.
+    """
+    terminal_id = row.get("id")
+    if not isinstance(terminal_id, str) or not terminal_id:
+        return None
+    if isinstance(row.get("deferred_init_failure"), dict):
+        return TerminalStatus.ERROR.value
+    observed = status_monitor.cached_status(terminal_id)
+    if observed is None:
+        return None
+    if observed == TerminalStatus.ERROR and row.get("deferred_init_external_owner"):
+        return TerminalStatus.UNKNOWN.value
+    return reported_status(terminal_id, observed).value
+
+
+def with_live_status(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Copies of ``rows`` with ``status`` set from :func:`live_status_of_row` (O(rows))."""
+    return [{**row, "status": live_status_of_row(row)} for row in rows]
+
+
 def get_terminal(terminal_id: str) -> Dict:
     """Get terminal data."""
     try:
@@ -5699,6 +5930,9 @@ def get_terminal(terminal_id: str) -> Dict:
             "allowed_tools": metadata.get("allowed_tools"),
             "delegate_tools": metadata.get("delegate_tools"),
             "engine": metadata.get("engine"),
+            # As stored, None included (#1131): None is a non-Kiro or legacy row,
+            # never coerced to False.
+            "identity_verified": metadata.get("identity_verified"),
             "group": metadata.get("group"),
             "metadata": public_metadata,
             "description": metadata.get("description"),
@@ -6634,13 +6868,21 @@ def capture_terminal_snapshot(terminal_id: str) -> Optional[Dict]:
 
     # Snapshot scrollback + metadata before killing (for debugging/restore)
     try:
-        # Capture plain text full scrollback (no -e, no line cap)
+        # Capture plain text full scrollback (no -e, no line cap). Rows tmux
+        # soft-wrapped at the pane width are rejoined into the lines the program
+        # wrote (-J): the workflow transcript route redacts this file, and a
+        # pattern matches a secret only whole, so a secret that crossed a wrap
+        # must not be split here. `cao terminal restore` then re-wraps the lines
+        # at its own pane's width. -J also keeps the trailing spaces a program
+        # wrote, which the default capture trims, so they are stripped.
         scrollback = get_backend().get_history(
             metadata["tmux_session"],
             metadata["tmux_window"],
             strip_escapes=True,
             full_history=True,
+            join_wrapped=True,
         )
+        scrollback = "\n".join(line.rstrip(" ") for line in scrollback.split("\n"))
         # Scrollback is raw terminal history and can hold anything the agent
         # printed, so both sidecars are published 0600 through the atomic
         # writer: a symlink planted at either path is replaced, not followed.

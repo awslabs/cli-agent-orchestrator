@@ -2,15 +2,37 @@
 #
 # Enable locally with:
 #   uv tool install pre-commit   # or: pipx install pre-commit
-#   pre-commit install
+#   pre-commit install           # installs the pre-commit AND pre-push hooks
 #
 # The gitleaks hook scans STAGED changes (gitleaks git --staged) so a secret is
 # caught before it enters a commit — the earliest possible point. It uses this
 # repo's .gitleaks.toml automatically. CI runs the same scanner as a backstop
 # (.github/workflows/secret-scan.yml), so skipping the hook never lets a secret
 # through; the hook just shortens the feedback loop.
+#
+# The two CAO Dojo trace hooks (#1116) shift the trace gates left: the leak rule
+# runs at commit time, and the offline replay (tier 1) at push time. CI runs
+# both in the Unit Tests job, so skipping them lets nothing through either.
+default_install_hook_types: [pre-commit, pre-push]
+# gitleaks and the leak hook stay commit-only; the replay opts into pre-push.
+default_stages: [pre-commit]
 repos:
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.30.1 # keep in sync with .github/workflows/secret-scan.yml
     hooks:
       - id: gitleaks
+  - repo: local
+    hooks:
+      - id: cao-dojo-trace-leaks
+        name: CAO Dojo trace leak rule
+        entry: uv run pytest test/examples/test_cao_dojo_trace_leaks.py -q --no-cov
+        language: system
+        pass_filenames: false
+        files: ^(examples/ag-ui/cao-dojo/(trace/|tools/(trace_|record_trace))|test/examples/(test_cao_dojo_trace_|cao_dojo_trace_support\.py))
+      - id: cao-dojo-trace-replay
+        name: CAO Dojo trace replay (offline tier 1)
+        entry: uv run pytest test/examples/test_cao_dojo_trace_replay.py test/examples/test_cao_dojo_trace_recorder.py -q --no-cov
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+        files: ^(examples/ag-ui/cao-dojo/|src/cli_agent_orchestrator/services/(agui/|agui_stream\.py|ui_state_service\.py)|test/examples/(test_cao_dojo_trace_|cao_dojo_trace_support\.py|fixtures/ag-ui-conformance/))

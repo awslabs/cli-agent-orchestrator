@@ -52,8 +52,10 @@ python3 -m http.server 8000
 You should see the six components appear in the **Generative UI** panel as
 `showcase.sh` emits them, the fleet panel populate from the snapshot, and the
 event log scroll. The off-list `iframe` intent is refused **server-side (HTTP
-400)** by `showcase.sh` and never reaches the stream; if any unknown component
-name ever did arrive, this client would still render it as an inert placeholder.
+400)** by `showcase.sh` and never renders: the stream carries only a
+metadata-only `RAW` refusal record for it, with no props (see `docs/agui.md`).
+If any unknown component name ever did arrive as UI, this client would still
+render it as an inert placeholder.
 
 ### CORS
 

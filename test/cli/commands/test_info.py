@@ -122,3 +122,48 @@ class TestInfoCommand:
 
         assert result.exit_code == 0
         assert "Could not connect to CAO server" in result.output
+
+    def test_info_maps_a_browser_view_session_to_its_owner(self):
+        """Inside an agent pane, '#S' can name the caoweb-* view a browser attached."""
+        runner = CliRunner()
+
+        def fake_run(argv, **kwargs):
+            out = MagicMock()
+            if argv[:2] == ["tmux", "display-message"]:
+                out.stdout = "caoweb-1a2b3c4d5e6f\n"
+            elif argv[:2] == ["tmux", "show-options"]:
+                # "=" makes tmux match the name exactly, never as a prefix.
+                assert argv[-2:] == ["=caoweb-1a2b3c4d5e6f", "@cao_web_view_of"]
+                out.stdout = "cao-test-session\n"
+            return out
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"terminals": [{"id": "abc"}]}
+
+        env = {k: v for k, v in __import__("os").environ.items() if k != "CAO_SESSION_NAME"}
+        with patch.dict("os.environ", env, clear=True):
+            with patch("subprocess.run", side_effect=fake_run):
+                with patch("requests.get", return_value=mock_response):
+                    result = runner.invoke(info)
+
+        assert result.exit_code == 0
+        assert "Session ID: cao-test-session" in result.output
+
+    def test_info_a_view_without_a_readable_owner_is_not_a_cao_session(self):
+        runner = CliRunner()
+
+        def fake_run(argv, **kwargs):
+            if argv[:2] == ["tmux", "show-options"]:
+                raise __import__("subprocess").CalledProcessError(1, argv)
+            out = MagicMock()
+            out.stdout = "caoweb-1a2b3c4d5e6f\n"
+            return out
+
+        env = {k: v for k, v in __import__("os").environ.items() if k != "CAO_SESSION_NAME"}
+        with patch.dict("os.environ", env, clear=True):
+            with patch("subprocess.run", side_effect=fake_run):
+                result = runner.invoke(info)
+
+        assert result.exit_code == 0
+        assert "Not currently in a CAO session." in result.output

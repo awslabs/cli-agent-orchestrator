@@ -1,15 +1,25 @@
 import { useMemo, useState, useSyncExternalStore, type FormEvent } from "react";
 import {
+  agentCardFor,
   batch,
+  groupByRunner,
   ownerText,
   propRows,
   stateText,
   isOpen,
+  callText,
+  isFinished,
+  stateLabel,
+  timeText,
   type Board,
   type Card,
   type Controller,
   type Entry,
+  type Fleet,
+  type FleetTerminal,
   type Panel,
+  type Timeline,
+  type TimelineEntry,
 } from "../core/index.ts";
 import type { Store } from "./store.ts";
 
@@ -23,7 +33,7 @@ export interface AppProps {
 }
 
 export function App({ store, server, ambientStatus }: AppProps) {
-  const { board, panel } = useSyncExternalStore(store.subscribe, store.getSnapshot);
+  const { board, panel, timeline, fleet } = useSyncExternalStore(store.subscribe, store.getSnapshot);
   const { controller } = store;
   const run = (fn: () => Promise<unknown>) => {
     void fn();
@@ -41,7 +51,9 @@ export function App({ store, server, ambientStatus }: AppProps) {
         </button>
       </header>
       <Approvals board={board} controller={controller} onDone={run} />
+      <FleetPanel fleet={fleet} />
       <GenUiPanel panel={panel} />
+      <TimelinePanel timeline={timeline} />
     </main>
   );
 }
@@ -160,6 +172,104 @@ function InterruptCard({
   );
 }
 
+function FleetPanel({ fleet }: { fleet: Fleet }) {
+  const groups = useMemo(() => groupByRunner(fleet), [fleet]);
+  return (
+    <section aria-label="Fleet">
+      <h2>Fleet (ambient stream)</h2>
+      <p>
+        The agents this server can see, grouped by the runner each one runs on. A terminal with no runner is
+        local. Cards come from the CAO profile catalog, not from anything an agent wrote. This panel has no
+        controls.
+      </p>
+      {fleet.stale ? (
+        <p role="status">
+          The fleet may be out of sync: a change from the stream could not be applied. It is corrected by the next
+          snapshot, which a reconnect brings.
+        </p>
+      ) : null}
+      <HostStrip fleet={fleet} />
+      {groups.length === 0 ? <p>No terminals yet.</p> : null}
+      {groups.map((group) => (
+        <section key={group.runnerId === null ? "group:local" : `runner:${group.runnerId}`} aria-label={`Runner ${group.label}`}>
+          <h3>{group.label}</h3>
+          <p>
+            {group.terminals.length} {group.terminals.length === 1 ? "terminal" : "terminals"}
+            {group.waiting > 0 ? `, ${group.waiting} waiting for an answer` : ""}
+          </p>
+          {group.sessions.map((session) => (
+            <div key={session.name}>
+              <h4>
+                Session {session.name || "(none)"} <small>({session.status})</small>
+              </h4>
+              <ul>
+                {session.terminals.map((terminal) => (
+                  <li key={terminal.id}>
+                    <TerminalRow terminal={terminal} fleet={fleet} />
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </section>
+      ))}
+    </section>
+  );
+}
+
+const shown = (value: number | null, unit = ""): string => (value === null ? "—" : `${value}${unit}`);
+
+/** Host resources. Numbers only; a missing one is "—", never 0. The server reports the local host only. */
+function HostStrip({ fleet }: { fleet: Fleet }) {
+  const local = fleet.host.find((entry) => entry.runnerId === null) ?? null;
+  return (
+    <section aria-label="Host resources">
+      <p>
+        <strong>Host resources</strong>
+      </p>
+      {local === null ? (
+        <p>Host resources: not reported.</p>
+      ) : (
+        <dl>
+          <dt>CPU</dt>
+          <dd>{shown(local.cpuPercent, "%")}</dd>
+          <dt>Load per core</dt>
+          <dd>{shown(local.loadPerCore)}</dd>
+          <dt>Memory used</dt>
+          <dd>{shown(local.memoryUsedPercent, "%")}</dd>
+          <dt>Memory pressure</dt>
+          <dd>{local.memoryPressure ?? "—"}</dd>
+        </dl>
+      )}
+      <p>
+        <small>
+          Local host only. Numbers refresh when the fleet changes and at most every 30 seconds, so an idle fleet
+          shows the last sample{local?.sampledAt ? ` (taken ${local.sampledAt})` : ""}.
+        </small>
+      </p>
+    </section>
+  );
+}
+
+function TerminalRow({ terminal, fleet }: { terminal: FleetTerminal; fleet: Fleet }) {
+  const card = agentCardFor(terminal, fleet.profiles);
+  return (
+    <article aria-label="agent_card">
+      <h5>
+        {terminal.id}: {terminal.status ?? "unknown"}
+      </h5>
+      <dl>
+        {Object.entries(card).map(([key, value]) => (
+          <div key={key}>
+            <dt>{key}</dt>
+            <dd>{value}</dd>
+          </div>
+        ))}
+      </dl>
+    </article>
+  );
+}
+
 function GenUiPanel({ panel }: { panel: Panel }) {
   return (
     <section aria-label="Generative UI">
@@ -183,6 +293,7 @@ function PanelEntry({ entry }: { entry: Entry }) {
       <article aria-label="refused component">
         <h3>Refused: "{entry.component}" is not on the allow-list</h3>
         <p>From {ownerText(entry.owner)}. Props are not shown.</p>
+        {entry.moreRefused ? <p>And {entry.moreRefused} more refused.</p> : null}
       </article>
     );
   }
@@ -197,6 +308,51 @@ function PanelEntry({ entry }: { entry: Entry }) {
             <dd>{value}</dd>
           </div>
         ))}
+      </dl>
+    </article>
+  );
+}
+
+function TimelinePanel({ timeline }: { timeline: Timeline }) {
+  return (
+    <section aria-label="Session timeline">
+      <h2>Session timeline (ambient stream)</h2>
+      <p>
+        Calls between agents, from the stream's metadata: who called whom, and whether the call is open, completed or ended.
+        A call completes when the receiver's work ends, and ends as superseded when a newer call goes to the same
+        receiver. After a reconnect, a call that was still open is shown as
+        unconfirmed: its end may have happened while the stream was down, and the stream does not resend it. No message
+        text is shown, and this panel has no controls.
+      </p>
+      {timeline.entries.length === 0 ? <p>No calls yet.</p> : null}
+      <ol>
+        {timeline.entries.map((entry) => (
+          <li key={entry.toolCallId}>
+            <TimelineRow entry={entry} />
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
+function TimelineRow({ entry }: { entry: TimelineEntry }) {
+  return (
+    <article aria-label={`call ${entry.toolCallId}`}>
+      <h3>{callText(entry)}</h3>
+      <dl>
+        <dt>State</dt>
+        <dd data-testid="call-state">{stateLabel(entry)}</dd>
+        <dt>Attributed to</dt>
+        <dd>{ownerText(entry.owner)}</dd>
+        <dt>Started</dt>
+        <dd>{timeText(entry.startedAt)}</dd>
+        {isFinished(entry) ? (
+          <>
+            <dt>{entry.state === "completed" ? "Completed" : "Ended"}</dt>
+            <dd>{timeText(entry.endedAt)}</dd>
+          </>
+        ) : null}
       </dl>
     </article>
   );

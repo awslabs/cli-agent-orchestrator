@@ -51,10 +51,6 @@ class TestMessages:
         assert 'delete_terminal("w1")' in text
         assert text.endswith("---\nresult")
 
-    def test_auto_forward_no_tool_reason(self):
-        text = svc.build_auto_forward_message("w1", "p", EdgeReason.NO_SEND_MESSAGE_TOOL, "x")
-        assert "Reason: has no send_message tool (cao-mcp-server is not in its profile)" in text
-
     def test_worker_ended_message(self):
         text = svc.build_worker_ended_message("w1", "developer", "was deleted", None)
         assert text.startswith("[CAO worker ended] Worker w1 (profile developer) was deleted")

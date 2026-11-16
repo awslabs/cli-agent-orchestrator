@@ -14,9 +14,13 @@ All factors are clamped to ``[0.0, 1.0]`` so the composite is bounded
 and future-dated timestamps.
 """
 
+import logging
 import math
+import threading
 from datetime import datetime, timezone
 from typing import Literal, Optional
+
+logger = logging.getLogger(__name__)
 
 # Public weights — frozen for U4. Adjusting requires a new spec unit.
 W_BM25 = 0.50
@@ -33,6 +37,9 @@ USAGE_NORMALISER = 100
 # set raises ``ValueError`` — no silent fallback.
 SortBy = Literal["score", "recency", "usage", "relevance"]
 SORT_BY_VALUES: frozenset = frozenset({"score", "recency", "usage", "relevance"})
+DEFAULT_SORT_VALUES: frozenset = frozenset({"recency", "bm25"})
+_warned_invalid_default_sorts: set[tuple[str, str]] = set()
+_warned_invalid_default_sorts_lock = threading.Lock()
 
 # Scope precedence. Lower index = higher precedence in the
 # final scope-stable sort that runs AFTER score sorting in ``recall()``.
@@ -121,6 +128,22 @@ def validate_sort_by(sort_by: str) -> str:
     if sort_by not in SORT_BY_VALUES:
         raise ValueError(f"sort_by must be one of {sorted(SORT_BY_VALUES)}; got {sort_by!r}")
     return sort_by
+
+
+def validate_default_sort(default_sort: object) -> str:
+    """Return a valid configured default sort, falling back safely to recency."""
+    if not isinstance(default_sort, str) or default_sort not in DEFAULT_SORT_VALUES:
+        warning_key = (type(default_sort).__qualname__, repr(default_sort))
+        with _warned_invalid_default_sorts_lock:
+            should_warn = warning_key not in _warned_invalid_default_sorts
+            _warned_invalid_default_sorts.add(warning_key)
+        if should_warn:
+            logger.warning(
+                "Invalid memory.ranking.default_sort=%r; using recency",
+                default_sort,
+            )
+        return "recency"
+    return str(default_sort)
 
 
 def scope_write_allowed(caller: str, target: str) -> bool:

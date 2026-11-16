@@ -2,7 +2,8 @@
 name: dojo-approver
 description: Claude Code seat for the CAO Dojo approval demo. Asks permission before it writes one file.
 provider: claude_code
-# Cheapest Claude Code model alias. The demo spends a few hundred tokens.
+# Cheapest Claude Code model alias. A demo run is one short session; most of its input
+# tokens are Claude Code's own system prompt, served through the prompt cache.
 model: haiku
 # Without this, CAO launches Claude Code with --dangerously-skip-permissions and
 # no permission prompt ever appears for the Dojo to answer.

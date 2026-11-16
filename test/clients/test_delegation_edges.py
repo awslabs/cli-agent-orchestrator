@@ -47,6 +47,24 @@ def test_new_assign_edge_is_open_and_unarmed(db):
     assert [e.id for e in list_open_edges_into("w1")] == [edge.id]
 
 
+def test_stored_reason_this_version_does_not_define_reads_as_default(db):
+    from cli_agent_orchestrator.clients import database
+
+    with database.SessionLocal() as session:
+        session.add(
+            database.DelegationEdgeModel(
+                caller_id="sup",
+                worker_id="w1",
+                source=EdgeSource.ASSIGN.value,
+                state=EdgeState.OPEN.value,
+                reason="a_reason_this_version_does_not_define",
+            )
+        )
+        session.commit()
+    [edge] = list_open_edges_into("w1")
+    assert edge.reason == EdgeReason.NO_CALLBACK
+
+
 def test_mark_assign_edges_delivered_arms_them(db):
     edge = create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
     mark_assign_edges_delivered("w1")

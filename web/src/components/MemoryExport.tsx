@@ -67,7 +67,7 @@ export function MemoryExport({ memories }: { memories: MemorySummary[] }) {
               aria-label="Export scope"
               value={scope}
               onChange={e => setScope(e.target.value as 'global' | 'project')}
-              className="mt-1 w-full rounded border border-gray-700 bg-gray-900 px-2 py-1 text-gray-200"
+              className="mt-1 w-full rounded border border-gray-700 bg-gray-900 py-1 pl-2 pr-8 text-gray-200"
             >
               <option value="global">global</option>
               <option value="project">project</option>

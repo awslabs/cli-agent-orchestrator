@@ -29,6 +29,7 @@ function terminal(overrides: Partial<TerminalView> = {}): TerminalView {
     window: "w0",
     status: "idle",
     last_active: null,
+    runner_id: null,
     ...overrides,
   };
 }

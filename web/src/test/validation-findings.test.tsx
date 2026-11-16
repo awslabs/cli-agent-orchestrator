@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, fireEvent, act, within } from '@testing-library/react'
+import { render, screen, fireEvent, act, within, waitFor } from '@testing-library/react'
 import { ValidationFindings, OMISSION_MESSAGE } from '../components/ValidationFindings'
 import { ProfileEditorModal } from '../components/ProfileEditorModal'
 import { ProfileValidationMessage } from '../api'
@@ -104,6 +104,10 @@ describe('editor save — errors block, warnings allow (stage 5)', () => {
   async function openEditorAndSave(mock: ReturnType<typeof vi.fn>) {
     render(<ProfileEditorModal open={true} mode="edit" name="local-agent" onClose={() => {}} onSaved={() => {}} />)
     await screen.findByRole('textbox', { name: /profile source/i })
+    // The Params section reads the loaded text through validate. Let that read
+    // settle and forget it, so the counts below are the save's own calls.
+    await waitFor(() => expect(screen.getByTestId('params-status')).not.toHaveTextContent('Reading'))
+    mock.mockClear()
     fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
     await act(async () => {})
     return mock
@@ -164,6 +168,10 @@ describe('editor save — errors block, warnings allow (stage 5)', () => {
     vi.stubGlobal('fetch', mock)
     render(<ProfileEditorModal open={true} mode="clone" name="local-agent" onClose={() => {}} onSaved={() => {}} />)
     await screen.findByRole('textbox', { name: /profile source/i })
+    // Forget the Params section's read of the loaded text: the call checked
+    // below is the one the save sends.
+    await waitFor(() => expect(screen.getByTestId('params-status')).not.toHaveTextContent('Reading'))
+    mock.mockClear()
     fireEvent.click(screen.getByRole('button', { name: /create copy/i }))
     await act(async () => {})
 

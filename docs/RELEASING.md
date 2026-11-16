@@ -38,7 +38,9 @@ publish-to-pypi.yml (a maintainer dispatches `release` from the tag, or publishe
 a commit that had not been bumped, built already-published filenames for ~80 minutes,
 and then failed at TestPyPI with `400 File already exists`. It runs
 `scripts/assert_release_version.py`, whose failure text names the remedy for the
-situation it found.
+situation it found. On the release chain it also runs `make check-agui-trace-release`,
+which refuses a missing or stale CAO Dojo trace. **Release** runs both checks before it
+tags, so a tree they would refuse never becomes a tag and a GitHub Release.
 
 Authentication uses [PyPI Trusted Publishing (OIDC)](https://docs.pypi.org/trusted-publishers/) —
 no API token secrets are stored in GitHub.
@@ -218,6 +220,22 @@ same tag fails the same way, because it checks out the same tree. Merge a
 `chore: release vX.Y.Z` PR that bumps `pyproject.toml`, `uv.lock` and
 `.devcontainer/features/cao/devcontainer-feature.json` together (the shape of #899),
 then delete the tag and its GitHub Release and re-create both on that merge commit.
+
+**Release, or `verify-release-version`, fails ("trace missing or stale"):**
+The published CAO Dojo AG-UI trace
+(`examples/ag-ui/cao-dojo/trace/cao-dojo-trace.ndjson`) is missing, or was recorded
+against an older committed shape file. PRs only warn about this, because re-recording
+needs a logged-in Claude Code. **Release** runs the same check before it tags, so in
+the usual case nothing was tagged: someone with Claude Code runs `make record-agui-trace`
+on `main`, merges the result, and runs **Release** again. If a tag and GitHub Release
+already exist (a tag created by hand, say), re-create them on that merge commit. The
+check reads two committed files and needs no server or network
+(`make check-agui-trace-release` reproduces it locally).
+
+A maintainer without Claude Code can still publish an already-tagged version through
+the `pypi` dispatch (see "Manual PyPI publish (escape hatch)"): the trace check runs
+only on the release chain, not on the `testpypi` or `pypi` dispatches. That publishes
+with the stale trace, so record it before the next release.
 
 **`verify-release-version` fails ("... is already on https://test.pypi.org"):**
 An earlier run of this version reached TestPyPI before failing later in the

@@ -157,12 +157,20 @@ def kiro_v3_allow_unverified_versions() -> bool:
     Provisional (#1167). When JSON ``true``, a Kiro v3 launch may run on a
     kiro-cli version whose allow-list entry is still pending operator
     verification, so that the operator can run the live checklist on it.
-    Nothing else is widened: a version absent from the allow-list still
-    refuses, and every other v3 check still applies. No environment override;
+    By itself this never admits an unlisted version; observed admission also
+    uses it to permit pending predecessor rows. Every other v3 check still
+    applies. No environment override;
     an unreadable settings file reads as off.
     """
     block = _load().get("kiro", {})
     return isinstance(block, dict) and block.get("v3_allow_unverified_versions") is True
+
+
+def kiro_v3_observed_admission() -> bool:
+    """Only the exact settings.json string enables observed admission; no env override."""
+    block = _load().get("kiro", {})
+    value = block.get("v3_admission") if isinstance(block, dict) else None
+    return isinstance(value, str) and value == "observed"
 
 
 def _load() -> Dict[str, Any]:
@@ -745,6 +753,7 @@ def get_memory_settings() -> Dict[str, Any]:
         "explain_enabled": True,
         "non_accessing_inspection": False,
         "lifecycle": {"enabled": False},
+        "ranking": {"default_sort": "recency"},
     }
     saved = settings.get("memory", {})
     if not isinstance(saved, dict):
@@ -1209,6 +1218,7 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``enabled`` (bool) — master switch for the memory subsystem.
         ``explain_enabled`` (bool) — on-demand CLI relevance diagnostic.
         ``lifecycle.enabled`` (bool) — opt-in supersedes lifecycle.
+        ``ranking.default_sort`` (str) — ``recency`` or ``bm25`` query recall default.
         ``non_accessing_inspection`` (bool) — opt-in operator reads without access bumps.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
         ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
@@ -1249,6 +1259,14 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         if not isinstance(value, bool):
             raise ValueError("lifecycle.enabled must be a bool")
         coerced = value
+    elif key == "ranking.default_sort":
+        from cli_agent_orchestrator.services.memory_scoring import DEFAULT_SORT_VALUES
+
+        if not isinstance(value, str) or value not in DEFAULT_SORT_VALUES:
+            raise ValueError(
+                f"ranking.default_sort must be one of {sorted(DEFAULT_SORT_VALUES)}, got {value!r}"
+            )
+        coerced = value
     elif key in {"explain_enabled", "non_accessing_inspection"}:
         if not isinstance(value, bool):
             raise ValueError(f"{key} must be a bool, got {type(value).__name__}")
@@ -1282,6 +1300,11 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
             if not isinstance(lifecycle, dict):
                 lifecycle = {}
             memory["lifecycle"] = {**lifecycle, "enabled": coerced}
+        elif key == "ranking.default_sort":
+            ranking = memory.get("ranking", {})
+            if not isinstance(ranking, dict):
+                ranking = {}
+            memory["ranking"] = {**ranking, "default_sort": coerced}
         else:
             memory[key] = coerced
         settings["memory"] = memory

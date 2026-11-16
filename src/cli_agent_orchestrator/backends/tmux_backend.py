@@ -6,7 +6,7 @@ no alternative is configured.
 """
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.backends.base import (
     TerminalBackend,
@@ -17,10 +17,15 @@ from cli_agent_orchestrator.clients.tmux import (
     DEFAULT_PANE_LAYOUT,
     PaneSpawnUnavailable,
     TmuxClient,
+    web_view_attach_argv,
 )
 from cli_agent_orchestrator.constants import TMUX_HISTORY_LIMIT
 
 logger = logging.getLogger(__name__)
+
+# See TmuxBackend.web_input_escape_hold.
+_TMUX_ESCAPE_HOLD_FLOOR_MS = 500
+_TMUX_ESCAPE_HOLD_MARGIN_MS = 50
 
 # The window pane-mode terminals share. Named rather than "the current window"
 # so a spawn triggered from anywhere lands in one place; the first pane-mode
@@ -225,12 +230,53 @@ class TmuxBackend(TerminalBackend):
         subprocess.run(["tmux", "attach-session", "-t", session_name], check=True)
 
     def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
-        """Return the tmux command used by the browser PTY WebSocket."""
+        """Return the tmux command used by the browser PTY WebSocket.
+
+        Attaches a private view session rather than the agent's session itself,
+        so several browser terminals on one session each keep their own window
+        (see ``web_view_attach_argv``).
+        """
         if self._spawn_mode != "pane":
-            return ["tmux", "-u", "attach-session", "-t", f"{session_name}:{window_name}"]
+            return web_view_attach_argv(session_name, f"{session_name}:{window_name}")
         # Only pane mode has to ask tmux where the terminal is; the window-mode
         # target is a pure function of its arguments and stays one.
-        return self._client.attach_command(session_name, window_name)
+        return self._client.web_view_attach_command(session_name, window_name)
+
+    def prepare_web_attach_input(
+        self, session_name: str, window_name: str
+    ) -> Tuple[List[str], Optional[Tuple[str, str]]]:
+        """The browser attach argv, plus ``(window_id, pane_id)`` in pane mode.
+
+        In pane mode several agents are panes of one window, and tmux keeps one
+        active pane per window, not per client: keys from any browser terminal
+        on that window go to whichever pane is active. The handler serialises
+        input per window and selects the pane before each write. Argv and pane
+        come from one lookup; a lookup that fails refuses the attach.
+        """
+        if self._spawn_mode != "pane":
+            return web_view_attach_argv(session_name, f"{session_name}:{window_name}"), None
+        try:
+            return self._client.web_view_attach_plan(session_name, window_name)
+        except Exception as e:  # noqa: BLE001 — TmuxLookupError, or libtmux with the server gone
+            raise TerminalBackendError(
+                f"Could not locate terminal '{session_name}:{window_name}': {e}"
+            ) from e
+
+    def web_input_escape_hold(self) -> float:
+        """tmux's ``escape-time``, floored at 500 ms, plus a margin.
+
+        tmux keeps a trailing Escape as a partial key for ``escape-time`` (10 ms
+        by default since 3.5, 500 ms before), and for at least 500 ms while it
+        still waits for the client's answers to its own terminal queries, which
+        is just after an attach. The floor covers both.
+        """
+        configured = self._client.escape_time_ms()
+        floor_ms = _TMUX_ESCAPE_HOLD_FLOOR_MS
+        ms = max(configured if configured is not None else floor_ms, floor_ms)
+        return (ms + _TMUX_ESCAPE_HOLD_MARGIN_MS) / 1000
+
+    def focus_web_input(self, target: str) -> None:
+        self._client.select_pane(target)
 
     # --- Pipe-pane ---
 

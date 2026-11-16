@@ -1,5 +1,6 @@
 """Agent profile utilities."""
 
+import errno
 import hashlib
 import logging
 import os
@@ -9,7 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from importlib import resources
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Set
+from typing import Any, Dict, List, Mapping, Optional, Set
 
 import frontmatter
 
@@ -176,7 +177,8 @@ def _scan_profile_source(source, profile_name: str) -> "tuple[Dict, bool]":
         return _discovery_fields({}), False
     discovery = _discovery_fields(data.metadata)
     try:
-        meta = dict(data.metadata)
+        # Frontmatter values are whatever YAML parsed; AgentProfile validates them.
+        meta: Dict[str, Any] = dict(data.metadata)
         meta["system_prompt"] = data.content.strip()
         meta.setdefault("name", profile_name)
         meta.setdefault("description", "")
@@ -541,7 +543,8 @@ def profile_set_digest(profile_set: Optional[Mapping[str, ProfileEntry]] = None)
 def parse_agent_profile_text(resolved_text: str, profile_name: str) -> AgentProfile:
     """Parse an AgentProfile from already-resolved markdown text."""
     profile_data = frontmatter.loads(resolved_text)
-    meta = profile_data.metadata
+    # Frontmatter values are whatever YAML parsed; AgentProfile validates them.
+    meta: Dict[str, Any] = profile_data.metadata
     meta["system_prompt"] = profile_data.content.strip()
     # Fill in required fields if missing (Kiro profiles don't have frontmatter)
     if "name" not in meta:
@@ -586,6 +589,30 @@ def installed_profile_exists(agent_name: str) -> bool:
     return True
 
 
+# errnos that mean "nothing at this path", as opposed to "can't look".
+_ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
+
+
+def _path_exists(path: Path) -> bool:
+    """``Path.exists()``, but a permission fault raises instead of reading as absent.
+
+    Python 3.11-3.13 raise ``PermissionError`` from ``exists()`` when a parent
+    directory denies access; 3.14 returns ``False``. The store reader below relies
+    on the raise: it is what ``load_agent_profile`` wraps into the RuntimeError a
+    sandboxed caller falls back on, and what keeps "can't read the store" from
+    being reported as "no such profile". Keep the 3.11-3.13 rule on every version.
+    """
+    try:
+        path.stat()
+    except OSError as exc:
+        if exc.errno in _ABSENT_ERRNOS:
+            return False
+        raise
+    except ValueError:
+        return False
+    return True
+
+
 def _read_installed_agent_profile_source(agent_name: str) -> str:
     """Raw installed lookup for namespace collision checks and the guarded reader."""
     _validate_agent_name(agent_name)
@@ -607,17 +634,17 @@ def _read_installed_agent_profile_source(agent_name: str) -> str:
     # anything that sneaks past (e.g. symlinks resolving outside the root).
     if normalized_path(LOCAL_AGENT_STORE_DIR) not in disabled:
         local_profile = _safe_join(LOCAL_AGENT_STORE_DIR, f"{agent_name}.md")
-        if local_profile is not None and local_profile.exists():
+        if local_profile is not None and _path_exists(local_profile):
             return local_profile.read_text(encoding="utf-8")
 
     def _lookup_in_directory(directory: Path) -> str | None:
-        if not directory.exists():
+        if not _path_exists(directory):
             return None
         flat = _safe_join(directory, f"{agent_name}.md")
-        if flat is not None and flat.exists():
+        if flat is not None and _path_exists(flat):
             return flat.read_text(encoding="utf-8")
         nested = _safe_join(directory, agent_name, "agent.md")
-        if nested is not None and nested.exists():
+        if nested is not None and _path_exists(nested):
             return nested.read_text(encoding="utf-8")
         return None
 
@@ -710,6 +737,13 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
         # will surface a clear error later.  Fall back for now.
         return fallback_provider
 
+    return provider_from_profile(profile, agent_profile_name, fallback_provider)
+
+
+def provider_from_profile(
+    profile: AgentProfile, agent_profile_name: str, fallback_provider: str
+) -> str:
+    """Return the profile's pinned provider if valid, else ``fallback_provider``."""
     if profile.provider:
         if profile.provider in PROVIDERS:
             return profile.provider

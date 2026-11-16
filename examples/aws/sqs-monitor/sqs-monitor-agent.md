@@ -18,6 +18,24 @@ mcpServers:
     type: stdio
     command: cao-mcp-server
     args: []
+params:
+  profile:
+    description: "AWS CLI profile name"
+    required: true
+  region:
+    description: "AWS region"
+    required: true
+  queue_url:
+    description: "Full SQS queue URL"
+    required: true
+  poll_interval_seconds:
+    description: "Seconds between polls"
+    type: int
+    default: 10
+  timeout_seconds:
+    description: "Max wait time in seconds"
+    type: int
+    default: 300
 ---
 
 # SQS Monitor Agent
@@ -39,7 +57,21 @@ Install this agent with your values via `cao install --env`:
 
 See `config.json` in this folder for a reference of all values.
 
+In a workflow, a step that uses this profile sets these params instead. Each
+one fills the placeholder named next to it:
+
+- `profile` fills `${AWS_PROFILE}`
+- `region` fills `${AWS_REGION}`
+- `queue_url` fills `${QUEUE_URL}`
+- `poll_interval_seconds` fills `${POLL_INTERVAL_SECONDS}`
+- `timeout_seconds` fills `${TIMEOUT_SECONDS}`
+
 ## Instructions
+
+When the message has a "Parameters for this step" list, it comes from a workflow
+step. Use each value there in place of the `${...}` placeholder that its param
+fills, as listed under Configuration. Outside a workflow, the placeholders work
+as before.
 
 When you receive a message, poll the queue until it drains or times out.
 

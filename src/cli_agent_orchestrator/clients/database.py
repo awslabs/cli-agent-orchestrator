@@ -496,6 +496,10 @@ LAUNCH_TARGET_KINDS = ("installed", "ephemeral", "workflow")
 # ``kept_expired`` and ``kept_evicted`` (#1225) are a kept child torn down by the
 # keep reaper after its idle window, and a kept child torn down to make room under
 # ``terminal.keep_finished.max_per_session``.
+# ``creator_rollback`` (#1277) is a terminal whose session was killed by the
+# rollback of ANOTHER terminal's failed create: the create that made the session
+# failed and, seeing no other row in it, killed the session. A row that joined
+# it anyway (written without this process's lifecycle lock) died with it.
 LAUNCH_END_REASONS = (
     "launch_failed",
     "deleted",
@@ -504,6 +508,7 @@ LAUNCH_END_REASONS = (
     "session_teardown",
     "kept_expired",
     "kept_evicted",
+    "creator_rollback",
 )
 
 
@@ -808,6 +813,40 @@ def get_launch_record(terminal_id: str) -> Optional[Dict[str, Any]]:
             .first()
         )
         return None if row is None else _launch_record_dict(row)
+
+
+def terminal_has_recorded_cao_call(terminal_id: str, since: datetime) -> bool:
+    """Did ``terminal_id`` make a CAO call the server recorded at or after ``since``?
+
+    Read-only evidence that a terminal still counted as initializing is in fact
+    up and working (#1277): a launch record naming it as the caller (its
+    ``assign``/``handoff`` reached the server and created a worker) or an
+    ephemeral profile it owns (its ``create_ephemeral_agent`` call). ``since``
+    is when this terminal's init began, so a row left by an earlier terminal that
+    reused the 8-hex id never counts. Raises on a genuine DB error; the caller
+    treats that as "no evidence".
+    """
+    with SessionLocal() as db:
+        launched = (
+            db.query(LaunchRecordModel.id)
+            .filter(
+                LaunchRecordModel.caller_id == terminal_id,
+                LaunchRecordModel.created_at >= since,
+            )
+            .first()
+        )
+        if launched is not None:
+            return True
+        owned = (
+            db.query(EphemeralAgentModel.name)
+            .filter(
+                EphemeralAgentModel.owner_kind == "terminal",
+                EphemeralAgentModel.owner_id == terminal_id,
+                EphemeralAgentModel.created_at >= since,
+            )
+            .first()
+        )
+        return owned is not None
 
 
 def compute_busy_seconds(record_id: int) -> float:
@@ -3478,6 +3517,9 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
                 "session_incarnation_id": t.session_incarnation_id,
+                # As stored, None included (#1131), read from the row already
+                # fetched here: no extra query per terminal.
+                "identity_verified": t.identity_verified,
                 # #1225: end of the keep window for a kept child, else None.
                 "kept_until": kept_until,
                 "last_active": t.last_active,
@@ -3586,6 +3628,9 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
                 "session_incarnation_id": t.session_incarnation_id,
+                # As stored, None included (#1131), read from the row already
+                # fetched here: no extra query per terminal.
+                "identity_verified": t.identity_verified,
                 # #1225: end of the keep window for a kept child, else None.
                 "kept_until": kept_until,
                 "last_active": t.last_active,
@@ -3622,6 +3667,9 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
                 "session_incarnation_id": t.session_incarnation_id,
+                # As stored, None included (#1131), read from the row already
+                # fetched here: no extra query per terminal.
+                "identity_verified": t.identity_verified,
                 # #1225: end of the keep window for a kept child, else None.
                 "kept_until": kept_until,
                 "last_active": t.last_active,
@@ -4209,6 +4257,15 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
 # Delegation edge functions (assign-callback-guarantee)
 
 
+def _edge_reason(value: str) -> EdgeReason:
+    # A stored row can carry a reason value this version does not define;
+    # it reads as the default so the edge stays usable.
+    try:
+        return EdgeReason(value)
+    except ValueError:
+        return EdgeReason.NO_CALLBACK
+
+
 def _edge_from_row(row: DelegationEdgeModel) -> DelegationEdge:
     return DelegationEdge(
         id=row.id,
@@ -4216,7 +4273,7 @@ def _edge_from_row(row: DelegationEdgeModel) -> DelegationEdge:
         worker_id=row.worker_id,
         source=EdgeSource(row.source),
         state=EdgeState(row.state),
-        reason=EdgeReason(row.reason),
+        reason=_edge_reason(row.reason),
         message_id=row.message_id,
         created_at=row.created_at,
         delivered_at=row.delivered_at,

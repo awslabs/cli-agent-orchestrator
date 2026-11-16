@@ -413,7 +413,7 @@ class TestValidateAgentProfileEndpoint:
         response = client.post("/agents/profiles/validate", json={"content": content})
 
         assert response.status_code == 200
-        assert response.json() == {"valid": True, "messages": []}
+        assert response.json() == {"valid": True, "messages": [], "params": None}
 
     def test_missing_required_name_is_an_error(self, client) -> None:
         """``name`` is the only required field; omitting it must invalidate."""

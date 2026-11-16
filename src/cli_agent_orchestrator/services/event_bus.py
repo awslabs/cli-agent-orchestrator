@@ -3,6 +3,10 @@
 Event Topics:
 - terminal.{id}.output  → raw output chunks (from FIFO readers)
 - terminal.{id}.status  → status changes (from StatusMonitor)
+- terminal.{id}.delivery → ``{"pending": False}``, published once when a terminal's
+  first-message mask lifts (terminal_service). The status a client reads changes then
+  without a status change, so this is how a live view learns to refresh. Consumed only by
+  the AG-UI ambient stream.
 """
 
 import asyncio

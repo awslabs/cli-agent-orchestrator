@@ -16,7 +16,7 @@ Design constraints:
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.services.agui.base import (
     AguiConstruct,
@@ -48,6 +48,15 @@ _ROLLUP_TYPES = frozenset(
         AGUI_TOOL_CALL_RESULT,
     }
 )
+
+
+#: What the local group (``runner_id is None``) is called.
+LOCAL_LABEL = "local"
+
+
+def _runner_sort_key(runner_id: Optional[str]) -> Tuple[int, str]:
+    """Local (``None``) first, then runners by id."""
+    return (0, "") if runner_id is None else (1, str(runner_id))
 
 
 class SupervisorDashboardStream(AguiConstruct):
@@ -129,8 +138,12 @@ class SupervisorDashboardStream(AguiConstruct):
     def hierarchy(self) -> Dict[str, Dict[str, Any]]:
         """Derive session hierarchy from fleet state.
 
-        Returns a dict mapping session_name -> {status, terminal_ids, terminal_count}.
-        Groups terminals by their session_name field.
+        Returns a dict mapping session_name -> {status, terminal_ids, terminal_count,
+        runner_ids}. Groups terminals by their session_name field.
+
+        The key is the session name alone, so two runners that both own a session with
+        the same name share one entry here; ``runner_ids`` lists who is in it. Use
+        :meth:`hierarchy_by_runner` for a view that keeps them apart.
         """
         if self._fleet is None:
             return {}
@@ -147,6 +160,7 @@ class SupervisorDashboardStream(AguiConstruct):
                 "status": session.get("status", "unknown"),
                 "terminal_ids": [],
                 "terminal_count": 0,
+                "runner_ids": [],
             }
 
         # Group terminals by session_name.
@@ -159,11 +173,78 @@ class SupervisorDashboardStream(AguiConstruct):
                     "status": "unknown",
                     "terminal_ids": [],
                     "terminal_count": 0,
+                    "runner_ids": [],
                 }
             result[session_name]["terminal_ids"].append(terminal.get("id", ""))
             result[session_name]["terminal_count"] += 1
+            runner_id = terminal.get("runner_id")
+            if runner_id not in result[session_name]["runner_ids"]:
+                result[session_name]["runner_ids"].append(runner_id)
 
+        for entry in result.values():
+            entry["runner_ids"].sort(key=_runner_sort_key)
         return result
+
+    def hierarchy_by_runner(self) -> Dict[Tuple[Optional[str], str], Dict[str, Any]]:
+        """Like :meth:`hierarchy`, keyed by ``(runner_id, session_name)``.
+
+        ``runner_id`` is ``None`` for local terminals. A session that no terminal of a
+        given runner belongs to has no entry for that runner, except that a session
+        listed in the fleet always has its ``(None, name)`` entry, as in ``hierarchy()``.
+        """
+        if self._fleet is None:
+            return {}
+
+        sessions: List[Dict[str, Any]] = self._fleet.get("sessions", [])
+        terminals: List[Dict[str, Any]] = self._fleet.get("terminals", [])
+        known = {s.get("name", s.get("id", "")): s.get("status", "unknown") for s in sessions}
+
+        result: Dict[Tuple[Optional[str], str], Dict[str, Any]] = {}
+        for name, status in known.items():
+            result[(None, name)] = {"status": status, "terminal_ids": [], "terminal_count": 0}
+        for terminal in terminals:
+            key = (terminal.get("runner_id"), terminal.get("session_name", ""))
+            if key not in result:
+                result[key] = {
+                    "status": known.get(key[1], "unknown"),
+                    "terminal_ids": [],
+                    "terminal_count": 0,
+                }
+            result[key]["terminal_ids"].append(terminal.get("id", ""))
+            result[key]["terminal_count"] += 1
+        return result
+
+    def by_runner(self) -> List[Dict[str, Any]]:
+        """Group the fleet's terminals by ``runner_id``: local first, then by id.
+
+        A list rather than a dict because the local group's id is ``None`` and JSON
+        cannot key an object by null. Each group is
+        ``{runner_id, label, terminal_count, waiting, by_status}``, ``label`` being
+        ``"local"`` for ``None``. A fleet whose rows carry no ``runner_id`` (every fleet
+        on ``main`` today) is exactly one local group.
+        """
+        if self._fleet is None:
+            return []
+        groups: Dict[Optional[str], Dict[str, Any]] = {}
+        for terminal in self._fleet.get("terminals", []):
+            runner_id = terminal.get("runner_id")
+            group = groups.setdefault(
+                runner_id,
+                {
+                    "runner_id": runner_id,
+                    "label": LOCAL_LABEL if runner_id is None else str(runner_id),
+                    "terminal_count": 0,
+                    "waiting": [],
+                    "by_status": {},
+                },
+            )
+            group["terminal_count"] += 1
+            status = terminal.get("status")
+            if status == "waiting_user_answer":
+                group["waiting"].append(terminal.get("id", ""))
+            if status is not None:
+                group["by_status"][status] = group["by_status"].get(status, 0) + 1
+        return [groups[k] for k in sorted(groups, key=_runner_sort_key)]
 
     def supervisor_snapshot(self) -> Dict[str, Any]:
         """Return a supervisor-level summary of the fleet.
@@ -174,6 +255,7 @@ class SupervisorDashboardStream(AguiConstruct):
                 "counts": dict - from fleet counts or zeros,
                 "by_provider": dict - terminal count per provider,
                 "waiting_terminals": list - terminal ids with status=="waiting_user_answer",
+                "by_runner": list - terminals grouped by runner_id (see by_runner()),
                 "last_activity": dict or None - {timestamp, event_id} of most recent frame,
             }
         """
@@ -183,6 +265,7 @@ class SupervisorDashboardStream(AguiConstruct):
                 "counts": {"sessions": 0, "terminals": 0},
                 "by_provider": {},
                 "waiting_terminals": [],
+                "by_runner": [],
                 "last_activity": self._last_activity,
             }
 
@@ -217,6 +300,7 @@ class SupervisorDashboardStream(AguiConstruct):
             "counts": counts,
             "by_provider": by_provider,
             "waiting_terminals": waiting_terminals,
+            "by_runner": self.by_runner(),
             "last_activity": self._last_activity,
         }
 

@@ -2055,10 +2055,10 @@ async def memory_recall(
         ge=1,
         le=100,
     ),
-    search_mode: str = "hybrid",
-    sort_by: str = Field(
-        default="recency",
-        description='Ranking: "recency" (default), "score" (BM25+recency+usage), "usage", or "relevance" (lexical relevance over a widened pool; needs query, else behaves as recency).',
+    search_mode: Optional[str] = None,
+    sort_by: Optional[str] = Field(
+        default=None,
+        description='Ranking: "recency" (default), "score" (BM25+recency+usage), "usage", or "relevance" (lexical relevance over a widened pool; needs query, else behaves as recency). When both ranking arguments are omitted, memory.ranking.default_sort may select BM25 for query recall.',
     ),
     include_related: bool = Field(
         default=False,
@@ -2410,8 +2410,8 @@ async def store_lesson(
     target_agent_profile: str = Field(
         description=(
             "Agent profile the lesson is for (e.g. 'transformer'). The lesson is "
-            "stored in THAT profile's agent scope so it reaches that agent's "
-            "future sessions."
+            "stored in THAT profile's agent scope; that agent finds it by calling "
+            "memory_recall (it is not injected into its sessions)."
         )
     ),
     content: str = Field(
@@ -3485,8 +3485,8 @@ async def workflow_create(
     """Create a NEW Python workflow spec (issue #583 FR-10).
 
     A thin HTTP client over ``POST /workflows``. Refuses to overwrite an existing spec — use
-    ``workflow_update`` for that. Python only; a YAML-tier name is refused with a message naming the
-    restriction.
+    ``workflow_update`` for that. Python only: this tool never sends ``tier``, so the server writes a
+    Python spec. A name that is not bare, ``x.yaml`` included, is refused here before any request.
 
     Send the SOURCE TEXT, never a path: the server decides where a spec lands, and validation, the lint
     gate, path containment, the atomic write and the index update all happen there. This tool opens no

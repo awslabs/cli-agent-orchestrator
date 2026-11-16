@@ -34,8 +34,8 @@ see [Configuration](configuration.md) and [Security](../SECURITY.md).
 ### Events and AG-UI
 
 - `/events` and `/events/history` expose server events.
-- `GET`/`POST /agui/v1/stream` serve the fleet as an AG-UI 1.0 run, and
-  `/agui/v1/emit_ui` takes generative UI input. `POST /agui/v1/run` is the run
+- `GET`/`POST /agui/v1/stream` serve the sessions and terminals this server can
+  see as an AG-UI 1.0 run, and `/agui/v1/emit_ui` takes generative UI input. `POST /agui/v1/run` is the run
   plane for approval interrupts, and `GET /agui/v1/capabilities` returns its
   AG-UI 1.0 `AgentCapabilities`.
 
@@ -58,7 +58,10 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
   `reuse_terminal_id` gives 422. Policy refusals use `{kind: "ephemeral_policy", rule, message}`.
   `assign` and `handoff` launch creator-owned ephemeral names from the creator terminal.
 - `GET /agents/profiles` and `GET /agents/profiles/{name}` list and inspect
-  installed profiles.
+  installed profiles. A profile's `params` declarations appear in the detail
+  body: each one always carries `type` and `required`, and carries `default`,
+  `description` and `enum` only when set, in declaration order. See
+  [Workflow step params](agent-profile.md#workflow-step-params).
 - `GET /agents/profiles/search` ranks installed, loadable profiles by capability
   using the same service as `cao profile find`.
 - `GET /agents/profiles/templates` lists public template metadata (`name` and
@@ -75,6 +78,17 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
   distinct from `templates/validate`, which checks a template *config* against
   that template's own schema. Findings are severity-tagged (`error` or
   `warning`); only errors clear the `valid` flag, so warnings are advisory.
+  The response also carries `params`, the profile's `params` block as the
+  model reads it, so an editor can show the declarations without parsing
+  YAML. Each declaration has the shape `GET /agents/profiles/{name}` returns,
+  in declaration order. The text is read as written, so a `${VAR}`
+  placeholder comes back as `${VAR}`. An empty block is `{}`. `params` is
+  `null` when the frontmatter has no `params` key, when a finding is an error
+  at `params` or below it, when an error stopped the checks before they
+  finished the block, such as a document past the ceilings below, or when the
+  block takes more than 64 KB as JSON. That limit stops YAML aliases from
+  making the response much larger than the request. The block is built from
+  the validated declarations, never from the parsed YAML.
 - `GET /agents/profiles/schema` returns the agent profile JSON-Schema, so a
   client can render create and edit forms from the server's definition instead
   of duplicating the field list.
@@ -167,12 +181,17 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
 ### Sessions and terminals
 
 - `/sessions*` creates, lists, inspects, and deletes sessions.
-- `/sessions/{session_name}/terminals*` creates and lists session terminals.
+- `/sessions/{session_name}/terminals*` creates and lists session terminals. Each listed row also carries `status`, the last status the monitor applied (`null` when none has been observed). Unlike `GET /terminals/{id}` it does not re-detect, so a terminal that nothing polls can show `processing` after it went idle, until its status is next polled.
   The list is ordered oldest-first, and index 0 is the session's conductor —
   `cao session status`/`list` rely on that. Sort client-side on `last_active`
   if you need a different order.
 - `/terminals/{terminal_id}*` inspects terminals, sends input or keys, reads
   output and working-directory state, exits providers, and deletes terminals.
+- Terminal responses carry `identity_verified`, whether a `kiro_cli` terminal's
+  identity check has passed: `false` until it has (CAO refuses input to it
+  meanwhile, whatever `status` says), `true` after, `null` for other providers
+  and for Kiro terminals older than the record. See
+  [Kiro CLI](kiro-cli.md).
 - Terminal responses carry `delegate_tools`, the terminal's recorded delegation
   ceiling. `POST /sessions/{session_name}/terminals` requires `caller_id` (403
   without it) and checks the requested `allowed_tools` (client string or profile
@@ -359,18 +378,42 @@ than calling these routes directly.
 ### Workflows
 
 - `/workflows*` creates, updates, deletes, validates and inspects workflow specifications.
-- `POST /workflows` creates a Python spec (`201`); requires `cao:write` or `cao:admin`.
-  Invalid specs or refused paths return `400`, existing names or tier collisions `409`,
-  and storage failures `500`.
-- `PUT /workflows/{name}` replaces a Python spec (`200`) using a required `expected_hash`;
-  requires `cao:write` or `cao:admin`. Unknown names return `404`, stale hashes or tier
-  collisions `409`, invalid specs or refused paths `400`, and storage failures `500`.
+- `POST /workflows` creates a spec (`201`); requires `cao:write` or `cao:admin`. The body is
+  `{name, source, tier}`. `tier` is `"python"` (the default) or `"yaml"`, and the server picks
+  the file extension from it: `<name>.py` or `<name>.yaml`. The name must be bare, with no
+  path and no extension. Invalid specs or refused paths return `400`, existing names or tier
+  collisions `409`, and storage failures `500`.
+  - A YAML create validates the source with the YAML grammar check before writing. It returns
+    `{name, path, content_hash, findings, status, reserved_notes}`, where `findings` is empty,
+    `status` is `pass` or `pass_reserved`, and `content_hash` is the sha256 of the bytes written.
+  - A YAML create returns `400` when the YAML does not parse or fails the grammar check (the
+    detail lists every error), when the spec's `name:` differs from the route name, or when the
+    source is over 256 KiB. It returns `409` when a workflow with that name exists in either
+    tier, as `<name>.yaml`, `<name>.yml` or `<name>.py`.
+- `PUT /workflows/{name}` replaces a spec (`200`) using a required `expected_hash`;
+  requires `cao:write` or `cao:admin`. It takes the same optional `tier`, defaulting to
+  `"python"`. Unknown names return `404`, stale hashes or tier collisions `409`, invalid specs
+  or refused paths `400`, and storage failures `500`.
+  - A YAML update replaces the YAML file at its own path (`<name>.yaml` or `<name>.yml`) and
+    returns the same body as a YAML create. It also returns `409` when the workflow is a Python
+    workflow, and when both `<name>.yaml` and `<name>.yml` exist.
+- `GET /workflows/{name}` returns the parsed spec. For a YAML spec the body also carries `path`,
+  `source` (the file text) and `content_hash` (the sha256 of the file bytes). That hash is the
+  `expected_hash` a YAML `PUT` compares. Each YAML step carries `call` and `params`, which are
+  `null` when the file does not set them. A Python spec's body is unchanged.
 - `DELETE /workflows/{name}` deletes a spec and its index row (`200`); requires `cao:admin`.
   An unknown or already-deleted name returns `404`; invalid paths return `400`.
 - `POST /workflows/validate` accepts exactly one of `path` or `source` (`200`);
-  requires `cao:read`, `cao:write` or `cao:admin`. The `source` form lints a Python draft
-  without writing a file; lint or size failures are reported in the `200` result.
-  Supplying both forms or neither, or source that cannot be encoded as UTF-8, returns `400`.
+  requires `cao:read`, `cao:write` or `cao:admin`. The `source` form validates a draft
+  without writing a file. Its optional `tier` picks the check: `"python"` (the default) lints
+  the source as a script, and `"yaml"` returns the YAML result
+  `{status, reserved_notes, errors}`. Validation or size failures are reported in the `200`
+  result. Supplying both forms or neither, sending `tier` with `path`, or sending source that
+  cannot be encoded as UTF-8 returns `400`.
+  - For a YAML spec, in either form, once the grammar check passes, each step's params are
+    checked against the params its profile declares. Each error is added to `errors` and makes
+    `status` `fail`. A profile that is not installed or fails to load adds no error. See
+    [Params a profile declares](workflows.md#params-a-profile-declares).
 
 The spec-route scope checks apply when authentication is enabled.
 
@@ -386,6 +429,13 @@ The spec-route scope checks apply when authentication is enabled.
   `{run_id, state, links}` as soon as the run is durably journaled, then drives the run in
   the background. The `links` map always carries `self`/`status`/`result`/`cancel`;
   `events` appears only on a build that serves the events route, so treat it as optional.
+- Both run routes refuse a YAML workflow that uses a reserved mode, or a step whose `call` is
+  `assign` or `send_message`, with `501`. The refusal comes before the run is journaled, so
+  no run row exists for it.
+- Both run routes refuse a YAML workflow with `422` when a step's params do not fit the
+  params its profile declares. `detail` is a string holding every error, joined by `; `. The
+  refusal comes before the run is journaled. Resume and step replay use the journaled spec and
+  do not check again.
 - `GET /workflows/runs` lists journaled runs newest-first (`?state=`, `?limit=`).
 - `GET /workflows/runs/{run_id}` **inspects** a run: run metadata, current state, and
   each step's durable projection — including the step's full `output_json` and
@@ -394,6 +444,36 @@ The spec-route scope checks apply when authentication is enabled.
   retention note in [Configuration](configuration.md#memory-memory). It is a
   superset of the older status-snapshot shape, so callers reading only
   `state`/`current_step_id`/`steps[].{id,state,attempts}` are unaffected.
+  - `steps[].terminal_id` is set as soon as the step's terminal exists, while the step
+    runs. Before the run view it was set only after the step ended, and never for YAML
+    runs.
+  - `steps[].result` is the step's final answer, or `null`:
+    `{"text": "...", "status": "completed", "truncated": false, "redacted": false}`.
+    It is parsed from the step's saved result envelope. `text` is the step's last terminal
+    message with secrets redacted (`redacted`) and capped at 32 KiB (`truncated`). A step
+    that failed or was cancelled has empty `text`, and its state as `status`. `result` is
+    `null` for a step that has not settled, for runs from before the run view, and for an
+    envelope that does not parse.
+- `GET /workflows/runs/{run_id}/steps/{step_id}/screen` returns a running step's screen:
+  `{terminal_id, text, truncated, redacted, captured_at}`. `text` is plain text with no
+  escape codes: the visible screen plus the scrollback above it, at most 200 lines and
+  64 KiB, with secrets redacted. Rows the terminal wrapped at its width are joined first,
+  so a secret that wraps is still redacted. herdr cannot join them, so on herdr a secret
+  split across lines is not redacted. `captured_at` is an ISO-8601 UTC time. The capture is
+  read-only: it attaches no client, sends no input and never resizes the agent's window.
+  Malformed `run_id` or `step_id` 400; unknown run or step, or a step with no terminal
+  recorded, 404; a terminal that has ended 410 (read the transcript instead).
+- `GET /workflows/runs/{run_id}/steps/{step_id}/transcript` returns a finished step's saved
+  transcript: `{terminal_id, text, truncated, redacted}`. `text` is the last 256 KiB of the
+  terminal's `<terminal_id>.scrollback` file, starting at a line, with secrets redacted.
+  CAO saves that file with wrapped rows joined, for the same reason as the screen.
+  Secrets are redacted before the text is cut, so a secret split at the cut is never
+  returned in part. `truncated` means the file holds more than `text`. Malformed `run_id`
+  or `step_id` 400; unknown run or step, no terminal recorded, or no transcript file yet
+  (the step is still running, the run predates the run view, or the file was deleted after
+  `RETENTION_DAYS`) 404.
+- Both step routes take the terminal id from the step's journal row, never from the
+  request.
 - `GET /workflows/runs/{run_id}/result` returns the complete retained result. It is
   assembled from the journal, so it answers for a **detached, in-flight, or post-restart**
   run — not only a finished one. No run-level `output` field is returned (run-level output
@@ -429,6 +509,13 @@ The spec-route scope checks apply when authentication is enabled.
   JSON page. `?after_seq=` is the replay cursor and must be `>= 0`; on the SSE arm it
   takes precedence over `Last-Event-ID`. A gap is data the server declares when an
   append was lost — never inferred by the client from seq numbering.
+  - `terminal.created` is emitted as soon as a step's terminal exists, before the step
+    finishes. Each attempt that opens a terminal emits one, carrying `step_id`, `attempt`,
+    `terminal_id`, `provider` and `agent_profile`. Per attempt the order is
+    `step.attempt.started`, `terminal.created`, then the attempt's outcome
+    (`step.completed`, `step.attempt.failed`, `step.failed` or `step.skipped`). The
+    structured-output reprompt runs on a new terminal within the same attempt and emits
+    its own `terminal.created`, with the same `attempt`, after `step.reprompted`.
 - `GET /workflows/runs/{run_id}/compare?against={other_run_id}` reports per-step
   differences between two runs. Outputs are compared at the reference level, never by
   diffing payloads. An unknown id on **either** side is a 404, not a partial compare.
@@ -444,10 +531,10 @@ The spec-route scope checks apply when authentication is enabled.
   terminal's append-only log, for correlating a step with the terminal output it
   produced. `length` is capped server-side.
 
-All five reads above (inspect, events, compare, diagnostics, and the run list)
-require a `cao:read`, `cao:write`, or `cao:admin` scope **when authentication is
-enabled**. With no IdP and no `CAO_AUTH_LOCAL_TOKEN` configured — the default —
-that check is inert.
+All seven reads above (inspect, the step screen and transcript, events, compare,
+diagnostics, and the run list) require a `cao:read`, `cao:write`, or `cao:admin` scope
+**when authentication is enabled**. With no IdP and no `CAO_AUTH_LOCAL_TOKEN` configured,
+which is the default, that check is inert.
 
 See [Workflows](workflows.md).
 
@@ -457,7 +544,8 @@ Read-only views of a CAO cluster's workers, reached through the fleet's worker b
 (`CAO_ELASTIC_BROKER_URL` / `CAO_ELASTIC_BROKER_TOKEN` in cao-server's environment). No
 broker configured, unreachable, or erroring is a `503` carrying the broker's message.
 Releasing workers and shutting the fleet down stay CLI actions (`cao worker release`,
-`cao fleet shutdown`).
+`cao fleet shutdown`). This is the Kubernetes worker fleet behind `cao fleet`, not the
+sessions-and-terminals fleet in the AG-UI stream.
 
 - `GET /fleet/status` mirrors `cao fleet status`: `{broker, live, cleanup_pending, states}`.
 - `GET /fleet/workers` mirrors `cao worker list` (`?all=true` for `--all`):

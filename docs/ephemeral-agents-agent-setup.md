@@ -166,7 +166,7 @@ Pick a pattern with the user:
 
 | Pattern | Command | Survives a CAO upgrade? | Touches CAO itself? |
 | --- | --- | --- | --- |
-| A: reinstall the tool with the decider added | `uv tool install <CAO source> <each existing extra> --with "cao-decider-jev @ <source>" --reinstall` | Only for an unpinned PyPI install upgraded with `uv tool upgrade`. For a git or version-pinned install, `cao update` drops it (see below). | Yes: CAO is reinstalled and may move to a newer version |
+| A: reinstall the tool with the decider added | `uv tool install <CAO source> <each existing extra> --with "cao-decider-jev @ <source>" --reinstall` | For Git and unpinned PyPI installs, `cao update` preserves recorded extras. Version-pinned PyPI and local reinstall guidance are covered below. | Yes: CAO is reinstalled and may move to a newer version |
 | B: add it to the tool's environment | `uv pip install --python "$CAO_PY" "cao-decider-jev @ <source>"` | **No.** The receipt never records it, so any CAO upgrade silently drops it | Not CAO's own package, but it can change dependencies CAO shares (such as `httpx`). Run it with `--dry-run` first and show the user the changes |
 
 **For pattern A, copy the source and the extras from the receipt.** The `cli-agent-orchestrator`
@@ -205,14 +205,13 @@ What you should see: `['fixed_table', 'jev']`. `fixed_table` is CAO's built-in d
 went into the wrong environment.
 
 **Tell the user about upgrades.** The check above shows that the decider loads *now*, and
-whether the receipt records it. It can't promise the decider survives the next upgrade, and
-often it won't:
+whether the receipt records it. Upgrade behavior depends on the source:
 
-- `cao update` on a git install runs `uv tool install <git source> --upgrade --reinstall` without
-  any `--with`, so it removes the decider even after pattern A;
+- `cao update` on a Git install runs `uv tool upgrade cli-agent-orchestrator --reinstall`.
+  It reuses the recorded Git ref and keeps deciders recorded by pattern A;
 - `cao update` on a version-pinned PyPI install (a receipt entry with a `specifier`) runs
-  `uv tool install cli-agent-orchestrator@latest --upgrade`, also without `--with`, so it removes
-  the decider too. An unpinned PyPI install runs `uv tool upgrade`, which keeps it;
+  `uv tool install cli-agent-orchestrator@latest --upgrade` without `--with`, so it removes
+  the decider. An unpinned PyPI install runs `uv tool upgrade`, which keeps recorded deciders;
 - on a local install, `cao update` changes nothing and prints a reinstall command that has no
   `--with` either;
 - after pattern B, any upgrade removes it.
@@ -324,9 +323,11 @@ environment variable name, and don't use `cao env list`: it prints values. Jev's
 the authority for its key, consent and revoke commands.
 
 A decider's key may be stored once per OS user, and so shared by every CAO install on the
-machine; Jev's current release does this. On a second or test install, leave the commands that
-change or use the key (`key set`, `key delete`, `key check --auth`) to the user, and check the
-decider's README for where it keeps its key.
+machine; Jev's current version does this. The agent never runs `key set`, `key delete` or
+`key check --auth` — those are always the user's steps. On a second install, first run
+`"$(dirname "$CAO_PY")/cao-decider-jev" key check` (the check above); if it reports the key
+present, tell the user they can skip `key set`. Check the decider's README for where it keeps
+its key.
 
 ## 6. Restart the server and reconnect your MCP
 
@@ -339,8 +340,9 @@ step 2 found it running:
   (`-k` stops the running instance first; without it, kickstart leaves a running job alone).
 
 Find the process by its port, never by matching command-line text: your own shell can match that
-text too. Then check the restart. The server can take a few seconds to answer, so the block
-first waits for it, trying once a second, up to 30 times:
+text too. Then check the restart. The block waits for the server, trying once a second: about
+30 s if nothing listens, or up to about 90 s if a server accepts the connection but never
+answers.
 
 ```bash
 PORT="${CAO_API_PORT:-9889}"
@@ -476,7 +478,9 @@ Each of these writes settings or restarts the server, so get the user's OK.
 These are **the user's** steps:
 
 - revoke consent, with `cao decisions disable jev`;
-- delete the key, with `cao-decider-jev key delete`;
+- delete the key, with `cao-decider-jev key delete` — tell the user first that this removes
+  the key for every CAO install on the machine (the key is shared per OS user), not just this
+  one;
 - uninstall the package: run pattern A again without the decider's `--with`, or
   `uv pip uninstall --python "$CAO_PY" cao-decider-jev` for pattern B.
 

@@ -1,8 +1,9 @@
 """``?framing=`` on ``GET /agui/v1/stream``: the legacy opt-in and its guards.
 
-``framing=cao-legacy`` must stay byte-identical to the stream as it was at
-``8bf6e8f0`` (#1193's ``off`` mode). The golden was captured from that code for a
-fixed fake-bus input. The legacy framing is deprecated, so its responses carry
+``framing=cao-legacy`` must stay as the stream was at ``8bf6e8f0`` (#1193's ``off``
+mode): the golden was captured from that code for a fixed fake-bus input (an empty fleet,
+so it does not exercise the terminal rows, which have since gained ``runner_id`` and a live
+``status``). The legacy framing is deprecated, so its responses carry
 RFC 9745 ``Deprecation`` (a structured date, ``@<unix-seconds>``) and a ``Link``
 with ``rel="deprecation"``.
 """
