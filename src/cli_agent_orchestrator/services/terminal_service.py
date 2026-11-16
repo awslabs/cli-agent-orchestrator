@@ -4850,9 +4850,9 @@ def _message_in_composer(terminal_id: str, message: str) -> Optional[bool]:
       bare Enter submits exactly what is there.
     - ``False``: the composer was extracted and the message is NOT in it. The
       paste itself was dropped, so a full re-send cannot double anything.
-    - ``None``: the composer cannot be read -- the provider has no
-      ``extract_current_composer``, the capture failed, or the message is too
-      short to probe for. Nothing is known about what a full re-send would land
+    - ``None``: the composer cannot be read, the match depends on an ambiguous
+      tail, or the message is too short to probe for. Nothing is known about
+      what a full re-send would land
       on top of. A caller that must not duplicate (the inbox path) sends nothing
       in this case; the deferred-init path's ``_message_visible_in_box`` keeps
       treating it like ``False`` (its worker is fresh, see
@@ -4869,7 +4869,12 @@ def _message_in_composer(terminal_id: str, message: str) -> Optional[bool]:
     composer = _capture_current_composer_region(terminal_id)
     if composer is None:
         return None
-    return probe in _normalized_box_text(composer)
+    certain = getattr(composer, "certain_prefix", composer)
+    if probe in _normalized_box_text(certain):
+        return True
+    if certain != composer and probe in _normalized_box_text(composer):
+        return None
+    return False
 
 
 def _message_visible_in_box(terminal_id: str, message: str) -> bool:
