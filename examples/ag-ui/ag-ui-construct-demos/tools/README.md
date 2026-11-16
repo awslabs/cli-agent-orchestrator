@@ -38,6 +38,8 @@ ONLY=agui-session-timeline npm run record   # a single feature
 
 `ffmpeg` is provided by the `ffmpeg-static` npm package (gif-capable), so no
 system ffmpeg install is needed. Override with `FFMPEG_BIN=/path/to/ffmpeg`.
+On Linux or WSL, install Chromium's system libraries once with
+`npx playwright install-deps chromium`.
 
 The GIFs are committed under `docs/media/` and re-generated + uploaded as the
 `agui-construct-demos` CI artifact on every run.
