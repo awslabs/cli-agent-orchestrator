@@ -11,6 +11,7 @@ import json
 import pytest
 
 from cli_agent_orchestrator.backends.factory import BackendFactory, ConfigurationError
+from cli_agent_orchestrator.backends.herdr_app_backend import HerdrAppBackend
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
 
@@ -33,6 +34,7 @@ def _isolated_settings(tmp_path, monkeypatch):
     )
     monkeypatch.delenv("CAO_TERMINAL_BACKEND", raising=False)
     monkeypatch.delenv("CAO_HERDR_SESSION", raising=False)
+    monkeypatch.delenv("CAO_HERDR_APP_SESSION", raising=False)
     return fake_settings
 
 
@@ -232,3 +234,31 @@ class TestSpawnModeWiring:
 
         assert backend._pane_layout == "tiled"
         assert "even-vertikal" in caplog.text
+
+
+class TestHerdrAppSelection:
+    """herdr-app backend selection; _connect is stubbed so no `hc` is needed."""
+
+    def test_herdr_app_backend_selected(self, _isolated_settings, monkeypatch):
+        monkeypatch.setenv("CAO_TERMINAL_BACKEND", "herdr-app")
+        monkeypatch.setattr(HerdrAppBackend, "_connect", lambda self: None)
+        backend = BackendFactory.create()
+        assert isinstance(backend, HerdrAppBackend)
+        assert backend.herdr_app_session == "cao"
+
+    def test_herdr_app_session_from_env(self, _isolated_settings, monkeypatch):
+        monkeypatch.setenv("CAO_TERMINAL_BACKEND", "herdr-app")
+        monkeypatch.setenv("CAO_HERDR_APP_SESSION", "cao-test")
+        monkeypatch.setattr(HerdrAppBackend, "_connect", lambda self: None)
+        assert BackendFactory.create().herdr_app_session == "cao-test"
+
+    def test_override_argument(self, _isolated_settings, monkeypatch):
+        monkeypatch.setattr(HerdrAppBackend, "_connect", lambda self: None)
+        assert isinstance(BackendFactory.create("herdr-app"), HerdrAppBackend)
+
+    def test_unknown_backend_lists_all_three(self, _isolated_settings, monkeypatch):
+        monkeypatch.setenv("CAO_TERMINAL_BACKEND", "screen")
+        with pytest.raises(ConfigurationError) as exc:
+            BackendFactory.create()
+        for name in ("tmux", "herdr", "herdr-app"):
+            assert f"'{name}'" in str(exc.value)
