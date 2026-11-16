@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Provider memory file writes now default off** (#1335). CAO delivers each terminal's
   memory without writing it into project files that can be committed. Interactive
-  Claude Code and Codex terminals receive it in their provider start prompt; orchestrated
-  terminals retain task-aware first-message delivery. Set
+  `cao launch` sessions using a runtime start-prompt provider — Claude Code, Codex,
+  Kimi CLI, Antigravity CLI, OMP, Grok CLI, or MiniMax Code — receive it in that
+  prompt; orchestrated terminals retain task-aware first-message delivery. Set
   `memory.injection.write_project_files=true` to opt back into the legacy provider-file
   behavior. With `memory.enabled=false`, CAO does not inspect or clean up those files.
 

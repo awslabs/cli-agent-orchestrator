@@ -334,8 +334,10 @@ containment checks. When the existing and selected block bodies are identical,
 the opted-in provider file is left byte-for-byte unchanged, including its existing
 `generated` stamp.
 Frozen workflow replays continue using the recorded memory block without
-rechecking lifecycle; another terminal creation does not invalidate that
-snapshot. A fresh workflow run resolves current memory.
+rechecking lifecycle; workflow terminal creation does not request start-prompt
+memory, so the recorded block remains the one delivered with the step's first
+message. Another terminal creation does not invalidate that snapshot. A fresh
+workflow run resolves current memory.
 
 Explicit recall retains superseded memories. With lifecycle enabled, recency
 moves them last without changing membership; usage demotes them before the
@@ -540,12 +542,14 @@ parse/validate/secret pipeline and reports without writing.
 ## Context Injection
 
 CAO normally injects memory without touching the project tree. Interactive
-Claude Code and Codex launches receive the block through the provider's start
-prompt. Orchestrated launches receive it on their first CAO-delivered message,
-which preserves task-aware context-manager selection and workflow replay
-semantics. Providers without either prompt seam, including an interactive Kiro
-launch, receive no start-time memory unless project-file injection is explicitly
-enabled.
+`cao launch` sessions using a runtime start-prompt provider — Claude Code,
+Codex, Kimi CLI, Antigravity CLI, OMP, Grok CLI, or MiniMax Code — receive the
+block through that prompt when the launch has no CAO-delivered first message.
+Orchestrated launches receive it on their first CAO-delivered message, which
+preserves task-aware context-manager selection; workflow steps stay on the
+frozen first-message route. Providers without either prompt seam, including an
+interactive Kiro launch, receive no start-time memory unless project-file
+injection is explicitly enabled.
 
 CAO injects relevant memories into a new session through its first message:
 
@@ -596,13 +600,14 @@ behavior and single project directory lookup. `memory.enabled=false` is a full o
 CAO does not inspect, create, rewrite, or clean up provider memory files.
 
 The operator's local `memory.enabled` / `CAO_MEMORY_ENABLED` switch always wins over a
-configured remote memory owner (`CAO_MEMORY_API_URL`) for first-message context injection:
-with the switch off, the owner is never called and no block is injected, exactly as when
-there is no remote owner at all. The frozen-replay path applies the same switch itself,
-before resolving through the gateway (`frozen_run_memory.py:144`) and again before injecting
-a recorded block (`terminal_service.py:455`). The `memory_store`, `memory_recall` and
-`memory_forget` MCP tools check the same switch before they branch to a remote owner, so with
-the switch off a write or delete is refused locally and never reaches the owner either.
+configured remote memory owner (`CAO_MEMORY_API_URL`) for first-message and provider
+start-prompt context injection: with the switch off, the owner is never called and no block
+is injected, exactly as when there is no remote owner at all. The frozen-replay path applies
+the same switch itself, before resolving through the gateway (`frozen_run_memory.py:144`) and
+again before injecting a recorded block (`terminal_service.py:455`). The `memory_store`,
+`memory_recall` and `memory_forget` MCP tools check the same switch before they branch to a
+remote owner, so with the switch off a write or delete is refused locally and never reaches
+the owner either.
 
 ## Saving Memories
 
