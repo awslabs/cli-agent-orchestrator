@@ -82,9 +82,20 @@ def ops_tool_denied_reason(tool_name: str, arguments: Mapping[str, Any]) -> Opti
     for ``cao-mcp-server``.
 
     Fails closed. An unset ``CAO_TERMINAL_ID`` is the supported operator context
-    -- this server is normally run by a human's MCP host, and ``cao-ops`` in the
-    operator agent-plugin -- and is unchanged by this gate. Once a caller claims
-    an identity, every failure to resolve it denies.
+    -- this server run by a human's MCP host, which is also how a client runs
+    ``cao-ops`` from the operator agent-plugin OUTSIDE CAO -- and is unchanged by
+    this gate. Once a caller claims an identity, every failure to resolve it
+    denies.
+
+    The same plugin delivered by ``cao install`` to an agent CAO launches is NOT
+    that context: the terminal is bound, so it is gated here. The grant is the
+    fixed :data:`CAO_OPS_MCP_SERVER_SELECTOR`, never ``@<key>`` for whatever key
+    the profile declares this server under -- this process cannot see that key.
+    A profile that names only ``@cao-ops`` is therefore refused, and so is a
+    role-default profile whose #772 auto-append produced ``@cao-ops``; a
+    role-default profile that declares the key ``cao-ops-mcp-server`` is
+    appended the selector itself and is granted. Both are pinned by
+    ``test/ops_mcp_server/test_ops_grant_names.py``.
     """
     if not caller_is_bound():
         return None

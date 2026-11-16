@@ -1719,9 +1719,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   issue until #1062. `UNGATED_SURFACES` is now empty, and both surfaces are enumerated by
   introspection in the per-tool coverage test, so a new ops tool is gated by default rather than by
   someone remembering.
-  **Migration:** a profile that lists `cao-ops-mcp-server` in `mcpServers` and pins an explicit
-  `tools:`/`allowedTools:` list must add `@cao-ops-mcp-server` to it. Profiles granting `*`, and
-  operator MCP hosts, need no change.
+  **Who holds the grant.** The #772 rule is unchanged: a profile with no explicit
+  `tools:`/`allowedTools:` list still gets `@<server>` appended for each server it declares, so a
+  role-default profile (developer, `supervisor`, `reviewer`) that declares the server under the key
+  `cao-ops-mcp-server` holds the grant and reaches every ops tool. Only an explicit list withholds
+  it; to declare the server and withhold the control plane, pin a list that omits the grant. The gate
+  reads the fixed selector, not the key the server is declared under.
+  **Migration:** inside a CAO terminal, (1) a profile that lists `cao-ops-mcp-server` in
+  `mcpServers` and pins an explicit `tools:`/`allowedTools:` list must add `@cao-ops-mcp-server` to
+  it; (2) a profile that reaches the server under **another key** must name `@cao-ops-mcp-server` as
+  well, or one glob covering both names. This includes the operator agent-plugin delivered through
+  `cao install`, whose server key is `cao-ops`: `allowedTools: [..., "@cao-ops"]` becomes
+  `[..., "@cao-ops", "@cao-ops-mcp-server"]` or `[..., "@cao-ops*"]`, and `@cao-ops` alone is now
+  refused on every tool except `decisions_off` (`docs/agent-plugins.md`). A role-default profile
+  that declares the server under another key is refused the same way, because the entry appended
+  for it is `@<that key>`. Profiles granting `*`, and operator MCP hosts outside CAO (no
+  `CAO_TERMINAL_ID`, which is how a client runs the plugin itself), need no change.
 
 - **Vault `secret_gate: "warn"` no longer forwards raw secret matches to a model** (#644 AC10).
   Under `warn` a secret-bearing note is still indexed and recallable, but every match is replaced by

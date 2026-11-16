@@ -128,14 +128,16 @@ Every tool `cao-mcp-server` registers is denied to a bound terminal whose effect
 
 #### `@cao-ops-mcp-server` gates the operations control plane separately
 
-`cao-ops-mcp-server` (the control-plane server — see [Control Planes](control-planes.md)) carries the same gate on its own selector, `@cao-ops-mcp-server` (#1062). It was knowingly ungated when #671 landed, and that gap was real: `CAO_TERMINAL_ID` is forwarded into **every** server in a profile's `mcpServers` map, so a profile that merely listed this server handed a bound terminal `launch_session`, `install_profile`, `shutdown_session`, `send_session_message` and the seven `decisions_*` controls with its `tools:` allowlist unconsulted.
+`cao-ops-mcp-server` (the control-plane server — see [Control Planes](control-planes.md)) carries the same gate on its own selector, `@cao-ops-mcp-server` (#1062). It was knowingly ungated when #671 landed, and that gap was real: `CAO_TERMINAL_ID` is forwarded into **every** server in a profile's `mcpServers` map, so a profile that listed this server handed a bound terminal `launch_session`, `install_profile`, `shutdown_session`, `send_session_message` and the seven `decisions_*` controls with its `tools:` allowlist unconsulted, **including a profile whose explicit list left the server out**. That last case is what the gate closes.
+
+It does not change who holds the grant by default. A profile with no explicit `tools:`/`allowedTools:` list still gets `@<server>` appended for every server it declares itself (#772, see [How Overrides Work](#how-overrides-work)), so a role-default profile (developer, `supervisor` or `reviewer`) that declares the server under the key `cao-ops-mcp-server` holds `@cao-ops-mcp-server` and reaches every tool. **To declare the server and withhold the control plane, pin an explicit list that omits the grant.** The gate reads the fixed selector, not the key: a server declared under another key (the operator agent-plugin's `cao-ops`, or `cao-ops-mcp` as in the [Control Planes](control-planes.md) example) is appended or named as `@<that key>`, which the gate refuses, so such a profile names `@cao-ops-mcp-server` as well or uses a glob that covers both (`@cao-ops*`).
 
 The two surfaces are granted independently and neither implies the other: `@cao-mcp-server` is delegation within the caller's own assign/handoff tree, `@cao-ops-mcp-server` acts on the node. Two carve-outs, mirroring the callback exemption above:
 
 - `decisions_off` stays reachable without the grant. It is argument-free and off-only — the operator's kill switch (#955) — and a fail-safe that needs a grant is not a fail-safe.
 - Lifting a halt is refused for any bound terminal, grant or not. `decisions_set_point` to `shadow` or `on` removes the halt marker, so allowing it here would let a caller undo an operator's `cao decisions off` through the same surface. The CLI path is unaffected. See [Decisions](decisions.md).
 
-An operator context — an MCP host with no `CAO_TERMINAL_ID`, including `cao-ops` in the operator agent-plugin — is unchanged on both surfaces.
+An operator context — an MCP host with no `CAO_TERMINAL_ID`, which includes `cao-ops` in the operator agent-plugin when a client runs it outside CAO — is unchanged on both surfaces. When CAO itself delivers that plugin to an agent it launches (`cao install <profile>`), the server runs in a bound terminal and is gated: see [Agent Plugins](agent-plugins.md) for the two entries that profile needs.
 
 #### `discovery` is a separate opt-in, not part of `@cao-mcp-server`
 

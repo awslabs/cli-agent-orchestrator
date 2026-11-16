@@ -213,12 +213,31 @@ The operations stdio MCP server offers `decisions_status`, `decisions_off`, `dec
 routes. The agent-facing MCP server has no tools to read, change or ask for
 decisions.
 
-A profile that lists `cao-ops-mcp-server` does **not** by itself grant these
-controls (#1062). `CAO_TERMINAL_ID` is forwarded into every server in a profile's
-`mcpServers` map, so every tool on that surface is gated on the calling terminal's
-`tools:` allowlist, which must carry `@cao-ops-mcp-server` (or `*`, or a glob that
-covers it). A bound terminal without the grant is refused on every ops tool, with
-two deliberate rules:
+Every tool on that surface is gated on the calling terminal's `tools:` allowlist,
+which must carry `@cao-ops-mcp-server` (or `*`, or a glob that covers it) (#1062).
+`CAO_TERMINAL_ID` is forwarded into every server in a profile's `mcpServers` map,
+so the server knows which terminal is calling and reads that terminal's recorded
+list.
+
+**Whether listing the server grants these controls depends on the profile's
+allowlist, so check which case a profile is in:**
+
+- A profile with **no explicit** `tools:`/`allowedTools:` list gets `@<server>`
+  appended for each server it declares itself (the #772 rule, see
+  [Tool Restrictions](tool-restrictions.md)). Declaring the server under the key
+  `cao-ops-mcp-server` therefore **does** grant it, for every role default
+  including `supervisor` and `reviewer`. Listing the server only to reach
+  `decisions_off` hands that profile the whole control plane.
+- A profile that **pins an explicit list** holds the grant only if the list names
+  it. To declare the server and withhold its controls, pin a list without
+  `@cao-ops-mcp-server`; `decisions_off` stays reachable regardless.
+- The grant is the fixed selector, not the key. A server declared under another
+  key (`cao-ops` in the operator agent-plugin, for example) is appended or named
+  as `@cao-ops`, which this gate does not accept: add `@cao-ops-mcp-server` or a
+  glob covering both, such as `@cao-ops*`.
+
+A bound terminal without the grant is refused on every ops tool, with two
+deliberate rules:
 
 - `decisions_off` stays reachable without the grant. It is argument-free and
   off-only — the operator's kill switch — and a fail-safe that needs a grant is
@@ -237,8 +256,11 @@ two deliberate rules:
   operator setter that finds the lock busy proceeds with a logged warning rather
   than losing the only way to lift a halt, while a bound caller is refused.
 
-An operator context — an MCP host with no `CAO_TERMINAL_ID`, including `cao-ops` in
-the operator agent-plugin — is unchanged and may do all of the above.
+An operator context — an MCP host with no `CAO_TERMINAL_ID`, which includes
+`cao-ops` in the operator agent-plugin when a client runs it outside CAO — is
+unchanged and may do all of the above. The same plugin delivered to an agent that
+CAO launches runs in a bound terminal and is gated like any other
+(see [Agent Plugins](agent-plugins.md)).
 
 “Operator only” therefore means an operator context: over the operations MCP server
 a bound CAO terminal needs the `@cao-ops-mcp-server` grant, and lifting a halt is
