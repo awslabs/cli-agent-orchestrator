@@ -616,11 +616,13 @@ export function AgentPanel() {
               </div>
 
               <div>
-                <label className="block text-xs text-gray-500 mb-1">Agent Profile</label>
+                <label htmlFor={profiles.length === 0 && !loadingProfiles ? "spawn-profile" : undefined} className="block text-xs text-gray-500 mb-1">Agent Profile</label>
                 {loadingProfiles ? (
                   <div className="bg-gray-900 border border-gray-700 text-gray-500 text-sm rounded-lg px-3 py-2.5">Loading profiles...</div>
                 ) : profiles.length > 0 ? (
                   <CustomSelect
+                    searchable
+                    ariaLabel="Agent Profile"
                     value={profile}
                     onChange={setProfile}
                     placeholder="Select a profile..."
@@ -633,6 +635,7 @@ export function AgentPanel() {
                   />
                 ) : (
                   <input
+                    id="spawn-profile"
                     type="text"
                     value={profile}
                     onChange={e => setProfile(e.target.value)}

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useLayoutEffect } from 'react'
+import { useState, useRef, useEffect, useLayoutEffect, useId } from 'react'
 import { createPortal } from 'react-dom'
 import { ChevronDown, Check } from 'lucide-react'
 
@@ -20,13 +20,20 @@ interface CustomSelectProps {
   ariaLabel?: string
   /** Validation-error styling: thick red boundary on the trigger. Additive; default unchanged. */
   invalid?: boolean
+  searchable?: boolean
 }
 
 /** Menu height cap; also used to decide when to flip the menu upward. */
 const MENU_MAX_H = 256
 
-export function CustomSelect({ value, onChange, options, placeholder = 'Select...', className = '', ariaLabel, invalid = false }: CustomSelectProps) {
+export function CustomSelect({ value, onChange, options, placeholder = 'Select...', className = '', ariaLabel, invalid = false, searchable = false }: CustomSelectProps) {
   const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const [active, setActive] = useState<string | null>(null)
+  const composing = useRef(false)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const listId = useId()
   const ref = useRef<HTMLDivElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   // Fixed-position coordinates for the portaled menu, derived from the trigger.
@@ -82,6 +89,11 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
     }
   }, [open])
 
+  useEffect(() => {
+    if (open && searchable) inputRef.current?.focus()
+    if (!open) { setQuery(''); setActive(null) }
+  }, [open, searchable])
+
   const selected = options.find(o => o.value === value)
 
   // Group options
@@ -96,9 +108,53 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
     }
   }
 
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean)
+  const visibleGroups = groups.map(group => ({
+    ...group,
+    items: group.items.filter(opt => terms.every(term => `${opt.label} ${opt.sublabel || ''}`.toLowerCase().includes(term))),
+  })).filter(group => group.items.length > 0)
+  const visible = visibleGroups.flatMap(group => group.items)
+  const enabled = visible.filter(opt => !opt.disabled)
+  const activeOption = enabled.find(opt => opt.value === active)
+  const optionId = (opt: SelectOption) => `${listId}-option-${options.indexOf(opt)}`
+  const select = (opt: SelectOption) => {
+    if (opt.disabled) return
+    onChange(opt.value)
+    setOpen(false)
+    triggerRef.current?.focus()
+  }
+  const handleSearchKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (composing.current || e.nativeEvent.isComposing) return
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault()
+      const index = enabled.findIndex(opt => opt.value === activeOption?.value)
+      const next = index < 0 ? (e.key === 'ArrowDown' ? 0 : enabled.length - 1)
+        : Math.max(0, Math.min(enabled.length - 1, index + (e.key === 'ArrowDown' ? 1 : -1)))
+      const option = enabled[next]
+      setActive(option?.value ?? null)
+      if (option) document.getElementById(optionId(option))?.scrollIntoView?.({ block: 'nearest' })
+    } else if (e.key === 'Enter') {
+      e.preventDefault()
+      if (activeOption) select(activeOption)
+    } else if (e.key === 'Escape') {
+      e.preventDefault()
+      e.stopPropagation()
+      setOpen(false)
+      triggerRef.current?.focus()
+    } else if (e.key === 'Tab') {
+      const focusable = Array.from(document.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'))
+        .filter(element => !menuRef.current?.contains(element) && element.tabIndex >= 0 && !element.closest('[hidden], [inert]'))
+      const index = focusable.indexOf(triggerRef.current!)
+      const target = focusable[index + (e.shiftKey ? -1 : 1)]
+      if (target) { e.preventDefault(); setOpen(false); target.focus() }
+      else setOpen(false)
+    }
+  }
+
   return (
     <div ref={ref} className={`relative ${className}`}>
       <button
+        ref={triggerRef}
         type="button"
         aria-label={ariaLabel}
         aria-expanded={open}
@@ -127,8 +183,28 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
           style={{ position: 'fixed', left: pos.left, width: pos.width, top: pos.top, bottom: pos.bottom, maxHeight: MENU_MAX_H }}
           className="z-80 bg-gray-900 border border-gray-700 rounded-lg shadow-xl shadow-black/30 overflow-y-auto"
         >
-          {groups.map((group, gi) => (
-            <div key={gi}>
+          {searchable && (
+            <input
+              ref={inputRef}
+              role="combobox"
+              aria-label={ariaLabel}
+              aria-expanded={open}
+              aria-controls={listId}
+              aria-autocomplete="list"
+              aria-activedescendant={activeOption ? optionId(activeOption) : undefined}
+              value={query}
+              onChange={e => { setQuery(e.target.value); setActive(null) }}
+              onKeyDown={handleSearchKey}
+              onCompositionStart={() => { composing.current = true }}
+              onCompositionEnd={() => { composing.current = false }}
+              onBlur={e => { if (!menuRef.current?.contains(e.relatedTarget as Node | null)) setOpen(false) }}
+              placeholder="Search profiles..."
+              className="w-full bg-gray-900 text-gray-200 text-sm px-3 py-2 border-b border-gray-700 focus:outline-hidden"
+            />
+          )}
+          <div role={searchable ? 'listbox' : undefined} aria-label={searchable ? ariaLabel : undefined} id={searchable ? listId : undefined}>
+          {(searchable ? visibleGroups : groups).map((group, gi) => (
+            <div key={gi} role={searchable && group.label ? "group" : undefined} aria-label={searchable && group.label ? group.label : undefined}>
               {group.label && (
                 <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-gray-500 font-semibold bg-gray-800/50 sticky top-0">
                   {group.label}
@@ -138,17 +214,22 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
                 <button
                   key={opt.value}
                   type="button"
+                  id={searchable ? optionId(opt) : undefined}
+                  role={searchable ? 'option' : undefined}
+                  aria-label={searchable ? [opt.label, opt.sublabel].filter(Boolean).join(', ') : undefined}
+                  aria-selected={searchable ? value === opt.value : undefined}
+                  aria-disabled={searchable && opt.disabled ? true : undefined}
+                  tabIndex={searchable ? -1 : undefined}
+                  onMouseDown={searchable ? e => e.preventDefault() : undefined}
                   disabled={opt.disabled}
                   onClick={() => {
-                    if (!opt.disabled) {
-                      onChange(opt.value)
-                      setOpen(false)
-                    }
+                    if (searchable) select(opt)
+                    else if (!opt.disabled) { onChange(opt.value); setOpen(false) }
                   }}
                   className={`w-full text-left px-3 py-2 flex items-center justify-between transition-colors ${
                     opt.disabled
                       ? 'text-gray-600 cursor-not-allowed'
-                      : value === opt.value
+                      : value === opt.value || (searchable && activeOption?.value === opt.value)
                         ? 'bg-emerald-900/30 text-emerald-300'
                         : 'text-gray-300 hover:bg-gray-800'
                   }`}
@@ -164,6 +245,10 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
               ))}
             </div>
           ))}
+          </div>
+          {searchable && visible.length === 0 && options.length > 0 && (
+            <div role="status" className="px-3 py-4 text-sm text-gray-500 text-center">No profiles match</div>
+          )}
           {options.length === 0 && (
             <div className="px-3 py-4 text-sm text-gray-500 text-center">No options available</div>
           )}

@@ -122,3 +122,76 @@ describe('CustomSelect — invalid prop (red boundary on selects)', () => {
     expect(alpha.className).toContain('text-emerald-300') // selected styling
   })
 })
+
+describe('CustomSelect — searchable', () => {
+  const options = [
+    { value: 'a', label: 'Alpha', sublabel: 'code review', group: 'First' },
+    { value: 'b', label: 'Reviewer', sublabel: 'CODE analysis', group: 'Second' },
+    { value: 'c', label: 'Review', sublabel: 'code work', group: 'First' },
+    { value: 'd', label: 'Disabled review', sublabel: 'code', group: 'Second', disabled: true },
+  ]
+  const setup = () => {
+    const onChange = vi.fn()
+    render(<><button>Previous</button><CustomSelect searchable ariaLabel="Agent Profile" value="a" onChange={onChange} options={options} /><button>Next</button></>)
+    const trigger = screen.getByRole('button', { name: 'Agent Profile' })
+    fireEvent.click(trigger)
+    return { trigger, input: screen.getByRole('combobox', { name: 'Agent Profile' }), onChange }
+  }
+  it('filters all terms in either order across name and description, preserving group order', () => {
+    const { input } = setup()
+    expect(input).toHaveFocus()
+    expect(input).toHaveAttribute('aria-controls', screen.getByRole('listbox').id)
+    fireEvent.change(input, { target: { value: '  REVIEW   code  ' } })
+    expect(screen.getAllByRole('option')).toHaveLength(4)
+    fireEvent.change(input, { target: { value: 'code review work' } })
+    expect(screen.getAllByRole('option')).toHaveLength(1)
+    expect(screen.queryByText('Second')).not.toBeInTheDocument()
+    fireEvent.change(input, { target: { value: 'code' } })
+    const menu = screen.getByTestId('custom-select-menu')
+    expect(menu.textContent?.indexOf('First')).toBeLessThan(menu.textContent!.indexOf('Second'))
+    fireEvent.change(input, { target: { value: 'no match' } })
+    expect(screen.getByRole('status')).toHaveTextContent('No profiles match')
+    fireEvent.change(input, { target: { value: '   ' } })
+    expect(screen.getAllByRole('option')).toHaveLength(4)
+  })
+  it('navigates enabled options, selects with Enter and restores focus and empty query', () => {
+    const { input, trigger, onChange } = setup()
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onChange).not.toHaveBeenCalled()
+    fireEvent.keyDown(input, { key: 'ArrowUp' })
+    expect(input).toHaveAttribute('aria-activedescendant', screen.getByRole('option', { name: /Reviewer, CODE analysis/ }).id)
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onChange).toHaveBeenCalledWith('b')
+    expect(trigger).toHaveFocus()
+    fireEvent.click(trigger)
+    expect(screen.getByRole('combobox')).toHaveValue('')
+    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Escape' })
+    expect(trigger).toHaveFocus()
+  })
+  it('does not select disabled or hidden options and allows Tab in both directions', () => {
+    const { input, trigger, onChange } = setup()
+    fireEvent.click(screen.getByRole('option', { name: /Disabled/ }))
+    expect(onChange).not.toHaveBeenCalled()
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    fireEvent.change(input, { target: { value: 'nothing' } })
+    expect(input).not.toHaveAttribute('aria-activedescendant')
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onChange).not.toHaveBeenCalled()
+    fireEvent.keyDown(input, { key: 'Tab' })
+    expect(screen.getByRole('button', { name: 'Next' })).toHaveFocus()
+    fireEvent.click(trigger)
+    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Tab', shiftKey: true })
+    expect(screen.getByRole('button', { name: 'Previous' })).toHaveFocus()
+  })
+  it('leaves IME composition keys alone and keeps internal scroll open', () => {
+    const { input, onChange } = setup()
+    fireEvent.scroll(screen.getByTestId('custom-select-menu'))
+    fireEvent.compositionStart(input)
+    fireEvent.keyDown(input, { key: 'ArrowDown', isComposing: true })
+    fireEvent.keyDown(input, { key: 'Enter', isComposing: true })
+    expect(onChange).not.toHaveBeenCalled()
+    expect(input).not.toHaveAttribute('aria-activedescendant')
+    fireEvent.compositionEnd(input)
+    expect(screen.getByRole('combobox')).toHaveFocus()
+  })
+})
