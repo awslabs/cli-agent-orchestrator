@@ -11,6 +11,7 @@ ours; another cao-server sharing the core owns the rest.
 
 import asyncio
 import logging
+import threading
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -37,14 +38,32 @@ SETTLE_RETRY_S = 10.5
 
 
 def _teardown(terminal_id: str, end_reason: str) -> None:
+    """Tear down a CAO terminal whose program finished, unless CAO is already doing so.
+
+    CAO's own deletes end in the same ``finished`` event. A single-terminal
+    delete unregisters the terminal before killing it, so its event is never
+    mapped. Session teardown kills first, but holds the session's lifecycle
+    lock from ``kill_session`` until its rows are gone: taking that lock and
+    finding the row still there means no CAO delete owns this terminal.
+    """
+    from cli_agent_orchestrator.clients import database
     from cli_agent_orchestrator.services.herdr_inbox_service import (
         _retain_deferred_failure_tombstone,
     )
+    from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
     from cli_agent_orchestrator.services.terminal_service import delete_terminal
 
-    if _retain_deferred_failure_tombstone(terminal_id):
+    if not database.terminal_exists(terminal_id):
         return
-    delete_terminal(terminal_id, end_reason=end_reason)
+    row = database.get_terminal_metadata(terminal_id)
+    if row is None:
+        return
+    with session_lifecycle_lock(str(row["tmux_session"])):
+        if not database.terminal_exists(terminal_id):
+            return  # a session teardown deleted it while this waited
+        if _retain_deferred_failure_tombstone(terminal_id):
+            return
+        delete_terminal(terminal_id, end_reason=end_reason)
 
 
 def _drop_ghost_row(terminal_id: str) -> None:
@@ -90,6 +109,12 @@ class HerdrAppInboxService:
         self._deliver = delivery_callback
         self._home = str(backend.home_label)
         self._subscribe: Callable[[], Any] = lambda: HcSubscription(backend.herdr_app_session)
+        # terminal_service calls register/unregister from worker threads (the
+        # API runs delete_terminal in asyncio.to_thread), so the two maps they
+        # share with the loop are guarded by this lock. Task state below is
+        # touched only on the loop (``self._loop``, set by start()).
+        self._state_lock = threading.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._by_address: Dict[str, str] = {}
         self._last_state: Dict[str, TerminalStatus] = {}
         self._floor_seq = -1
@@ -110,18 +135,50 @@ class HerdrAppInboxService:
         tid = labels.get("cao.terminal_id")
         return str(tid) if tid else None
 
-    # Called by terminal_service after it creates a terminal.
+    # Called by terminal_service, from any thread, after it creates a terminal.
     def register_terminal(self, terminal_id: str, pane_id: str, is_kiro: bool = False) -> None:
-        self._by_address[pane_id] = terminal_id
+        with self._state_lock:
+            self._by_address[pane_id] = terminal_id
 
     def unregister_terminal(self, terminal_id: str) -> None:
-        for address in [a for a, t in self._by_address.items() if t == terminal_id]:
-            del self._by_address[address]
-        self._last_state.pop(terminal_id, None)
-        self._cancel_settle(terminal_id)
+        """Forget a terminal; callable from any thread.
+
+        The mapping is gone when this returns, so the ``finished`` event of a
+        kill that follows it is ignored (``dismantle_terminal_runtime``
+        unregisters before ``kill_window``). A pending retry is cancelled on
+        the loop.
+        """
+        self._forget(terminal_id)
+        self._on_loop(self._cancel_settle, terminal_id)
+
+    def _forget(self, terminal_id: str) -> None:
+        with self._state_lock:
+            for address in [a for a, t in self._by_address.items() if t == terminal_id]:
+                del self._by_address[address]
+            self._last_state.pop(terminal_id, None)
+
+    def _on_loop(self, fn: Callable[[str], None], arg: str) -> None:
+        """Run ``fn(arg)`` now when on the service's loop (or it never started), else on it."""
+        loop = self._loop
+        try:
+            running: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if loop is None or loop is running:
+            fn(arg)
+            return
+        try:
+            loop.call_soon_threadsafe(fn, arg)
+        except RuntimeError:  # loop closed: its tasks are gone with it
+            pass
+
+    def _tid_at(self, address: str) -> Optional[str]:
+        with self._state_lock:
+            return self._by_address.get(address)
 
     def mapped(self) -> Dict[str, str]:
-        return dict(self._by_address)
+        with self._state_lock:
+            return dict(self._by_address)
 
     def load_snapshot(self, snapshot: Dict[str, Any]) -> None:
         mapping: Dict[str, str] = {}
@@ -129,10 +186,21 @@ class HerdrAppInboxService:
             tid = self._managed_id(t)
             if tid and t.get("address"):
                 mapping[str(t["address"])] = tid
-        self._by_address = mapping
+        with self._state_lock:
+            self._by_address = mapping
         self._floor_seq = int(snapshot.get("seq") or 0)
 
     async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        try:
+            await self._follow()
+        except asyncio.CancelledError:
+            # Cancelled anywhere: mid-stream, mid-subscribe, or in the backoff sleep.
+            for task in [*self._delivering.values(), *self._settling.values()]:
+                task.cancel()
+            raise
+
+    async def _follow(self) -> None:
         delay = BACKOFF_START_S
         while True:
             sub = None
@@ -149,10 +217,6 @@ class HerdrAppInboxService:
                 logger.warning("herdr-app event stream ended (%r); reconnecting", exc)
             except Exception as exc:  # noqa: BLE001 - keep delivering after any failure
                 logger.warning("herdr-app event stream failed: %s; reconnecting", exc)
-            except asyncio.CancelledError:
-                for task in [*self._delivering.values(), *self._settling.values()]:
-                    task.cancel()
-                raise
             finally:
                 if sub is not None:
                     try:
@@ -167,6 +231,9 @@ class HerdrAppInboxService:
         params = message.get("params") or {}
         if method == "missed":
             self.load_snapshot(params)
+            # Terminals that finished during the gap are in no snapshot and
+            # sent no event that reached us: reconcile drops their rows.
+            await asyncio.to_thread(self._reconcile)
             await asyncio.to_thread(self._backend.sync_layout_names)
             return
         if method != "event":
@@ -185,13 +252,14 @@ class HerdrAppInboxService:
             tid = self._managed_id(record)
             if not (tid and address):
                 return
-            if etype == "restarted" and address not in self._by_address:
+            if etype == "restarted" and self._tid_at(address) is None:
                 # A kept agent was lost and replaced by a shell; CAO already tore it down.
                 await self._kill(address)
             else:
-                self._by_address[address] = tid
+                with self._state_lock:
+                    self._by_address[address] = tid
             return
-        tid = self._by_address.get(address or "")
+        tid = self._tid_at(address or "")
         if tid is None:
             return
         if etype == "status":
@@ -221,9 +289,12 @@ class HerdrAppInboxService:
             self._cancel_settle(tid)
             _note_activity(tid)
         mapped = HC_STATUS_TO_TERMINAL_STATUS.get(state) if isinstance(state, str) else None
-        if mapped is not None and self._last_state.get(tid) != mapped:
-            self._last_state[tid] = mapped
-            await asyncio.to_thread(_record_status, tid, mapped)
+        if mapped is not None:
+            with self._state_lock:
+                changed = self._last_state.get(tid) != mapped
+                self._last_state[tid] = mapped
+            if changed:
+                await asyncio.to_thread(_record_status, tid, mapped)
         if state in ("idle", "done"):
             self._schedule_delivery(tid)
             self._cancel_settle(tid)

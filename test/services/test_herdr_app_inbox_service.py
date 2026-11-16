@@ -288,6 +288,65 @@ def test_register_and_unregister(env):
     assert "t5" not in svc.mapped()
 
 
+class TestCallsFromWorkerThreads:
+    """terminal_service registers and unregisters from worker threads (the API
+    runs delete_terminal in asyncio.to_thread) while the loop handles events."""
+
+    @pytest.fixture(autouse=True)
+    def fast(self, monkeypatch):
+        monkeypatch.setattr(mod, "SETTLE_RETRY_S", 30)
+
+    def test_unregister_off_loop_unmaps_now_and_cancels_on_the_loop(self, env):
+        import threading
+
+        svc, _, deliver, *_ = env
+        cancelled_on = []
+        real_cancel = svc._cancel_settle
+
+        def spy(tid):
+            cancelled_on.append(threading.get_ident())
+            real_cancel(tid)
+
+        svc._cancel_settle = spy
+
+        async def go():
+            # The loop the service runs on; start() records it.
+            svc._loop = asyncio.get_running_loop()
+            await svc.handle(status(1, "t1", "idle"))
+            await svc.drain()
+            settle = svc._settling["aaaa0001"]
+            cancelled_on.clear()
+            worker = threading.Thread(target=svc.unregister_terminal, args=("aaaa0001",))
+            worker.start()
+            worker.join(5)
+            # The map is updated before unregister returns, so the `finished`
+            # event of the kill that follows it is never mapped.
+            assert svc.mapped() == {}
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(settle, 1)
+            return threading.get_ident()
+
+        loop_thread = asyncio.run(go())
+        assert cancelled_on == [loop_thread]
+        assert deliver.call_count == 1
+
+    def test_register_off_loop(self, env):
+        import threading
+
+        svc = env[0]
+
+        async def go():
+            svc._loop = asyncio.get_running_loop()
+            worker = threading.Thread(target=svc.register_terminal, args=("aaaa0007", "t7"))
+            worker.start()
+            worker.join(5)
+            await svc.handle(status(1, "t7", "idle"))
+            await svc.drain()
+
+        asyncio.run(go())
+        env[2].assert_any_call("aaaa0007")
+
+
 def test_doc_event_runs_naming(env):
     svc, backend, *_ = env
     run(svc, ev(1, "doc", None, name="herdr-app", version=3))
@@ -306,8 +365,9 @@ def test_heartbeat_is_ignored(env):
     deliver.assert_not_called()
 
 
-def test_missed_replaces_map_and_drops_stale(env):
+def test_missed_replaces_map_and_drops_stale(env, monkeypatch):
     svc, backend, deliver, *_ = env
+    monkeypatch.setattr(svc, "_reconcile", lambda: None)
     run(
         svc,
         {
@@ -321,6 +381,18 @@ def test_missed_replaces_map_and_drops_stale(env):
     assert svc.mapped() == {"t3": "aaaa0003"}
     assert deliver.call_count == 1
     backend.sync_layout_names.assert_called_once()
+
+
+def test_missed_reconciles_with_the_new_map(env, monkeypatch):
+    # A terminal that finished during the gap is in no snapshot and its
+    # `finished` event never arrived: only reconcile can drop its row.
+    svc, backend, *_ = env
+    order = []
+    monkeypatch.setattr(svc, "_reconcile", lambda: order.append(("reconcile", svc.mapped())))
+    backend.sync_layout_names.side_effect = lambda: order.append(("names", None))
+    missed = {"seq": 10, "terminals": [rec("t3", "aaaa0003")]}
+    run(svc, {"jsonrpc": "2.0", "method": "missed", "params": missed})
+    assert order == [("reconcile", {"t3": "aaaa0003"}), ("names", None)]
 
 
 class _Sub:
@@ -381,6 +453,32 @@ def test_backoff_resets_after_a_notification(env, monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(svc.start())
     assert sleeps == [1, 1, 2]
+
+
+def test_cancel_during_backoff_cancels_pending_tasks(env, monkeypatch):
+    svc = env[0]
+
+    async def cancelled_sleep(s):
+        raise asyncio.CancelledError  # cancelled while waiting to reconnect
+
+    def subscribe():
+        raise RuntimeError("core down")
+
+    svc._subscribe = subscribe
+
+    async def go():
+        delivery = asyncio.create_task(asyncio.Event().wait())
+        settle = asyncio.create_task(asyncio.Event().wait())
+        svc._delivering["aaaa0001"] = delivery
+        svc._settling["aaaa0001"] = settle
+        monkeypatch.setattr(mod.asyncio, "sleep", cancelled_sleep)
+        with pytest.raises(asyncio.CancelledError):
+            await svc.start()
+        for task in (delivery, settle):
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 1)
+
+    asyncio.run(go())
 
 
 def test_failed_subscribe_backs_off(env, monkeypatch):
@@ -579,23 +677,67 @@ class TestReconcile:
         backend.kill_address.assert_not_called()
 
 
-def test_teardown_retains_deferred_tombstone(monkeypatch):
-    from cli_agent_orchestrator.services import herdr_inbox_service, terminal_service
+class TestTeardown:
+    """_teardown: the real seam behind a `finished` / `lost` event."""
 
-    monkeypatch.setattr(herdr_inbox_service, "_retain_deferred_failure_tombstone", lambda t: True)
-    called = []
-    monkeypatch.setattr(terminal_service, "delete_terminal", lambda *a, **k: called.append(a))
-    mod._teardown("aaaa0001", "terminal_finished")
-    assert called == []
+    @pytest.fixture
+    def db(self, monkeypatch):
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.services import herdr_inbox_service, terminal_service
 
+        rows = {"aaaa0001": {"id": "aaaa0001", "tmux_session": "cao-a"}}
+        monkeypatch.setattr(database, "terminal_exists", lambda tid: tid in rows)
+        monkeypatch.setattr(database, "get_terminal_metadata", lambda tid: rows.get(tid))
+        retained = []
+        monkeypatch.setattr(
+            herdr_inbox_service,
+            "_retain_deferred_failure_tombstone",
+            lambda tid: tid in retained,
+        )
+        deleted = []
 
-def test_teardown_deletes_with_end_reason(monkeypatch):
-    from cli_agent_orchestrator.services import herdr_inbox_service, terminal_service
+        def delete_terminal(tid, **kwargs):
+            from cli_agent_orchestrator.services import session_lock
 
-    monkeypatch.setattr(herdr_inbox_service, "_retain_deferred_failure_tombstone", lambda t: False)
-    called = []
-    monkeypatch.setattr(
-        terminal_service, "delete_terminal", lambda tid, **k: called.append((tid, k))
-    )
-    mod._teardown("aaaa0001", "terminal_lost")
-    assert called == [("aaaa0001", {"end_reason": "terminal_lost"})]
+            entry = session_lock._session_locks.get("cao-a")
+            deleted.append((tid, kwargs, entry is not None and entry[0].locked()))
+
+        monkeypatch.setattr(terminal_service, "delete_terminal", delete_terminal)
+        return rows, retained, deleted
+
+    def test_retains_deferred_tombstone(self, db):
+        _, retained, deleted = db
+        retained.append("aaaa0001")
+        mod._teardown("aaaa0001", "terminal_finished")
+        assert deleted == []
+
+    def test_deletes_with_end_reason_under_the_session_lock(self, db):
+        _, _, deleted = db
+        mod._teardown("aaaa0001", "terminal_lost")
+        assert deleted == [("aaaa0001", {"end_reason": "terminal_lost"}, True)]
+
+    def test_row_already_gone_is_left_alone(self, db):
+        # CAO deleted the terminal itself (its own kill produced the event).
+        rows, _, deleted = db
+        rows.clear()
+        mod._teardown("aaaa0001", "terminal_finished")
+        assert deleted == []
+
+    def test_waits_for_a_session_teardown_and_skips_its_terminal(self, db):
+        # delete_session holds the lock from kill_session (which makes the
+        # `finished` event) until it has deleted the session's rows.
+        import threading
+
+        from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
+
+        rows, _, deleted = db
+        done = threading.Event()
+        with session_lifecycle_lock("cao-a"):
+            worker = threading.Thread(
+                target=lambda: (mod._teardown("aaaa0001", "terminal_finished"), done.set())
+            )
+            worker.start()
+            assert not done.wait(0.3), "teardown did not wait for the session teardown"
+            rows.clear()  # the session teardown drops its rows, then releases
+        worker.join(5)
+        assert done.is_set() and deleted == []
