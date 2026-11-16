@@ -14,6 +14,7 @@ import os
 import secrets
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from cli_agent_orchestrator.backends.base import (
@@ -47,6 +48,17 @@ HC_STATUS_TO_TERMINAL_STATUS: Dict[str, TerminalStatus] = {
     "idle": TerminalStatus.IDLE,
     "error": TerminalStatus.ERROR,
 }
+
+
+def cao_home_label() -> str:
+    """This server's identity among cao-servers sharing a core: the first 16 hex
+    of the SHA-256 of its resolved CAO home directory (``CAO_HOME_DIR``). Two
+    servers with different homes have separate databases, so neither may see,
+    reconcile, or kill the other's terminals."""
+    from cli_agent_orchestrator import constants
+
+    home = Path(constants.CAO_HOME_DIR).resolve()
+    return hashlib.sha256(str(home).encode("utf-8")).hexdigest()[:16]
 
 
 def space_id_for(session_name: str) -> str:
@@ -95,6 +107,8 @@ class HerdrAppBackend(TerminalBackend):
         # injected ``client`` (tests) doubles as the input client.
         self._input_client = input_client if input_client is not None else client
         self._input_lock = threading.Lock()
+        self._home = cao_home_label()
+        self._managed = {**MANAGED, "cao.home": self._home}
         self._connect()
 
     def _connect(self) -> None:
@@ -111,6 +125,11 @@ class HerdrAppBackend(TerminalBackend):
     @property
     def herdr_app_session(self) -> str:
         return self._session
+
+    @property
+    def home_label(self) -> str:
+        """Value of this server's ``cao.home`` label."""
+        return self._home
 
     def _call(self, method: str, _timeout: float = RPC_TIMEOUT_S, **params: Any) -> Any:
         assert self._client is not None
@@ -170,7 +189,7 @@ class HerdrAppBackend(TerminalBackend):
             "labels": {
                 "herdr.space": space_id_for(session_name),
                 "herdr.tab": "tb" + secrets.token_hex(16),
-                **MANAGED,
+                **self._managed,
                 "cao.terminal_id": terminal_id,
                 "cao.session": session_name,
                 "cao.window": window_name,
@@ -240,7 +259,7 @@ class HerdrAppBackend(TerminalBackend):
     def sync_layout_names(self) -> None:
         """Name every CAO space and tab after its CAO session and window. Never raises."""
         try:
-            live = self._call("terminal.list", labels=MANAGED)["terminals"]
+            live = self._list()
             spaces = {
                 space_id_for(t["labels"]["cao.session"]): t["labels"]["cao.session"] for t in live
             }
@@ -268,7 +287,7 @@ class HerdrAppBackend(TerminalBackend):
     # --- Lookup ---
 
     def _list(self, **labels: str) -> List[Dict[str, Any]]:
-        return list(self._call("terminal.list", labels={**MANAGED, **labels})["terminals"])
+        return list(self._call("terminal.list", labels={**self._managed, **labels})["terminals"])
 
     def _terminal(self, session_name: str, window_name: str) -> Dict[str, Any]:
         found = self._list(**{"cao.session": session_name, "cao.window": window_name})
@@ -329,6 +348,14 @@ class HerdrAppBackend(TerminalBackend):
         if self._list(**{"cao.session": session_name}):
             return False
         sp = space_id_for(session_name)
+        try:
+            # Another cao-server (other CAO home) may use the same session name
+            # and so the same space; leave the space to whoever is still in it.
+            if self._call("terminal.list", labels={"herdr.space": sp})["terminals"]:
+                return True
+        except HcRpcError as exc:
+            logger.warning("herdr-app: kept space for %s, lookup failed: %s", session_name, exc)
+            return True
 
         def drop_space(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             kept = [s for s in doc["spaces"] if not (isinstance(s, dict) and s.get("id") == sp)]

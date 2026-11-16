@@ -4,7 +4,11 @@ from test.backends.fake_hc import FakeHc, layout_with
 import pytest
 
 from cli_agent_orchestrator.backends.factory import ConfigurationError
-from cli_agent_orchestrator.backends.herdr_app_backend import HerdrAppBackend, space_id_for
+from cli_agent_orchestrator.backends.herdr_app_backend import (
+    HerdrAppBackend,
+    cao_home_label,
+    space_id_for,
+)
 
 
 @pytest.fixture
@@ -50,6 +54,7 @@ def test_create_session_and_window_share_a_space(backend, hc, tmp_path):
         assert labels["herdr.space"] == space_id_for("cao-a")
         assert labels["herdr.tab"].startswith("tb") and len(labels["herdr.tab"]) == 34
         assert labels["cao.managed"] == "1"
+        assert labels["cao.home"] == HOME
         assert (labels["cao.terminal_id"], labels["cao.session"], labels["cao.window"]) == (
             tid,
             "cao-a",
@@ -123,10 +128,14 @@ from cli_agent_orchestrator.backends.base import (
 from cli_agent_orchestrator.constants import HC_READ_MAX_LINES
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
+HOME = cao_home_label()
+FOREIGN_HOME = "f" * 16
 
-def _labels(session, window, tid):
+
+def _labels(session, window, tid, home=HOME):
     return {
         "cao.managed": "1",
+        "cao.home": home,
         "cao.session": session,
         "cao.window": window,
         "cao.terminal_id": tid,
@@ -438,3 +447,53 @@ class TestInputConnection:
         first = backend._input()
         assert len(made) == 2 and first is not made[0] and first.session == "cao-x"
         assert backend._input() is first and len(made) == 2
+
+
+class TestServerIdentity:
+    """Two cao-servers with different CAO homes can share one core."""
+
+    def test_home_label_hashes_the_resolved_home(self, monkeypatch, tmp_path):
+        from cli_agent_orchestrator import constants
+
+        monkeypatch.setattr(constants, "CAO_HOME_DIR", tmp_path / "x" / ".." / "home")
+        expected = hashlib.sha256(str((tmp_path / "home").resolve()).encode()).hexdigest()[:16]
+        assert cao_home_label() == expected and len(expected) == 16
+
+    @pytest.fixture
+    def mixed(self, hc, two_windows):
+        foreign = hc.add_terminal(_labels("cao-a", "w1", "aaaa0002", FOREIGN_HOME))
+        other = hc.add_terminal(_labels("cao-z", "sup", "zzzz0001", FOREIGN_HOME))
+        return foreign, other
+
+    def test_foreign_terminals_are_invisible(self, backend, mixed):
+        assert backend.session_exists("cao-z") is False
+        assert backend.list_sessions() == [{"id": "cao-a", "name": "cao-a", "status": "active"}]
+        assert {t["address"] for t in backend.list_managed()} == {"t1", "t2"}
+        assert backend.get_pane_id("aaaa0002") == "t2"
+        assert backend.cleanup_terminal_exact("zzzz0001").outcome == TerminalCleanupOutcome.ABSENT
+
+    def test_exact_cleanup_is_not_ambiguous_across_homes(self, backend, hc, mixed):
+        r = backend.cleanup_terminal_exact("aaaa0002")
+        assert r.outcome == TerminalCleanupOutcome.DELETED
+        assert "t2" not in hc.terminals and mixed[0]["address"] in hc.terminals
+
+    def test_kill_session_spares_foreign_terminals_and_shared_space(self, backend, hc, mixed):
+        sp = space_id_for("cao-a")
+        hc.set_doc("herdr-app", layout_with(sp, [("tbA", "sup", "t1")], "cao-a"))
+        assert backend.kill_session("cao-a") is True
+        assert set(hc.terminals) == {mixed[0]["address"], mixed[1]["address"]}
+        # The other server still has a terminal in that space: keep it.
+        assert [s["id"] for s in hc.docs["herdr-app"]["value"]["spaces"]] == [sp]
+        assert backend.kill_session("cao-z") is False
+
+    def test_kill_window_and_input_ignore_foreign(self, backend, hc, mixed):
+        backend.send_keys("cao-a", "w1", "hi")
+        assert hc.calls_to("terminal.send")[0]["terminal"] == "t2"
+        assert backend.kill_window("cao-z", "sup") is False
+
+    def test_naming_ignores_foreign_terminals(self, backend, hc, tmp_path):
+        sp = space_id_for("cao-q")
+        foreign = hc.add_terminal(_labels("cao-q", "theirs", "qqqq0001", FOREIGN_HOME))
+        hc.set_doc("herdr-app", layout_with(sp, [("tbF", "", foreign["address"])]))
+        backend.sync_layout_names()
+        assert hc.calls_to("doc.set") == []
