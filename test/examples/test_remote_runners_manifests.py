@@ -594,13 +594,15 @@ def test_the_workspace_is_mounted_only_through_its_access_point():
     no_tls = statements["DenyWithoutTls"]
     assert _as_set(no_tls["Action"]) == _EFS_CLIENT
     assert no_tls["Condition"] == {"Bool": {"aws:SecureTransport": "false"}}
-    root = statements["DenyRoot"]
+    # Root squashing: a client with UID 0 is mapped to a limited user; the
+    # mount itself is not refused.
+    root = statements["SquashRoot"]
     assert _as_set(root["Action"]) == {"elasticfilesystem:ClientRootAccess"}
     assert "Condition" not in root
     assert set(statements) == {
         "DenyWithoutAnAccessPoint",
         "DenyWithoutTls",
-        "DenyRoot",
+        "SquashRoot",
     }
     # The one EFS client grant in the stack: the node role, through the
     # workspace access point. (The file system policy cannot limit mounts to
@@ -626,6 +628,12 @@ def test_the_workspace_is_mounted_only_through_its_access_point():
     ]
     ((role, grant),) = grants
     assert role == "EfsCsiNodeRole"
+    # Not the name of round 1's standalone AWS::IAM::RolePolicy on this role:
+    # deleting that resource on an update would delete the inline policy.
+    inline_names = [
+        p["PolicyName"] for p in resources["EfsCsiNodeRole"]["Properties"].get("Policies", [])
+    ]
+    assert inline_names and "mount-the-workspace" not in inline_names
     (addon,) = _resources("AWS::EKS::Addon").values()
     (node,) = [
         a for a in addon["Properties"]["PodIdentityAssociations"] if a["RoleArn"] == f"{role}.Arn"

@@ -206,10 +206,13 @@ examples/cao-clusters/kubernetes/remote-runners/overlays/eks/deploy.sh cao-remot
   driver's node role (Pod Identity on `efs-csi-node-sa`), whose policy lets it
   mount and write only through the workspace access point. The file system
   policy allows nothing to clients without IAM, and denies every mount
-  without an access point, without TLS, or as root, whatever an identity
-  policy allows. It cannot limit mounts to the node role: EFS enforces only
-  a few condition keys for NFS clients, and none of them names the
-  principal. So any principal of this account whose own IAM policy grants
+  without an access point or without TLS, whatever an identity policy
+  allows. It also denies root access, which squashes root rather than
+  refusing the mount: UID 0 on the client is mapped to a user with limited
+  permissions (through the workspace access point, every request runs as
+  uid/gid 1000 regardless). It cannot limit mounts to the node role: EFS
+  enforces only a few condition keys for NFS clients, and none of them names
+  the principal. So any principal of this account whose own IAM policy grants
   EFS client actions (`elasticfilesystem:ClientMount`, `ClientWrite`) can
   still mount through an access point of this file system, including the
   workspace one (there as uid/gid 1000 under `/cao-workspace`; through

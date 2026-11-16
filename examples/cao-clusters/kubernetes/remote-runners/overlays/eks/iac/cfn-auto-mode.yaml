@@ -535,7 +535,10 @@ Resources:
               - sts:AssumeRole
               - sts:TagSession
       Policies:
-        - PolicyName: mount-the-workspace
+        # Not mount-the-workspace, the name of an earlier standalone
+        # AWS::IAM::RolePolicy on this role: deleting that resource on an
+        # update would delete an inline policy of the same name.
+        - PolicyName: workspace-through-its-access-point
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -613,7 +616,11 @@ Resources:
       # target mount the root as any uid. With this one, nothing is allowed
       # here, so a client without IAM gets nothing, and the denials hold
       # whatever an identity policy allows: no mount goes without an access
-      # point, without TLS, or as root. Only the condition keys EFS enforces
+      # point or without TLS, and no client gets root access. Denying
+      # ClientRootAccess does not refuse the mount: it turns on root
+      # squashing, so UID 0 on the client is mapped to a user with limited
+      # permissions (and through the workspace access point every request
+      # runs as uid/gid 1000 anyway). Only the condition keys EFS enforces
       # for NFS clients are used (aws:SecureTransport, aws:SourceIp,
       # elasticfilesystem:AccessPointArn and AccessedViaMountTarget; EFS
       # does not enforce others, such as aws:PrincipalArn), so this policy
@@ -650,7 +657,7 @@ Resources:
             Condition:
               Bool:
                 aws:SecureTransport: "false"
-          - Sid: DenyRoot
+          - Sid: SquashRoot
             Effect: Deny
             Principal:
               AWS: "*"
