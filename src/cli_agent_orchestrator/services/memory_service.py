@@ -168,6 +168,23 @@ class MemoryDisabledError(RuntimeError):
     """
 
 
+class MemoryNotFoundError(LookupError):
+    """An exact-key read found no note visible to this caller."""
+
+    error_kind = "not_found"
+
+
+class MemoryAmbiguousScopeError(LookupError):
+    """An exact-key read needs a scope because several visible scopes match."""
+
+    error_kind = "ambiguous_scope"
+
+    def __init__(self, key: str, scopes: list[str]) -> None:
+        self.key = key
+        self.scopes = scopes
+        super().__init__(f"memory key {key!r} exists in scopes: {', '.join(scopes)}")
+
+
 class MemoryPartialWriteError(RuntimeError):
     """Raised when durable wiki projections outlive a failed metadata write."""
 
@@ -2688,6 +2705,7 @@ class MemoryService:
         search_mode: Optional[str] = None,
         sort_by: Optional[str] = None,
         include_related: bool = False,
+        detail: Literal["full", "snippet"] = "full",
         *,
         record_access: bool = True,
     ) -> list[Memory]:
@@ -2710,6 +2728,9 @@ class MemoryService:
 
         ``record_access``: False skips reinforcement bookkeeping (operator inspection).
 
+        ``detail``: ``full`` preserves the existing body shape; ``snippet``
+        returns a compact matched-term window plus a ``memory_get`` hint.
+
         ``include_related``: when True, each result's
         ``related_keys`` cross-references are loaded (one level, same scope)
         and appended after the primary results, marked ``is_related=True``.
@@ -2719,6 +2740,8 @@ class MemoryService:
         """
         if not _is_memory_enabled():
             return []
+        if detail not in {"full", "snippet"}:
+            raise ValueError("detail must be 'full' or 'snippet'")
 
         explicit_search_mode = search_mode is not None
         explicit_sort_by = sort_by is not None
@@ -2827,7 +2850,7 @@ class MemoryService:
                 lifecycle_on=lifecycle_on,
                 superseded_snapshot=superseded_snapshot,
             )
-            return self._finish_recall(
+            recalled = self._finish_recall(
                 ordered,
                 scope,
                 limit,
@@ -2840,17 +2863,215 @@ class MemoryService:
                 superseded_snapshot=superseded_snapshot,
                 target_plan=target_plan,
             )
-        return self._apply_sort_and_increment(
-            pool.rows,
-            scope,
-            pool.effective_sort,
-            limit,
-            include_related=include_related,
-            query=query,
+        else:
+            recalled = self._apply_sort_and_increment(
+                pool.rows,
+                scope,
+                pool.effective_sort,
+                limit,
+                include_related=include_related,
+                query=query,
+                terminal_context=terminal_context,
+                scan_all=scan_all,
+                policy=recall_policy,
+            )
+        self._apply_recall_detail(recalled, query, search_mode, detail)
+        return recalled
+
+    @staticmethod
+    def _query_terms(query: Optional[str]) -> list[str]:
+        """Lower-cased query terms in caller order, without duplicates."""
+        return list(dict.fromkeys(term for term in (query or "").lower().split() if term))
+
+    @staticmethod
+    def _snippet(content: str, terms: list[str], limit: int = 300) -> str:
+        """Choose a compact window spanning the matched terms when possible."""
+        if len(content) <= limit:
+            return content
+        lowered = content.lower()
+        positions = [
+            (position, len(term)) for term in terms if (position := lowered.find(term)) >= 0
+        ]
+        if positions:
+            first = min(position for position, _length in positions)
+            last = max(position + length for position, length in positions)
+            if last - first <= limit:
+                start = max(0, min(first - (limit - (last - first)) // 2, len(content) - limit))
+            else:
+                start = max(0, first - limit // 4)
+        else:
+            start = 0
+        end = min(len(content), start + limit)
+        prefix = "…" if start else ""
+        suffix = "…" if end < len(content) else ""
+        return prefix + content[start:end].strip() + suffix
+
+    def _apply_recall_detail(
+        self,
+        memories: list[Memory],
+        query: Optional[str],
+        search_mode: str,
+        detail: Literal["full", "snippet"],
+    ) -> None:
+        """Attach transient v2 fields without widening the default serializer."""
+        terms = self._query_terms(query)
+        for memory in memories:
+            memory.fact_date = memory.fact_date or memory.created_at
+            memory.edited_at = memory.edited_at or memory.updated_at
+            memory.match = {
+                "mode": search_mode,
+                "terms": [term for term in terms if term in memory.content.lower()],
+                "rank_reason": f"{search_mode} match",
+            }
+            memory.status = memory.lifecycle_status or "active"
+            memory.get = f"memory_get(key={memory.key!r}, scope={memory.scope!r})"
+            if detail == "snippet":
+                memory.snippet = self._snippet(memory.content, terms)
+
+    async def get_memory(
+        self,
+        key: str,
+        scope: Optional[str] = None,
+        terminal_context: Optional[dict] = None,
+        include_history: bool = False,
+        max_chars: int = 8000,
+    ) -> dict[str, Any]:
+        """Read one visible note by exact sanitised key.
+
+        Candidate discovery deliberately reuses recall so native/vault
+        bindings, private-scope filtering and eligibility policy stay in one
+        place. The census itself does not count as access; only the one note
+        returned to the explicit MCP caller does.
+        """
+        if not _is_memory_enabled():
+            raise MemoryNotFoundError(key)
+        if max_chars < 1:
+            raise ValueError("max_chars must be at least 1")
+        sanitised = self._sanitize_key(key)
+        rows = await self.recall(
+            scope=scope,
+            limit=1_000_000,
             terminal_context=terminal_context,
-            scan_all=scan_all,
-            policy=recall_policy,
+            search_mode="metadata",
+            record_access=False,
         )
+        matches = [memory for memory in rows if memory.key == sanitised]
+        if not matches:
+            raise MemoryNotFoundError(sanitised)
+        scopes = list(dict.fromkeys(memory.scope for memory in matches))
+        if scope is None and len(scopes) > 1:
+            raise MemoryAmbiguousScopeError(sanitised, scopes)
+        memory = matches[0]
+        try:
+            self._increment_access_count([memory])
+        except Exception as exc:  # noqa: BLE001 — explicit read remains best-effort
+            logger.warning("memory_get increment failed scope=%s", memory.scope)
+            logger.debug("memory_get increment failure detail: %s", exc)
+
+        status = (
+            "superseded"
+            if self._is_superseded(memory, self._superseded_keys([memory]))
+            else "active"
+        )
+        history = self._memory_history(memory)
+        earlier_entries = memory.earlier_entries
+        content = memory.content
+        clipped_content = content[:max_chars]
+        truncated = memory.content_truncated or earlier_entries > 0 or len(content) > max_chars
+        result: dict[str, Any] = {
+            "key": memory.key,
+            "scope": memory.scope,
+            "memory_type": memory.memory_type,
+            "tags": memory.tags,
+            "content": clipped_content,
+            "status": status,
+            "fact_date": (memory.fact_date or memory.created_at).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "edited_at": (memory.edited_at or memory.updated_at).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "earlier_entries": earlier_entries,
+            "content_truncated": truncated,
+            "links_out": [],
+            "links_in": [],
+        }
+        links_out, links_in = self._memory_links(memory)
+        result["links_out"] = links_out
+        result["links_in"] = links_in
+        if include_history:
+            remaining = max_chars
+            visible_history = []
+            for item in history:
+                if remaining <= 0:
+                    truncated = True
+                    break
+                item_content = item["content"]
+                shown = item_content[:remaining]
+                visible_history.append({**item, "content": shown})
+                remaining -= len(shown)
+                if len(shown) < len(item_content):
+                    truncated = True
+                    break
+            if len(visible_history) < len(history):
+                truncated = True
+            result["history"] = visible_history
+            result["content_truncated"] = truncated
+        return result
+
+    def _memory_history(self, memory: Memory) -> list[dict[str, str]]:
+        """Return native entries newest-first; vault rows retain recall's body."""
+        if memory.source_kind != "native":
+            return [
+                {
+                    "date": memory.updated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "content": memory.content,
+                }
+            ]
+        try:
+            file_content = Path(memory.file_path).read_text(encoding="utf-8")
+        except OSError:
+            return []
+        matches = list(_LENIENT_ENTRY_HEADING_RE.finditer(file_content))
+        compiled = any(_COMPILED_MARKER_RE.fullmatch(line) for line in file_content.splitlines())
+        if compiled or not matches:
+            return [
+                {
+                    "date": memory.updated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "content": memory.content,
+                }
+            ]
+        entries = []
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(file_content)
+            content = self._strip_existing_see_also(file_content[match.end() : end]).strip()
+            value = match.group("timestamp")
+            if len(value) == 17:
+                value = value.replace("Z", ":00Z")
+            entries.append({"date": value, "content": content})
+        return list(reversed(entries))
+
+    def _memory_links(self, memory: Memory) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        """Return today's active relationship edges in both directions."""
+        try:
+            from cli_agent_orchestrator.services.memory_relationship_service import (
+                MemoryRelationshipService,
+            )
+
+            relationships = MemoryRelationshipService().list_relationships(
+                memory.scope,
+                self._effective_scope_id(memory),
+            )
+        except Exception as exc:  # noqa: BLE001 — relationship enrichment is best-effort
+            logger.debug("memory_get relationship read failed: %s", exc)
+            return [], []
+        links_out = [
+            {"type": edge.type, "key": edge.target_key}
+            for edge in relationships
+            if edge.source_key == memory.key
+        ][:5]
+        links_in = [
+            {"type": edge.type, "key": edge.source_key}
+            for edge in relationships
+            if edge.target_key == memory.key
+        ][:5]
+        return links_out, links_in
 
     async def recall_explain(
         self,
@@ -4533,6 +4754,9 @@ class MemoryService:
             created_at=created_at,
             updated_at=updated_at,
             content=latest_content,
+            fact_date=min(timestamps) if timestamps else created_at,
+            edited_at=max(timestamps) if timestamps else updated_at,
+            earlier_entries=0 if compiled else max(0, len(timestamps) - 1),
         )
         split = WikiContentSplit(
             latest_section=latest_section,

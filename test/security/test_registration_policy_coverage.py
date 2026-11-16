@@ -227,6 +227,7 @@ _CAO_MCP_EXEMPT: Dict[str, str] = {
     # Memory and learning: writes land in the caller's own scope.
     "memory_store": _IDENTITY_LOCAL,
     "memory_recall": _IDENTITY_LOCAL,
+    "memory_get": _IDENTITY_LOCAL,
     "memory_forget": _IDENTITY_LOCAL,
     "report_outcome": _IDENTITY_LOCAL,
     "store_lesson": _IDENTITY_LOCAL,

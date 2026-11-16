@@ -77,6 +77,10 @@ class InjectionConfig(BaseModel):
     write_project_files: bool = False
 
 
+class RecallConfig(BaseModel):
+    v2_fields: bool = False
+
+
 class RankingConfig(BaseModel):
     default_sort: Literal["recency", "bm25"] = "recency"
 
@@ -86,6 +90,7 @@ class MemoryConfig(BaseModel):
     explain_enabled: bool = True
     non_accessing_inspection: bool = True
     parser: MemoryParserConfig = Field(default_factory=MemoryParserConfig)
+    recall: RecallConfig = Field(default_factory=RecallConfig)
     lifecycle: LifecycleConfig = Field(default_factory=LifecycleConfig)
     injection: InjectionConfig = Field(default_factory=InjectionConfig)
     ranking: RankingConfig = Field(default_factory=RankingConfig)
@@ -242,6 +247,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_MEMORY_ENABLED": ("memory.enabled", "bool", True),
     "CAO_MEMORY_EXPLAIN_ENABLED": ("memory.explain_enabled", "bool", True),
     "CAO_MEMORY_NON_ACCESSING_INSPECTION": ("memory.non_accessing_inspection", "bool", True),
+    "CAO_MEMORY_RECALL_V2_FIELDS": ("memory.recall.v2_fields", "bool", False),
     "CAO_MEMORY_LIFECYCLE_ENABLED": ("memory.lifecycle.enabled", "bool", False),
     "CAO_MEMORY_LINT_ENABLED": ("memory.lint_enabled", "bool", True),
     "CAO_MEMORY_COMPILE_MODE": ("memory.compile_mode", "str", "llm"),
@@ -497,6 +503,8 @@ def _get_owned_section(path: str, default: Any) -> Any:
                 if isinstance(injection, dict)
                 else injection_default
             )
+        if key == "recall.v2_fields":
+            return settings_service.is_memory_recall_v2_fields_enabled()
         if key == "ranking.default_sort":
             ranking = settings_service.get_memory_settings().get("ranking", {})
             return ranking.get("default_sort", default) if isinstance(ranking, dict) else default
@@ -678,6 +686,7 @@ _ALL_PATHS = sorted(
         "memory.flush_threshold",
         "memory.compile_timeout_s",
         "memory.parser.lenient",
+        "memory.recall.v2_fields",
         "memory.ranking.default_sort",
         "memory.vault",
         "terminal.keep_finished.enabled",
@@ -767,6 +776,9 @@ class ConfigService:
                 explain_enabled=settings_service.is_memory_explain_enabled(),
                 non_accessing_inspection=settings_service.is_non_accessing_inspection_enabled(),
                 parser=MemoryParserConfig(lenient=settings_service.is_memory_parser_lenient()),
+                recall=RecallConfig(
+                    v2_fields=settings_service.is_memory_recall_v2_fields_enabled()
+                ),
                 lifecycle=LifecycleConfig(enabled=settings_service.is_memory_lifecycle_enabled()),
                 injection=InjectionConfig(
                     **{

@@ -167,8 +167,14 @@ DUAL_MODE_ALLOWLIST: Dict[PinKey, Pin] = {
         MODULE_SCOPE,
         "cli_agent_orchestrator.services.memory_service",
     ): Pin(
-        ("MEMORY_DISABLED_MESSAGE", "MemoryDisabledError", "MemoryPartialWriteError"),
-        "a message constant and two exception types -- no client is used "
+        (
+            "MEMORY_DISABLED_MESSAGE",
+            "MemoryAmbiguousScopeError",
+            "MemoryDisabledError",
+            "MemoryNotFoundError",
+            "MemoryPartialWriteError",
+        ),
+        "a message constant and four exception types -- no client is used "
         "through these names (importing the module still binds clients.database; "
         "see the caveat above)",
     ),
@@ -198,6 +204,14 @@ DUAL_MODE_ALLOWLIST: Dict[PinKey, Pin] = {
         ("MemoryService",),
         "dual-mode: remote fallback is memory_gateway.recall_memory "
         "(POST /internal/memory/recall)",
+    ),
+    (
+        "mcp_server/server.py",
+        "memory_get",
+        "cli_agent_orchestrator.services.memory_service",
+    ): Pin(
+        ("MemoryService",),
+        "dual-mode: remote fallback is memory_gateway.get_memory " "(POST /internal/memory/get)",
     ),
     (
         "mcp_server/server.py",

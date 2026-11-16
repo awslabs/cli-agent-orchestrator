@@ -13,7 +13,7 @@ available to a brand-new agent in a later session — even on a different provid
 the user never has to repeat themselves.
 
 These are CAO's cross-provider memory tools (`memory_store`, `memory_recall`,
-`memory_forget`), exposed by the CAO MCP server. They are **distinct from any
+`memory_get`, `memory_forget`), exposed by the CAO MCP server. They are **distinct from any
 provider-native memory** the CLI tool may have.
 
 ## Scopes and types
@@ -39,6 +39,10 @@ already told you, search memory first.
 ```
 memory_recall(query="database widgets endpoint testing")
 ```
+
+For a compact response, pass `detail="snippet"`; each result includes a
+`memory_get` hint. Use `memory_get(key=..., scope=...)` to fetch one note's
+complete body and available history.
 
 Omit `scope` to search all scopes (results follow precedence session → project → global → agent → federated).
 Filter with `scope=` or `memory_type=` when you know where to look. Recall is for searching

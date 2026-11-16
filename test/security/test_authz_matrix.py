@@ -82,6 +82,7 @@ READ_TIER_MUTATING = READ_TIER_MUTATING_ROUTES | {
     ("POST", "/agui/v1/run"),
     ("POST", "/agui/v1/stream"),
     ("POST", "/internal/memory/recall"),
+    ("POST", "/internal/memory/get"),
     ("POST", "/internal/memory/context"),
 }
 

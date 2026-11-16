@@ -11314,6 +11314,15 @@ class InternalMemoryRecallRequest(BaseModel):
     sort_by: Optional[str] = None
     include_related: bool = False
     record_access: bool = True
+    detail: Literal["full", "snippet"] = "full"
+
+
+class InternalMemoryGetRequest(BaseModel):
+    key: LenientMemoryKey
+    scope: Optional[MemoryScope] = None
+    include_history: bool = False
+    max_chars: int = Field(default=8000, ge=1, le=100_000)
+    terminal_context: Optional[InternalMemoryContext] = None
 
 
 class InternalMemoryForgetRequest(BaseModel):
@@ -11376,10 +11385,65 @@ async def internal_memory_recall(
         sort_by=body.sort_by,
         include_related=body.include_related,
         record_access=body.record_access,
+        detail=body.detail,
     )
+    from cli_agent_orchestrator.services.settings_service import (
+        is_memory_recall_v2_fields_enabled,
+    )
+
     # One serializer for both recall surfaces (this route and the MCP
     # memory_recall tool); see models/memory.py.
-    return {"memories": [recall_wire_dict(memory) for memory in memories]}
+    return {
+        "memories": [
+            recall_wire_dict(
+                memory,
+                detail=body.detail,
+                include_v2_fields=is_memory_recall_v2_fields_enabled(),
+            )
+            for memory in memories
+        ]
+    }
+
+
+@app.post("/internal/memory/get")
+async def internal_memory_get(
+    body: InternalMemoryGetRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Any:
+    """Read one exact memory for a remote CAO worker."""
+    from cli_agent_orchestrator.services.memory_service import (
+        MemoryAmbiguousScopeError,
+        MemoryNotFoundError,
+    )
+
+    _require_memory_enabled()
+    try:
+        memory = await _get_memory_service().get_memory(
+            key=body.key,
+            scope=body.scope.value if body.scope else None,
+            include_history=body.include_history,
+            max_chars=body.max_chars,
+            terminal_context=(
+                body.terminal_context.model_dump(exclude_none=True)
+                if body.terminal_context
+                else None
+            ),
+        )
+    except MemoryAmbiguousScopeError as error:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "error_kind": error.error_kind,
+                "error": str(error),
+                "scopes": error.scopes,
+            },
+        )
+    except MemoryNotFoundError as error:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"error_kind": error.error_kind, "error": str(error)},
+        )
+    return {"memory": memory}
 
 
 @app.post("/internal/memory/forget")

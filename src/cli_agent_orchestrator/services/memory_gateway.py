@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import requests
 
@@ -15,6 +15,8 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 )
 from cli_agent_orchestrator.services.memory_service import (
     ForgetResult,
+    MemoryAmbiguousScopeError,
+    MemoryNotFoundError,
     MemoryPartialWriteError,
     MemoryService,
 )
@@ -65,6 +67,12 @@ def _post(path: str, body: dict[str, Any]) -> dict[str, Any]:
                             scope_id=scope_id,
                             file_path=partial["file_path"],
                         )
+        if error.get("error_kind") == MemoryAmbiguousScopeError.error_kind:
+            scopes = error.get("scopes")
+            if isinstance(scopes, list) and all(isinstance(scope, str) for scope in scopes):
+                raise MemoryAmbiguousScopeError("", scopes)
+        if error.get("error_kind") == MemoryNotFoundError.error_kind:
+            raise MemoryNotFoundError(error.get("error", "memory not found"))
     response.raise_for_status()
     result: dict[str, Any] = response.json()
     return result
@@ -117,6 +125,7 @@ async def recall_memory(
     search_mode: Optional[str],
     sort_by: Optional[str],
     include_related: bool,
+    detail: Literal["full", "snippet"] = "full",
 ):
     if not remote_memory_url():
         return await MemoryService().recall(
@@ -128,6 +137,7 @@ async def recall_memory(
             search_mode=search_mode,
             sort_by=sort_by,
             include_related=include_related,
+            detail=detail,
         )
     body = {
         key: value
@@ -140,6 +150,7 @@ async def recall_memory(
             "search_mode": search_mode,
             "sort_by": sort_by,
             "include_related": include_related,
+            "detail": detail if detail != "full" else None,
         }.items()
         if value is not None
     }
@@ -151,6 +162,41 @@ async def recall_memory(
     from cli_agent_orchestrator.models.memory import Memory
 
     return [Memory.model_validate(item) for item in payload["memories"]]
+
+
+async def get_memory(
+    *,
+    key: str,
+    scope: Optional[str],
+    include_history: bool,
+    max_chars: int,
+    terminal_context: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    if not remote_memory_url():
+        return await MemoryService().get_memory(
+            key=key,
+            scope=scope,
+            include_history=include_history,
+            max_chars=max_chars,
+            terminal_context=terminal_context,
+        )
+    payload = await asyncio.to_thread(
+        _post,
+        "/internal/memory/get",
+        {
+            key_: value
+            for key_, value in {
+                "key": key,
+                "scope": scope,
+                "include_history": include_history,
+                "max_chars": max_chars,
+                "terminal_context": terminal_context,
+            }.items()
+            if value is not None
+        },
+    )
+    result: dict[str, Any] = payload["memory"]
+    return result
 
 
 async def forget_memory(

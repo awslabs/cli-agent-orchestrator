@@ -44,6 +44,7 @@ UNGATED_BEFORE = (
     "memory_store",  # durable write
     "memory_forget",  # durable delete
     "memory_recall",  # durable read
+    "memory_get",  # exact durable read
     "delete_terminal",  # another terminal's lifecycle
     "update_metadata",  # another terminal's record
     "store_lesson",  # cross-agent learning write

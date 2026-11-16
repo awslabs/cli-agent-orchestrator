@@ -134,12 +134,57 @@ async def test_remote_recall_omits_none_fields(monkeypatch):
         search_mode=None,
         sort_by=None,
         include_related=False,
+        detail="snippet",
     )
 
     assert result == []
     assert post.call_args.args == (
         "/internal/memory/recall",
-        {"limit": 10, "include_related": False},
+        {"limit": 10, "include_related": False, "detail": "snippet"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_remote_memory_get_parity(monkeypatch):
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner:9889")
+
+    async def run_inline(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(memory_gateway.asyncio, "to_thread", run_inline)
+    post = Mock(
+        return_value={
+            "memory": {
+                "key": "shared-fact",
+                "scope": "global",
+                "content": "Complete body.",
+                "status": "active",
+                "earlier_entries": 0,
+                "links_in": [],
+                "links_out": [],
+            }
+        }
+    )
+    monkeypatch.setattr(memory_gateway, "_post", post)
+
+    result = await memory_gateway.get_memory(
+        key="shared-fact",
+        scope="global",
+        include_history=True,
+        max_chars=1234,
+        terminal_context={"terminal_id": "fixture-terminal"},
+    )
+
+    assert result["content"] == "Complete body."
+    assert post.call_args.args == (
+        "/internal/memory/get",
+        {
+            "key": "shared-fact",
+            "scope": "global",
+            "include_history": True,
+            "max_chars": 1234,
+            "terminal_context": {"terminal_id": "fixture-terminal"},
+        },
     )
 
 

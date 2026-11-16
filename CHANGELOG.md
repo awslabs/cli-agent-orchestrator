@@ -47,6 +47,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses unmarked access to a real-home memory directory and relocates memory
   for live-provider test runs.
 - **FIFO output readers continue working when a busy server has allocated a descriptor above 1023** (#1350).
+
+- **Memory recall supports compact snippets and exact-key reads** (#1329).
+  `memory_recall(detail="snippet")` returns a matched-term window and a
+  `memory_get` hint, while the new `memory_get` tool fetches one visible note,
+  optional history, lifecycle status, and existing links. The
+  `memory.recall.v2_fields` setting defaults to `false`; enabling it adds fact
+  and edit dates, match reason, status, and visible history truncation. With
+  the setting off and full detail, the pinned recall response is unchanged.
 - **Memory topics without a canonical entry heading are visible again** (#1329). The
   default-on `memory.parser.lenient` parser accepts a valid topic header with body content,
   including minute-precision timestamps; set it to `false` for the legacy behavior. LLM

@@ -63,9 +63,16 @@ SERIALIZED_FIELDS = (
 # ``injection_redaction.*`` counters; no recall surface consumes it.
 NEVER_SERIALIZED = (
     "action",
+    "edited_at",
+    "earlier_entries",
+    "fact_date",
+    "get",
     "is_related",
     "lifecycle_status",
+    "match",
     "redacted_patterns",
+    "snippet",
+    "status",
     "timestamp_clamped",
 )
 
