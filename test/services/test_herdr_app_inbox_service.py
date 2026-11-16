@@ -114,6 +114,62 @@ def test_slow_delivery_does_not_hold_up_other_events(env):
     assert seen == ["aaaa0001", "aaaa0001"]  # one in flight, one rerun
 
 
+def test_settle_retry_outlasts_the_provider_flush_wait():
+    # providers/base.py waits 10 s after native idle/done before COMPLETED.
+    assert mod.SETTLE_RETRY_S > 10.0
+
+
+class TestSettleRetry:
+    """After idle/done, the provider reports PROCESSING for its 10 s flush wait,
+    so the immediate delivery finds the terminal busy; one more delivery runs
+    once that wait is over."""
+
+    @pytest.fixture(autouse=True)
+    def fast(self, monkeypatch):
+        monkeypatch.setattr(mod, "SETTLE_RETRY_S", 0.05)
+
+    @staticmethod
+    def run_and_wait(svc, *messages):
+        async def go():
+            for m in messages:
+                await svc.handle(m)
+            await asyncio.sleep(0.3)
+            await svc.drain()
+
+        asyncio.run(go())
+
+    def test_delivers_again_after_the_flush_wait(self, env):
+        svc, _, deliver, *_ = env
+        self.run_and_wait(svc, status(1, "t1", "idle"))
+        assert [c.args[0] for c in deliver.call_args_list] == ["aaaa0001", "aaaa0001"]
+
+    @pytest.mark.parametrize("state", ["working", "blocked"])
+    def test_new_work_cancels_the_retry(self, env, state):
+        svc, _, deliver, *_ = env
+        self.run_and_wait(svc, status(1, "t1", "idle"), status(2, "t1", state))
+        assert deliver.call_count == 1
+
+    def test_exit_cancels_the_retry(self, env):
+        svc, _, deliver, *_ = env
+        self.run_and_wait(svc, status(1, "t1", "idle"), ev(2, "finished", "t1"))
+        assert deliver.call_count == 1
+
+    def test_repeated_idle_keeps_one_retry(self, env):
+        svc, _, deliver, *_ = env
+
+        async def go():
+            await svc.handle(status(1, "t1", "idle"))
+            await svc.drain()
+            await svc.handle(status(2, "t1", "done"))
+            await svc.drain()
+            assert len(svc._settling) == 1
+            await asyncio.sleep(0.3)
+            await svc.drain()
+
+        asyncio.run(go())
+        assert deliver.call_count == 3  # two immediate, one retry
+
+
 def test_working_and_blocked_note_activity(env):
     svc, *_, activity = env
     run(svc, status(1, "t1", "working"), status(2, "t1", "blocked"))

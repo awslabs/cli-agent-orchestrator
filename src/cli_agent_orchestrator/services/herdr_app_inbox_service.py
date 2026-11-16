@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 SILENCE_LIMIT_S = 45.0  # three 15 s heartbeats
 BACKOFF_START_S = 1
 BACKOFF_MAX_S = 30
+# After a native idle/done, providers/base.py keeps reporting PROCESSING for a
+# 10 s flush wait, so the delivery that event triggers finds the terminal busy.
+# Deliver once more after that wait instead of leaving the message to the 30 s
+# reconciliation sweep.
+SETTLE_RETRY_S = 10.5
 
 
 # --- Seams to the rest of CAO (patched in tests; imports local to avoid cycles) ---
@@ -92,6 +97,8 @@ class HerdrAppInboxService:
         # types through terminal.send, which can wait ~60 s for a person's draft.
         self._delivering: Dict[str, "asyncio.Task[None]"] = {}
         self._deliver_again: Set[str] = set()
+        # One pending post-flush-wait delivery per terminal (SETTLE_RETRY_S).
+        self._settling: Dict[str, "asyncio.Task[None]"] = {}
 
     def _managed_id(self, record: Any) -> Optional[str]:
         """CAO terminal id of one of this server's terminals, else None."""
@@ -111,6 +118,7 @@ class HerdrAppInboxService:
         for address in [a for a, t in self._by_address.items() if t == terminal_id]:
             del self._by_address[address]
         self._last_state.pop(terminal_id, None)
+        self._cancel_settle(terminal_id)
 
     def mapped(self) -> Dict[str, str]:
         return dict(self._by_address)
@@ -142,7 +150,7 @@ class HerdrAppInboxService:
             except Exception as exc:  # noqa: BLE001 - keep delivering after any failure
                 logger.warning("herdr-app event stream failed: %s; reconnecting", exc)
             except asyncio.CancelledError:
-                for task in list(self._delivering.values()):
+                for task in [*self._delivering.values(), *self._settling.values()]:
                     task.cancel()
                 raise
             finally:
@@ -210,6 +218,7 @@ class HerdrAppInboxService:
     async def _on_status(self, tid: str, status: Any) -> None:
         state = status.get("state") if isinstance(status, dict) else None
         if state in ("working", "blocked"):
+            self._cancel_settle(tid)
             _note_activity(tid)
         mapped = HC_STATUS_TO_TERMINAL_STATUS.get(state) if isinstance(state, str) else None
         if mapped is not None and self._last_state.get(tid) != mapped:
@@ -217,6 +226,19 @@ class HerdrAppInboxService:
             await asyncio.to_thread(_record_status, tid, mapped)
         if state in ("idle", "done"):
             self._schedule_delivery(tid)
+            self._cancel_settle(tid)
+            self._settling[tid] = asyncio.create_task(self._settle_then_deliver(tid))
+
+    def _cancel_settle(self, tid: str) -> None:
+        task = self._settling.pop(tid, None)
+        if task is not None:
+            task.cancel()
+
+    async def _settle_then_deliver(self, tid: str) -> None:
+        await asyncio.sleep(SETTLE_RETRY_S)
+        if self._settling.get(tid) is asyncio.current_task():
+            del self._settling[tid]
+        self._schedule_delivery(tid)
 
     def _schedule_delivery(self, tid: str) -> None:
         if tid in self._delivering:
