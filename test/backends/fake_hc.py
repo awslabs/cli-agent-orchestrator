@@ -16,6 +16,9 @@ class FakeHc:
         self.calls: List[tuple] = []
         self.conflicts_to_inject = 0
         self.fail_methods: set = set()
+        # Addresses whose terminal outlives terminal.kill and terminal.rm (a
+        # kill the core accepted but that did not take, as seen by a re-list).
+        self.unkillable: set = set()
         self._addr = itertools.count(1)
 
     # helpers for tests
@@ -87,11 +90,13 @@ class FakeHc:
             return copy.deepcopy(self._find(params["terminal"]))
         if method == "terminal.kill":
             t = self._find(params["terminal"])
-            t["state"] = "finished"
+            if t["address"] not in self.unkillable:
+                t["state"] = "finished"
             return copy.deepcopy(t)
         if method == "terminal.rm":
             t = self._find(params["terminal"])
-            del self.terminals[t["address"]]
+            if t["address"] not in self.unkillable:
+                del self.terminals[t["address"]]
             return {"removed": t["address"]}
         if method == "terminal.read":
             return {"text": self._find(params["terminal"]).get("text", ""), "complete": True}

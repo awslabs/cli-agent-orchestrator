@@ -481,6 +481,28 @@ def test_cancel_during_backoff_cancels_pending_tasks(env, monkeypatch):
     asyncio.run(go())
 
 
+def test_stream_read_uses_the_silence_limit(env, monkeypatch):
+    svc = env[0]
+    timeouts = []
+
+    class RecordingSub(_Sub):
+        def next_notification(self, timeout):
+            timeouts.append(timeout)
+            return super().next_notification(timeout)
+
+    async def fake_sleep(s):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(svc, "_reconcile", lambda: None)
+    heartbeat = {"jsonrpc": "2.0", "method": "heartbeat", "params": {}}
+    svc._subscribe = lambda: RecordingSub([heartbeat])
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(svc.start())
+    assert timeouts == [mod.SILENCE_LIMIT_S, mod.SILENCE_LIMIT_S]
+    assert mod.SILENCE_LIMIT_S == 45.0  # three 15 s heartbeats
+
+
 def test_failed_subscribe_backs_off(env, monkeypatch):
     svc = env[0]
     sleeps = []
@@ -593,6 +615,17 @@ class TestReconcile:
     def test_row_with_a_live_record_among_finished_ones_stays(self, env, monkeypatch):
         svc, backend, *_ = env
         core_with(backend, finished("t2", "aaaa0001"), rec("t3", "aaaa0001"))
+        rows = [{"id": "aaaa0001", "tmux_session": "cao-a"}]
+        monkeypatch.setattr(mod, "_rows_by_session", lambda: {"cao-a": rows})
+        monkeypatch.setattr(mod, "_rows_for", lambda s: rows)
+        ghosts = []
+        monkeypatch.setattr(mod, "_drop_ghost_row", lambda tid: ghosts.append(tid))
+        svc._reconcile()
+        assert ghosts == []
+
+    def test_finished_and_unknown_state_records_keep_the_row(self, env, monkeypatch):
+        svc, backend, *_ = env
+        core_with(backend, finished("t2", "aaaa0001"), {**rec("t3", "aaaa0001"), "state": "parked"})
         rows = [{"id": "aaaa0001", "tmux_session": "cao-a"}]
         monkeypatch.setattr(mod, "_rows_by_session", lambda: {"cao-a": rows})
         monkeypatch.setattr(mod, "_rows_for", lambda s: rows)

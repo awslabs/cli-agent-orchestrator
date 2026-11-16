@@ -244,6 +244,15 @@ class TestLifecycle:
         assert hc.terminals == {}
         assert [s["id"] for s in hc.docs["herdr-app"]["value"]["spaces"]] == ["spOther"]
 
+    def test_kill_session_that_survives_is_not_confirmed(self, backend, hc, two_windows):
+        sp = space_id_for("cao-a")
+        hc.set_doc("herdr-app", layout_with(sp, [("tbA", "sup", "t1")], "cao-a"))
+        hc.unkillable.add("t2")
+        assert backend.kill_session("cao-a") is False
+        assert "t2" in hc.terminals
+        # The space stays while one of its terminals is still live.
+        assert [s["id"] for s in hc.docs["herdr-app"]["value"]["spaces"]] == [sp]
+
     def test_kill_missing_session(self, backend):
         assert backend.kill_session("cao-x") is False
 
@@ -252,6 +261,12 @@ class TestExactCleanup:
     def test_one_match_deleted(self, backend, hc, two_windows):
         r = backend.cleanup_terminal_exact("aaaa0002")
         assert r.outcome == TerminalCleanupOutcome.DELETED and "t2" not in hc.terminals
+
+    def test_survivor_is_still_present_not_deleted(self, backend, hc, two_windows):
+        hc.unkillable.add("t2")
+        r = backend.cleanup_terminal_exact("aaaa0002")
+        assert r.outcome == TerminalCleanupOutcome.STILL_PRESENT
+        assert not r.reclaimed
 
     def test_absent(self, backend, two_windows):
         assert backend.cleanup_terminal_exact("ffff0000").outcome == TerminalCleanupOutcome.ABSENT
@@ -548,6 +563,28 @@ class TestServerIdentity:
         backend.send_keys("cao-a", "w1", "hi")
         assert hc.calls_to("terminal.send")[0]["terminal"] == "t2"
         assert backend.kill_window("cao-z", "sup") is False
+
+    def test_naming_leaves_the_users_spaces_and_tabs_alone(self, backend, hc, two_windows):
+        sp = space_id_for("cao-a")
+        doc = layout_with(sp, [("tbA", "", "t1"), ("tbU", "my notes", "t77")], "")
+        user_space = layout_with("spUser", [("tbV", "logs", "t78")], "work")["spaces"][0]
+        doc["spaces"].insert(0, user_space)
+        hc.set_doc("herdr-app", doc)
+        backend.sync_layout_names()
+        after = hc.docs["herdr-app"]["value"]["spaces"]
+        assert after[0] == user_space  # the user's own space, untouched
+        assert after[1]["name"] == "cao-a"
+        assert [t["name"] for t in after[1]["tabs"]] == ["sup", "my notes"]
+
+    def test_names_the_space_before_the_app_places_the_tab(self, backend, hc, two_windows):
+        # The app has adopted the session's space but not yet the CAO tab: the
+        # space is named now, the tab on the next pass (same rule as the inbox).
+        sp = space_id_for("cao-a")
+        hc.set_doc("herdr-app", layout_with(sp, [("tbU", "mine", "t77")], ""))
+        backend.sync_layout_names()
+        space = hc.docs["herdr-app"]["value"]["spaces"][0]
+        assert space["name"] == "cao-a"
+        assert [t["name"] for t in space["tabs"]] == ["mine"]
 
     def test_naming_ignores_foreign_terminals(self, backend, hc, tmp_path):
         sp = space_id_for("cao-q")
