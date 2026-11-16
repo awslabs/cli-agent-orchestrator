@@ -495,6 +495,17 @@ def test_clear_report_falls_back_to_the_screen():
     assert provider.get_status(load_fixture("omp18_band_idle.txt")) == TerminalStatus.IDLE
 
 
+@pytest.mark.parametrize("screen", ["omp18_band_idle.txt", "omp18_band_processing.txt"])
+def test_unknown_report_state_falls_back_to_the_screen(screen):
+    """A state OMP may add later carries no verdict; the screen decides."""
+    provider = make_provider()
+    provider.record_status_chunk(_osc7501("working") + _osc7501("paused"), epoch=0)
+    assert provider._program_status == "paused"
+
+    reference = make_provider()
+    assert provider.get_status(load_fixture(screen)) == reference.get_status(load_fixture(screen))
+
+
 def test_raw_status_reports_error_when_omp_exits():
     provider = make_provider()
     provider._initialized = True
