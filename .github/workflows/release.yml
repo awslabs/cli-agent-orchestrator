@@ -107,7 +107,7 @@ jobs:
       # Bumps pyproject.toml, uv.lock and the devcontainer feature together, then the
       # changelog. publish-to-pypi.yml refuses a tag unless all three agree; release.yml
       # used to skip uv.lock, which is why 2.5.3 and 2.5.4 were bumped by hand (#899, #946).
-      - name: Bump version and generate changelog
+      - name: Bump version and promote the changelog
         id: bump
         env:
           # Validated by the preflight for both events: one of patch, minor, major.

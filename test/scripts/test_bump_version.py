@@ -119,8 +119,8 @@ class TestGenerateChangelog:
         changelog = tmp_path / "CHANGELOG.md"
         changelog.write_bytes(content)
         monkeypatch.setattr(bv, "ROOT", tmp_path)
-        monkeypatch.setattr(bv, "CHANGELOG", changelog, raising=False)
-        monkeypatch.setattr(bv, "_release_date", lambda: "2030-04-05", raising=False)
+        monkeypatch.setattr(bv, "CHANGELOG", changelog)
+        monkeypatch.setattr(bv, "_release_date", lambda: "2030-04-05")
         bv.generate_changelog(version)
         return changelog.read_bytes()
 

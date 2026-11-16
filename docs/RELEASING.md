@@ -252,7 +252,7 @@ Release on it.
 See the table under "The weekly release". The schedule will not guess; run **Release** by
 hand with the bump you intend.
 
-**Release fails at "Bump version and generate changelog" with "`uv lock` changed N
+**Release fails at "Bump version and promote the changelog" with "`uv lock` changed N
 line(s) of uv.lock beyond the cli-agent-orchestrator version":**
 The uv on the runner would rewrite more of the lock than the version line, usually
 because the lock was written by a different uv. Nothing was committed. Relock `main` in
