@@ -487,6 +487,52 @@ STARTUP_IDLE_PLACEHOLDER_PATTERN = (
 CODEX_WELCOME_PATTERN = r"OpenAI Codex"
 
 
+_BACKGROUND_TERMINALS_RE = re.compile(
+    r"\s*\d+ background terminals? running · /ps to view · /stop to close\s*"
+)
+
+
+class _ComposerWithAmbiguousTail(str):
+    """Preserve the display text while identifying the portion safe to match."""
+
+    certain_prefix: str
+
+    def __new__(cls, text: str, certain_prefix: str) -> "_ComposerWithAmbiguousTail":
+        result = super().__new__(cls, text)
+        result.certain_prefix = certain_prefix
+        return result
+
+
+def _tui_status_bar_start(lines: list[str]) -> Optional[int]:
+    bottom = max(len(lines) - IDLE_PROMPT_TAIL_LINES, 0)
+    for index in range(len(lines) - 1, bottom - 1, -1):
+        if re.match(rf"^\s*{IDLE_PROMPT_PATTERN}", lines[index]) or not re.search(
+            TUI_FOOTER_PATTERN, lines[index]
+        ):
+            continue
+        previous = index - 1
+        while previous >= bottom and index - previous <= 3 and not lines[previous].strip():
+            previous -= 1
+        if (
+            previous >= bottom
+            and index - previous <= 3
+            and not re.match(rf"^\s*{IDLE_PROMPT_PATTERN}", lines[previous])
+            and re.search(r"\?\s+for shortcuts", lines[index])
+            and re.search(r"·\s+[~/]", lines[previous])
+        ):
+            # Text alone cannot distinguish a configurable status row from a
+            # contiguous draft continuation. Preserve that entire draft; a
+            # blank boundary before the candidate permits recognizing status
+            # without depending on model names or spacing within the row.
+            start = previous - 1
+            while start >= 0 and lines[start].startswith("  ") and lines[start].strip():
+                start -= 1
+            if start < 0 or not re.match(rf"^\s*{IDLE_PROMPT_PATTERN}", lines[start]):
+                return previous
+        return index
+    return None
+
+
 def _compute_tui_footer_cutoff(all_lines: list) -> int:
     """Compute the character position where the TUI footer area starts.
 
@@ -499,27 +545,41 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
     where the footer starts. Returns ``len('\\n'.join(all_lines))`` if no
     footer is found.
     """
-    n = len(all_lines)
-    footer_start_idx = n
-
-    # Find the status bar line (last TUI_FOOTER_PATTERN match in the bottom area)
-    for i in range(n - 1, max(n - IDLE_PROMPT_TAIL_LINES - 1, -1), -1):
-        if re.search(TUI_FOOTER_PATTERN, all_lines[i]):
-            footer_start_idx = i
-            break
-
-    if footer_start_idx == n:
+    footer_start_idx = _tui_status_bar_start(all_lines)
+    if footer_start_idx is None:
         return len("\n".join(all_lines))
 
     # Scan upward from the status bar to include blank lines and the
     # suggestion hint (› with text) that are part of the TUI footer chrome.
-    for j in range(footer_start_idx - 1, max(footer_start_idx - 4, -1), -1):
+    crossed_continuation = False
+    for j in range(footer_start_idx - 1, -1, -1):
         line = all_lines[j]
         if not line.strip():
-            footer_start_idx = j
+            if not crossed_continuation:
+                footer_start_idx = j
         elif re.match(rf"\s*{IDLE_PROMPT_PATTERN}", line):
             footer_start_idx = j
+            # A notice without a preceding completion footer could be reply text.
+            # This remains a visual heuristic: a reply can imitate both rows.
+            notice_idx = j - 1
+            while notice_idx >= 0 and not all_lines[notice_idx].strip():
+                notice_idx -= 1
+            if notice_idx >= 0 and _BACKGROUND_TERMINALS_RE.fullmatch(all_lines[notice_idx]):
+                preceding = notice_idx - 1
+                while preceding >= 0 and not all_lines[preceding].strip():
+                    preceding -= 1
+                # Bare clocks are ambiguous without the provider version here.
+                if preceding >= 0 and _is_completion_footer(
+                    all_lines[preceding], BARE_CLOCK_FOOTER_VERSIONS[1]
+                ):
+                    footer_start_idx = notice_idx
             break
+        elif line.startswith("  "):
+            # Explore provisionally: these may be response rows during a
+            # redraw. Only a prompt confirms that the intervening rows belong
+            # to the composer; until then retain their original cutoff.
+            crossed_continuation = True
+            continue
         else:
             break
 
@@ -2898,18 +2958,14 @@ class CodexProvider(BaseProvider):
         return self._get_status(frame, rendered=True) == TerminalStatus.PROCESSING
 
     def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
-        """Return Codex's bottom composer without admitting transcript prompts."""
+        """Return Codex's bottom composer without admitting transcript prompts.
+
+        A status-looking row contiguous with a draft is visually ambiguous and
+        is preserved. A blank separator is needed to exclude arbitrary status
+        copy; this text capture cannot prove the exact boundary otherwise.
+        """
         lines = rendered_pane.splitlines()
-        footer_index = next(
-            (
-                index
-                for index in range(
-                    len(lines) - 1, max(len(lines) - IDLE_PROMPT_TAIL_LINES - 1, -1), -1
-                )
-                if re.search(TUI_FOOTER_PATTERN, lines[index])
-            ),
-            None,
-        )
+        footer_index = _tui_status_bar_start(lines)
         if footer_index is None:
             return None
 
@@ -2932,7 +2988,16 @@ class CodexProvider(BaseProvider):
             STARTUP_IDLE_PLACEHOLDER_PATTERN, first_composer_line
         ):
             return ""
-        return "\n".join(composer_lines).rstrip()
+        composer = "\n".join(composer_lines).rstrip()
+        rows = composer.splitlines()
+        if (
+            len(rows) > 1
+            and re.search(r"·\s+[~/]", rows[-1])
+            and re.search(r"\?\s+for shortcuts", lines[footer_index])
+        ):
+            # This last row can be either a status bar or draft continuation.
+            return _ComposerWithAmbiguousTail(composer, "\n".join(rows[:-1]))
+        return composer
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Codex's final response from terminal output.
@@ -2998,12 +3063,9 @@ class CodexProvider(BaseProvider):
             # With --no-alt-screen, the TUI footer (› hint + status bar) has no
             # empty idle prompt. Use cutoff_pos as the boundary when TUI is present.
             idle_after = _strict_idle_prompt_start(clean_output[response_start:])
+            end_pos = cutoff_pos
             if idle_after is not None:
-                end_pos = response_start + idle_after
-            elif tui_footer_detected:
-                end_pos = cutoff_pos
-            else:
-                end_pos = len(clean_output)
+                end_pos = min(end_pos, response_start + idle_after)
 
             response_text = clean_output[response_start:end_pos].strip()
 
@@ -3021,6 +3083,7 @@ class CodexProvider(BaseProvider):
         # Fallback: assistant marker based extraction (no user message found).
         # Filter out "• Called <tool>(...)" MCP tool call markers so we anchor
         # on the model's actual reply, not tool output.
+        clean_output = clean_output[:cutoff_pos]
         all_matches = list(
             re.finditer(ASSISTANT_PREFIX_PATTERN, clean_output, re.IGNORECASE | re.MULTILINE)
         )

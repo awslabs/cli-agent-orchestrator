@@ -98,7 +98,7 @@ or has them promoted into its profile.
    ```
 
    Format contract: 1–2 sentence conclusion, then `Applies when: <trigger>`.
-   The trigger clause is how future curators match your lesson to a task.
+   The trigger clause lets you tell, when you recall the lesson, whether it applies to the task.
 3. **Correct, don't accumulate.** If a stored lesson proves wrong, re-store
    the corrected text under the SAME key (or `memory_forget` it). Never store
    a contradicting lesson under a new key.

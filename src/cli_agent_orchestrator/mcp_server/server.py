@@ -2073,7 +2073,7 @@ async def memory_recall(
 
     Returns content from matching wiki files, ranked by ``sort_by`` (default
     recency). When no scope is specified, results follow scope precedence:
-    session > project > global.
+    session > project > global > agent > federated.
 
     Use this to check if relevant knowledge already exists before asking the user.
     """

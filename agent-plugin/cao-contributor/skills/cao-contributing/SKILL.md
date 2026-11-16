@@ -171,7 +171,8 @@ two checks can share a name, is in
   state machines; when a CLI tool changes its TUI, update the regexes **and** add a fixture.
 - **The AG-UI demo recorder** (`examples/ag-ui/ag-ui-eventsource-viewer/tools`) needs a
   Chromium `headless_shell` matching the pinned `@playwright/test` version (`npm run
-  playwright:install`) plus `ffmpeg`, and boots its own `CAO_AGUI_ENABLED` server. It gates
+  playwright:install`), and boots its own `CAO_AGUI_ENABLED` server (`npm ci` brings ffmpeg
+  via `ffmpeg-static`). On Linux, also run `npx playwright install-deps chromium`. It gates
   in CI, so you don't have to run it locally to land a change. The construct-demo recorder
   is the sibling at `examples/ag-ui/ag-ui-construct-demos/tools`.
 
