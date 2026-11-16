@@ -241,7 +241,7 @@ def test_an_available_baseline_is_part_of_the_identity_and_unavailable_baselines
 
 
 def test_non_git_plan_ids_bind_root_and_git_golden_is_unchanged(tmp_path, monkeypatch):
-    """The golden value is pinned under an empty profile store (see ``_store`` below).
+    """The golden value covers the checked-in built-in profile set and an empty local store (see ``_store`` below).
 
     Without pinning ``usable_agent_dirs``/extra/disabled dirs and the local store, this golden hash
     would also depend on whatever agent profiles happen to be installed on the machine running the
@@ -267,7 +267,7 @@ def test_non_git_plan_ids_bind_root_and_git_golden_is_unchanged(tmp_path, monkey
     )
     assert (
         _frozen()["plan_id"]
-        == "plan-v2:c89991b472d5f8aed662a8677d00770f3ae19224d17c95112f3863545f248d38"
+        == "plan-v2:c4f71c4c8f4e58270e0c82afb7c9a58ab7a6969408171be744c66db313c1837c"
     )
 
 
