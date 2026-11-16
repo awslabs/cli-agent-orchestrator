@@ -390,6 +390,20 @@ def test_the_eks_cluster_api_is_reachable_only_from_listed_sources():
     assert cluster["Properties"]["EncryptionConfig"][0]["Resources"] == ["secrets"]
 
 
+def test_the_control_plane_log_group_is_in_the_stack_and_expires():
+    """Otherwise EKS creates it outside the stack, and delete-stack leaves it, unexpiring."""
+    template = _cfn()
+    ((name, group),) = _resources("AWS::Logs::LogGroup").items()
+    # The name EKS writes control-plane logs to.
+    assert group["Properties"]["LogGroupName"] == "/aws/eks/${ClusterName}/cluster"
+    assert group["Properties"]["RetentionInDays"] == 30
+    assert group.get("DeletionPolicy", "Delete") == "Delete"
+    ((cluster_name, cluster),) = _resources("AWS::EKS::Cluster").items()
+    assert name in cluster["DependsOn"]  # created before EKS would create its own
+    assert cluster["Properties"]["Logging"]["ClusterLogging"]["EnabledTypes"]
+    assert template["Resources"][cluster_name]["Properties"]["Name"] == "ClusterName"
+
+
 def test_the_eks_cluster_is_auto_mode_with_a_pinned_service_range():
     (cluster,) = _resources("AWS::EKS::Cluster").values()
     props = cluster["Properties"]

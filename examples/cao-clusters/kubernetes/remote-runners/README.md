@@ -208,8 +208,16 @@ examples/cao-clusters/kubernetes/remote-runners/overlays/eks/deploy.sh cao-remot
   account token.
 - **Cost:** the control plane, the nodes, the NAT gateway and EFS bill while the
   stack exists. `aws cloudformation delete-stack --stack-name cao-remote`
-  removes everything, including the image repository's images; delete the
-  `cao-remote` namespace first so Auto Mode releases its volumes and nodes.
+  removes everything, including the image repository's images and the
+  control-plane log group (`/aws/eks/<ClusterName>/cluster`, kept 30 days
+  while the stack exists); delete the `cao-remote` namespace first so Auto
+  Mode releases its volumes and nodes. The stack declares that log group, so
+  creating it fails while a group of that name exists, for example one left
+  by an earlier cluster of the same name. A stack created before the template
+  declared the group cannot add it on update either, since its cluster
+  already created the group: delete the group first with
+  `aws logs delete-log-group --log-group-name /aws/eks/<ClusterName>/cluster`
+  (its logs go with it), or delete and recreate the stack.
 
 ## Placement
 

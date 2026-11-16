@@ -18,7 +18,14 @@ AWSTemplateFormatVersion: "2010-09-09"
 #
 # Cost while running: the EKS control plane, the Auto Mode nodes, the NAT
 # gateway and the EFS file system bill hourly. Delete the stack when done;
-# the image repository is emptied on delete, so nothing blocks it.
+# the image repository is emptied on delete, so nothing blocks it, and the
+# control-plane log group (30-day retention) goes with it.
+#
+# A stack created from an earlier version of this template, which did not
+# declare the log group, cannot add it on update while the cluster's own
+# /aws/eks/<ClusterName>/cluster group exists: delete that group first
+# (aws logs delete-log-group --log-group-name /aws/eks/<ClusterName>/cluster),
+# or delete the stack and create it again.
 
 Description: >-
   CAO remote runners on EKS Auto Mode: VPC, cluster, EFS workspace, runner
@@ -345,9 +352,26 @@ Resources:
               - kms:CreateGrant
             Resource: !GetAtt SecretsKey.Arn
 
+  # EKS writes the control-plane logs (Logging below) to this group. Declared
+  # here so that delete-stack removes it and the logs expire; otherwise EKS
+  # creates it outside the stack, where it stays after delete-stack with no
+  # expiry. Creating the stack fails if a group of this name already exists
+  # (say, left by an earlier cluster of the same name, or created by this
+  # cluster before the stack declared it): delete that group first.
+  ClusterLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/eks/${ClusterName}/cluster"
+      RetentionInDays: 30
+
   Cluster:
     Type: AWS::EKS::Cluster
-    DependsOn: ClusterKmsPolicy
+    # The log group first, so EKS writes to it rather than creating its own.
+    DependsOn:
+      - ClusterKmsPolicy
+      - ClusterLogGroup
     Properties:
       Name: !Ref ClusterName
       Version: !Ref KubernetesVersion
