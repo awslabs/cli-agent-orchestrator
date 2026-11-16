@@ -2,9 +2,21 @@
 
 These read the manifests, so an edit cannot quietly expose the hub, mount an
 API token into runner pods, or turn on cleartext outside the local overlay.
-Where ``kubectl`` is installed, the base and the overlays are also rendered
-with ``kubectl kustomize`` and checked as applied. The EKS overlay's
-CloudFormation template (``overlays/eks/iac``) is checked here too.
+The EKS overlay's CloudFormation template (``overlays/eks/iac``) is checked
+here too.
+
+Two groups of tests need tools on ``PATH`` and are skipped, not failed,
+without them, so a green run without the tools covers less than half of this
+module (``pytest -rs`` lists the skips):
+
+- ``kubectl``: the rendered-overlay tests (``needs_kubectl``) render the base
+  and the overlays with ``kubectl kustomize``;
+- ``kubectl`` and a working ``openssl``: every test that takes the
+  ``deploy`` fixture runs the real ``overlays/eks/deploy.sh`` against the stub
+  ``aws``, ``kubectl`` and ``docker`` in ``fixtures/eks_deploy_stubs`` (the
+  stub ``kubectl`` runs the real one for ``kustomize`` and client-side
+  ``--dry-run``; ``openssl`` issues and checks the hub's TLS material). Nothing
+  reaches AWS or a cluster.
 """
 
 import base64
