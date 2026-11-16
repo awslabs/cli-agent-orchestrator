@@ -351,3 +351,90 @@ def test_server_env_drops_blocked_keys(monkeypatch):
     # The core's own environment is the operator's: PATH etc. stay.
     assert seen["drop"]("PATH") is False
     assert seen["drop"]("AWS_PROFILE") is False
+
+
+class TestInputConnection:
+    """terminal.send / terminal.keys run on their own connection."""
+
+    def test_slow_send_does_not_block_status_lookup(self, hc, monkeypatch):
+        import threading
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.mcp_resolution.cao_server_env", lambda: {}
+        )
+        release = threading.Event()
+        sending = threading.Event()
+
+        class LockingFakeHc(FakeHc):
+            """Serializes calls like HcRpcClient; terminal.send waits for a draft."""
+
+            def __init__(self):
+                super().__init__()
+                self._lock = threading.Lock()
+
+            def call(self, method, params=None, timeout=10.0):
+                with self._lock:
+                    if method == "terminal.send":
+                        sending.set()
+                        assert release.wait(5), "test never released the send"
+                    return super().call(method, params, timeout)
+
+        main, inp = LockingFakeHc(), LockingFakeHc()
+        inp.terminals = main.terminals  # one core, two connections
+        rec = main.add_terminal(_labels("cao-a", "w1", "aaaa0002"))
+        rec["status"] = {"app": "kiro-cli", "state": "working"}
+        backend = HerdrAppBackend("cao", client=main, input_client=inp)
+
+        sender = threading.Thread(target=backend.send_keys, args=("cao-a", "w1", "hi"))
+        sender.start()
+        try:
+            assert sending.wait(5)
+            result = {}
+            looker = threading.Thread(
+                target=lambda: result.update(s=backend.get_native_status("cao-a", "w1"))
+            )
+            looker.start()
+            looker.join(2)
+            assert not looker.is_alive(), "status lookup waited behind terminal.send"
+            assert result["s"] == TerminalStatus.PROCESSING
+        finally:
+            release.set()
+            sender.join(5)
+        assert inp.calls_to("terminal.send") and not main.calls_to("terminal.send")
+
+    def test_keys_use_input_connection(self, backend, hc, two_windows):
+        other = FakeHc()
+        other.terminals = hc.terminals
+        backend._input_client = other
+        backend.send_keys("cao-a", "w1", "3", enter_count=0)
+        backend.send_special_key("cao-a", "w1", "Enter")
+        backend.send_keys("cao-a", "w1", "x", enter_count=2)
+        assert hc.calls_to("terminal.keys") == [] and hc.calls_to("terminal.send") == []
+        assert len(other.calls_to("terminal.keys")) == 3
+        assert len(other.calls_to("terminal.send")) == 1
+
+    def test_injected_client_doubles_as_input_client(self, backend, hc):
+        assert backend._input() is hc
+
+    def test_default_input_client_is_a_second_lazy_connection(self, monkeypatch):
+        from cli_agent_orchestrator.backends import herdr_app_backend as mod
+
+        made = []
+
+        class _Client:
+            def __init__(self, session):
+                self.session = session
+                made.append(self)
+
+            def start_server(self, drop_env=None):
+                pass
+
+            def hello(self):
+                return {}
+
+        monkeypatch.setattr(mod, "HcRpcClient", _Client)
+        backend = HerdrAppBackend("cao-x")
+        assert len(made) == 1
+        first = backend._input()
+        assert len(made) == 2 and first is not made[0] and first.session == "cao-x"
+        assert backend._input() is first and len(made) == 2

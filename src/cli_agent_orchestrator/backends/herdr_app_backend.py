@@ -12,6 +12,7 @@ import hashlib
 import logging
 import os
 import secrets
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -81,10 +82,19 @@ class HerdrAppBackend(TerminalBackend):
     """TerminalBackend for the Herdr app (herdr-core)."""
 
     def __init__(
-        self, herdr_app_session: str = "cao", client: Optional[HcRpcClient] = None
+        self,
+        herdr_app_session: str = "cao",
+        client: Optional[HcRpcClient] = None,
+        input_client: Optional[HcRpcClient] = None,
     ) -> None:
         self._session = herdr_app_session
         self._client = client
+        # terminal.send / terminal.keys can wait up to ~60 s for a person's
+        # draft. HcRpcClient serializes exchanges, so they get their own
+        # connection and never stall status lookups or terminal.list. An
+        # injected ``client`` (tests) doubles as the input client.
+        self._input_client = input_client if input_client is not None else client
+        self._input_lock = threading.Lock()
         self._connect()
 
     def _connect(self) -> None:
@@ -105,6 +115,16 @@ class HerdrAppBackend(TerminalBackend):
     def _call(self, method: str, _timeout: float = RPC_TIMEOUT_S, **params: Any) -> Any:
         assert self._client is not None
         return self._client.call(method, params, timeout=_timeout)
+
+    def _input(self) -> HcRpcClient:
+        """The input connection, opened on first use (same session as ``_client``)."""
+        with self._input_lock:
+            if self._input_client is None:
+                self._input_client = HcRpcClient(self._session)
+            return self._input_client
+
+    def _input_call(self, method: str, **params: Any) -> Any:
+        return self._input().call(method, params, timeout=INPUT_TIMEOUT_S)
 
     # --- Environment and creation ---
 
@@ -384,18 +404,18 @@ class HerdrAppBackend(TerminalBackend):
                 # hc rejects shifted punctuation as key names (invalid_params,
                 # nothing typed), which surfaces as a TerminalBackendError.
                 names = [_CHAR_KEY_NAMES.get(ch, ch) for ch in keys]
-                self._call("terminal.keys", INPUT_TIMEOUT_S, terminal=address, keys=names)
+                self._input_call("terminal.keys", terminal=address, keys=names)
             return
         # force: CAO's own delivery gates decide when to type, as on tmux.
-        self._call("terminal.send", INPUT_TIMEOUT_S, terminal=address, text=keys, force=True)
+        self._input_call("terminal.send", terminal=address, text=keys, force=True)
         for _ in range(enter_count - 1):
-            self._call("terminal.keys", INPUT_TIMEOUT_S, terminal=address, keys=["enter"])
+            self._input_call("terminal.keys", terminal=address, keys=["enter"])
 
     def send_special_key(self, session_name: str, window_name: str, key: str) -> None:
         lowered = (key or "enter").lower()
         name = self._KEY_NAMES.get(lowered, lowered)
         address = self._address(session_name, window_name)
-        self._call("terminal.keys", INPUT_TIMEOUT_S, terminal=address, keys=[name])
+        self._input_call("terminal.keys", terminal=address, keys=[name])
 
     # --- Output ---
 
