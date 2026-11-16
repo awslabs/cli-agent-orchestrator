@@ -29,9 +29,9 @@ spec:
   claimRef:
     namespace: cao-remote
     name: cao-remote-workspace
-  # iam: the driver's node pods mount as their Pod Identity role, the only
-  # principal the file system's policy does not deny, and whose own policy
-  # allows only the access point in the handle; tls, which the file system
+  # iam: the driver's node pods mount as their Pod Identity role, whose
+  # policy allows only the access point in the handle (the file system
+  # policy allows clients without IAM nothing); tls, which the file system
   # policy requires (the driver adds it for an access point anyway).
   mountOptions: [tls, iam]
   csi:

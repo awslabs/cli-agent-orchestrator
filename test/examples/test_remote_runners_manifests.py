@@ -454,13 +454,13 @@ def test_only_the_runner_service_account_gets_bedrock_and_only_for_the_allowed_m
     policies = [p.rsplit("/", 1)[-1] for p in controller["ManagedPolicyArns"]]
     assert policies == ["AmazonEFSCSIDriverPolicy"]
     node = roles["efs-csi-node-sa"]["Properties"]
-    assert "ManagedPolicyArns" not in node and "Policies" not in node
+    assert "ManagedPolicyArns" not in node
     node_role = next(
         a["RoleArn"]
         for a in addon["Properties"]["PodIdentityAssociations"]
         if a["ServiceAccount"] == "efs-csi-node-sa"
     ).split(".")[0]
-    node_policies = [
+    node_policies = [p["PolicyDocument"] for p in node.get("Policies", [])] + [
         r["Properties"]["PolicyDocument"]
         for r in _cfn()["Resources"].values()
         if r["Type"] in ("AWS::IAM::RolePolicy", "AWS::IAM::Policy")
@@ -552,8 +552,33 @@ def _as_set(value):
     return {value} if isinstance(value, str) else set(value)
 
 
+# The condition keys EFS enforces for NFS clients (EFS user guide, "Using IAM
+# to control access to file systems", "EFS condition keys for clients"): "Any
+# other condition keys are not enforced". A file system policy that relies on
+# another (aws:PrincipalArn, say) may deny every mount or none.
+_EFS_CLIENT_CONDITION_KEYS = {
+    "aws:SecureTransport",
+    "aws:SourceIp",
+    "elasticfilesystem:AccessPointArn",
+    "elasticfilesystem:AccessedViaMountTarget",
+}
+
+
+def test_the_file_system_policy_uses_only_condition_keys_efs_enforces():
+    (filesystem,) = _resources("AWS::EFS::FileSystem").values()
+    keys = {
+        key
+        for st in filesystem["Properties"]["FileSystemPolicy"]["Statement"]
+        for operator in st.get("Condition", {}).values()
+        for key in operator
+    }
+    assert keys and keys <= _EFS_CLIENT_CONDITION_KEYS, keys - _EFS_CLIENT_CONDITION_KEYS
+    for st in filesystem["Properties"]["FileSystemPolicy"]["Statement"]:
+        assert "NotPrincipal" not in st  # needs the session ARN, which Pod Identity varies
+
+
 def test_the_workspace_is_mounted_only_through_its_access_point():
-    """The access point pins uid/gid 1000; the policies make it, as the node role, the only way in."""
+    """The access point pins uid/gid 1000; the file system policy makes an access point the only way in."""
     resources = _cfn()["Resources"]
     (filesystem,) = _resources("AWS::EFS::FileSystem").values()
     policy = filesystem["Properties"]["FileSystemPolicy"]
@@ -563,9 +588,6 @@ def test_the_workspace_is_mounted_only_through_its_access_point():
     assert {st["Effect"] for st in statements.values()} == {"Deny"}
     for st in statements.values():
         assert st["Principal"] == {"AWS": "*"} and st["Resource"] == "*"
-    others = statements["DenyAllButTheDriverNodeRole"]
-    assert _as_set(others["Action"]) == _EFS_CLIENT
-    assert others["Condition"] == {"ArnNotEquals": {"aws:PrincipalArn": "EfsCsiNodeRole.Arn"}}
     no_ap = statements["DenyWithoutAnAccessPoint"]
     assert _as_set(no_ap["Action"]) == _EFS_CLIENT
     assert no_ap["Condition"] == {"Null": {"elasticfilesystem:AccessPointArn": "true"}}
@@ -576,14 +598,13 @@ def test_the_workspace_is_mounted_only_through_its_access_point():
     assert _as_set(root["Action"]) == {"elasticfilesystem:ClientRootAccess"}
     assert "Condition" not in root
     assert set(statements) == {
-        "DenyAllButTheDriverNodeRole",
         "DenyWithoutAnAccessPoint",
         "DenyWithoutTls",
         "DenyRoot",
     }
     # The one EFS client grant in the stack: the node role, through the
-    # workspace access point. In a policy of its own, so the role does not
-    # depend on the file system whose policy names it.
+    # workspace access point. (The file system policy cannot limit mounts to
+    # that role; see the README.)
     inline = [
         (name, p["PolicyDocument"])
         for name, r in resources.items()
@@ -605,7 +626,6 @@ def test_the_workspace_is_mounted_only_through_its_access_point():
     ]
     ((role, grant),) = grants
     assert role == "EfsCsiNodeRole"
-    assert "Policies" not in resources["EfsCsiNodeRole"]["Properties"]
     (addon,) = _resources("AWS::EKS::Addon").values()
     (node,) = [
         a for a in addon["Properties"]["PodIdentityAssociations"] if a["RoleArn"] == f"{role}.Arn"

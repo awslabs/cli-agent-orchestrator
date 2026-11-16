@@ -205,14 +205,19 @@ examples/cao-clusters/kubernetes/remote-runners/overlays/eks/deploy.sh cao-remot
   `/cao-workspace`. The volume mounts with the `iam` option, as the EFS CSI
   driver's node role (Pod Identity on `efs-csi-node-sa`), whose policy lets it
   mount and write only through the workspace access point. The file system
-  policy denies every other principal, whatever its own IAM policies allow,
-  and clients without IAM, and denies every mount without an access point,
-  without TLS, or as root. So the workspace access point, as that role, is
-  the only way in; an administrator who needs another must change the file
-  system policy first. Whoever can run pods as `efs-csi-node-sa` in
-  `kube-system` (a cluster admin) can use the role. Pod Identity gives a pod
-  its credentials when it starts: on a cluster whose driver ran before the
-  node role existed, restart the driver's node pods
+  policy allows nothing to clients without IAM, and denies every mount
+  without an access point, without TLS, or as root, whatever an identity
+  policy allows. It cannot limit mounts to the node role: EFS enforces only
+  a few condition keys for NFS clients, and none of them names the
+  principal. So any principal of this account whose own IAM policy grants
+  EFS client actions (`elasticfilesystem:ClientMount`, `ClientWrite`) can
+  still mount through an access point of this file system, including the
+  workspace one (there as uid/gid 1000 under `/cao-workspace`; through
+  another access point as whatever that access point sets). Whoever can run
+  pods as `efs-csi-node-sa` in `kube-system` (a cluster admin) can use the
+  node role. Pod Identity gives a pod its credentials when it starts: on a
+  cluster whose driver ran before the node role existed, restart the
+  driver's node pods
   (`kubectl -n kube-system rollout restart daemonset efs-csi-node`) before
   the next runner mounts the workspace.
 - **Auto Mode and NetworkPolicy:** cluster DNS runs on each node at the `.10`

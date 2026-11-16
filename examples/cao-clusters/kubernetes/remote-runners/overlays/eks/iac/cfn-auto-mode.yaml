@@ -517,9 +517,9 @@ Resources:
   # The driver's node DaemonSet mounts the workspace with the `iam` mount
   # option (../storage.yaml), as this role: efs-utils takes Pod Identity
   # credentials before the node's instance profile, which has no EFS access.
-  # The file system policy below lets no other principal mount, and this
-  # role's policy (EfsCsiNodePolicy) lets it mount and write only through the
-  # workspace access point and a mount target. Pod Identity sets a pod's
+  # Its policy lets it mount and write only through the workspace access
+  # point and a mount target; the file system policy below cannot limit
+  # mounts to this role (see there). Pod Identity sets a pod's
   # credentials when the pod is created, so node pods that started before
   # this association must be restarted.
   EfsCsiNodeRole:
@@ -534,44 +534,35 @@ Resources:
             Action:
               - sts:AssumeRole
               - sts:TagSession
-
-  # Apart from the role, so that the role does not depend on the file system
-  # whose policy names the role.
-  EfsCsiNodePolicy:
-    Type: AWS::IAM::RolePolicy
-    Properties:
-      RoleName: !Ref EfsCsiNodeRole
-      PolicyName: mount-the-workspace
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: MountThroughTheWorkspaceAccessPoint
-            Effect: Allow
-            Action:
-              - elasticfilesystem:ClientMount
-              - elasticfilesystem:ClientWrite
-            Resource: !GetAtt WorkspaceFileSystem.Arn
-            Condition:
-              StringEquals:
-                elasticfilesystem:AccessPointArn: !GetAtt WorkspaceAccessPoint.Arn
-              Bool:
-                elasticfilesystem:AccessedViaMountTarget: "true"
-          # efs-utils looks up a mount target when the file system's DNS
-          # name does not resolve (as in the driver's node policy).
-          - Sid: FindMountTargets
-            Effect: Allow
-            Action: elasticfilesystem:DescribeMountTargets
-            Resource: !GetAtt WorkspaceFileSystem.Arn
-          - Sid: FindAvailabilityZones
-            Effect: Allow
-            Action: ec2:DescribeAvailabilityZones
-            Resource: "*"
+      Policies:
+        - PolicyName: mount-the-workspace
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: MountThroughTheWorkspaceAccessPoint
+                Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                Resource: !GetAtt WorkspaceFileSystem.Arn
+                Condition:
+                  StringEquals:
+                    elasticfilesystem:AccessPointArn: !GetAtt WorkspaceAccessPoint.Arn
+                  Bool:
+                    elasticfilesystem:AccessedViaMountTarget: "true"
+              # efs-utils looks up a mount target when the file system's DNS
+              # name does not resolve (as in the driver's node policy).
+              - Sid: FindMountTargets
+                Effect: Allow
+                Action: elasticfilesystem:DescribeMountTargets
+                Resource: !GetAtt WorkspaceFileSystem.Arn
+              - Sid: FindAvailabilityZones
+                Effect: Allow
+                Action: ec2:DescribeAvailabilityZones
+                Resource: "*"
 
   EfsCsiAddon:
     Type: AWS::EKS::Addon
-    # The node pods get the role's credentials from their start: with its
-    # policy already attached.
-    DependsOn: EfsCsiNodePolicy
     Properties:
       ClusterName: !Ref Cluster
       AddonName: aws-efs-csi-driver
@@ -621,27 +612,20 @@ Resources:
       # Without a file system policy, EFS lets any client that reaches a mount
       # target mount the root as any uid. With this one, nothing is allowed
       # here, so a client without IAM gets nothing, and the denials hold
-      # whatever an identity policy allows: no principal but the driver's
-      # node role mounts at all, and no mount goes without an access point,
-      # without TLS, or as root. The node role's own policy narrows it to
-      # the workspace access point (whose ARN cannot be named here: the
-      # access point depends on this file system). To mount the file system
-      # some other way, as an administrator, change this policy first.
+      # whatever an identity policy allows: no mount goes without an access
+      # point, without TLS, or as root. Only the condition keys EFS enforces
+      # for NFS clients are used (aws:SecureTransport, aws:SourceIp,
+      # elasticfilesystem:AccessPointArn and AccessedViaMountTarget; EFS
+      # does not enforce others, such as aws:PrincipalArn), so this policy
+      # cannot single out the driver's node role. What remains: any
+      # principal of this account whose own IAM policy grants EFS client
+      # actions can mount through an access point of this file system,
+      # including the workspace one (as uid/gid 1000, under /cao-workspace).
+      # The workspace access point's ARN cannot be named here either: the
+      # access point depends on this file system.
       FileSystemPolicy:
         Version: "2012-10-17"
         Statement:
-          - Sid: DenyAllButTheDriverNodeRole
-            Effect: Deny
-            Principal:
-              AWS: "*"
-            Action:
-              - elasticfilesystem:ClientMount
-              - elasticfilesystem:ClientWrite
-              - elasticfilesystem:ClientRootAccess
-            Resource: "*"
-            Condition:
-              ArnNotEquals:
-                aws:PrincipalArn: !GetAtt EfsCsiNodeRole.Arn
           - Sid: DenyWithoutAnAccessPoint
             Effect: Deny
             Principal:
@@ -677,7 +661,7 @@ Resources:
           Value: !Sub "${ClusterName}-workspace"
 
   # Pins every NFS client to uid/gid 1000, the image's `cao` user. The file
-  # system policy and EfsCsiNodePolicy make it the only way in.
+  # system policy makes an access point the only way in.
   WorkspaceAccessPoint:
     Type: AWS::EFS::AccessPoint
     Properties:
