@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Memory inspection and fixture hygiene are safer by default** (#1329).
+  This resolves #861 Q3: CLI list/show and REST list/show no longer increment
+  `access_count` unless `memory.non_accessing_inspection=false`; MCP recall
+  still counts, while internal recall accepts `record_access=false` for
+  benchmarks. Lesson promotion reads `access_count`, so inspection can no
+  longer make a lesson promotion-eligible. Long key truncation is visible in
+  `memory_store` results and long links resolve through the same sanitiser.
+  `cao memory doctor --fixtures` inventories synthetic residue and audit volume
+  as a dry-run; `--apply` requires a backup and moves fixture topic files to
+  quarantine without deleting them. Audit-log day files are report-only and
+  remain in place because they can also hold real events. The test harness now
+  refuses unmarked access to a real-home memory directory and relocates memory
+  for live-provider test runs.
+- **FIFO output readers continue working when a busy server has allocated a descriptor above 1023** (#1350).
 - **Synthetic memory-evaluation arms run with their own CAO settings homes**, so
   future memory phases can measure their setting without changing the legacy baseline (#1329).
 - **Synthetic memory retrieval evaluation fixtures and baseline harness** provide
@@ -892,6 +906,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The release job now promotes the hand-written `## [Unreleased]` section to the dated
+  release section and inserts a fresh empty one instead of replacing the changelog with
+  commit subjects through git-cliff (#1353).
 - The `memory_store` and `memory_forget` MCP tools now honor the caller's local memory switch
   when a remote memory owner is configured (#1087). `memory_recall` checked the switch before
   branching to the owner, but the write and delete tools did not, so a caller with memory off

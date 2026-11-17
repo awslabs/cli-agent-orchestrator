@@ -264,7 +264,7 @@ class TestListMemories:
             limit=1000,
             scan_all=True,
             search_mode="metadata",
-            record_access=True,
+            record_access=False,
         )
 
     def test_list_filters_project_by_scope_id(self, client, mock_service):
@@ -363,7 +363,7 @@ class TestGetMemory:
             limit=1000,
             scan_all=True,
             search_mode="metadata",
-            record_access=True,
+            record_access=False,
         )
 
     def test_get_exact_match_only(self, client, mock_service):
