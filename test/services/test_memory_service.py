@@ -1266,6 +1266,101 @@ class TestSessionScopeIdRoundTrip:
         assert results == []
 
 
+class TestReadExactKeyScopeId:
+    """Exact reads honor the native folder identity selected by the caller."""
+
+    @pytest.mark.asyncio
+    async def test_native_project_alias_reads_legacy_folder(self, tmp_path, monkeypatch):
+        from cli_agent_orchestrator.clients.database import record_project_alias
+        from cli_agent_orchestrator.services import memory_service, settings_service
+
+        service = MemoryService(base_dir=tmp_path / "native")
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(
+            settings_service, "get_vault_config", lambda: VaultConfig(enabled=False)
+        )
+        monkeypatch.setattr(
+            service,
+            "resolve_scope_id",
+            lambda scope, _context: "legacy-project" if scope == "project" else None,
+        )
+
+        await service.store(
+            content="legacy native project note",
+            scope="project",
+            memory_type="reference",
+            key="legacy-note",
+            terminal_context=_make_terminal_context(),
+        )
+        record_project_alias("canonical-project", "legacy-project", "cwd_hash")
+
+        memory = await service.read_exact_key(
+            "legacy-note",
+            scope="project",
+            scope_id="legacy-project",
+            scan_all=True,
+        )
+
+        assert memory is not None
+        assert memory.content == "legacy native project note"
+
+    @pytest.mark.asyncio
+    async def test_native_project_exact_key_rejects_another_project(self, tmp_path, monkeypatch):
+        from cli_agent_orchestrator.services import memory_service, settings_service
+
+        service = MemoryService(base_dir=tmp_path / "native")
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(
+            settings_service, "get_vault_config", lambda: VaultConfig(enabled=False)
+        )
+
+        await service.store(
+            content="project one note",
+            scope="project",
+            memory_type="reference",
+            key="shared-key",
+            terminal_context=_make_terminal_context(cwd=str(tmp_path / "project-one")),
+        )
+
+        assert (
+            await service.read_exact_key(
+                "shared-key",
+                scope="project",
+                scope_id="project-two",
+                scan_all=True,
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_native_session_exact_key_rejects_another_session(self, tmp_path, monkeypatch):
+        from cli_agent_orchestrator.services import memory_service, settings_service
+
+        service = MemoryService(base_dir=tmp_path / "native")
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(
+            settings_service, "get_vault_config", lambda: VaultConfig(enabled=False)
+        )
+
+        await service.store(
+            content="session one note",
+            scope="session",
+            memory_type="reference",
+            key="shared-key",
+            terminal_context=_make_terminal_context(session_name="session-one"),
+        )
+
+        assert (
+            await service.read_exact_key(
+                "shared-key",
+                scope="session",
+                scope_id="session-two",
+                scan_all=True,
+            )
+            is None
+        )
+
+
 class TestVaultScopeAuthority:
     """Configured vault mappings replace native visibility for their identity."""
 

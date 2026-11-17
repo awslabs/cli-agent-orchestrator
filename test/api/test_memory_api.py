@@ -382,6 +382,37 @@ class TestGetMemory:
             record_access=True,
         )
 
+    def test_get_project_alias_reads_listed_native_folder(self, client, tmp_path, monkeypatch):
+        from cli_agent_orchestrator.clients.database import record_project_alias
+
+        alias = "legacy-project"
+        service = MemoryService(base_dir=tmp_path / "native")
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(
+            settings_service, "get_vault_config", lambda: VaultConfig(enabled=False)
+        )
+        monkeypatch.setattr(
+            service,
+            "resolve_scope_id",
+            lambda scope, _context: alias if scope == "project" else None,
+        )
+        asyncio.run(
+            service.store(
+                content="legacy native project note",
+                scope="project",
+                memory_type="reference",
+                key="legacy-note",
+                terminal_context={"cwd": str(tmp_path / "project")},
+            )
+        )
+        record_project_alias("canonical-project", alias, "cwd_hash")
+
+        with patch(FACTORY_TARGET, return_value=service):
+            response = client.get(f"/memory/legacy-note?scope=project&scope_id={alias}")
+
+        assert response.status_code == 200
+        assert response.json()["content"] == "legacy native project note"
+
     def test_get_not_found(self, client, mock_service):
         response = client.get("/memory/missing-key")
         assert response.status_code == 404

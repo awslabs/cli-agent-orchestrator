@@ -2483,11 +2483,12 @@ class MemoryService:
             if isinstance(binding, VaultBinding):
                 search_dirs: list[Path] = []
                 vault_bindings = [binding]
+                selected_scope_id = binding.scope_id
             else:
-                project_dir = self._get_project_dir(scope, binding.scope_id)
+                project_dir = self._get_project_dir(scope, scope_id)
                 search_dirs = [project_dir] if project_dir.exists() else []
                 vault_bindings = []
-            selected_scope_id = binding.scope_id
+                selected_scope_id = scope_id
         else:
             search_dirs, vault_bindings, _max_body_chars, vault_config = self._resolve_sources(
                 scope,
