@@ -51,6 +51,29 @@ _SUBSCRIBE_ACK_TIMEOUT = 10.0  # seconds
 # resubscribe cycle instead of one per pane.
 _RESUBSCRIBE_COALESCE_DELAY = 0.25  # seconds
 
+# After an idle/done event, re-check delivery a few times over this window.
+# A provider can hold PROCESSING for a post-turn "flush wait" (10s cap from
+# first detection; see providers/base.py), and that cap RESETS every time the
+# agent flaps back to working — e.g. while it generates its reply — so the real
+# settle can be tens of seconds after the first done event. pane.agent_status_
+# changed fires ONCE per transition, so a single delivery attempt at the event
+# instant finds the gate closed and nothing re-opens it until the 30s
+# reconciliation sweep. (The retired broadcast pane.updated hid this by firing
+# on every output change, which re-checked delivery for free.) These retries
+# re-run the SAME readiness gate — they never bypass the flush wait — just often
+# enough to catch it opening; deliver_pending is idempotent so a tick after the
+# message already landed is a cheap no-op. One loop per terminal (see
+# _arm_settle_retries): a later event does NOT stack a second loop, and if the
+# window lapses while the agent is still flapping, the next done event re-arms.
+_SETTLE_RETRY_INTERVAL = 3.0  # seconds between re-checks
+# Cover ~27s past the event — long enough for a turn that flaps several times
+# while generating a reply (measured live: a settle ~27s after task start) to
+# land before the reconciliation sweep (INBOX_RECONCILE_INTERVAL + grace).
+# Cheap because the loop stops at the first successful delivery (see
+# _settle_retry_loop), so the full tick count only runs when nothing is
+# deliverable, in which case there is nothing to spam into the pane.
+_SETTLE_RETRY_TICKS = 9
+
 # herdr socket protocol versions this integration has been verified against.
 # Outside this range the event contract may have changed shape again (0.9.x
 # silently stopped emitting broadcast pane.updated while still acking its
@@ -179,7 +202,7 @@ class HerdrInboxService:
     def __init__(
         self,
         socket_path: Optional[str] = None,
-        delivery_callback: Optional[Callable[[str, str], None]] = None,
+        delivery_callback: Optional[Callable[[str, str], int]] = None,
         herdr_session: str = "cao",
     ) -> None:
         """Initialize the inbox service.
@@ -187,8 +210,9 @@ class HerdrInboxService:
         Args:
             socket_path: Path to herdr socket. None = auto-detect from env.
             delivery_callback: Function to call for message delivery.
-                Signature: callback(terminal_id, source) → checks and delivers
-                pending messages; source names the trigger for log attribution.
+                Signature: callback(terminal_id, source) → int, the number of
+                messages delivered; source names the trigger for log attribution.
+                The count lets the settle-retry loop stop once a message lands.
             herdr_session: Name of the herdr session to connect to. Used to
                 derive the default socket path and prefix CLI calls.
         """
@@ -238,6 +262,14 @@ class HerdrInboxService:
 
         # Protocol observability: log herdr's version/protocol once per process.
         self._protocol_logged = False
+
+        # At most one bounded settle-retry loop per terminal, to carry a
+        # delivery across the provider's flush-wait window (see
+        # _SETTLE_RETRY_INTERVAL / _SETTLE_RETRY_TICKS). Mutated only on the
+        # event loop (_dispatch_event, _deliver_settled_panes, _close_connection),
+        # never from the request threads that call register/unregister, so no
+        # cross-thread task cancellation.
+        self._settle_tasks: Dict[str, "asyncio.Task"] = {}
 
     @staticmethod
     def _default_socket_path(session_name: str = "cao") -> str:
@@ -687,6 +719,9 @@ class HerdrInboxService:
         leaked writer per cycle would accumulate real file descriptors rather
         than only one per rare network error.
         """
+        # A recycle re-runs the settled-pane sweep, which re-arms any retry that
+        # still matters, so in-flight ones from the old connection can be dropped.
+        self._cancel_settle_retries()
         writer = self._writer
         self._reader = None
         self._writer = None
@@ -1042,6 +1077,9 @@ class HerdrInboxService:
             if pane.get("agent_status") in ("idle", "done"):
                 self._working_since.pop(terminal_id, None)
                 self._deliver(terminal_id, source="settled-sweep")
+                # A pane already settled at connect time has the same flush-wait
+                # gap as a live event, and no event will follow, so carry it too.
+                self._arm_settle_retries(terminal_id)
                 delivered += 1
             self._note_activity(terminal_id, pane.get("agent_status"))
             # A transition missed while disconnected surfaces here as the
@@ -1332,8 +1370,11 @@ class HerdrInboxService:
         if status in ("idle", "done"):
             # Clear working timestamp
             self._working_since.pop(terminal_id, None)
-            # Trigger delivery
+            # Trigger delivery now, then re-check across the flush-wait window:
+            # this single event is the only agent-status signal herdr sends for
+            # the transition, and the provider may not report ready yet.
             self._deliver(terminal_id, source="herdr-event")
+            self._arm_settle_retries(terminal_id)
 
         elif status == "working":
             # Track working start for kiro supplement check
@@ -1652,20 +1693,92 @@ class HerdrInboxService:
 
     # TODO: _deliver() calls callback synchronously — if callback is async,
     # this will need a threadsafe bridge (out of scope for this change).
-    def _deliver(self, terminal_id: str, source: str = "herdr") -> None:
-        """Check and deliver pending messages for a terminal.
+    def _arm_settle_retries(self, terminal_id: str) -> None:
+        """Ensure a bounded re-delivery loop is running for a terminal.
 
-        ``source`` names the trigger (herdr-event, settled-sweep,
+        Call on the event loop only. If a loop is already active for this
+        terminal, do nothing — it is already covering the window, and stacking
+        a second loop per event just multiplies redundant readiness checks
+        (seen live: a turn that flaps working/done fires several done events).
+        A later event that arrives AFTER the loop has lapsed re-arms it, so a
+        settle beyond the window is still caught (or, failing that, by the 30s
+        reconciliation backstop).
+        """
+        loop = self._loop
+        if loop is None:
+            return
+        existing = self._settle_tasks.get(terminal_id)
+        if existing is not None and not existing.done():
+            return
+        self._settle_tasks[terminal_id] = loop.create_task(self._settle_retry_loop(terminal_id))
+
+    async def _settle_retry_loop(self, terminal_id: str) -> None:
+        """Re-attempt delivery over the flush-wait window, then defer to reconcile.
+
+        TODO: this is a tactical bridge between two layers that do not talk —
+        herdr's agent-status events and the provider's output-flush readiness.
+        The clean fix is a provider/StatusMonitor "delivery-ready" signal that
+        herdr subscribes to, so no polling is needed; that is a provider-contract
+        change tracked separately. Until then, re-check the existing gate.
+        """
+        try:
+            for _ in range(_SETTLE_RETRY_TICKS):
+                # Check before sleeping so a terminal unregistered during the
+                # previous tick's sleep exits now instead of burning another
+                # interval.
+                if terminal_id not in self._terminal_to_pane:
+                    return
+                await asyncio.sleep(_SETTLE_RETRY_INTERVAL)
+                if terminal_id not in self._terminal_to_pane:
+                    return
+                # Offload the delivery: _deliver → deliver_pending reads status
+                # via the herdr CLI (blocking subprocess) and types into the
+                # pane, so running it inline here would block the single event
+                # loop for every other terminal on each tick. deliver_pending is
+                # already driven off-loop this way by the reconciliation daemon
+                # (asyncio.to_thread) and the inbox POST pool, and serializes per
+                # terminal under its own lock, so a concurrent on-loop live-event
+                # delivery cannot double-send.
+                #
+                # Stop as soon as a message lands: the gate has opened, so there
+                # is no point re-checking. Anything still queued is delivered by
+                # the normal event/sweep paths now that the terminal is ready.
+                delivered = await asyncio.to_thread(self._deliver, terminal_id, "herdr-settle")
+                if delivered > 0:
+                    return
+        except asyncio.CancelledError:
+            # Propagates automatically after finally (Python 3.8+); re-raised
+            # explicitly only to make the cancel path obvious to readers.
+            raise
+        finally:
+            # Drop self from the registry so a later event can re-arm. Guard
+            # against a replacement task having already taken the slot.
+            if self._settle_tasks.get(terminal_id) is asyncio.current_task():
+                self._settle_tasks.pop(terminal_id, None)
+
+    def _cancel_settle_retries(self) -> None:
+        """Cancel all in-flight settle retries (event loop only)."""
+        for task in list(self._settle_tasks.values()):
+            task.cancel()
+        self._settle_tasks.clear()
+
+    def _deliver(self, terminal_id: str, source: str = "herdr") -> int:
+        """Check and deliver pending messages for a terminal; return the count.
+
+        ``source`` names the trigger (herdr-event, herdr-settle, settled-sweep,
         kiro-supplement) so a delivery in the logs can be told apart from the
         reconciliation sweep's — the event path dying silently is exactly how
-        this backend degraded unnoticed on herdr 0.9.x.
+        this backend degraded unnoticed on herdr 0.9.x. The count lets the
+        settle-retry loop stop once a message lands.
         """
         logger.debug("Delivery trigger (%s) for terminal %s", source, terminal_id)
         if self._delivery_callback:
             try:
-                self._delivery_callback(terminal_id, source)
+                result = self._delivery_callback(terminal_id, source)
+                return result if isinstance(result, int) else 0
             except Exception as e:
                 logger.error(f"Delivery failed for terminal {terminal_id}: {e}")
+        return 0
 
     async def check_kiro_supplements(self) -> None:
         """Periodic check for kiro-cli terminals stuck in 'working' state.

@@ -1383,6 +1383,148 @@ class TestHerdrInboxServiceResubscribeOnRegistration:
         assert service._pane_to_terminal["pane-early"] == "tid-early"
 
 
+class TestHerdrInboxServiceSettleRetries:
+    """An idle/done event must carry delivery across the provider flush-wait.
+
+    herdr sends ONE pane.agent_status_changed per transition, but the provider
+    can report PROCESSING for a ~10s post-turn flush wait, so a single delivery
+    attempt at the event instant finds the gate closed and (without the retry)
+    only the 30s reconciliation sweep re-opens it. These tests pin the bounded
+    re-delivery that closes that gap.
+    """
+
+    def test_idle_event_arms_bounded_retries(self):
+        """A done event delivers once immediately, then re-delivers at each
+        tick with the herdr-settle source."""
+        from cli_agent_orchestrator.services import herdr_inbox_service as mod
+
+        calls = []
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock",
+            delivery_callback=lambda tid, source: calls.append((tid, source)),
+        )
+        service._pane_to_terminal = {"w1:p1": "tid1"}
+        service._terminal_to_pane = {"tid1": "w1:p1"}
+        frame = {
+            "event": "pane.agent_status_changed",
+            "data": {"pane_id": "w1:p1", "agent_status": "done"},
+        }
+
+        async def run():
+            service._loop = asyncio.get_running_loop()
+            with (
+                patch.object(mod, "_SETTLE_RETRY_INTERVAL", 0.0),
+                patch.object(mod, "_SETTLE_RETRY_TICKS", 3),
+                patch.object(service, "_record_agent_status", new=AsyncMock()),
+            ):
+                await service._dispatch_event(frame)
+                await asyncio.gather(*list(service._settle_tasks.values()))
+
+        _run_async(run())
+
+        # One immediate herdr-event delivery + three herdr-settle retries.
+        assert calls[0] == ("tid1", "herdr-event")
+        assert calls[1:] == [("tid1", "herdr-settle")] * 3
+
+    def test_settle_retry_stops_on_first_successful_delivery(self):
+        """Once a delivery lands (callback returns >0), the loop stops instead of
+        running out its whole window — no more redundant get_status subprocesses."""
+        from cli_agent_orchestrator.services import herdr_inbox_service as mod
+
+        ticks = {"n": 0}
+
+        def callback(tid, source):
+            ticks["n"] += 1
+            # Not ready on the first tick, delivers on the second.
+            return 1 if ticks["n"] >= 2 else 0
+
+        service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
+        service._terminal_to_pane = {"tid1": "w1:p1"}
+
+        async def run():
+            service._loop = asyncio.get_running_loop()
+            with (
+                patch.object(mod, "_SETTLE_RETRY_INTERVAL", 0.0),
+                patch.object(mod, "_SETTLE_RETRY_TICKS", 9),
+            ):
+                service._arm_settle_retries("tid1")
+                await asyncio.gather(*list(service._settle_tasks.values()))
+
+        _run_async(run())
+        # Stopped at tick 2, did NOT run all 9 ticks.
+        assert ticks["n"] == 2
+
+    def test_second_event_does_not_stack_a_second_loop(self):
+        """A terminal that flaps done→working→done fires several events, but only
+        ONE retry loop runs at a time (no multiplied readiness checks)."""
+        from cli_agent_orchestrator.services import herdr_inbox_service as mod
+
+        service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=lambda *a: None)
+        service._terminal_to_pane = {"tid1": "w1:p1"}
+
+        async def run():
+            service._loop = asyncio.get_running_loop()
+            with (
+                patch.object(mod, "_SETTLE_RETRY_INTERVAL", 10.0),  # keep the loop alive
+                patch.object(mod, "_SETTLE_RETRY_TICKS", 6),
+            ):
+                service._arm_settle_retries("tid1")
+                first = service._settle_tasks["tid1"]
+                service._arm_settle_retries("tid1")  # second event, loop still active
+                second = service._settle_tasks["tid1"]
+                assert first is second  # not replaced, not stacked
+                assert len(service._settle_tasks) == 1
+                first.cancel()
+
+        _run_async(run())
+
+    def test_settle_retry_stops_when_terminal_unregistered(self):
+        """A retry that finds the terminal gone stops rather than delivering."""
+        from cli_agent_orchestrator.services import herdr_inbox_service as mod
+
+        calls = []
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock",
+            delivery_callback=lambda tid, source: calls.append((tid, source)),
+        )
+        service._terminal_to_pane = {}  # terminal already gone
+
+        async def run():
+            service._loop = asyncio.get_running_loop()
+            with (
+                patch.object(mod, "_SETTLE_RETRY_INTERVAL", 0.0),
+                patch.object(mod, "_SETTLE_RETRY_TICKS", 3),
+            ):
+                service._arm_settle_retries("tid-gone")
+                await asyncio.gather(*list(service._settle_tasks.values()))
+
+        _run_async(run())
+        assert calls == []
+        # The loop removed itself from the registry on exit.
+        assert service._settle_tasks == {}
+
+    def test_close_connection_cancels_settle_retries(self):
+        """A connection recycle cancels in-flight retries (the new connection's
+        settled-pane sweep re-arms whatever still matters)."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._terminal_to_pane = {"tid1": "w1:p1"}
+
+        async def run():
+            service._loop = asyncio.get_running_loop()
+            service._arm_settle_retries("tid1")  # long sleeps by default
+            assert len(service._settle_tasks) == 1
+            await service._close_connection()
+            assert service._settle_tasks == {}
+
+        _run_async(run())
+
+    def test_arm_is_safe_before_start(self):
+        """No event loop captured yet (service never start()ed) — arming is a no-op."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._arm_settle_retries("tid1")  # must not raise
+        assert service._settle_tasks == {}
+
+
 class TestHerdrProtocolObservability:
     """herdr's protocol is logged and an untested protocol warns loudly:
     0.9.x changed the event contract (stopped emitting broadcast pane.updated)

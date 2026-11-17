@@ -176,7 +176,7 @@ class InboxService:
         registry: PluginRegistry | None = None,
         after_dispatch: Optional[Callable[[], None]] = None,
         source: Optional[str] = None,
-    ) -> None:
+    ) -> int:
         """Deliver pending message(s) to a ready terminal. Use num_messages=0 for all.
 
         Status comes from the StatusMonitor (the event-driven source of truth).
@@ -212,7 +212,7 @@ class InboxService:
 
         try:
             with self._delivery_lock(terminal_id):
-                self._deliver_pending_locked(
+                return self._deliver_pending_locked(
                     terminal_id, num_messages, registry, notify, source=source
                 )
         finally:
@@ -225,14 +225,23 @@ class InboxService:
         registry: PluginRegistry | None,
         after_dispatch: Callable[[], None] = lambda: None,
         source: Optional[str] = None,
-    ) -> None:
+    ) -> int:
+        """Return the number of messages actually handed to the pane.
+
+        The count lets an event-driven caller (the herdr settle-retry) stop
+        re-checking once a delivery lands, instead of running out its whole
+        window. Zero covers both "nothing pending" and "pending but the
+        readiness gate is still closed"; the caller only needs the positive
+        signal.
+        """
         limit = num_messages if num_messages > 0 else 100
         messages = get_pending_messages(terminal_id, limit=limit)
         if not messages:
-            return
+            return 0
 
         status = status_monitor.get_status(terminal_id)
         eager = False
+        delivered_count = 0
         if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
             # Not ready on the normal path. Eager delivery (#251) lets providers
             # that accept input mid-turn receive messages while PROCESSING or
@@ -260,7 +269,7 @@ class InboxService:
                 ):
                     eager_eligible = False
             if not eager_eligible:
-                return
+                return 0
             eager = True
 
         # Mark DELIVERED before sending (#164). send_input() types into the tmux
@@ -319,6 +328,7 @@ class InboxService:
                     terminal_id,
                     f" (trigger: {source})" if source else "",
                 )
+                delivered_count += len(batch)
                 # The paste is in the pane: the immediate-delivery caller may
                 # answer now. Everything below is confirmation and recovery.
                 after_dispatch()
@@ -426,6 +436,8 @@ class InboxService:
                     logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
                     update_message_status(message.id, MessageStatus.FAILED)
                 self._close_message_edges(terminal_id, batch, _short_reason(e), registry)
+
+        return delivered_count
 
     def deliver_pending_in_background(
         self, terminal_id: str, registry: PluginRegistry | None = None
