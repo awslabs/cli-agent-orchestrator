@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1000" height="560" viewBox="0 0 1000 560" role="img" aria-labelledby="title desc">
-  <title id="title">The three agents and their workers</title>
-  <desc id="desc">The user talks only to the conductor, one question at a time. The conductor exchanges CAO messages with the PR shepherd, which looks after the user's own pull requests, and with the PR reviewer, which reviews other people's pull requests. The shepherd creates, checks and deletes short-lived workers: a fixer, a main-merger, a pre-push reviewer, and a publisher or armer. A zero-token poll loop wakes the shepherd only on real events.</desc>
+  <title id="title">The conductor, the shepherd and the Kiro Crew bot</title>
+  <desc id="desc">The user talks only to the conductor, one question at a time. The conductor exchanges CAO messages with the PR shepherd, which looks after the user's own pull requests. The Kiro Crew bot reviews other people's pull requests on its own, outside the conductor. The shepherd creates, checks and deletes short-lived workers: a fixer, a main-merger, a pre-push reviewer, and a publisher or armer. A zero-token poll loop wakes the shepherd only on real events.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
       <path d="M0 0L10 5L0 10Z" fill="#2563eb"/>
@@ -35,9 +35,7 @@
 
   <!-- Links to shepherd and reviewer -->
   <path d="M420 228L270 284" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow)"/>
-  <path d="M580 228L730 284" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow)"/>
-  <text class="label" x="290" y="250">CAO messages</text>
-  <text class="label" x="640" y="250">CAO messages</text>
+    <text class="label" x="290" y="250">CAO messages</text>
 
   <!-- Shepherd -->
   <rect x="80" y="288" width="320" height="72" rx="14" fill="#f8fafc" stroke="#0f172a" stroke-width="2"/>
@@ -45,9 +43,9 @@
   <text class="box-copy" x="240" y="336" text-anchor="middle">your own open PRs, until they merge</text>
 
   <!-- Reviewer -->
-  <rect x="600" y="288" width="320" height="72" rx="14" fill="#f8fafc" stroke="#0f172a" stroke-width="2"/>
-  <text class="box-title" x="760" y="315" text-anchor="middle">PR reviewer</text>
-  <text class="box-copy" x="760" y="336" text-anchor="middle">other people's PRs</text>
+  <rect x="600" y="288" width="320" height="72" rx="14" fill="#f8fafc" stroke="#0f172a" stroke-width="2" stroke-dasharray="6 4"/>
+  <text class="box-title" x="760" y="315" text-anchor="middle">Kiro Crew bot</text>
+  <text class="box-copy" x="760" y="336" text-anchor="middle">reviews other people's PRs, on its own</text>
 
   <!-- Workers -->
   <path d="M240 360V392" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow-grey)"/>
