@@ -812,7 +812,7 @@ def get_memory_settings() -> Dict[str, Any]:
         "learning_enabled": False,
         "instruction_promotion_enabled": False,
         "explain_enabled": True,
-        "non_accessing_inspection": False,
+        "non_accessing_inspection": True,
         "parser": {"lenient": True},
         "lifecycle": {"enabled": False},
         "ranking": {"default_sort": "recency"},
@@ -962,12 +962,12 @@ def is_memory_lint_enabled(settings: Optional[Dict[str, Any]] = None) -> bool:
 
 
 def is_non_accessing_inspection_enabled() -> bool:
-    """Opt-in operator inspection: env > file > False; read errors stay off."""
+    """Non-accessing operator inspection: env > file > True; read errors stay on."""
     try:
-        return bool(get_memory_settings().get("non_accessing_inspection", False))
+        return bool(get_memory_settings().get("non_accessing_inspection", True))
     except Exception:
-        logger.warning("Failed to read memory.non_accessing_inspection; defaulting to False")
-        return False
+        logger.warning("Failed to read memory.non_accessing_inspection; defaulting to True")
+        return True
 
 
 def is_memory_parser_lenient() -> bool:
@@ -1295,7 +1295,7 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``explain_enabled`` (bool) — on-demand CLI relevance diagnostic.
         ``lifecycle.enabled`` (bool) — opt-in supersedes lifecycle.
         ``ranking.default_sort`` (str) — ``recency`` or ``bm25`` query recall default.
-        ``non_accessing_inspection`` (bool) — opt-in operator reads without access bumps.
+        ``non_accessing_inspection`` (bool) — operator reads without access bumps.
         ``parser.lenient`` (bool) — parse valid native topics without canonical timestamps.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
         ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.

@@ -6,6 +6,8 @@ selection), because there is then nothing to assert.
 """
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 from test import conftest
 
@@ -123,3 +125,97 @@ def test_a_leaked_home_is_repinned_for_the_next_test_part_two():
 @pytest.mark.real_home
 def test_real_home_marker_restores_the_real_home():
     assert os.environ.get("HOME") == conftest._REAL_HOME_ENV.get("HOME")
+
+
+def _run_memory_guard_probe(
+    tmp_path,
+    nodeid,
+    *,
+    isolate_home=False,
+    temp_under_home=False,
+    pytest_args=(),
+):
+    real_home = tmp_path / "guard-real-home"
+    real_home.mkdir()
+    temp_root = (real_home if temp_under_home else tmp_path) / "guard-tmp"
+    temp_root.mkdir()
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("CAO_", "_CAO_", "HERDR_", "PYTEST_XDIST_", "TMUX"))
+    }
+    env.update(
+        {
+            "HOME": str(real_home),
+            "TMPDIR": str(temp_root),
+            "TMUX_TMPDIR": str(temp_root / "tmux"),
+        }
+    )
+    if not isolate_home:
+        env.update(
+            {
+                "CAO_HOME_DIR": str(real_home / ".aws" / "cli-agent-orchestrator"),
+                "CAO_TEST_REAL_HOME": "1",
+            }
+        )
+    for name in tuple(env):
+        if name.startswith("COV_CORE"):
+            env.pop(name)
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            nodeid,
+            "-p",
+            "no:cacheprovider",
+            "--no-cov",
+            "--basetemp",
+            str(temp_root / "bt"),
+            *pytest_args,
+        ],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_memory_home_guard_rejects_unmarked_real_home(tmp_path):
+    result = _run_memory_guard_probe(
+        tmp_path, "test/test_memory_home_guard_probe.py::test_unmarked_real_home_memory_probe"
+    )
+
+    assert result.returncode != 0
+    assert "real_home_memory" in result.stdout + result.stderr
+
+
+def test_memory_home_guard_allows_explicit_marker(tmp_path):
+    result = _run_memory_guard_probe(
+        tmp_path, "test/test_memory_home_guard_probe.py::test_marked_real_home_memory_probe"
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_memory_home_guard_allows_xdist_isolated_home(tmp_path):
+    result = _run_memory_guard_probe(
+        tmp_path,
+        "test/test_memory_home_guard_probe.py",
+        isolate_home=True,
+        pytest_args=("-n", "2"),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_memory_home_guard_allows_isolated_home_under_startup_home(tmp_path):
+    result = _run_memory_guard_probe(
+        tmp_path,
+        "test/test_memory_home_guard_probe.py",
+        isolate_home=True,
+        temp_under_home=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr

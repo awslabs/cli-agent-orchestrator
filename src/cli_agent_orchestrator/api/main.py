@@ -764,7 +764,7 @@ class RunStepRequest(BaseModel):
                 # error rule). `from None` drops the value-bearing cause.
                 raise ValueError(
                     f"value for '{key}' is invalid (must be a 1-64 char "
-                    "[A-Za-z0-9_-] identifier)"
+                    + "[A-Za-z0-9_-] identifier)"
                 ) from None
         return v
 
@@ -9247,9 +9247,8 @@ async def delete_workflow_run_endpoint(
 
     try:
         await asyncio.to_thread(workflow_journal.delete_run, run_id)
-    except (
-        Exception
-    ) as e:  # noqa: BLE001 — surface a genuine DB failure; unknown id never lands here (BR-3)
+    # Surface a genuine DB failure; unknown id never lands here (BR-3).
+    except Exception as e:  # noqa: BLE001
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"failed to delete run '{run_id}': {e}",
@@ -10960,7 +10959,7 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             input_drop_logged = True
             logger.warning(
                 "Dropping WebSocket input for terminal %r until its Kiro identity is "
-                "verified (%s)",
+                + "verified (%s)",
                 terminal_id,
                 reason,
             )
@@ -11269,6 +11268,7 @@ class InternalMemoryRecallRequest(BaseModel):
     search_mode: Optional[str] = None
     sort_by: Optional[str] = None
     include_related: bool = False
+    record_access: bool = True
 
 
 class InternalMemoryForgetRequest(BaseModel):
@@ -11330,6 +11330,7 @@ async def internal_memory_recall(
         search_mode=body.search_mode,
         sort_by=body.sort_by,
         include_related=body.include_related,
+        record_access=body.record_access,
     )
     # One serializer for both recall surfaces (this route and the MCP
     # memory_recall tool); see models/memory.py.
@@ -12165,8 +12166,9 @@ async def create_lesson_endpoint(
         "provider": record.get("provider"),
         "agent_profile": target,
     }
+    service = _get_memory_service()
     try:
-        memory = await _get_memory_service().store(
+        memory = await service.store(
             content=body.content,
             scope=MemoryScope.AGENT.value,
             memory_type=MemoryType.FEEDBACK.value,
@@ -12184,13 +12186,17 @@ async def create_lesson_endpoint(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=LEARNING_DISABLED_MESSAGE)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    return {
+    result = {
         "success": True,
         "key": memory.key,
         "scope": memory.scope,
         "scope_id": memory.scope_id,
         "target_agent_profile": target,
     }
+    if body.key is not None and service._key_was_truncated(body.key):
+        result["key_truncated"] = True
+        result["requested_key"] = body.key
+    return result
 
 
 @app.get("/outcomes")
