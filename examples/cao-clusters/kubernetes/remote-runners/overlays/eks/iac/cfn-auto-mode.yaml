@@ -23,19 +23,20 @@ AWSTemplateFormatVersion: "2010-09-09"
 #
 # Upgrading a stack created from an earlier version of this template, which
 # did not declare the log group (the cluster created its own
-# /aws/eks/<ClusterName>/cluster):
-# 1. Import the group, which keeps its logs: take the deployed template
-#    (aws cloudformation get-template --stack-name <stack>
-#    --template-stage Original), add only ClusterLogGroup as below, and
-#    create a change set with --change-set-type IMPORT, --resources-to-import
-#    '[{"ResourceType":"AWS::Logs::LogGroup","LogicalResourceId":"ClusterLogGroup",
-#    "ResourceIdentifier":{"LogGroupName":"/aws/eks/<ClusterName>/cluster"}}]'
-#    and every parameter UsePreviousValue=true; check that it imports only that
-#    group, and execute it. An import keeps the group's current retention:
-#    aws logs put-retention-policy --log-group-name /aws/eks/<ClusterName>/cluster
+# /aws/eks/<ClusterName>/cluster): the remote-runners README ("Upgrading a
+# stack created before the template declared the log group") has the
+# commands. In short:
+# 1. Import the group, which keeps its logs: save the deployed template
+#    (get-template --template-stage Original --query TemplateBody), add only
+#    ClusterLogGroup as below, create-change-set --change-set-type IMPORT
+#    with --resources-to-import for it and every parameter UsePreviousValue,
+#    check with describe-change-set that it imports only that group, then
+#    execute-change-set and wait stack-import-complete.
+# 2. An import keeps the group's current retention: aws logs
+#    put-retention-policy --log-group-name /aws/eks/<ClusterName>/cluster
 #    --retention-in-days 30
-# 2. Update the stack with this template, then restart the EFS driver's node
-#    pods and run ../deploy.sh right away (see WorkspaceFileSystem).
+# 3. Update the stack with this template, then restart the EFS driver's node
+#    pods and the runner pods (see WorkspaceFileSystem).
 # Alternatively, delete the group before the update (aws logs delete-log-group
 # --log-group-name /aws/eks/<ClusterName>/cluster), which loses its logs, or
 # delete the stack and create it again.
@@ -650,8 +651,11 @@ Resources:
       # applies it, mounts made without `iam` (all of them, before) are
       # anonymous and lose access, so running agents lose the workspace. Update
       # when no agent runs, and right after it restart the driver's node pods
-      # (kubectl -n kube-system rollout restart daemonset efs-csi-node), then
-      # run ../deploy.sh, which recreates the runner pods with `iam` mounts.
+      # (kubectl -n kube-system rollout restart daemonset efs-csi-node, then
+      # rollout status), then the runner pods (kubectl -n cao-remote rollout
+      # restart deployment/cao-runner, then rollout status), which remounts
+      # the workspace with `iam`; then run ../deploy.sh. deploy.sh alone rolls
+      # the runners only when their pod template changes.
       FileSystemPolicy:
         Version: "2012-10-17"
         Statement:

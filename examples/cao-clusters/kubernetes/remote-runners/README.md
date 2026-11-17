@@ -226,9 +226,23 @@ examples/cao-clusters/kubernetes/remote-runners/overlays/eks/deploy.sh cao-remot
   until then) are anonymous and lose access, so the workspace is unavailable
   to running agents until the driver's node pods are restarted (Pod Identity
   gives a pod its credentials when it starts) and the runner pods are
-  recreated. Update when no agent runs, in this order: the stack update, then
-  `kubectl -n kube-system rollout restart daemonset efs-csi-node`, then
-  `deploy.sh` right away, which recreates the runner pods.
+  recreated, which remounts the workspace with `iam`. Update when no agent
+  runs, and right after the stack update (step 5 of the log group upgrade
+  below, if that applies) run:
+
+  ```bash
+  kubectl -n kube-system rollout restart daemonset efs-csi-node
+  kubectl -n kube-system rollout status daemonset efs-csi-node --timeout=300s
+  kubectl -n cao-remote rollout restart deployment/cao-runner
+  kubectl -n cao-remote rollout status deployment/cao-runner --timeout=600s
+  examples/cao-clusters/kubernetes/remote-runners/overlays/eks/deploy.sh <stack>
+  ```
+
+  The explicit runner restart is what guarantees the remount: `deploy.sh`
+  applies the manifests and rolls the runners only when their pod template
+  changes (a new image, TLS material or provider settings). Running
+  `deploy.sh` first is fine too, but restart the runners after it either
+  way.
 - **Auto Mode and NetworkPolicy:** cluster DNS runs on each node at the `.10`
   address of the service range, not in CoreDNS pods, and Pod Identity's agent
   answers on `169.254.170.23:80`. The overlay allows exactly those two, on top
@@ -247,18 +261,29 @@ examples/cao-clusters/kubernetes/remote-runners/overlays/eks/deploy.sh cao-remot
   by an earlier cluster of the same name.
 - **Upgrading a stack created before the template declared the log group:**
   its cluster already created the group, so the update cannot create it.
-  Import it into the stack first, which keeps its logs:
-  1. Save the deployed template
-     (`aws cloudformation get-template --stack-name <stack> --template-stage Original`)
-     and add only the `ClusterLogGroup` resource, exactly as
-     `iac/cfn-auto-mode.yaml` defines it.
-  2. Create an import change set and check that it imports only that group:
+  Import it into the stack first, which keeps its logs. With `STACK` and
+  `CLUSTER` set to the stack and its `ClusterName`:
+
+  1. Save the deployed template. For a stack created from this (YAML)
+     template, `--output text` prints the YAML as it was deployed; for a
+     JSON template, use `--output json > deployed.json` instead.
 
      ```bash
-     aws cloudformation create-change-set --stack-name <stack> \
+     aws cloudformation get-template --stack-name "$STACK" \
+       --template-stage Original --query TemplateBody --output text > deployed.yaml
+     ```
+
+  2. Edit `deployed.yaml`: add the `ClusterLogGroup` resource under
+     `Resources`, exactly as `iac/cfn-auto-mode.yaml` defines it (with its
+     `DeletionPolicy` and `UpdateReplacePolicy`), and change nothing else.
+  3. Create the import change set, and check that its only change is
+     `Import` of `ClusterLogGroup`:
+
+     ```bash
+     aws cloudformation create-change-set --stack-name "$STACK" \
        --change-set-name import-cluster-log-group --change-set-type IMPORT \
-       --resources-to-import '[{"ResourceType":"AWS::Logs::LogGroup","LogicalResourceId":"ClusterLogGroup","ResourceIdentifier":{"LogGroupName":"/aws/eks/<ClusterName>/cluster"}}]' \
-       --template-body file://<deployed template with ClusterLogGroup> \
+       --resources-to-import "[{\"ResourceType\":\"AWS::Logs::LogGroup\",\"LogicalResourceId\":\"ClusterLogGroup\",\"ResourceIdentifier\":{\"LogGroupName\":\"/aws/eks/$CLUSTER/cluster\"}}]" \
+       --template-body file://deployed.yaml \
        --parameters ParameterKey=ClusterName,UsePreviousValue=true \
          ParameterKey=KubernetesVersion,UsePreviousValue=true \
          ParameterKey=VpcCidr,UsePreviousValue=true \
@@ -266,16 +291,33 @@ examples/cao-clusters/kubernetes/remote-runners/overlays/eks/deploy.sh cao-remot
          ParameterKey=PublicAccessCidrs,UsePreviousValue=true \
          ParameterKey=BedrockModelPattern,UsePreviousValue=true \
        --capabilities CAPABILITY_NAMED_IAM
-     aws cloudformation describe-change-set --stack-name <stack> \
+     aws cloudformation wait change-set-create-complete --stack-name "$STACK" \
        --change-set-name import-cluster-log-group
+     aws cloudformation describe-change-set --stack-name "$STACK" \
+       --change-set-name import-cluster-log-group \
+       --query 'Changes[].ResourceChange.[Action,LogicalResourceId,ResourceType]' --output text
      ```
 
-  3. Execute it (`aws cloudformation execute-change-set`) and wait
-     (`aws cloudformation wait stack-import-complete`).
-  4. The import keeps the group's current retention; set the template's:
-     `aws logs put-retention-policy --log-group-name /aws/eks/<ClusterName>/cluster --retention-in-days 30`.
-  5. Update the stack with the new template, every parameter with
-     `UsePreviousValue`, then follow the workspace upgrade order above.
+  4. Execute it, wait, and set the retention: an import keeps the group's
+     current retention.
+
+     ```bash
+     aws cloudformation execute-change-set --stack-name "$STACK" \
+       --change-set-name import-cluster-log-group
+     aws cloudformation wait stack-import-complete --stack-name "$STACK"
+     aws logs put-retention-policy --log-group-name "/aws/eks/$CLUSTER/cluster" \
+       --retention-in-days 30
+     ```
+
+  5. Update the stack with the new template. `aws cloudformation deploy`
+     keeps the current value of every parameter not overridden; then follow
+     the workspace upgrade above.
+
+     ```bash
+     aws cloudformation deploy --stack-name "$STACK" \
+       --template-file examples/cao-clusters/kubernetes/remote-runners/overlays/eks/iac/cfn-auto-mode.yaml \
+       --capabilities CAPABILITY_NAMED_IAM
+     ```
 
   Alternatively, delete the group before the update
   (`aws logs delete-log-group --log-group-name /aws/eks/<ClusterName>/cluster`),
