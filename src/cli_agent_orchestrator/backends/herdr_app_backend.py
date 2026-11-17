@@ -267,19 +267,39 @@ class HerdrAppBackend(TerminalBackend):
         return False
 
     def _creation_order(self, sessions: Iterable[str]) -> Dict[str, int]:
-        """CAO terminal id -> creation rank, from the registry's oldest-first order.
+        """CAO terminal id -> tab rank: grouped by parent, then creation order.
 
         The app inserts an adopted tab after the space's selected tab (herdr-app
         ``Model::add_tab``), so new workers pile up next to the conductor. CAO
-        puts its tabs back in creation order. Unreadable registry: no ordering.
+        puts each terminal right after its parent's group (the terminal that
+        created it, ``caller_id``), siblings in creation order. A terminal whose
+        parent is not in the session is a top-level entry, in creation order.
+        Unreadable registry: no ordering.
         """
-        from cli_agent_orchestrator.clients.database import list_terminals_by_session
+        from cli_agent_orchestrator.clients.database import (
+            get_terminal_metadata,
+            list_terminals_by_session,
+        )
 
         rank: Dict[str, int] = {}
         try:
             for session in sessions:
-                for row in list_terminals_by_session(session):
-                    rank.setdefault(str(row["id"]), len(rank))
+                ids = [str(r["id"]) for r in list_terminals_by_session(session)]  # oldest first
+                in_session = set(ids)
+                children: Dict[Optional[str], List[str]] = {}
+                for tid in ids:
+                    caller = (get_terminal_metadata(tid) or {}).get("caller_id")
+                    parent = str(caller) if caller and str(caller) in in_session else None
+                    children.setdefault(parent, []).append(tid)
+                stack = list(reversed(children.get(None, [])))
+                while stack:  # depth-first, pre-order
+                    tid = stack.pop()
+                    if tid in rank:
+                        continue
+                    rank[tid] = len(rank)
+                    stack.extend(reversed(children.get(tid, [])))
+                for tid in ids:  # a parent cycle would leave some unvisited
+                    rank.setdefault(tid, len(rank))
         except Exception as exc:  # noqa: BLE001 - ordering is cosmetic
             logger.debug("herdr-app: no tab ordering this pass: %s", exc)
             return {}

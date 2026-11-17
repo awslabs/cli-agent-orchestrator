@@ -662,3 +662,40 @@ class TestTabOrder:
         )
         backend.sync_layout_names()
         assert self._tab_names(hc) == ["w1", "sup"]  # names still synced, order left alone
+
+    def test_grouped_by_parent(self, backend, hc, tmp_path, monkeypatch):
+        # creation order: sup, w1 (by sup), w2 (by sup), w1b (by w1), cli (no caller)
+        spec = [
+            ("sup", "aaaa0001", None),
+            ("w1", "aaaa0002", "aaaa0001"),
+            ("w2", "aaaa0003", "aaaa0001"),
+            ("w1b", "aaaa0004", "aaaa0002"),
+            ("cli", "aaaa0005", None),
+        ]
+        for window, tid, _ in spec:
+            backend.create_window("cao-a", window, tid, str(tmp_path))
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.list_terminals_by_session",
+            lambda session: [{"id": tid} for _, tid, _ in spec],
+        )
+        callers = {tid: caller for _, tid, caller in spec}
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            lambda tid: {"caller_id": callers.get(tid)},
+        )
+        # the app's order: every new tab right after the selected conductor
+        hc.set_doc(
+            "herdr-app",
+            layout_with(
+                space_id_for("cao-a"),
+                [
+                    ("tb1", "", "t1"),
+                    ("tb5", "", "t5"),
+                    ("tb4", "", "t4"),
+                    ("tb3", "", "t3"),
+                    ("tb2", "", "t2"),
+                ],
+            ),
+        )
+        backend.sync_layout_names()
+        assert self._tab_names(hc) == ["sup", "w1", "w1b", "w2", "cli"]
