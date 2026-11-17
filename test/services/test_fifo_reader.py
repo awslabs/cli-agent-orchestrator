@@ -3,6 +3,11 @@
 import errno
 import fcntl
 import os
+
+try:
+    import resource
+except ImportError:
+    resource = None  # type: ignore[assignment]
 import stat
 import threading
 import time
@@ -319,6 +324,55 @@ class TestReaderThreadLifecycle:
         assert all(not t.is_alive() for t in threads)
         leftover = [t.name for t in threading.enumerate() if t.name.startswith("fifo-term-cycle")]
         assert leftover == []
+
+    def test_reader_handles_descriptor_above_select_limit(self, tmp_path, monkeypatch):
+        """A busy server can allocate the FIFO reader fd above FD_SETSIZE."""
+        if resource is None:
+            pytest.skip("resource limits are unavailable on this platform")
+
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target_soft_limit = 4096 if hard_limit == resource.RLIM_INFINITY else min(hard_limit, 4096)
+        if target_soft_limit < 1100:
+            pytest.skip("descriptor limit cannot reach FD_SETSIZE")
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target_soft_limit, hard_limit))
+        except (OSError, ValueError):
+            pytest.skip("unable to raise file descriptor limit for this regression")
+
+        held_fds = []
+        writer = -1
+        fd_count_before_reader = None
+        try:
+            while max(held_fds, default=0) < 1024:
+                held_fds.append(os.open("/dev/null", os.O_RDONLY))
+
+            proc_fds = "/proc/self/fd"
+            if os.path.isdir(proc_fds):
+                fd_count_before_reader = len(os.listdir(proc_fds))
+
+            received = threading.Event()
+
+            def publish(topic, payload):
+                if payload["data"] == "high descriptor":
+                    received.set()
+
+            monkeypatch.setattr(fr.bus, "publish", publish)
+            manager = self._manager(tmp_path, monkeypatch)
+            manager.create_reader("term-high-fd")
+            writer = _open_writer(tmp_path / "term-high-fd.fifo")
+            try:
+                os.write(writer, b"high descriptor")
+                assert received.wait(timeout=2.0)
+            finally:
+                if writer >= 0:
+                    os.close(writer)
+                manager.stop_reader("term-high-fd")
+                if fd_count_before_reader is not None:
+                    assert len(os.listdir(proc_fds)) == fd_count_before_reader
+        finally:
+            for fd in reversed(held_fds):
+                os.close(fd)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft_limit, hard_limit))
 
 
 class TestReaderLoopCoalescing:

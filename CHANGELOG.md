@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remain in place because they can also hold real events. The test harness now
   refuses unmarked access to a real-home memory directory and relocates memory
   for live-provider test runs.
+- **FIFO output readers continue working when a busy server has allocated a descriptor above 1023** (#1350).
 - **Docs: the retrospector profile, the `store_lesson` description, the self-learning guides and the `cao-learning` skill no longer say lessons reach future sessions or can be recalled by a curator or supervisor, or that they are injected into new sessions** (#1335, #1329).
   A lesson is found only by the owning agent's `memory_recall` or a promoted `## Learned Patterns` block.
   A supervisor's recall returns only lessons under its own profile, so it tells the worker to recall.
@@ -901,6 +902,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The release job now promotes the hand-written `## [Unreleased]` section to the dated
+  release section and inserts a fresh empty one instead of replacing the changelog with
+  commit subjects through git-cliff (#1353).
 - The `memory_store` and `memory_forget` MCP tools now honor the caller's local memory switch
   when a remote memory owner is configured (#1087). `memory_recall` checked the switch before
   branching to the owner, but the write and delete tools did not, so a caller with memory off

@@ -122,5 +122,5 @@ user first. Never issue a shutdown that targets all sessions at once.
 
 ## Related
 
-- [cao-session-management](../cao-session-management/SKILL.md) — launching,
+- `cao-session-management` skill — launching,
   messaging, and worker communication mechanics
