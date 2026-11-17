@@ -900,7 +900,33 @@ def _detect_graph_density(rows_by_scope: dict) -> list:
                 k = tok.strip()
                 if not k:
                     continue
-                inverse.setdefault(k, set()).add(r["key"])
+                try:
+                    from cli_agent_orchestrator.services.memory_service import MemoryService
+
+                    normalized = MemoryService._normalize_key(k)
+                    canonical = MemoryService._sanitize_key(k) if normalized == k else k
+                    was_truncated = normalized == k and MemoryService._key_was_truncated(k)
+                except ValueError:
+                    canonical = k
+                    was_truncated = False
+                if was_truncated and canonical in scope_keys:
+                    if len(issues) >= cap:
+                        truncated += 1
+                    else:
+                        issues.append(
+                            _make_issue(
+                                issue_type="truncated_link",
+                                key=r["key"],
+                                related_key=canonical,
+                                description=(
+                                    "related_keys target resolves only after "
+                                    "60-character truncation"
+                                ),
+                                severity="warning",
+                                scope_id=scope_id,
+                            )
+                        )
+                inverse.setdefault(canonical, set()).add(r["key"])
         for ref_key, sources in inverse.items():
             if ref_key not in scope_keys:
                 # Surface as stale_claim, not graph_density.

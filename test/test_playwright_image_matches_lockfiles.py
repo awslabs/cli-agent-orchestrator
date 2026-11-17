@@ -1,4 +1,7 @@
-"""The Playwright image tag in ci.yml must match the lockfile of each job that uses it."""
+"""The Playwright image in ci.yml must match the lockfile of each job that uses it, and be pinned by digest.
+
+The tag keeps the image in step with the locked playwright-core; the digest keeps a re-pushed tag from
+changing what CI runs. Refreshing both is described in skills/cao-contributing/SKILL.md."""
 
 import json
 import re
@@ -7,20 +10,24 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-IMAGE = re.compile(
-    r"mcr\.microsoft\.com/playwright:v(\d+\.\d+\.\d+)-[a-z]+(?:@sha256:[0-9a-f]{64})?"
-)
+IMAGE = re.compile(r"mcr\.microsoft\.com/playwright:v(\d+\.\d+\.\d+)-[a-z]+(@sha256:[0-9a-f]{64})?")
 
 
 def test_playwright_image_matches_each_job_lockfile() -> None:
     jobs = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]
     checked = 0
+    digests = set()
     for name, job in jobs.items():
         container = job.get("container")
         image = container if isinstance(container, str) else (container or {}).get("image", "")
         match = IMAGE.fullmatch(image or "")
         if not match:
             continue
+        assert match.group(2), (
+            f"{name}: the Playwright image is pinned by tag only ({image}). "
+            "Pin it as <tag>@sha256:<digest>; see the refresh steps in skills/cao-contributing/SKILL.md."
+        )
+        digests.add(match.group(2))
         default_dir = job.get("defaults", {}).get("run", {}).get("working-directory", ".")
         lock_dirs = {
             s.get("working-directory", default_dir)
@@ -37,3 +44,6 @@ def test_playwright_image_matches_each_job_lockfile() -> None:
             )
         checked += 1
     assert checked == 5, f"expected 5 jobs on the Playwright image, found {checked}"
+    assert (
+        len(digests) == 1
+    ), f"the five jobs pin different Playwright image digests: {sorted(digests)}"
