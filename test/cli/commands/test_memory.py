@@ -1018,7 +1018,7 @@ class TestNonAccessingInspection:
         ]:
             result = CliRunner().invoke(command, args)
             assert result.exit_code == 0, result.output
-            assert read.await_args.kwargs["record_access"] is (not enabled)
+            assert read.await_args.kwargs["record_access"] is (enabled is False)
 
     def test_on_passes_false(self, monkeypatch):
         self._assert_record_access(monkeypatch, True)
