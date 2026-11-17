@@ -20,7 +20,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remain in place because they can also hold real events. The test harness now
   refuses unmarked access to a real-home memory directory and relocates memory
   for live-provider test runs.
-- **Docs: the `cao-learning` skill and self-learning guide no longer claim lessons are injected into new sessions** (#1335, #1329).
 - **Docs: the retrospector profile, the `store_lesson` description, the self-learning guides and the `cao-learning` skill no longer say lessons reach future sessions or can be recalled by a curator or supervisor, or that they are injected into new sessions** (#1335, #1329).
   A lesson is found only by the owning agent's `memory_recall` or a promoted `## Learned Patterns` block.
   A supervisor's recall returns only lessons under its own profile, so it tells the worker to recall.
