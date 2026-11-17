@@ -46,6 +46,11 @@ _KIRO_WORKING_THRESHOLD = 30.0  # seconds
 # the server is wedged.
 _SUBSCRIBE_ACK_TIMEOUT = 10.0  # seconds
 
+# Max event lines tolerated before the events.subscribe ack. Normally 0-1 (the
+# ack is the first line); a larger run means a herdr replay bug or a hostile
+# socket, so cap the buffer and reconnect rather than accumulate memory.
+_PRE_ACK_BUFFER_CAP = 1000
+
 # Pause before reconnecting when the pane set changed, so a burst of
 # registrations (one session launching several workers) coalesces into one
 # resubscribe cycle instead of one per pane.
@@ -1186,13 +1191,24 @@ class HerdrInboxService:
             "params": {"subscriptions": subscriptions},
         }
         await self._send(message)
-        await self._await_subscribe_ack()
+        buffered = await self._await_subscribe_ack()
         logger.info(
             "Subscribed to %d per-pane agent-status event(s) + broadcast pane.updated "
             "+ lifecycle events in one events.subscribe call%s",
             len(subscriptions) - 3,
             f" ({skipped} stale pane(s) left to reconcile)" if skipped else "",
         )
+        # Dispatch any event lines that arrived before the ack AFTER the ack read
+        # has completed, so a slow DB write inside _dispatch_event (via
+        # _record_agent_status) can never stall the ack-critical read path.
+        # Isolate each dispatch: one failing event (e.g. a transient DB error)
+        # must not drop the rest and tip the whole connection into reconnect —
+        # the settled-pane sweep below is the backstop for anything missed here.
+        for event in buffered:
+            try:
+                await self._dispatch_event(event)
+            except Exception:  # noqa: BLE001 — a bad pre-ack event must not abort setup
+                logger.warning("Failed to dispatch buffered pre-ack event", exc_info=True)
 
     def _list_live_pane_ids(self) -> Optional[Set[str]]:
         """Return the pane_ids herdr currently knows, or None when unavailable.
@@ -1217,19 +1233,23 @@ class HerdrInboxService:
             and pane_id
         }
 
-    async def _await_subscribe_ack(self) -> None:
+    async def _await_subscribe_ack(self) -> list:
         """Read herdr's response to events.subscribe; fail loudly on an error ack.
 
         The old fire-and-forget subscribe could not tell an active subscription
         from a rejected one, which turns every later delivery into a silent
         fallback to the 30s reconciliation sweep. The ack is the first line
         herdr sends on a fresh connection; any event line that somehow precedes
-        it is dispatched through the normal handler rather than dropped.
+        it is COLLECTED and returned for the caller to dispatch AFTER the ack
+        read — dispatching inline here would run a DB write (_record_agent_status
+        via asyncio.to_thread) on the ack-critical path, so a wedged DB could
+        stall subscription setup past the timeout. Reading only parses lines.
 
         Raises ConnectionError on an error ack, EOF, or timeout, so
         _socket_loop's retry/backoff path owns recovery.
         """
         assert self._reader is not None
+        buffered: list = []
         deadline = time.monotonic() + _SUBSCRIBE_ACK_TIMEOUT
         while True:
             remaining = deadline - time.monotonic()
@@ -1252,8 +1272,16 @@ class HerdrInboxService:
                 if error:
                     # repr(): the error can echo pane labels; keep log lines unforgeable.
                     raise ConnectionError(f"events.subscribe rejected: {error!r}")
-                return
-            await self._dispatch_event(msg)
+                return buffered
+            buffered.append(msg)
+            # The ack is normally the first line, so this buffer holds 0-1
+            # entries. A flood before the ack is abnormal (a herdr replay bug or
+            # a hostile socket); cap it so it cannot grow without bound, and let
+            # the reconnect path recover rather than accumulating memory.
+            if len(buffered) > _PRE_ACK_BUFFER_CAP:
+                raise ConnectionError(
+                    f"events.subscribe ack not seen after {_PRE_ACK_BUFFER_CAP} events"
+                )
 
     def _log_herdr_protocol(self, snapshot: dict) -> None:
         """Log herdr's version/protocol once; warn outside the tested range.

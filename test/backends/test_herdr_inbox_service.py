@@ -264,6 +264,71 @@ class TestHerdrInboxServiceSubscription:
             )
 
     @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_subscribe_caps_pre_ack_event_flood(self, mock_snap):
+        """A flood of event lines before the ack is bounded, not accumulated."""
+        from cli_agent_orchestrator.services import herdr_inbox_service as mod
+
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._writer = AsyncMock()
+        service._pane_to_terminal = {"pane-1": "tid1"}
+        mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
+        flood = (
+            json.dumps({"event": "pane.scroll_changed", "data": {"pane_id": "pane-1"}}).encode()
+            + b"\n"
+        ) * (mod._PRE_ACK_BUFFER_CAP + 5)
+
+        with pytest.raises(ConnectionError, match="ack not seen"):
+            _run_subscribe_with_ack(service, ack=flood)  # ack never arrives
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_one_bad_buffered_event_does_not_drop_the_rest(self, mock_snap):
+        """A failing replayed pre-ack event is logged and the rest still dispatch."""
+        delivered = []
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock",
+            delivery_callback=lambda tid, source: (delivered.append(tid) or 0),
+        )
+        service._writer = AsyncMock()
+        service._pane_to_terminal = {"pane-1": "tid1", "pane-2": "tid2"}
+        mock_snap.return_value = {
+            "panes": [
+                {"pane_id": "pane-1", "agent_status": "idle"},
+                {"pane_id": "pane-2", "agent_status": "idle"},
+            ]
+        }
+        ev1 = json.dumps(
+            {
+                "event": "pane.agent_status_changed",
+                "data": {"pane_id": "pane-1", "agent_status": "idle"},
+            }
+        ).encode()
+        ev2 = json.dumps(
+            {
+                "event": "pane.agent_status_changed",
+                "data": {"pane_id": "pane-2", "agent_status": "idle"},
+            }
+        ).encode()
+        strays = ev1 + b"\n" + ev2 + b"\n"
+
+        calls = {"n": 0}
+        real_dispatch = service._dispatch_event
+
+        async def flaky_dispatch(event):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient DB error on first buffered event")
+            await real_dispatch(event)
+
+        with (
+            patch.object(service, "_record_agent_status", new=AsyncMock()),
+            patch.object(service, "_dispatch_event", side_effect=flaky_dispatch),
+        ):
+            _run_subscribe_with_ack(service, extra_lines=strays)
+
+        # The second buffered event was still delivered despite the first failing.
+        assert "tid2" in delivered
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
     def test_subscribe_ack_wait_dispatches_stray_event_lines(self, mock_snap):
         """An event line arriving before the ack is dispatched, not dropped."""
         callback = MagicMock()
