@@ -10,6 +10,12 @@ permissions:
   contents: read
   security-events: write
 
+# Supersede only obsolete pull-request heads. Push and merge-queue runs must
+# complete because release preflight and merge protection rely on their results.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   # Every uv command in this workflow (including the ones the Makefile runs)
   # must execute against the committed uv.lock and fail if pyproject.toml has
