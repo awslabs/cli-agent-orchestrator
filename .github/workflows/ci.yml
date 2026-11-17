@@ -109,6 +109,11 @@ jobs:
       - name: Check CAO agent plugin packages
         run: make check-agent-plugin
 
+      # Per built package, not the source tree (#1384): a link that resolves in the
+      # repository but escapes the installed package fails here.
+      - name: Check links inside each built agent plugin package
+        run: make check-agent-plugin-links
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
