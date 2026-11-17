@@ -363,7 +363,6 @@ class TestGetMemory:
             scope=None,
             scope_id=None,
             scan_all=True,
-            search_mode="metadata",
             record_access=False,
         )
 
@@ -380,7 +379,6 @@ class TestGetMemory:
             scope="project",
             scope_id="proj-mine",
             scan_all=True,
-            search_mode="metadata",
             record_access=False,
         )
 
