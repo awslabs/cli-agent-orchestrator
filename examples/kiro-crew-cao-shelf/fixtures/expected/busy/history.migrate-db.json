@@ -1,0 +1,47 @@
+{
+  "session": "migrate-db",
+  "source": "inbox_rows",
+  "complete": true,
+  "window_rows": 100,
+  "rows_seen": 13,
+  "closed": [
+    {
+      "terminal_id": "0f691b16",
+      "label": null,
+      "rows": 3,
+      "first_at": "2026-11-14T19:30:00+00:00",
+      "last_at": "2026-11-14T20:00:00+00:00",
+      "last_status": "delivered"
+    },
+    {
+      "terminal_id": "d67e8c34",
+      "label": null,
+      "rows": 3,
+      "first_at": "2026-11-14T15:30:00+00:00",
+      "last_at": "2026-11-14T16:00:00+00:00",
+      "last_status": "delivered"
+    },
+    {
+      "terminal_id": "8258e533",
+      "label": null,
+      "rows": 3,
+      "first_at": "2026-11-14T07:30:00+00:00",
+      "last_at": "2026-11-14T08:00:00+00:00",
+      "last_status": "delivered"
+    },
+    {
+      "terminal_id": "9aeff40c",
+      "label": null,
+      "rows": 3,
+      "first_at": "2026-11-13T19:30:00+00:00",
+      "last_at": "2026-11-13T20:00:00+00:00",
+      "last_status": "delivered"
+    }
+  ],
+  "external_senders": [
+    {
+      "sender_id": "cao-ops-mcp",
+      "rows": 1
+    }
+  ]
+}

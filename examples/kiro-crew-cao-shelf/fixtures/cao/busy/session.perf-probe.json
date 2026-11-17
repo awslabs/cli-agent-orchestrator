@@ -1,0 +1,30 @@
+{
+  "session": {
+    "id": "cao-perf-probe",
+    "name": "cao-perf-probe",
+    "status": "detached"
+  },
+  "terminals": [
+    {
+      "id": "c497c893",
+      "tmux_session": "cao-perf-probe",
+      "tmux_window": "conductor",
+      "provider": "mock_cli",
+      "agent_profile": "supervisor",
+      "description": null,
+      "model": null,
+      "model_honored": null,
+      "ephemeral": false,
+      "working_directory": "/work/example",
+      "engine": null,
+      "deferred_init_failure": null,
+      "deferred_init_external_owner": false,
+      "deferred_init_runtime_reclaimed": false,
+      "session_incarnation_id": "c0c5d0f6",
+      "kept_until": null,
+      "last_active": "2026-11-10T04:00:00.000000Z",
+      "pending_inbox_count": 0,
+      "status": "idle"
+    }
+  ]
+}

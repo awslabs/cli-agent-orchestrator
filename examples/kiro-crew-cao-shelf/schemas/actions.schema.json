@@ -1,0 +1,573 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/cao-shelf/actions.schema.json",
+  "title": "Request and response bodies of the write endpoints",
+  "$defs": {
+    "AskRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "message",
+        "conductor_id"
+      ],
+      "properties": {
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8000
+        },
+        "conductor_id": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{8}$",
+          "description": "Terminal the user saw; 409 conflict_changed if no longer the session's conductor."
+        }
+      }
+    },
+    "AskResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accepted",
+        "terminal_id",
+        "message_id",
+        "delivery"
+      ],
+      "properties": {
+        "accepted": {
+          "const": true
+        },
+        "terminal_id": {
+          "type": "string"
+        },
+        "message_id": {
+          "type": "integer"
+        },
+        "delivery": {
+          "enum": [
+            "delivered",
+            "pending",
+            "failed",
+            "unknown"
+          ],
+          "description": "What CAO did with the message, read back from the conductor's inbox: delivered, queued until the conductor is idle (pending), failed, or unknown when the row could not be read."
+        }
+      }
+    },
+    "PromptResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "terminal_id",
+        "status",
+        "provider",
+        "tail",
+        "suggested"
+      ],
+      "properties": {
+        "terminal_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "tail": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "maxLength": 400
+          },
+          "description": "Last lines of terminal output. Untrusted text; render as text."
+        },
+        "suggested": {
+          "type": "array",
+          "maxItems": 4,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "label",
+              "send"
+            ],
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "send": {
+                "type": "string",
+                "maxLength": 20
+              }
+            }
+          },
+          "description": "Quick answers, only when the tail matches a known yes/no prompt; otherwise empty and the user types an answer."
+        }
+      }
+    },
+    "AnswerRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "answer",
+        "expect_status"
+      ],
+      "properties": {
+        "answer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "expect_status": {
+          "const": "waiting_user_answer"
+        }
+      }
+    },
+    "AnswerResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "delivered",
+        "terminal_id"
+      ],
+      "properties": {
+        "delivered": {
+          "const": true
+        },
+        "terminal_id": {
+          "type": "string"
+        }
+      }
+    },
+    "StartRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "idempotency_key",
+        "agent_profile",
+        "working_directory"
+      ],
+      "properties": {
+        "idempotency_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{16,64}$",
+          "description": "Chosen by the page once per Start dialog and sent again on every retry of the same request. The backend passes it to CAO and answers a repeat with the first launch result; it never invents one."
+        },
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,58}$"
+        },
+        "agent_profile": {
+          "type": "string",
+          "minLength": 1
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "working_directory": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 8000
+        }
+      }
+    },
+    "StartResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session",
+        "conductor_id"
+      ],
+      "properties": {
+        "session": {
+          "type": "string"
+        },
+        "conductor_id": {
+          "type": "string"
+        }
+      }
+    },
+    "RelayStart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "idempotency_key",
+        "agent_profile",
+        "working_directory"
+      ],
+      "properties": {
+        "idempotency_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{16,64}$",
+          "description": "Chosen by the page once per Start dialog and sent again on every retry of the same request. The backend passes it to CAO and answers a repeat with the first launch result; it never invents one."
+        },
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,58}$"
+        },
+        "agent_profile": {
+          "type": "string",
+          "minLength": 1
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "working_directory": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "description": "The start part of POST /api/relays: the Start body without a first message. The handshake is the session's first message."
+    },
+    "StopPlanRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope"
+      ],
+      "properties": {
+        "scope": {
+          "enum": [
+            "stale",
+            "named"
+          ]
+        },
+        "sessions": {
+          "type": "array",
+          "maxItems": 25,
+          "items": {
+            "type": "string"
+          },
+          "description": "Required when scope is 'named'. Forbidden for 'stale'."
+        }
+      }
+    },
+    "StopPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "plan_id",
+        "expires_at",
+        "sessions"
+      ],
+      "properties": {
+        "plan_id": {
+          "type": "string"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "sessions": {
+          "type": "array",
+          "maxItems": 25,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "tier",
+              "last_active",
+              "terminals",
+              "working"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "tier": {
+                "enum": [
+                  "needs_you",
+                  "live",
+                  "parked",
+                  "stale"
+                ]
+              },
+              "last_active": {
+                "type": "string"
+              },
+              "terminals": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "id",
+                    "label",
+                    "role",
+                    "status"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "label": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "working": {
+                "type": "boolean",
+                "description": "Any terminal processing or waiting; the dialog must warn."
+              }
+            }
+          }
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "More than 25 stale sessions; the first 25 (oldest idle first) are listed."
+        }
+      }
+    },
+    "StopExecuteRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "plan_id",
+        "sessions"
+      ],
+      "properties": {
+        "plan_id": {
+          "type": "string"
+        },
+        "sessions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 25,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "last_active"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "last_active": {
+                "type": "string",
+                "description": "Echo of the plan's last_active."
+              },
+              "acknowledge_working": {
+                "type": "boolean",
+                "default": false
+              }
+            }
+          }
+        }
+      },
+      "description": "No 'all' field exists; unknown properties are rejected. Every named session must be in the plan."
+    },
+    "StopExecuteResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "results"
+      ],
+      "properties": {
+        "results": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "outcome"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "outcome": {
+                "enum": [
+                  "stopped",
+                  "skipped_changed",
+                  "skipped_working",
+                  "skipped_not_in_plan",
+                  "not_found",
+                  "failed"
+                ]
+              },
+              "message": {
+                "type": "string",
+                "maxLength": 300
+              }
+            }
+          }
+        }
+      }
+    },
+    "Config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cao_url",
+        "poll_seconds",
+        "warm_hours",
+        "stale_hours",
+        "persist_history"
+      ],
+      "properties": {
+        "cao_url": {
+          "type": "string",
+          "description": "http only; host must be 127.0.0.1, localhost or ::1."
+        },
+        "poll_seconds": {
+          "type": "integer",
+          "minimum": 3,
+          "maximum": 60
+        },
+        "warm_hours": {
+          "type": "number",
+          "minimum": 0.25,
+          "maximum": 24
+        },
+        "stale_hours": {
+          "type": "number",
+          "minimum": 2,
+          "maximum": 720
+        },
+        "persist_history": {
+          "type": "boolean"
+        }
+      }
+    },
+    "Profiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profiles"
+      ],
+      "description": "GET /api/profiles: the profiles the Start dialog offers.",
+      "properties": {
+        "profiles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "description",
+              "provider"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "provider": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The profile's default provider when CAO states one, else null."
+              }
+            }
+          }
+        }
+      }
+    },
+    "StatusResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "poller",
+        "cao_error"
+      ],
+      "description": "GET /api/status: backend facts for the About line. Never any message or terminal text.",
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "poller": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "running",
+            "interval_seconds",
+            "last_tick_at",
+            "requests_last_minute"
+          ],
+          "properties": {
+            "running": {
+              "type": "boolean"
+            },
+            "interval_seconds": {
+              "type": "number"
+            },
+            "last_tick_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "requests_last_minute": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "cao_error": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The error code of the last failed or partial CAO read (see errors.schema.json), or null."
+        }
+      }
+    },
+    "ConfigPatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cao_url": {
+          "type": "string",
+          "description": "http only; host must be 127.0.0.1, localhost or ::1."
+        },
+        "poll_seconds": {
+          "type": "integer",
+          "minimum": 3,
+          "maximum": 60
+        },
+        "warm_hours": {
+          "type": "number",
+          "minimum": 0.25,
+          "maximum": 24
+        },
+        "stale_hours": {
+          "type": "number",
+          "minimum": 2,
+          "maximum": 720
+        },
+        "persist_history": {
+          "type": "boolean"
+        }
+      },
+      "description": "PUT /api/config body: any subset of Config. Unknown fields are rejected; warm_hours must stay below stale_hours (400 invalid_request); the whole change is refused or applied."
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "cao-shelf",
+  "version": "0.2.0",
+  "displayName": "CAO Shelf",
+  "description": "Your CAO sessions at a glance: what needs you, what is working, what is parked. Remote control a session from a Kiro Crew chat.",
+  "author": "CAO contributors",
+  "license": "Apache-2.0",
+  "minKiroCrewVersion": "0.12.2",
+  "tags": ["cao", "orchestration", "sessions"],
+  "iconPath": "assets/icon.png",
+  "platform": {"os": ["macos", "linux"]},
+  "agents": ["agents/cao-remote-control.json"],
+  "backend": {"entryPoint": "backend/server.py", "port": "auto", "healthCheck": "/health"},
+  "ui": {
+    "entry": "bundle/index.mjs",
+    "pages": [{"route": "/apps/cao-shelf", "label": "CAO Shelf", "icon": "Layers"}],
+    "loading": {"layout": "page"}
+  },
+  "permissions": {
+    "api": ["/apps/cao-shelf/api", "/apps/cao-shelf/api/*", "/api/chat", "/api/chat/*"],
+    "mcpTools": ["wait"],
+    "network": false,
+    "sessionApproval": true
+  }
+}

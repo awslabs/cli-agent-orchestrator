@@ -1,0 +1,520 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/cao-shelf/shelf.schema.json",
+  "title": "GET /api/shelf response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "revision",
+    "generated_at",
+    "last_good_at",
+    "stale_snapshot",
+    "snapshot_age_seconds",
+    "cao",
+    "thresholds",
+    "counts",
+    "history_total",
+    "sessions"
+  ],
+  "properties": {
+    "revision": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Bumps only when the projection changes; used for ?since=."
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "last_good_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "When CAO was last read successfully (null before the first read). The page ages a stale snapshot from this on its own clock. It holds still while CAO is down and is not part of the change signature: the flip to stale_snapshot is."
+    },
+    "stale_snapshot": {
+      "type": "boolean",
+      "description": "true when CAO is unreachable and this is the last good snapshot."
+    },
+    "snapshot_age_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Age of the snapshot at the moment of this answer. It is NOT refreshed by an `unchanged` answer, so the page must not print it: it shows the age from last_good_at against its own clock."
+    },
+    "cao": {
+      "$ref": "#/$defs/cao"
+    },
+    "thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "warm_hours",
+        "stale_hours"
+      ],
+      "properties": {
+        "warm_hours": {
+          "type": "number"
+        },
+        "stale_hours": {
+          "type": "number"
+        }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessions",
+        "terminals",
+        "by_status",
+        "by_tier",
+        "hidden_sessions"
+      ],
+      "properties": {
+        "sessions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "terminals": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "by_status": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "processing",
+            "waiting_user_answer",
+            "error",
+            "completed",
+            "idle",
+            "unknown"
+          ],
+          "properties": {
+            "processing": {
+              "type": "integer"
+            },
+            "waiting_user_answer": {
+              "type": "integer"
+            },
+            "error": {
+              "type": "integer"
+            },
+            "completed": {
+              "type": "integer"
+            },
+            "idle": {
+              "type": "integer"
+            },
+            "unknown": {
+              "type": "integer"
+            }
+          }
+        },
+        "by_tier": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "needs_you",
+            "live",
+            "parked",
+            "stale"
+          ],
+          "properties": {
+            "needs_you": {
+              "type": "integer"
+            },
+            "live": {
+              "type": "integer"
+            },
+            "parked": {
+              "type": "integer"
+            },
+            "stale": {
+              "type": "integer"
+            }
+          }
+        },
+        "hidden_sessions": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "cao- sessions left out because their name cannot be addressed (outside [A-Za-z0-9][A-Za-z0-9_-]{0,58}). They cannot be read, answered or stopped from the shelf; the page says how many."
+        }
+      }
+    },
+    "history_total": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Closed helpers across sessions; null until every session's inbox was read once."
+    },
+    "sessions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/session"
+      }
+    }
+  },
+  "$defs": {
+    "cao": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reachable",
+        "base_url",
+        "version",
+        "terminal_backend",
+        "error"
+      ],
+      "properties": {
+        "reachable": {
+          "type": "boolean"
+        },
+        "base_url": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "terminal_backend": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "errors.schema.json#/$defs/error"
+            }
+          ]
+        }
+      }
+    },
+    "status": {
+      "enum": [
+        "unknown",
+        "idle",
+        "processing",
+        "completed",
+        "waiting_user_answer",
+        "error"
+      ]
+    },
+    "terminal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "profile",
+        "provider",
+        "status",
+        "last_active",
+        "idle_seconds",
+        "role",
+        "caller_id",
+        "orphan",
+        "pending_inbox_count"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{8}$"
+        },
+        "label": {
+          "type": "string",
+          "description": "CAO tmux_window; shown as text only, never as markup."
+        },
+        "profile": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "last_active": {
+          "type": "string",
+          "description": "CAO's last_active (date-time); empty when CAO sent none or one that cannot be read. The page says 'age unknown', never 'now'."
+        },
+        "idle_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "role": {
+          "enum": [
+            "conductor",
+            "helper",
+            "peer"
+          ]
+        },
+        "caller_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "null for the conductor and peers. Helpers: the creating terminal id."
+        },
+        "orphan": {
+          "type": "boolean",
+          "description": "caller_id set and not among any live terminal in the fleet."
+        },
+        "pending_inbox_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "cao_name",
+        "tier",
+        "tier_reason",
+        "warm",
+        "idle_seconds",
+        "last_active",
+        "poll_class",
+        "conductor_missing",
+        "conductor",
+        "helpers",
+        "terminal_count",
+        "asks",
+        "in_flight",
+        "history_count",
+        "relay"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "CAO session name without the cao- prefix."
+        },
+        "cao_name": {
+          "type": "string",
+          "pattern": "^cao-"
+        },
+        "tier": {
+          "enum": [
+            "needs_you",
+            "live",
+            "parked",
+            "stale"
+          ]
+        },
+        "tier_reason": {
+          "enum": [
+            "waiting_user_answer",
+            "error",
+            "processing",
+            "completed",
+            "idle_under_stale_hours",
+            "idle_over_stale_hours",
+            "age_unknown"
+          ],
+          "description": "age_unknown: a terminal has no readable last_active, so the session is parked and is never stale or warm."
+        },
+        "warm": {
+          "type": "boolean",
+          "description": "Parked and youngest last_active under warm_hours."
+        },
+        "idle_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Age of the YOUNGEST readable last_active in the session; 0 when none is readable (see tier_reason age_unknown)."
+        },
+        "last_active": {
+          "type": "string",
+          "description": "last_active of the youngest terminal whose clock is readable (CAO text, date-time); empty when none is readable."
+        },
+        "poll_class": {
+          "enum": [
+            "hot",
+            "parked",
+            "stale"
+          ]
+        },
+        "conductor_missing": {
+          "type": "boolean",
+          "description": "No terminal of the session is its conductor: the first terminal has a caller that no longer exists. `conductor` then holds that first terminal as an orphaned helper (role helper, orphan true) and Ask is not offered."
+        },
+        "conductor": {
+          "$ref": "#/$defs/terminal"
+        },
+        "helpers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/terminal"
+          }
+        },
+        "terminal_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "asks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "terminal_id",
+              "label",
+              "status",
+              "since",
+              "since_is_approximate"
+            ],
+            "properties": {
+              "terminal_id": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "waiting_user_answer",
+                  "error"
+                ]
+              },
+              "since": {
+                "type": "string",
+                "format": "date-time",
+                "description": "The terminal's last_active; CAO exposes no waiting-since time."
+              },
+              "since_is_approximate": {
+                "const": true
+              }
+            }
+          }
+        },
+        "in_flight": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "helper_terminal_id",
+                "label"
+              ],
+              "properties": {
+                "helper_terminal_id": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                }
+              }
+            }
+          ],
+          "description": "Conductor processing while a helper it created is processing or waiting. Cannot tell handoff from assign."
+        },
+        "history_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Closed helpers rebuilt from inbox rows; null until read."
+        },
+        "relay": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/relay"
+            }
+          ],
+          "description": "The session's active relay, else its newest relay that needs re-attaching, else null."
+        }
+      }
+    },
+    "unchanged": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revision",
+        "unchanged"
+      ],
+      "description": "The reply to GET /api/shelf?since=<revision> when nothing changed: the whole body.",
+      "properties": {
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unchanged": {
+          "const": true
+        }
+      }
+    },
+    "relay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relay_id",
+        "slot_key",
+        "title",
+        "state",
+        "label",
+        "not_relayed",
+        "permission_pending",
+        "ended_notice_pending"
+      ],
+      "properties": {
+        "relay_id": {
+          "type": "string",
+          "pattern": "^rc-[a-f0-9]{10}$"
+        },
+        "slot_key": {
+          "type": "string",
+          "description": "The Kiro Crew chat to open (useChatLauncher().openChat({slotKey}))."
+        },
+        "title": {
+          "type": "string",
+          "description": "The chat's title, Remote control: <label>."
+        },
+        "state": {
+          "enum": [
+            "active",
+            "needs_reattach",
+            "ended"
+          ],
+          "description": "ended only while a relay-ended message is still owed to its chat (ended_notice_pending)."
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "not_relayed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Owner messages the agent answered without forwarding or checking the session."
+        },
+        "permission_pending": {
+          "type": "boolean",
+          "description": "The chat waits on an unanswered permission request, for any tool. Its title can be model-authored, so which tool it names is not read."
+        },
+        "ended_notice_pending": {
+          "type": "boolean",
+          "description": "A relay-ended message is owed to a chat of this session (this relay's, or one it replaced): that chat keeps relaying until CAO Shelf can post it."
+        }
+      }
+    }
+  }
+}
