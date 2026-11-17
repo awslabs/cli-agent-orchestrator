@@ -826,14 +826,41 @@ def test_writer_refresh_reenters_projection_lock_without_deadlock(tmp_path, monk
     """Removing the writer's outer lock permits a contender during refresh."""
     service, fixture, _Session, _engine = _vault_service(tmp_path, monkeypatch)
     vault_lock = importlib.import_module("cli_agent_orchestrator.services.vault.vault_lock")
+    real_lock = vault_lock.vault_projection_lock
+    release_observation_lock = threading.Lock()
+    writer_released = threading.Event()
     contender_acquired = threading.Event()
     contender_done = threading.Event()
+    contender_acquired_after_release: list[bool] = []
+    contender_errors: list[BaseException] = []
+
+    @contextmanager
+    def observed_writer_lock(vault):
+        # Keep the post-unlock marker and the contender's observation atomic.
+        with release_observation_lock:
+            with real_lock(vault):
+                yield
+            writer_released.set()
+
+    @contextmanager
+    def deadlock_bounded_lock(vault):
+        with real_lock(vault, timeout=30.0):
+            yield
+
+    monkeypatch.setattr(writer_module, "vault_projection_lock", observed_writer_lock)
+    monkeypatch.setattr(reconcile_module, "vault_projection_lock", deadlock_bounded_lock)
 
     def refresh(_path: str) -> None:
         def contend() -> None:
-            with vault_lock.vault_projection_lock(fixture.vault, timeout=2.0):
-                contender_acquired.set()
-            contender_done.set()
+            try:
+                with real_lock(fixture.vault, timeout=30.0):
+                    contender_acquired.set()
+                    with release_observation_lock:
+                        contender_acquired_after_release.append(writer_released.is_set())
+            except BaseException as exc:
+                contender_errors.append(exc)
+            finally:
+                contender_done.set()
 
         thread = threading.Thread(target=contend)
         thread.start()
@@ -850,7 +877,10 @@ def test_writer_refresh_reenters_projection_lock_without_deadlock(tmp_path, monk
         expected_content_sha256=None,
         refresh=refresh,
     )
-    assert contender_done.wait(2)
+    assert contender_done.wait(30)
+    assert not contender_errors
+    assert contender_acquired.is_set()
+    assert contender_acquired_after_release == [True]
     assert (fixture.root / "CAO" / "reentrant.md").exists()
 
 
