@@ -1008,10 +1008,10 @@ class TestNonAccessingInspection:
         monkeypatch.setattr(
             "cli_agent_orchestrator.cli.commands.memory._get_memory_service", lambda: service
         )
-        if enabled:
-            monkeypatch.setenv("CAO_MEMORY_NON_ACCESSING_INSPECTION", "true")
-        else:
+        if enabled is None:
             monkeypatch.delenv("CAO_MEMORY_NON_ACCESSING_INSPECTION", raising=False)
+        else:
+            monkeypatch.setenv("CAO_MEMORY_NON_ACCESSING_INSPECTION", str(enabled).lower())
         for command, args, read in [
             (list_memories, ["--scope", "global"], service.recall),
             (show, ["inspection-key", "--scope", "global"], service.read_exact_key),
@@ -1023,5 +1023,8 @@ class TestNonAccessingInspection:
     def test_on_passes_false(self, monkeypatch):
         self._assert_record_access(monkeypatch, True)
 
-    def test_default_passes_true(self, monkeypatch):
+    def test_off_passes_true(self, monkeypatch):
         self._assert_record_access(monkeypatch, False)
+
+    def test_default_passes_false(self, monkeypatch):
+        self._assert_record_access(monkeypatch, None)

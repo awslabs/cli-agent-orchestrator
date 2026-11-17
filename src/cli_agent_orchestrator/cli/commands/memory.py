@@ -6,11 +6,14 @@ import json
 import logging
 import os
 import re
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import click
 
-from cli_agent_orchestrator.constants import MEMORY_ARCHIVE_DEFAULT_FORMAT
+from cli_agent_orchestrator.constants import MEMORY_ARCHIVE_DEFAULT_FORMAT, MEMORY_BASE_DIR
 from cli_agent_orchestrator.models.memory import MemoryScope, MemoryType
 from cli_agent_orchestrator.services.memory_service import MemoryDisabledError, MemoryService
 from cli_agent_orchestrator.services.settings_service import is_non_accessing_inspection_enabled
@@ -54,6 +57,221 @@ def _validate_key(key: str) -> str:
 @click.group()
 def memory():
     """Manage CAO memories."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _FixtureFinding:
+    path: Path
+    shapes: tuple[str, ...]
+    audit_events: int = 0
+    audit_bytes: int = 0
+    report_only: bool = False
+
+
+_TOPIC_FIXTURE_KEYS = frozenset({"topic-x", "topic-y"})
+_TOPIC_FIXTURE_LINES = frozenset({"alpha", "beta"})
+_RETROSPECTOR_FIXTURE_KEY = "lesson"
+_RETROSPECTOR_FIXTURE_TEXT = "Use X. Applies when: transforming Y."
+_EDGE_FIXTURE_KEY_RE = re.compile(r"\b(?:source_key|target_key)=b-[0-9a-f]{8}\b")
+_PROJECT_EDGE_RE = re.compile(r"\bscope_id=project(?:\s|$)")
+_TRANSFORMER_PROMOTION_RE = re.compile(r"\bprofile=transformer(?:\s|$)")
+
+
+def _fixture_audit_shape(line: str) -> str | None:
+    if "[relationship_mutation]" in line and (
+        _EDGE_FIXTURE_KEY_RE.search(line) or _PROJECT_EDGE_RE.search(line)
+    ):
+        return "fixture_relationship_audit"
+    if "[instruction_promotion]" in line and _TRANSFORMER_PROMOTION_RE.search(line):
+        return "transformer_promotion_audit"
+    return None
+
+
+def _scan_fixture_file(base_dir: Path, path: Path) -> _FixtureFinding | None:
+    """Classify one regular Markdown file without following symlinks."""
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        path.resolve().relative_to(base_dir.resolve())
+        relative = path.relative_to(base_dir)
+    except (OSError, ValueError):
+        return None
+    if ".quarantine" in relative.parts:
+        return None
+
+    shapes: set[str] = set()
+    audit_events = 0
+    audit_bytes = 0
+    if relative.parts[:2] == ("logs", "memory"):
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    shape = _fixture_audit_shape(line)
+                    if shape is None:
+                        continue
+                    shapes.add(shape)
+                    audit_events += 1
+                    audit_bytes += len(line.encode("utf-8"))
+        except OSError:
+            return None
+    else:
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        content_lines = {line.strip() for line in content.splitlines()}
+        if path.stem in _TOPIC_FIXTURE_KEYS and _TOPIC_FIXTURE_LINES <= content_lines:
+            shapes.add("fixture_topic_key")
+        if path.stem == _RETROSPECTOR_FIXTURE_KEY and _RETROSPECTOR_FIXTURE_TEXT in content_lines:
+            shapes.add("retrospector_fixture_text")
+
+    if not shapes:
+        return None
+    return _FixtureFinding(
+        path=path,
+        shapes=tuple(sorted(shapes)),
+        audit_events=audit_events,
+        audit_bytes=audit_bytes,
+        report_only=relative.parts[:2] == ("logs", "memory"),
+    )
+
+
+def _fixture_findings(base_dir: Path) -> list[_FixtureFinding]:
+    if not base_dir.is_dir():
+        return []
+    return [
+        finding
+        for path in sorted(base_dir.rglob("*.md"))
+        if (finding := _scan_fixture_file(base_dir, path)) is not None
+    ]
+
+
+def _fixture_memory_identity(base_dir: Path, path: Path) -> tuple[str, str | None, str] | None:
+    """Return the native memory identity encoded by a canonical topic path."""
+    try:
+        relative = path.relative_to(base_dir)
+    except ValueError:
+        return None
+    parts = relative.parts
+    if len(parts) < 4 or parts[1] != "wiki":
+        return None
+    scope = parts[2]
+    if scope not in {item.value for item in MemoryScope}:
+        return None
+    scope_id: Optional[str]
+    if scope in {  # subset-ok: only session and agent paths include scope IDs
+        MemoryScope.SESSION.value,
+        MemoryScope.AGENT.value,
+    }:
+        if len(parts) != 5:
+            return None
+        scope_id, filename = parts[3], parts[4]
+    else:
+        if len(parts) != 4:
+            return None
+        scope_id = parts[0] if scope == MemoryScope.PROJECT.value else None
+        filename = parts[3]
+    key = Path(filename).stem
+    service = MemoryService(base_dir=base_dir)
+    if service.get_wiki_path(scope, scope_id, key).resolve() != path.resolve():
+        return None
+    return scope, scope_id, key
+
+
+def _prepare_fixture_backup(base_dir: Path, backup: Path, findings: list[_FixtureFinding]) -> None:
+    try:
+        backup.resolve().relative_to(base_dir.resolve())
+    except ValueError:
+        pass
+    else:
+        raise click.ClickException("--backup must be outside the memory directory")
+    if backup.exists() and (not backup.is_dir() or any(backup.iterdir())):
+        raise click.ClickException("--backup must name a new or empty directory")
+
+    # Finish every copy before moving the first source. A backup failure leaves
+    # the memory home unchanged.
+    for finding in findings:
+        relative = finding.path.relative_to(base_dir)
+        destination = backup / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(finding.path, destination, follow_symlinks=False)
+
+
+@memory.command(name="doctor")
+@click.option(
+    "--fixtures",
+    is_flag=True,
+    help="Find known synthetic memory-test residue.",
+)
+@click.option(
+    "--apply",
+    "do_apply",
+    is_flag=True,
+    help="Back up and move matching topic files into memory/.quarantine/.",
+)
+@click.option(
+    "--backup",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Required backup directory for --apply.",
+)
+def doctor_cmd(fixtures: bool, do_apply: bool, backup: Path | None) -> None:
+    """Inspect memory hygiene. Fixture cleanup is a dry-run by default."""
+    if not fixtures:
+        raise click.UsageError("Select a doctor check; currently available: --fixtures.")
+    if do_apply and backup is None:
+        raise click.UsageError("--apply requires --backup PATH.")
+    if backup is not None and not do_apply:
+        raise click.UsageError("--backup requires --apply.")
+
+    base_dir = Path(MEMORY_BASE_DIR)
+    findings = _fixture_findings(base_dir)
+    audit_events = sum(finding.audit_events for finding in findings)
+    audit_bytes = sum(finding.audit_bytes for finding in findings)
+    mode = "APPLY" if do_apply else "DRY-RUN"
+    click.echo(
+        f"{mode} fixture_files={len(findings)} "
+        f"audit_events={audit_events} audit_bytes={audit_bytes}"
+    )
+    for finding in findings:
+        disposition = "report-only" if finding.report_only else "quarantine"
+        click.echo(
+            f"{disposition} {','.join(finding.shapes)} "
+            f"{finding.path.relative_to(base_dir).as_posix()}"
+        )
+    if not do_apply or not findings:
+        return
+
+    movable_findings = [finding for finding in findings if not finding.report_only]
+    if not movable_findings:
+        click.echo("moved=0")
+        return
+
+    assert backup is not None
+    _prepare_fixture_backup(base_dir, backup, movable_findings)
+    service = MemoryService(base_dir=base_dir)
+    quarantine = (
+        base_dir
+        / ".quarantine"
+        / f"fixtures-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+    )
+    moved = 0
+    for finding in movable_findings:
+        relative = finding.path.relative_to(base_dir)
+        identity = _fixture_memory_identity(base_dir, finding.path)
+        destination = quarantine / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(finding.path), str(destination))
+        if identity is not None:
+            scope, scope_id, key = identity
+            index_path = service.get_index_path(scope, scope_id)
+            if index_path.exists():
+                timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                service._update_index(scope, scope_id, key, "", "", "", timestamp, "remove")
+            service._delete_metadata(key, scope, scope_id)
+        moved += 1
+        click.echo(f"moved {relative.as_posix()} -> {destination.relative_to(base_dir).as_posix()}")
+    click.echo(f"moved={moved} backup={backup}")
 
 
 @memory.command(name="repair")

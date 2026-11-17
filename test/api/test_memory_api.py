@@ -265,7 +265,7 @@ class TestListMemories:
             limit=1000,
             scan_all=True,
             search_mode="metadata",
-            record_access=True,
+            record_access=False,
         )
 
     def test_list_filters_project_by_scope_id(self, client, mock_service):
@@ -363,7 +363,8 @@ class TestGetMemory:
             scope=None,
             scope_id=None,
             scan_all=True,
-            record_access=True,
+            search_mode="metadata",
+            record_access=False,
         )
 
     def test_get_narrows_by_scope_id(self, client, mock_service):
@@ -379,7 +380,8 @@ class TestGetMemory:
             scope="project",
             scope_id="proj-mine",
             scan_all=True,
-            record_access=True,
+            search_mode="metadata",
+            record_access=False,
         )
 
     def test_get_project_alias_reads_listed_native_folder(self, client, tmp_path, monkeypatch):
