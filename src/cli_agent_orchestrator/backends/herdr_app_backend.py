@@ -15,7 +15,7 @@ import secrets
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from cli_agent_orchestrator.backends.base import (
     TerminalBackend,
@@ -266,14 +266,44 @@ class HerdrAppBackend(TerminalBackend):
         logger.warning("herdr-app: could not name spaces after %d conflicts", DOC_WRITE_ATTEMPTS)
         return False
 
+    def _creation_order(self, sessions: Iterable[str]) -> Dict[str, int]:
+        """CAO terminal id -> creation rank, from the registry's oldest-first order.
+
+        The app inserts an adopted tab after the space's selected tab (herdr-app
+        ``Model::add_tab``), so new workers pile up next to the conductor. CAO
+        puts its tabs back in creation order. Unreadable registry: no ordering.
+        """
+        from cli_agent_orchestrator.clients.database import list_terminals_by_session
+
+        rank: Dict[str, int] = {}
+        try:
+            for session in sessions:
+                for row in list_terminals_by_session(session):
+                    rank.setdefault(str(row["id"]), len(rank))
+        except Exception as exc:  # noqa: BLE001 - ordering is cosmetic
+            logger.debug("herdr-app: no tab ordering this pass: %s", exc)
+            return {}
+        return rank
+
     def sync_layout_names(self) -> None:
-        """Name every CAO space and tab after its CAO session and window. Never raises."""
+        """Name every CAO space and tab after its CAO session and window, and put
+        CAO's tabs in creation order (new ones at the end). Never raises."""
         try:
             live = self._list()
             spaces = {
                 space_id_for(t["labels"]["cao.session"]): t["labels"]["cao.session"] for t in live
             }
             windows = {t["address"]: t["labels"]["cao.window"] for t in live}
+            terminal_ids = {t["address"]: t["labels"].get("cao.terminal_id") for t in live}
+            rank = self._creation_order(spaces.values())
+
+            def tab_rank(tab: Any) -> int:
+                ranks = [
+                    rank[terminal_ids[a]]
+                    for a in _terminals_in(tab.get("root") if isinstance(tab, dict) else None)
+                    if terminal_ids.get(a) in rank
+                ]
+                return min(ranks) if ranks else len(rank)  # tabs CAO doesn't know go last
 
             def mutate(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 changed = False
@@ -287,6 +317,12 @@ class HerdrAppBackend(TerminalBackend):
                         owned = [windows[a] for a in _terminals_in(tab.get("root")) if a in windows]
                         if owned and tab.get("name") != owned[0]:
                             tab["name"] = owned[0]
+                            changed = True
+                    tabs = space.get("tabs")
+                    if rank and isinstance(tabs, list):
+                        ordered = sorted(tabs, key=tab_rank)  # stable: equal ranks keep order
+                        if ordered != tabs:
+                            space["tabs"] = ordered
                             changed = True
                 return doc if changed else None
 

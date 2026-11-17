@@ -592,3 +592,73 @@ class TestServerIdentity:
         hc.set_doc("herdr-app", layout_with(sp, [("tbF", "", foreign["address"])]))
         backend.sync_layout_names()
         assert hc.calls_to("doc.set") == []
+
+
+class TestTabOrder:
+    """The app inserts an adopted tab after the selected one; CAO restores creation order."""
+
+    @pytest.fixture
+    def three(self, backend, tmp_path, monkeypatch):
+        for window, tid in (("sup", "aaaa0001"), ("w1", "aaaa0002"), ("w2", "aaaa0003")):
+            backend.create_window("cao-a", window, tid, str(tmp_path))
+        rows = [{"id": "aaaa0001"}, {"id": "aaaa0002"}, {"id": "aaaa0003"}]
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.list_terminals_by_session",
+            lambda session: rows if session == "cao-a" else [],
+        )
+        return rows
+
+    def _tab_names(self, hc):
+        return [t["name"] for t in hc.docs["herdr-app"]["value"]["spaces"][0]["tabs"]]
+
+    def test_new_tabs_move_to_the_end(self, backend, hc, three):
+        # what the app does today: newest worker right after the conductor
+        hc.set_doc(
+            "herdr-app",
+            layout_with(
+                space_id_for("cao-a"), [("tbA", "", "t1"), ("tbC", "", "t3"), ("tbB", "", "t2")]
+            ),
+        )
+        backend.sync_layout_names()
+        assert self._tab_names(hc) == ["sup", "w1", "w2"]
+
+    def test_no_write_when_already_ordered(self, backend, hc, three):
+        hc.set_doc(
+            "herdr-app",
+            layout_with(
+                space_id_for("cao-a"),
+                [("tbA", "sup", "t1"), ("tbB", "w1", "t2"), ("tbC", "w2", "t3")],
+                "cao-a",
+            ),
+        )
+        writes = len(hc.calls_to("doc.set"))
+        backend.sync_layout_names()
+        assert len(hc.calls_to("doc.set")) == writes
+
+    def test_unknown_tab_goes_last_and_registry_failure_skips_ordering(
+        self, backend, hc, three, monkeypatch
+    ):
+        hc.set_doc(
+            "herdr-app",
+            layout_with(
+                space_id_for("cao-a"),
+                [("tbU", "mine", "t99"), ("tbB", "", "t2"), ("tbA", "", "t1")],
+            ),
+        )
+        backend.sync_layout_names()
+        assert self._tab_names(hc) == ["sup", "w1", "mine"]
+
+        def boom(session):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.list_terminals_by_session", boom
+        )
+        hc.set_doc(
+            "herdr-app",
+            layout_with(
+                space_id_for("cao-a"), [("tbB", "w1", "t2"), ("tbA", "sup", "t1")], "cao-a"
+            ),
+        )
+        backend.sync_layout_names()
+        assert self._tab_names(hc) == ["w1", "sup"]  # names still synced, order left alone
