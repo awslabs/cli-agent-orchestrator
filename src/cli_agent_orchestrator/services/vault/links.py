@@ -88,8 +88,31 @@ def resolve_wikilink(
         if resolved_name is None:
             return LinkOutcome("unsupported", finding_code=FindingCode.LINK_TARGET_INVALID)
         name = resolved_name
+    names: tuple[str, ...] = (name,)
+    truncated_canonical = None
+    if not relative_path and "/" not in name and "\\" not in name:
+        try:
+            from cli_agent_orchestrator.services.memory_service import MemoryService
+
+            normalized = MemoryService._normalize_key(name)
+            canonical = MemoryService._sanitize_key(name) if normalized == name else name
+        except ValueError:
+            canonical = name
+        if canonical != name:
+            names = (name, canonical)
+            truncated_canonical = canonical
     matching = tuple(
-        candidate for candidate in candidates if _matches(name, candidate, exact_path=relative_path)
+        candidate
+        for candidate in candidates
+        if any(
+            _matches(
+                candidate_name,
+                candidate,
+                exact_path=relative_path,
+                match_key=candidate_name == truncated_canonical,
+            )
+            for candidate_name in names
+        )
     )
     if not matching:
         if embed and _is_non_markdown_attachment(name):
@@ -115,12 +138,22 @@ def resolve_wikilink(
     return LinkOutcome("resolved", available[0].key, finding, attributes or None)
 
 
-def _matches(name: str, candidate: LinkCandidate, *, exact_path: bool = False) -> bool:
+def _matches(
+    name: str,
+    candidate: LinkCandidate,
+    *,
+    exact_path: bool = False,
+    match_key: bool = False,
+) -> bool:
     plain = candidate.relpath[:-3] if candidate.relpath.endswith(".md") else candidate.relpath
     basename = plain.rsplit("/", 1)[-1]
     if exact_path:
         return name == candidate.relpath
-    return name in (plain, candidate.relpath, basename) or name in candidate.aliases
+    return (
+        name in (plain, candidate.relpath, basename)
+        or name in candidate.aliases
+        or (match_key and name == candidate.key)
+    )
 
 
 def _relative_markdown_destination(destination: str) -> Optional[str]:

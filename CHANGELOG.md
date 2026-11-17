@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Memory inspection and fixture hygiene are safer by default** (#1329).
+  This resolves #861 Q3: CLI list/show and REST list/show no longer increment
+  `access_count` unless `memory.non_accessing_inspection=false`; MCP recall
+  still counts, while internal recall accepts `record_access=false` for
+  benchmarks. Lesson promotion reads `access_count`, so inspection can no
+  longer make a lesson promotion-eligible. Long key truncation is visible in
+  `memory_store` results and long links resolve through the same sanitiser.
+  `cao memory doctor --fixtures` inventories synthetic residue and audit volume
+  as a dry-run; `--apply` requires a backup and moves fixture topic files to
+  quarantine without deleting them. Audit-log day files are report-only and
+  remain in place because they can also hold real events. The test harness now
+  refuses unmarked access to a real-home memory directory and relocates memory
+  for live-provider test runs.
 - **FIFO output readers continue working when a busy server has allocated a descriptor above 1023** (#1350).
 - **Docs: the retrospector profile, the `store_lesson` description, the self-learning guides and the `cao-learning` skill no longer say lessons reach future sessions or can be recalled by a curator or supervisor, or that they are injected into new sessions** (#1335, #1329).
   A lesson is found only by the owning agent's `memory_recall` or a promoted `## Learned Patterns` block.

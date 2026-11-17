@@ -83,7 +83,8 @@ pytest_plugins = (
 # - A session that selects e2e tests or the Kiro integration test keeps the real
 #   HOME for the whole session: those drive authenticated provider CLIs, and
 #   their session-scoped fixtures read provider logins under HOME before any
-#   function-scoped opt-out could apply.
+#   function-scoped opt-out could apply. CAO_HOME_DIR is still redirected to a
+#   per-session temp directory so those tests cannot reach real-home memory.
 # - ``CAO_TEST_REAL_HOME=1`` keeps the real HOME for the whole session, and
 #   ``CAO_TEST_REAL_HOME=0`` forces isolation.
 #
@@ -114,6 +115,8 @@ HOME_ROOT_ENV_VARS = (
 
 _REAL_HOME_ENV: Dict[str, str] = {}
 _ISOLATED_HOME: Dict[str, str] = {}
+_STARTUP_REAL_HOME = os.path.realpath(os.path.expanduser("~"))
+_ISOLATED_MEMORY_HOME: Dict[str, str] = {}
 #: Root variables kept at import because they already pointed at a throwaway
 #: location (see ``_keeps_root``); the per-test fixture re-pins them instead of
 #: removing them.
@@ -127,6 +130,17 @@ def _needs_real_home(args, markexpr: str) -> bool:
     """True when the invocation selects tests that drive real provider logins."""
     if os.environ.get("CAO_TEST_REAL_HOME") in ("0", "1"):
         return os.environ["CAO_TEST_REAL_HOME"] == "1"
+    if "e2e" in (markexpr or "").replace("not e2e", ""):
+        return True
+    for arg in args:
+        parts = pathlib.PurePath(str(arg).split("::", 1)[0]).parts
+        if "e2e" in parts or "test_kiro_cli_integration.py" in parts:
+            return True
+    return False
+
+
+def _selects_live_provider_tests(args, markexpr: str) -> bool:
+    """True only for selections that need provider credentials under real HOME."""
     if "e2e" in (markexpr or "").replace("not e2e", ""):
         return True
     for arg in args:
@@ -223,6 +237,18 @@ def _isolate_home() -> None:
         {"home": home, "real": _REAL_HOME_ENV, "pinned": _PINNED_ROOT_ENV}
     )
     atexit.register(shutil.rmtree, home, True)
+
+
+def _isolate_memory_home() -> None:
+    """Keep live-provider sessions' CAO memory outside the real HOME."""
+    import atexit
+    import shutil
+    import tempfile
+
+    memory_home = os.path.realpath(tempfile.mkdtemp(prefix="cao-test-memory-"))
+    _ISOLATED_MEMORY_HOME["path"] = memory_home
+    os.environ["CAO_HOME_DIR"] = memory_home
+    atexit.register(shutil.rmtree, memory_home, True)
 
 
 def _throwaway_roots() -> tuple:
@@ -370,6 +396,8 @@ def _decide_at_import() -> None:
     if not _needs_real_home(args, markexpr):
         _isolate_home()
         _isolate_tmux()
+    elif _selects_live_provider_tests(args, markexpr):
+        _isolate_memory_home()
 
 
 _decide_at_import()
@@ -381,6 +409,11 @@ def pytest_configure(config):
         "markers",
         "real_home: run with the developer's real HOME and provider config roots "
         "(see test/conftest.py, HOME isolation)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "real_home_memory: explicitly allow a test to resolve "
+        + "MEMORY_BASE_DIR under the real HOME",
     )
     if _ISOLATED_HOME.get("too_late"):
         raise pytest.UsageError(
@@ -556,7 +589,33 @@ def ensure_cao_home_schema() -> None:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _cao_home_schema() -> None:
+def _memory_home_guard(request) -> None:
+    """Refuse a session whose unmarked tests could reach real-home memory."""
+    from cli_agent_orchestrator.constants import MEMORY_BASE_DIR
+
+    isolated_roots = (
+        _ISOLATED_HOME.get("path"),
+        _ISOLATED_MEMORY_HOME.get("path"),
+    )
+    if any(root and _is_within(str(MEMORY_BASE_DIR), root) for root in isolated_roots):
+        return
+    if not _is_within(str(MEMORY_BASE_DIR), _STARTUP_REAL_HOME):
+        return
+    unmarked = [
+        item.nodeid
+        for item in request.session.items
+        if item.get_closest_marker("real_home_memory") is None
+    ]
+    if unmarked:
+        pytest.fail(
+            "MEMORY_BASE_DIR resolves under the real HOME; mark an intentional "
+            "test with @pytest.mark.real_home_memory. Unmarked test: "
+            f"{unmarked[0]}"
+        )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _cao_home_schema(_memory_home_guard) -> None:
     """Make the configured home's DB schema exist before any test runs.
 
     ``clients/database.py`` binds ``SessionLocal`` to a module-global engine at
