@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-This section also covers 2.5.1 to 2.5.4, which were released without their own sections.
+- **FIFO output readers continue working when a busy server has allocated a descriptor above 1023** (#1350).
 - **Docs: the retrospector profile, the `store_lesson` description, the self-learning guides and the `cao-learning` skill no longer say lessons reach future sessions or can be recalled by a curator or supervisor, or that they are injected into new sessions** (#1335, #1329).
   A lesson is found only by the owning agent's `memory_recall` or a promoted `## Learned Patterns` block.
   A supervisor's recall returns only lessons under its own profile, so it tells the worker to recall.
