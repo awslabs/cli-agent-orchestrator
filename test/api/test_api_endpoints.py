@@ -399,6 +399,7 @@ class TestCreateSession:
             engine=None,
             initial_message=None,
             initial_message_orchestration_type=None,
+            inject_memory_at_start=False,
             model=None,
             use_worktree=False,
             idempotency_key=None,
@@ -735,6 +736,27 @@ class TestCreateSession:
         assert call_kwargs["model"] == "gpt-5.1-codex"
         assert call_kwargs["initial_message"] == initial_message
         assert call_kwargs["initial_message_orchestration_type"] == OrchestrationType.SEND_MESSAGE
+
+    def test_create_session_forwards_explicit_start_memory_request(self, client):
+        """The opt-in body field reaches the service and defaults off elsewhere."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="codex",
+            agent_profile="developer",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={"provider": "codex", "agent_profile": "developer"},
+                json={"inject_memory_at_start": True},
+            )
+
+        assert response.status_code == 201
+        assert mock_svc.create_session.call_args.kwargs["inject_memory_at_start"] is True
 
     def test_create_session_preserves_env_vars_body_shape(self, client):
         """Existing cao launch --env callers keep using {"env_vars": {...}}."""

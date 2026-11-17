@@ -70,6 +70,7 @@ class LifecycleConfig(BaseModel):
 class InjectionConfig(BaseModel):
     clear_on_empty: bool = True
     v1_fixes: bool = True
+    write_project_files: bool = False
 
 
 class RankingConfig(BaseModel):

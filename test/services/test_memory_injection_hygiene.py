@@ -170,6 +170,7 @@ def test_injection_settings_default_to_hygiene_fixes() -> None:
     assert get_memory_settings()["injection"] == {
         "clear_on_empty": True,
         "v1_fixes": True,
+        "write_project_files": False,
     }
 
 

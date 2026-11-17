@@ -16,6 +16,15 @@ from cli_agent_orchestrator.plugins.builtin.kiro_cli_memory import (
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
 
 
+@pytest.fixture(autouse=True)
+def _enable_project_file_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory."
+        "memory_injection_write_project_files_enabled",
+        lambda: True,
+    )
+
+
 def _event(provider: str = "kiro_cli", terminal_id: str = "t1") -> PostCreateTerminalEvent:
     return PostCreateTerminalEvent(
         terminal_id=terminal_id,

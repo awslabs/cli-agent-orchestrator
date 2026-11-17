@@ -24,10 +24,11 @@ _DEFAULTS = {
 
 _BOOL_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _BOOL_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
-# To add write_project_files, add its bool default here and a matching InjectionConfig field.
+# Single source for every ``memory.injection.*`` flag and its safe fallback.
 MEMORY_INJECTION_DEFAULTS = {
     "clear_on_empty": True,
     "v1_fixes": True,
+    "write_project_files": False,
 }
 
 
@@ -899,7 +900,7 @@ def get_memory_settings() -> Dict[str, Any]:
 
 
 def _memory_injection_flag(key: str) -> bool:
-    """Read one default-on injection fix; invalid/read errors stay on."""
+    """Read one injection flag; invalid/read errors use its safe default."""
     default = MEMORY_INJECTION_DEFAULTS[key]
     try:
         injection = get_memory_settings().get("injection", {})
@@ -930,6 +931,11 @@ def is_memory_injection_clear_on_empty_enabled() -> bool:
 def is_memory_injection_v1_fixes_enabled() -> bool:
     """Whether the v1 builder skips/clips and follows aliases (default true)."""
     return _memory_injection_flag("v1_fixes")
+
+
+def is_memory_injection_write_project_files_enabled() -> bool:
+    """Whether provider plugins write memory into project files (default false)."""
+    return _memory_injection_flag("write_project_files")
 
 
 def get_vault_config(*, canonicalize: bool = True):
@@ -1329,6 +1335,7 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``lifecycle.enabled`` (bool) — opt-in supersedes lifecycle.
         ``injection.clear_on_empty`` (bool) — replace stale provider blocks on empty retrieval.
         ``injection.v1_fixes`` (bool) — enable injection traversal and clipping fixes.
+        ``injection.write_project_files`` (bool) — opt-in provider project-file writes.
         ``ranking.default_sort`` (str) — ``recency`` or ``bm25`` query recall default.
         ``non_accessing_inspection`` (bool) — opt-in operator reads without access bumps.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.

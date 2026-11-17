@@ -3,20 +3,12 @@
 On ``post_create_terminal`` for a ``kiro_cli`` provider, writes the CAO
 memory context to ``<cwd>/.kiro/steering/cao-memory.md``. Kiro CLI natively
 loads every ``*.md`` file under ``.kiro/steering/``, so this file is picked
-up automatically. The plugin owns this file end-to-end and overwrites it
-whole on each run (no in-file markers).
+up automatically. CAO owns this file and replaces it as a whole on each run.
 
-Unlike the Claude Code / Codex plugins, the whole-file overwrite means the
-lost-update race (defect B) does not apply here — there is no
-read-modify-write cycle to serialize, only a full replace. But the target
-path is fixed *per working directory* (``<cwd>/.kiro/steering/cao-memory.md``),
-so two terminals sharing a cwd still write the same file, and the old
-fixed ``.tmp`` idiom is still exposed to defect A (one writer's
-``finally``-unlink deleting the other's live temp file → ``FileNotFoundError``,
-or a half-written temp being published). ``locked_atomic_rewrite`` closes
-that hole too: it uses a unique per-call temp file and an inter-process
-lock, so concurrent overwrites are safe even though the content itself does
-not depend on the prior file state.
+The target path is fixed *per working directory*
+(``<cwd>/.kiro/steering/cao-memory.md``), so its whole-file update uses
+``locked_atomic_rewrite``. This serializes concurrent writes and publishes
+through a unique temp file.
 
 Observer-only: runs after terminal creation, logs-and-skips on every
 error path rather than crashing ``cao-server``.
@@ -26,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -36,7 +29,10 @@ from cli_agent_orchestrator.services.memory_injection import (
     memory_blocks_have_same_body,
     stamp_memory_block,
 )
-from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
+from cli_agent_orchestrator.utils.atomic_file import (
+    locked_atomic_rewrite,
+    locked_atomic_rewrite_or_delete,
+)
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.backends.base import TerminalBackend
@@ -46,6 +42,10 @@ logger = logging.getLogger(__name__)
 
 STEERING_SUBDIR = ".kiro/steering"
 MEMORY_FILENAME = "cao-memory.md"
+_CAO_GENERATED_MEMORY_FILE = re.compile(
+    r'\A\s*<cao-memory(?: generated="[^"]*")?>.*</cao-memory>\s*\Z',
+    re.DOTALL,
+)
 
 
 def get_backend() -> "TerminalBackend":
@@ -96,6 +96,15 @@ def memory_injection_clear_on_empty_enabled() -> bool:
     return is_memory_injection_clear_on_empty_enabled()
 
 
+def memory_injection_write_project_files_enabled() -> bool:
+    """Resolve the opt-in project-file writer only on the handler path."""
+    from cli_agent_orchestrator.services.settings_service import (
+        is_memory_injection_write_project_files_enabled,
+    )
+
+    return is_memory_injection_write_project_files_enabled()
+
+
 def get_terminal_metadata(terminal_id: str):
     """Lazy indirection onto ``clients.database.get_terminal_metadata``.
 
@@ -131,6 +140,9 @@ class KiroCliMemoryPlugin(CaoPlugin):
         if event.provider != "kiro_cli":
             return
 
+        if not memory_is_enabled():
+            return
+
         try:
             working_directory = self._resolve_working_directory(event)
         except Exception as exc:
@@ -148,7 +160,8 @@ class KiroCliMemoryPlugin(CaoPlugin):
             )
             return
 
-        if not memory_is_enabled():
+        if not memory_injection_write_project_files_enabled():
+            await self._remove_project_file_memory(working_directory)
             return
 
         try:
@@ -201,17 +214,10 @@ class KiroCliMemoryPlugin(CaoPlugin):
                 context_block = empty_memory_block()
             if memory_blocks_have_same_body(existing, context_block):
                 return
-            # Whole-file overwrite (no read-modify-write), but routed through
-            # the shared locked-atomic helper so concurrent writers sharing a
-            # cwd cannot collide on the temp file (defect A). The compute
-            # callback ignores the existing content by design: this plugin
-            # owns the file end-to-end.
-            #
-            # locked_atomic_rewrite polls with time.sleep up to the lock
-            # timeout; run it off the event loop so a contended lock cannot
-            # stall cao-server for other terminals.
             await asyncio.to_thread(
-                locked_atomic_rewrite, target, lambda _existing: context_block + "\n"
+                locked_atomic_rewrite,
+                target,
+                lambda _existing: context_block + "\n",
             )
         except Exception as exc:
             logger.warning(
@@ -219,6 +225,20 @@ class KiroCliMemoryPlugin(CaoPlugin):
                 target,
                 exc,
             )
+
+    async def _remove_project_file_memory(self, working_directory: str) -> None:
+        """Delete a recognizable CAO-owned steering file without fetching memory."""
+        try:
+            target = self._validated_target_path(working_directory)
+            await asyncio.to_thread(self._remove_owned_file, target)
+        except ValueError as exc:
+            logger.warning(
+                "kiro_cli_memory: path validation rejected %s: %s",
+                working_directory,
+                exc,
+            )
+        except Exception as exc:
+            logger.warning("kiro_cli_memory: cleanup failed for %s: %s", working_directory, exc)
 
     # ------------------------------------------------------------------
     # helpers
@@ -263,3 +283,14 @@ class KiroCliMemoryPlugin(CaoPlugin):
         except ValueError:
             raise ValueError(f"target {target} escapes working directory {base}")
         return target
+
+    @staticmethod
+    def _remove_owned_file(target: Path) -> None:
+        def remove_if_owned(content: str) -> str:
+            return "" if _CAO_GENERATED_MEMORY_FILE.match(content) else content
+
+        locked_atomic_rewrite_or_delete(
+            target,
+            remove_if_owned,
+            lambda content: not content.strip(),
+        )

@@ -95,6 +95,7 @@ async def create_session(
     description: Any = _DESCRIPTION_UNSET,
     create_working_directory: bool = False,
     launch_plan: "LaunchPlan | None" = None,
+    inject_memory_at_start: bool = False,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
@@ -125,6 +126,10 @@ async def create_session(
     SAME terminal this function already created for it, without a second
     tmux window or provider process.
 
+    ``inject_memory_at_start`` is the explicit interactive ``cao launch``
+    signal. It defaults to false so callers that create first and send their
+    task later retain task-aware first-message memory.
+    
     ``create_working_directory`` (#724): forwarded as-is to ``create_terminal``,
     which validates the directory against the path policy and creates it only
     once every check that can refuse the request has passed.
@@ -159,6 +164,7 @@ async def create_session(
         defer_init=initial_message is not None,
         initial_message=initial_message,
         initial_message_orchestration_type=initial_message_orchestration_type,
+        inject_memory_at_start=inject_memory_at_start,
         model=model,
         use_worktree=use_worktree,
         idempotency_key=idempotency_key,
