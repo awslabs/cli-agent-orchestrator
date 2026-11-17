@@ -27,7 +27,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 
@@ -333,6 +333,58 @@ def forward_terminal_identity(
         )
     env[CAO_TERMINAL_ID_ENV] = terminal_id
     entry[_ENV_FIELD] = env
+    return entry
+
+
+def drop_declared_terminal_identity(config: Any, *, server_name: str = "") -> Any:
+    """Return ``config`` without a ``CAO_TERMINAL_ID`` its author declared.
+
+    The install-time half of :func:`forward_terminal_identity`. Kiro and OpenCode
+    read their MCP configuration from a file ``cao install`` writes
+    (``~/.kiro/agents/<agent>.json``, ``opencode.json``), before any terminal
+    exists, and their MCP children take the identity from the pane environment.
+    That inheritance is the reason nothing is INJECTED here. It was never a
+    reason to carry a value the profile DECLARED: a client may apply the entry's
+    own ``env`` over the inherited environment (OpenCode v1.19.6 does, per the
+    review of #1069), and the installed file would then start CAO's own MCP
+    servers under another terminal's id, with both gates authorizing against that
+    terminal's allowlist. Review of #1062 found the launch-time writers closed and
+    these two still open.
+
+    There is no real id to forward at install time, so this applies the rule
+    antigravity already had (#940/#958): the key is DROPPED, and the drop is
+    logged so the operator who wrote the line learns it had no effect. The server
+    then gets the identity the pane gives it, whatever order a client merges
+    ``env`` in. Any declared value is dropped, an empty one included (an empty
+    value is a claim to an identity that cannot be resolved). Other ``env`` values
+    are untouched, and an ``env`` left empty by the drop is removed, so the entry
+    is what it would have been had the line never been written.
+
+    PURE, like the forwarder: a new entry with a new ``env`` dict. An entry that is
+    not a mapping, or whose ``env`` is not one, is returned as it came; neither
+    can be written by the install path, which normalizes every entry to a dict.
+    """
+    if not isinstance(config, Mapping):
+        return config
+    declared_env = config.get(_ENV_FIELD)
+    if not isinstance(declared_env, Mapping) or CAO_TERMINAL_ID_ENV not in declared_env:
+        return config
+    entry = dict(config)
+    env = dict(declared_env)
+    declared = env.pop(CAO_TERMINAL_ID_ENV)
+    logger.warning(
+        "Dropping %s=%r declared in the env of MCP server %r: a profile does not "
+        "choose the calling terminal's identity -- the CAO MCP gates authorize on "
+        "it -- and an installed configuration has no terminal to name, so the "
+        "server takes the id of the terminal that launches it",
+        CAO_TERMINAL_ID_ENV,
+        declared,
+        server_name or entry.get("command", ""),
+    )
+    if env:
+        entry[_ENV_FIELD] = env
+    else:
+        entry.pop(_ENV_FIELD, None)
     return entry
 
 

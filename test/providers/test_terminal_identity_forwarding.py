@@ -24,6 +24,15 @@ The gate's half of this is ``test/security/test_mcp_tool_gate_boundness.py``.
 import json
 import re
 from pathlib import Path
+
+# The install-seam fixtures: a temp CAO home, plugin store, Kiro agents dir and
+# opencode.json wired into the real ``install_agent``.
+from test.agent_plugins.test_mcp_delivery import (  # noqa: F401
+    agent_workspace,
+    install_plugin,
+    mcp_doc,
+    opencode_workspace,
+)
 from unittest.mock import patch
 
 import pytest
@@ -32,6 +41,7 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.utils.mcp_resolution import (
     CAO_MCP_SERVER_MODULE,
     CAO_TERMINAL_ID_ENV,
+    drop_declared_terminal_identity,
     forward_terminal_identity,
     is_bundled_cao_server,
 )
@@ -455,3 +465,274 @@ class TestTheKimiCodeProviderHandsTheBuilderItsRealId:
         home = provider._runtime_home_builder.home
         written = json.loads((home / "mcp.json").read_text(encoding="utf-8"))
         assert written["mcpServers"]["sneaky"]["env"][CAO_TERMINAL_ID_ENV] == "a1b2c3d4"
+
+
+class TestTheInstallTimeDrop:
+    """``drop_declared_terminal_identity``: install time has no id to forward.
+
+    Kiro and OpenCode read MCP configuration from a file ``cao install`` writes,
+    so the forwarder never runs for them. Review of #1069 showed both files
+    carrying a profile's ``CAO_TERMINAL_ID: deadbeef`` verbatim. The rule there is
+    antigravity's: the key is dropped and the drop is logged.
+    """
+
+    @pytest.mark.parametrize("pinned", PINNED)
+    def test_a_declared_value_is_dropped_and_logged(self, pinned, caplog):
+        with caplog.at_level("WARNING"):
+            entry = drop_declared_terminal_identity(
+                {"command": "x", "env": {CAO_TERMINAL_ID_ENV: pinned, "KEEP": "yes"}},
+                server_name="ops",
+            )
+        assert entry == {"command": "x", "env": {"KEEP": "yes"}}
+        assert "ops" in caplog.text and CAO_TERMINAL_ID_ENV in caplog.text
+        assert repr(pinned) in caplog.text
+
+    def test_an_env_emptied_by_the_drop_is_removed(self):
+        entry = drop_declared_terminal_identity(
+            {"command": "x", "env": {CAO_TERMINAL_ID_ENV: "deadbeef"}}, server_name="s"
+        )
+        assert entry == {"command": "x"}
+
+    def test_an_entry_that_declares_nothing_is_returned_untouched_and_unlogged(self, caplog):
+        config = {"command": "x", "env": {"KEEP": "yes"}}
+        with caplog.at_level("WARNING"):
+            assert drop_declared_terminal_identity(config, server_name="s") is config
+            assert drop_declared_terminal_identity({"command": "x"}) == {"command": "x"}
+            assert drop_declared_terminal_identity({"type": "http", "url": "u"}) == {
+                "type": "http",
+                "url": "u",
+            }
+        assert caplog.text == ""
+
+    def test_the_profile_s_own_env_dict_is_not_mutated(self):
+        original = {CAO_TERMINAL_ID_ENV: "deadbeef", "KEEP": "yes"}
+        config = {"command": "x", "env": original}
+        drop_declared_terminal_identity(config, server_name="s")
+        assert original == {CAO_TERMINAL_ID_ENV: "deadbeef", "KEEP": "yes"}
+        assert config["env"] is original
+
+    @pytest.mark.parametrize("config", [None, "cao-mcp-server", {"command": "x", "env": "A=b"}])
+    def test_a_shape_it_cannot_read_is_returned_as_it_came(self, config):
+        assert drop_declared_terminal_identity(config) is config
+
+
+def _pinning_frontmatter(pinned: str) -> str:
+    """Frontmatter whose two CAO entries each pin ``pinned``, as the review's did."""
+    value = json.dumps(pinned)
+    return (
+        "mcpServers:\n"
+        "  cao-mcp-server:\n"
+        "    type: stdio\n"
+        "    command: cao-mcp-server\n"
+        "    env:\n"
+        f"      {CAO_TERMINAL_ID_ENV}: {value}\n"
+        '      KEEP: "yes"\n'
+        "  cao-ops-mcp-server:\n"
+        "    type: stdio\n"
+        "    command: cao-ops-mcp-server\n"
+        "    env:\n"
+        f"      {CAO_TERMINAL_ID_ENV}: {value}\n"
+    )
+
+
+def _assert_no_identity(servers: dict, env_field: str) -> None:
+    assert set(servers) >= {"cao-mcp-server", "cao-ops-mcp-server"}, sorted(servers)
+    for name, entry in servers.items():
+        assert CAO_TERMINAL_ID_ENV not in (entry.get(env_field) or {}), (name, entry)
+    assert servers["cao-mcp-server"][env_field] == {"KEEP": "yes"}
+    assert env_field not in servers["cao-ops-mcp-server"]
+
+
+@pytest.mark.parametrize("pinned", PINNED)
+class TestEachInstallTimeWriterDropsAPinnedId:
+    """Asked of the real ``install_agent``, reading the file each CLI will load.
+
+    The two providers ``TestEachProviderInjectsTheRealId`` cannot cover, because
+    their MCP configuration is written before any terminal exists. Both surfaces
+    (``cao-mcp-server`` and ``cao-ops-mcp-server``) are checked, as in the
+    review's repro, and an unrelated ``env`` value has to survive.
+    """
+
+    def test_kiro_cli(self, pinned, agent_workspace, caplog):  # noqa: F811
+        from cli_agent_orchestrator.services.install_service import install_agent
+
+        agent_workspace["write_profile"]("borrower", frontmatter=_pinning_frontmatter(pinned))
+        with caplog.at_level("WARNING"):
+            result = install_agent("borrower", "kiro_cli")
+        assert result.success, result.message
+
+        written = (agent_workspace["kiro_dir"] / "borrower.json").read_text(encoding="utf-8")
+        _assert_no_identity(json.loads(written)["mcpServers"], "env")
+        assert CAO_TERMINAL_ID_ENV not in written
+        assert f"Dropping {CAO_TERMINAL_ID_ENV}={pinned!r}" in caplog.text
+        assert "'cao-ops-mcp-server'" in caplog.text and "'cao-mcp-server'" in caplog.text
+
+    def test_kiro_cli_universal_agent(self, pinned, agent_workspace, caplog):  # noqa: F811
+        """The v3-capable render is a second writer of the same file."""
+        from cli_agent_orchestrator.services.install_service import install_agent
+
+        agent_workspace["write_profile"](
+            "borrower",
+            frontmatter=_pinning_frontmatter(pinned)
+            + 'allowedTools:\n  - "fs_read"\n  - "@cao-mcp-server"\n  - "@cao-ops-mcp-server"\n',
+        )
+        with caplog.at_level("WARNING"):
+            result = install_agent("borrower", "kiro_cli", engine="v3")
+        assert result.success, result.message
+
+        written = (agent_workspace["kiro_dir"] / "borrower.json").read_text(encoding="utf-8")
+        servers = json.loads(written)["mcpServers"]
+        assert set(servers) == {"cao-mcp-server", "cao-ops-mcp-server"}
+        assert CAO_TERMINAL_ID_ENV not in written
+        assert f"Dropping {CAO_TERMINAL_ID_ENV}={pinned!r}" in caplog.text
+
+    def test_opencode_cli(self, pinned, opencode_workspace, caplog):  # noqa: F811
+        from cli_agent_orchestrator.services.install_service import install_agent
+
+        opencode_workspace["write_profile"]("borrower", frontmatter=_pinning_frontmatter(pinned))
+        with caplog.at_level("WARNING"):
+            result = install_agent("borrower", "opencode_cli")
+        assert result.success, result.message
+
+        written = opencode_workspace["opencode_config"].read_text(encoding="utf-8")
+        _assert_no_identity(json.loads(written)["mcp"], "environment")
+        assert CAO_TERMINAL_ID_ENV not in written
+        assert f"Dropping {CAO_TERMINAL_ID_ENV}={pinned!r}" in caplog.text
+
+
+class TestAnAgentPluginCannotPinTheIdEither:
+    """The plugin branch of the install seam: an ``mcp.json`` that declares one.
+
+    A plugin entry skips CAO's own resolution (it is already expanded), so it
+    reaches the provider file by a different branch than a profile entry does.
+    """
+
+    PLUGIN_MCP = {
+        "plugin-tools": {
+            "type": "stdio",
+            "command": "cao-ops-mcp-server",
+            "env": {CAO_TERMINAL_ID_ENV: "deadbeef", "KEEP": "yes"},
+        }
+    }
+
+    def test_kiro_cli(self, agent_workspace, caplog):  # noqa: F811
+        from cli_agent_orchestrator.services.install_service import install_agent
+
+        install_plugin(agent_workspace, "pinner", mcp=mcp_doc(**self.PLUGIN_MCP))
+        agent_workspace["write_profile"]("worker")
+        with caplog.at_level("WARNING"):
+            result = install_agent("worker", "kiro_cli")
+        assert result.success, result.message
+
+        written = (agent_workspace["kiro_dir"] / "worker.json").read_text(encoding="utf-8")
+        entry = json.loads(written)["mcpServers"]["plugin-tools"]
+        assert entry["env"]["KEEP"] == "yes"
+        assert CAO_TERMINAL_ID_ENV not in written
+        assert "'plugin-tools'" in caplog.text
+
+    def test_opencode_cli(self, opencode_workspace, caplog):  # noqa: F811
+        from cli_agent_orchestrator.services.install_service import install_agent
+
+        install_plugin(opencode_workspace, "pinner", mcp=mcp_doc(**self.PLUGIN_MCP))
+        opencode_workspace["write_profile"]("worker")
+        with caplog.at_level("WARNING"):
+            result = install_agent("worker", "opencode_cli")
+        assert result.success, result.message
+
+        written = opencode_workspace["opencode_config"].read_text(encoding="utf-8")
+        entry = json.loads(written)["mcp"]["plugin-tools"]
+        assert entry["environment"]["KEEP"] == "yes"
+        assert CAO_TERMINAL_ID_ENV not in written
+        assert "'plugin-tools'" in caplog.text
+
+
+class TestAReinstallRemovesAValueAnEarlierInstallWrote:
+    """Files written before this fix still carry the pin; the next install clears it.
+
+    Kiro's agent JSON is rewritten wholesale, so only OpenCode's shared
+    ``opencode.json`` can refuse: an agent-plugin entry that differs from what CAO
+    would write now is overwritten only if it is provably CAO's. An entry that
+    differs by exactly the dropped key has to stay provably CAO's.
+    """
+
+    @pytest.mark.parametrize("source", ["profile", "agent-plugin"])
+    def test_opencode_cli(self, source, opencode_workspace):  # noqa: F811
+        from cli_agent_orchestrator.services.install_service import install_agent
+
+        if source == "profile":
+            opencode_workspace["write_profile"](
+                "worker", frontmatter=_pinning_frontmatter("deadbeef")
+            )
+            names = ["cao-mcp-server", "cao-ops-mcp-server"]
+        else:
+            install_plugin(
+                opencode_workspace,
+                "pinner",
+                mcp=mcp_doc(**TestAnAgentPluginCannotPinTheIdEither.PLUGIN_MCP),
+            )
+            opencode_workspace["write_profile"]("worker")
+            names = ["plugin-tools"]
+        assert install_agent("worker", "opencode_cli").success
+
+        # Put back what the pre-fix writer left on disk.
+        config_file = opencode_workspace["opencode_config"]
+        data = json.loads(config_file.read_text(encoding="utf-8"))
+        for name in names:
+            data["mcp"][name].setdefault("environment", {})[CAO_TERMINAL_ID_ENV] = "deadbeef"
+        config_file.write_text(json.dumps(data), encoding="utf-8")
+
+        result = install_agent("worker", "opencode_cli")
+        assert result.success, result.message
+        written = config_file.read_text(encoding="utf-8")
+        assert set(names) <= set(json.loads(written)["mcp"])
+        assert CAO_TERMINAL_ID_ENV not in written
+
+
+class TestTheOpenCodeTranslatorIsClosedOnItsOwn:
+    """``translate_mcp_server_config`` is the last step before ``opencode.json``.
+
+    The install seam drops the key before this runs; a caller that reaches the
+    translator some other way must not be able to write it either.
+    """
+
+    @pytest.mark.parametrize("pinned", PINNED)
+    def test_a_declared_value_is_not_translated(self, pinned, caplog):
+        from cli_agent_orchestrator.utils.opencode_config import translate_mcp_server_config
+
+        with caplog.at_level("WARNING"):
+            entry = translate_mcp_server_config(
+                {
+                    "command": "cao-ops-mcp-server",
+                    "env": {CAO_TERMINAL_ID_ENV: pinned, "KEEP": "yes"},
+                },
+                name="ops",
+            )
+        assert entry["environment"] == {"KEEP": "yes"}
+        assert "'ops'" in caplog.text
+
+    def test_the_launch_path_is_not_the_install_path(self):
+        """``persisted=False`` leaves the entry for the provider's forwarder.
+
+        Dropping at launch would lose nothing (the forwarder overwrites the key),
+        but it would log a second, different line for one profile mistake.
+        """
+        from cli_agent_orchestrator.agent_plugins.mcp_delivery import apply_plugin_mcp_servers
+        from cli_agent_orchestrator.agent_plugins.store import InstalledPluginStore
+
+        def run(persisted: bool, tmp: Path) -> dict:
+            profile = _profile(
+                {"ops": {"command": "cao-ops-mcp-server", "env": {CAO_TERMINAL_ID_ENV: "deadbeef"}}}
+            )
+            apply_plugin_mcp_servers(
+                profile,
+                provider="kiro_cli",
+                persisted=persisted,
+                store=InstalledPluginStore(plugins_dir=tmp / "p", data_dir=tmp / "d"),
+            )
+            return profile.mcpServers["ops"]
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            assert run(False, Path(tmp))["env"] == {CAO_TERMINAL_ID_ENV: "deadbeef"}
+            assert "env" not in run(True, Path(tmp))

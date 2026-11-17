@@ -59,6 +59,14 @@ contains no identity occurrence of its own. Every other site must appear in
 here; a classified site that disappears, starts forwarding, or grows an
 occurrence fails it too, so the list cannot go stale.
 
+Two writers run at INSTALL time, before any terminal exists, and so have no id
+to forward: the install seam in ``agent_plugins/mcp_delivery.py`` (what Kiro's
+agent JSON is written from) and OpenCode's translator. Review of #1069 found both
+classified here with reasons that were true only for an ABSENT value, while a
+declared one was written to disk verbatim. They now call
+``drop_declared_terminal_identity``, and ``INSTALL_TIME_DROPPERS`` asserts that
+call rather than trusting the sentence that describes it.
+
 This is a structural guard over the SHAPE of every site. The behavioural
 guarantee -- that a pinned ``''``/``other-id``/``deadbeef`` really is replaced by
 the launching terminal's id in each provider's real output -- is
@@ -86,6 +94,20 @@ MCP_WRITER_CALLS = {"resolve_mcp_server_config", "resolve_cao_mcp_command"}
 #: The one helper that settles the identity.
 FORWARDER = "forward_terminal_identity"
 
+#: Its install-time counterpart: removes (and logs) a declared identity where
+#: there is no terminal whose id could replace it.
+DROPPER = "drop_declared_terminal_identity"
+
+#: Sites whose ALLOWED reason is "drops instead of forwarding". The reason is
+#: only true while the call is there, so the call is asserted, not trusted: the
+#: reasons these two carried before ("every provider forwards downstream of it",
+#: "inherit the identity from the pane env instead") were prose nothing checked,
+#: and both were wrong for a declared value.
+INSTALL_TIME_DROPPERS = {
+    "agent_plugins/mcp_delivery.py::_deliverable",
+    "utils/opencode_config.py::translate_mcp_server_config",
+}
+
 # Reasons shared by a whole category of site. Repeating one verbatim twelve
 # times would read as twelve separate judgements; naming the category once makes
 # it reviewable, and each site is still listed individually so it cannot go
@@ -109,6 +131,13 @@ READS_ANOTHER_PROCESS = (
     "is compared and never copied into an env handed to a child process"
 )
 
+DROPS_AT_INSTALL_TIME = (
+    "runs at install time, before any terminal exists, so there is no real id "
+    "to forward: it calls drop_declared_terminal_identity instead, which removes "
+    "and logs a declared CAO_TERMINAL_ID rather than persisting it (review of "
+    "#1069 found the value written verbatim; INSTALL_TIME_DROPPERS pins the call)"
+)
+
 RESOLVES_COMMAND_ONLY = (
     "resolves the bundled cao-mcp-server command/args and never touches `env`; "
     "only the caller knows which terminal it is launching for, so forwarding is "
@@ -127,22 +156,29 @@ ALLOWED: Dict[str, str] = {
         "IS the forwarder: the one function allowed to decide this value, which "
         "it sets to the launching terminal's own id after logging any pinned one"
     ),
+    "utils/mcp_resolution.py::drop_declared_terminal_identity": (
+        "IS the install-time rule: it only ever REMOVES a declared key (and logs "
+        "it), for the writers that run before any terminal exists; it cannot put "
+        "a value into an env"
+    ),
     "utils/mcp_resolution.py::resolve_mcp_server_config": RESOLVES_COMMAND_ONLY,
     # -- MCP-config writers that legitimately do not forward ---------------
-    "agent_plugins/mcp_delivery.py::_deliverable": (
-        "normalizes a plugin/profile entry's command, args and cwd at the seam "
-        "shared by install and launch; it has no terminal id to forward (install "
-        "time has no terminal) and every provider forwards downstream of it"
+    "agent_plugins/mcp_delivery.py::_deliverable": DROPS_AT_INSTALL_TIME
+    + (
+        "; this is the seam shared by install and launch, and on the launch path "
+        "(persisted=False) it leaves the entry for the provider's own forwarder. "
+        "The file Kiro reads is written from its install-time output"
     ),
     "providers/minimax_code.py::_serialize_server": (
         "a staticmethod that assembles one entry's env (including PATH for an "
         "absolute command); the identity is written by `_write_plugin`, which "
         "forwards every stdio entry it serialized"
     ),
-    "utils/opencode_config.py::translate_mcp_server_config": (
-        "install-time translation into opencode.json, run before any terminal "
-        "exists, so there is no real id to forward; OpenCode's MCP children "
-        "inherit the identity from the pane env instead"
+    "utils/opencode_config.py::translate_mcp_server_config": DROPS_AT_INSTALL_TIME
+    + (
+        "; the translation into opencode.json. OpenCode applies an entry's "
+        "`environment` over the pane env its MCP children inherit, so only an "
+        "ABSENT key is inherited, which is why a declared one is removed here"
     ),
     # -- providers that deliberately do not let the forwarder decide -------
     "providers/antigravity_cli.py::_register_mcp_servers": (
@@ -230,6 +266,7 @@ ALLOWED_OCCURRENCES: Dict[str, int] = {
     "security/mcp_tool_gate.py::caller_is_bound": 1,
     "services/vault/reader.py::_resolve_injection_policy": 1,
     "utils/mcp_resolution.py::<module>": 2,
+    "utils/mcp_resolution.py::drop_declared_terminal_identity": 3,
     "utils/mcp_resolution.py::forward_terminal_identity": 3,
     "utils/mcp_resolution.py::resolve_mcp_server_config": 0,
     "utils/opencode_config.py::translate_mcp_server_config": 0,
@@ -264,6 +301,7 @@ SENTINELS = {
     "providers/omp.py::_write_extension_root",
     "security/mcp_tool_gate.py::caller_is_bound",
     "services/vault/reader.py::_resolve_injection_policy",
+    "utils/mcp_resolution.py::drop_declared_terminal_identity",
     "utils/mcp_resolution.py::forward_terminal_identity",
     "utils/opencode_config.py::translate_mcp_server_config",
     "utils/orchestration.py::_current_terminal_id",
@@ -411,6 +449,11 @@ def sites_in_source(source: str, rel: str) -> Dict[str, dict]:
         for node in ast.walk(tree)
         if isinstance(node, ast.Call) and _callee(node) == FORWARDER
     }
+    dropping: Set[str] = {
+        owner.get(id(node), "<module>")
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _callee(node) == DROPPER
+    }
     found: Dict[str, dict] = {}
     for node in ast.walk(tree):
         kind = None if id(node) in discarded else _identity_occurrence(node, names)
@@ -420,7 +463,7 @@ def sites_in_source(source: str, rel: str) -> Dict[str, dict]:
             # A forwarding call is itself a site, so every function that settles
             # the identity is enumerated and SENTINELS can pin one that would
             # otherwise vanish from the walk.
-            if called in MCP_WRITER_CALLS or called == FORWARDER:
+            if called in MCP_WRITER_CALLS or called in (FORWARDER, DROPPER):
                 kind = f"{called}()"
         if kind is None:
             continue
@@ -432,6 +475,7 @@ def sites_in_source(source: str, rel: str) -> Dict[str, dict]:
                 "occurrences": 0,
                 "line": getattr(node, "lineno", 0),
                 "forwards": function in forwarding,
+                "drops": function in dropping,
             },
         )
         entry["kinds"].add(kind)
@@ -523,6 +567,27 @@ def test_an_allowlisted_site_may_not_grow_a_new_identity_occurrence():
         "write may now be hiding behind a reason given for a read. Re-read the "
         "site and update the count:\n  " + "\n  ".join(drifted)
     )
+
+
+def test_every_install_time_writer_drops_a_declared_identity():
+    """The two writers that cannot forward must drop; and no one else claims to.
+
+    Mutation-checked: deleting the ``drop_declared_terminal_identity`` call from
+    either site fails here, as well as in the behavioural tests that read the
+    installed files (``test_terminal_identity_forwarding.py``).
+    """
+    assert INSTALL_TIME_DROPPERS <= set(ALLOWED)
+    not_dropping = sorted(key for key in INSTALL_TIME_DROPPERS if not SITES[key]["drops"])
+    assert not not_dropping, (
+        "install-time MCP writer(s) classified as dropping a declared "
+        f"CAO_TERMINAL_ID that no longer call {DROPPER}: {not_dropping}"
+    )
+    claimed = sorted(key for key, why in ALLOWED.items() if DROPS_AT_INSTALL_TIME in why)
+    assert claimed == sorted(INSTALL_TIME_DROPPERS)
+    unlisted = sorted(
+        key for key, info in SITES.items() if info["drops"] and key not in INSTALL_TIME_DROPPERS
+    )
+    assert not unlisted, f"sites that call {DROPPER} but are not listed: {unlisted}"
 
 
 # One snippet per shape review 3 showed the round-3 walker missing, plus the
