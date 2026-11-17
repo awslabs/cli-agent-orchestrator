@@ -21,12 +21,14 @@ interface CustomSelectProps {
   /** Validation-error styling: thick red boundary on the trigger. Additive; default unchanged. */
   invalid?: boolean
   searchable?: boolean
+  searchPlaceholder?: string
+  noResultsMessage?: string
 }
 
 /** Menu height cap; also used to decide when to flip the menu upward. */
 const MENU_MAX_H = 256
 
-export function CustomSelect({ value, onChange, options, placeholder = 'Select...', className = '', ariaLabel, invalid = false, searchable = false }: CustomSelectProps) {
+export function CustomSelect({ value, onChange, options, placeholder = 'Select...', className = '', ariaLabel, invalid = false, searchable = false, searchPlaceholder = 'Search options...', noResultsMessage = 'No options match' }: CustomSelectProps) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [active, setActive] = useState<string | null>(null)
@@ -128,7 +130,10 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
       e.preventDefault()
       const index = enabled.findIndex(opt => opt.value === activeOption?.value)
-      const next = index < 0 ? (e.key === 'ArrowDown' ? 0 : enabled.length - 1)
+      // Start at the confirmed value only in an unfiltered list; subsequent
+      // arrows follow rendered group order and stop at the enabled extremes.
+      const selectedIndex = terms.length === 0 ? enabled.findIndex(opt => opt.value === value) : -1
+      const next = index < 0 ? (selectedIndex >= 0 ? selectedIndex : e.key === 'ArrowDown' ? 0 : enabled.length - 1)
         : Math.max(0, Math.min(enabled.length - 1, index + (e.key === 'ArrowDown' ? 1 : -1)))
       const option = enabled[next]
       setActive(option?.value ?? null)
@@ -174,11 +179,14 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
       {open && createPortal(
         <div
           ref={menuRef}
-          // Deliberately role-less (matching the pre-portal behaviour): a
-          // role="listbox" whose children are plain buttons announces a list
-          // box with zero items to assistive technology (#692 review). The
-          // complete combobox/option pattern changes the trigger's role for
-          // every consumer and is deferred to a dedicated follow-up.
+          // The outer container has no role. Normal mode retains plain buttons;
+          // searchable mode uses an input combobox with listbox/option semantics.
+          onMouseDown={searchable ? e => {
+            const target = e.target as Element
+            // Preserve mouse editing and future internal controls. Option buttons
+            // use virtual focus, so noninteractive surfaces keep focus in the input.
+            if (!target.closest('input, textarea, select, a[href], [contenteditable]:not([contenteditable="false"]), [tabindex]:not([tabindex="-1"]), button:not([role="option"])')) e.preventDefault()
+          } : undefined}
           data-testid="custom-select-menu"
           style={{ position: 'fixed', left: pos.left, width: pos.width, top: pos.top, bottom: pos.bottom, maxHeight: MENU_MAX_H }}
           className="z-80 bg-gray-900 border border-gray-700 rounded-lg shadow-xl shadow-black/30 overflow-y-auto"
@@ -197,8 +205,11 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
               onKeyDown={handleSearchKey}
               onCompositionStart={() => { composing.current = true }}
               onCompositionEnd={() => { composing.current = false }}
-              onBlur={e => { if (!menuRef.current?.contains(e.relatedTarget as Node | null)) setOpen(false) }}
-              placeholder="Search profiles..."
+              onBlur={e => {
+                const target = e.relatedTarget as Node | null
+                if (!ref.current?.contains(target) && !menuRef.current?.contains(target)) setOpen(false)
+              }}
+              placeholder={searchPlaceholder}
               className="w-full bg-gray-900 text-gray-200 text-sm px-3 py-2 border-b border-gray-700 focus:outline-hidden"
             />
           )}
@@ -220,7 +231,6 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
                   aria-selected={searchable ? value === opt.value : undefined}
                   aria-disabled={searchable && opt.disabled ? true : undefined}
                   tabIndex={searchable ? -1 : undefined}
-                  onMouseDown={searchable ? e => e.preventDefault() : undefined}
                   disabled={opt.disabled}
                   onClick={() => {
                     if (searchable) select(opt)
@@ -229,10 +239,12 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
                   className={`w-full text-left px-3 py-2 flex items-center justify-between transition-colors ${
                     opt.disabled
                       ? 'text-gray-600 cursor-not-allowed'
-                      : value === opt.value || (searchable && activeOption?.value === opt.value)
+                      : value === opt.value
                         ? 'bg-emerald-900/30 text-emerald-300'
-                        : 'text-gray-300 hover:bg-gray-800'
-                  }`}
+                        : searchable && activeOption?.value === opt.value
+                          ? 'bg-gray-800 text-gray-300'
+                          : 'text-gray-300 hover:bg-gray-800'
+                  } ${searchable && activeOption?.value === opt.value ? 'ring-2 ring-inset ring-emerald-400' : ''}`}
                 >
                   <div className="min-w-0">
                     <span className="text-sm block truncate">{opt.label}</span>
@@ -247,7 +259,7 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
           ))}
           </div>
           {searchable && visible.length === 0 && options.length > 0 && (
-            <div role="status" className="px-3 py-4 text-sm text-gray-500 text-center">No profiles match</div>
+            <div role="status" className="px-3 py-4 text-sm text-gray-500 text-center">{noResultsMessage}</div>
           )}
           {options.length === 0 && (
             <div className="px-3 py-4 text-sm text-gray-500 text-center">No options available</div>

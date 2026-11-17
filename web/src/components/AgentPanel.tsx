@@ -622,6 +622,8 @@ export function AgentPanel() {
                 ) : profiles.length > 0 ? (
                   <CustomSelect
                     searchable
+                    searchPlaceholder="Search profiles..."
+                    noResultsMessage="No profiles match"
                     ariaLabel="Agent Profile"
                     value={profile}
                     onChange={setProfile}
