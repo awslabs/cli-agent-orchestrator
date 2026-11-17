@@ -19,6 +19,7 @@ from cli_agent_orchestrator.clients.database import (
     VaultExclusionModel,
     VaultNoteModel,
 )
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 
 @pytest.fixture
@@ -33,7 +34,7 @@ def isolated_db(tmp_path, monkeypatch):
 
 
 def _secondary_indexes(db_path: Path) -> set[str]:
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         return {
             row[1]
             for row in conn.execute("PRAGMA index_list(memory_metadata)")
@@ -42,7 +43,7 @@ def _secondary_indexes(db_path: Path) -> set[str]:
 
 
 def _create_legacy_memory_metadata(db_path: Path, *, related_keys: str | None = None) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         conn.execute("""
             CREATE TABLE memory_metadata (
                 id VARCHAR NOT NULL PRIMARY KEY,
@@ -96,7 +97,7 @@ def test_fresh_database_has_vault_schema_and_secondary_indexes(isolated_db):
 
     db_mod.init_db()
 
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         columns = {row[1]: row for row in conn.execute("PRAGMA table_info(memory_metadata)")}
         vault_note_columns = {row[1]: row for row in conn.execute("PRAGMA table_info(vault_note)")}
         vault_exclusion_columns = {
@@ -138,7 +139,7 @@ def test_legacy_database_rebuilds_once_preserves_rows_and_indexes(isolated_db, m
     db_mod.init_db()
     db_mod.init_db()
 
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         row = conn.execute(
             "SELECT key, source_kind FROM memory_metadata WHERE key = 'legacy'"
         ).fetchone()
@@ -233,7 +234,7 @@ def test_rebuild_omits_related_keys_check_and_preserves_overlong_value(isolated_
 
     db_mod.init_db()
 
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         columns = {row[1]: row for row in conn.execute("PRAGMA table_info(memory_metadata)")}
         ddl = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memory_metadata'"
@@ -310,7 +311,7 @@ def test_vault_exclusion_migration_backfills_excluded_notes_idempotently(isolate
     db_mod.init_db()
     db_mod.init_db()
 
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(vault_exclusion)")}
     with sessionmaker(bind=engine)() as session:
         rows = session.query(VaultExclusionModel).all()
@@ -357,7 +358,7 @@ def test_vault_exclusion_helper_fallback_ddl_has_nullable_provenance_columns(iso
 
     db_mod._migrate_vault_exclusions()
 
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         columns = {row[1]: row for row in conn.execute("PRAGMA table_info(vault_exclusion)")}
 
     assert set(columns) == {
@@ -380,7 +381,7 @@ def test_fresh_database_has_exact_vault_migration_receipt_schema(isolated_db):
 
     db_mod.init_db()
 
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         columns = {
             row[1]: row for row in conn.execute("PRAGMA table_info(vault_migration_receipt)")
         }
@@ -431,13 +432,13 @@ def test_fresh_database_has_exact_vault_migration_receipt_schema(isolated_db):
 
 def test_legacy_database_adds_vault_migration_receipt_idempotently(isolated_db):
     db_path, _ = isolated_db
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         conn.execute("CREATE TABLE unrelated_legacy_state (id TEXT PRIMARY KEY)")
 
     db_mod.init_db()
     db_mod.init_db()
 
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(vault_migration_receipt)")}
         unrelated = conn.execute(
             "SELECT sql FROM sqlite_master " "WHERE type='table' AND name='unrelated_legacy_state'"
@@ -463,7 +464,7 @@ def test_legacy_database_adds_vault_migration_receipt_idempotently(isolated_db):
 
 def test_legacy_vault_provenance_columns_are_nullable_lossless_and_idempotent(isolated_db):
     db_path, _ = isolated_db
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         conn.execute("""
             CREATE TABLE vault_note (
                 note_uid VARCHAR NOT NULL PRIMARY KEY,
@@ -510,7 +511,7 @@ def test_legacy_vault_provenance_columns_are_nullable_lossless_and_idempotent(is
     db_mod.init_db()
     db_mod.init_db()
 
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         note_columns = {row[1]: row for row in conn.execute("PRAGMA table_info(vault_note)")}
         exclusion_columns = {
             row[1]: row for row in conn.execute("PRAGMA table_info(vault_exclusion)")
@@ -536,7 +537,7 @@ def test_vault_key_provenance_migration_is_a_noop_without_vault_tables(isolated_
 
     db_mod._migrate_vault_key_provenance()
 
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         tables = {
             row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
@@ -573,13 +574,13 @@ def test_vault_key_provenance_migration_upgrades_only_existing_legacy_table(
 ):
     db_path, _ = isolated_db
     absent_table = "vault_exclusion" if table == "vault_note" else "vault_note"
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         conn.execute(legacy_schema)
 
     db_mod._migrate_vault_key_provenance()
     db_mod._migrate_vault_key_provenance()
 
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         tables = {
             row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
@@ -592,20 +593,20 @@ def test_vault_key_provenance_migration_upgrades_only_existing_legacy_table(
 def test_source_kind_migration_failure_propagates(isolated_db):
     db_path, _ = isolated_db
     _create_legacy_memory_metadata(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         conn.execute("CREATE TABLE memory_metadata_new (id TEXT)")
 
     with pytest.raises(sqlite3.OperationalError, match="already exists"):
         db_mod.init_db()
 
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_metadata)")}
     assert "source_kind" not in columns
 
 
 def test_source_kind_migration_ignores_database_without_memory_metadata(isolated_db):
     db_path, _ = isolated_db
-    with sqlite3.connect(db_path) as conn:
+    with closing_transaction(sqlite3.connect(db_path)) as conn:
         conn.execute("CREATE TABLE workflow_only (id TEXT PRIMARY KEY)")
 
     db_mod._migrate_memory_source_kind()

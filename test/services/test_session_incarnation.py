@@ -18,6 +18,7 @@ from cli_agent_orchestrator.services import flow_service as fs
 from cli_agent_orchestrator.services import session_service as ss
 from cli_agent_orchestrator.services import terminal_service as ts
 from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 
 @pytest.fixture(autouse=True)
@@ -75,7 +76,7 @@ def test_legacy_schema_migration_creates_pointer_table_idempotently(tmp_path, mo
     from cli_agent_orchestrator import constants
 
     path = tmp_path / "legacy.db"
-    with sqlite3.connect(path) as conn:
+    with closing_transaction(sqlite3.connect(path)) as conn:
         conn.execute(
             "CREATE TABLE terminals (id TEXT PRIMARY KEY, tmux_session TEXT, tmux_window TEXT, "
             "provider TEXT, agent_profile TEXT, last_active DATETIME)"

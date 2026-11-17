@@ -50,6 +50,7 @@ from cli_agent_orchestrator.clients.database import (
     update_terminal_shell_command,
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 
 @pytest.fixture
@@ -58,7 +59,8 @@ def test_db():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
     TestSession = sessionmaker(bind=engine)
-    return TestSession
+    yield TestSession
+    engine.dispose()
 
 
 class TestTerminalOperations:
@@ -1957,7 +1959,7 @@ class TestTerminalsSchemaMigration:
         from cli_agent_orchestrator.clients import database as db_mod
 
         db_file = tmp_path / "legacy.db"
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             conn.execute(
                 "CREATE TABLE terminals ("
                 "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, "
@@ -1978,7 +1980,7 @@ class TestTerminalsSchemaMigration:
 
         db_mod._migrate_terminals_schema()
 
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(terminals)")}
             rows = conn.execute(
                 "SELECT id, caller_id, working_directory, model, model_honored FROM terminals"
@@ -1995,7 +1997,7 @@ class TestTerminalsSchemaMigration:
         assert rows == [
             ("abc12345", None, None, None, None)
         ], "existing rows must get NULL launch-model values"
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             ceilings = conn.execute("SELECT delegate_tools FROM terminals").fetchall()
         assert ceilings == [(None,)], "pre-migration rows have no recorded ceiling"
 
@@ -2006,7 +2008,7 @@ class TestTerminalsSchemaMigration:
         from cli_agent_orchestrator.clients import database as db_mod
 
         db_file = tmp_path / "current.db"
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             conn.execute(
                 "CREATE TABLE terminals ("
                 "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, "
@@ -2022,7 +2024,7 @@ class TestTerminalsSchemaMigration:
         db_mod._migrate_terminals_schema()
         db_mod._migrate_terminals_schema()
 
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
         assert columns.count("caller_id") == 1
         assert columns.count("working_directory") == 1
@@ -2045,7 +2047,7 @@ class TestTerminalsSchemaMigration:
         from cli_agent_orchestrator.clients import database as db_mod
 
         db_file = tmp_path / "pre432.db"
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             conn.execute(
                 "CREATE TABLE terminals ("
                 "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, "
@@ -2065,7 +2067,7 @@ class TestTerminalsSchemaMigration:
 
         db_mod._migrate_terminals_schema()
 
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(terminals)")}
             rows = conn.execute('SELECT id, "group", "metadata" FROM terminals').fetchall()
         assert {"group", "metadata"} <= columns
@@ -2078,7 +2080,7 @@ class TestTerminalsSchemaMigration:
         from cli_agent_orchestrator.clients import database as db_mod
 
         db_file = tmp_path / "pre432_twice.db"
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             conn.execute(
                 "CREATE TABLE terminals ("
                 "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, "
@@ -2093,12 +2095,14 @@ class TestTerminalsSchemaMigration:
         db_mod._migrate_terminals_schema()
         db_mod._migrate_terminals_schema()
 
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
         assert columns.count("group") == 1
         assert columns.count("metadata") == 1
 
-    def test_real_production_upgrade_seeded_rows_survive_init_db(self, tmp_path, monkeypatch):
+    def test_real_production_upgrade_seeded_rows_survive_init_db(
+        self, tmp_path, monkeypatch, request
+    ):
         """tedswinyar, PR #433 review: every other migration test here starts
         from an empty database and only checks the resulting schema. This is
         the actual production-upgrade case -- a DB with SEVERAL pre-#432
@@ -2117,7 +2121,7 @@ class TestTerminalsSchemaMigration:
         from cli_agent_orchestrator.clients import database as db_mod
 
         db_file = tmp_path / "prod_upgrade.db"
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             conn.execute(
                 "CREATE TABLE terminals ("
                 "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, "
@@ -2171,6 +2175,7 @@ class TestTerminalsSchemaMigration:
         new_engine = create_engine(
             f"sqlite:///{db_file}", connect_args={"check_same_thread": False}
         )
+        request.addfinalizer(new_engine.dispose)
         monkeypatch.setattr(db_mod, "engine", new_engine)
         monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=new_engine))
         monkeypatch.setattr(
@@ -2207,7 +2212,7 @@ class TestTerminalsSchemaMigration:
         db_mod.init_db()
         assert_seeded_rows_intact()
 
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
         assert columns.count("group") == 1
         assert columns.count("metadata") == 1
@@ -2215,7 +2220,7 @@ class TestTerminalsSchemaMigration:
         assert columns.count("model") == 1
         assert columns.count("model_honored") == 1
         # create_all adds new tables to old databases, including decision records.
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             indexes = conn.execute(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = ?"
                 " AND name NOT LIKE 'sqlite_autoindex%'",
@@ -2229,7 +2234,7 @@ class TestTerminalMetadataRoundTrip:
     """Terminal metadata used by orchestration surfaces must round-trip."""
 
     def test_caller_id_and_working_directory_round_trip_through_real_db(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, request
     ):
         """create_terminal persists ownership metadata; reads return it."""
         from sqlalchemy import create_engine
@@ -2238,6 +2243,7 @@ class TestTerminalMetadataRoundTrip:
         from cli_agent_orchestrator.clients import database as db_mod
 
         engine = create_engine(f"sqlite:///{tmp_path / 'rt.db'}")
+        request.addfinalizer(engine.dispose)
         Base.metadata.create_all(bind=engine)
         monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
 
@@ -2258,7 +2264,7 @@ class TestTerminalMetadataRoundTrip:
         assert fetched["caller_id"] == "def67890"
         assert fetched["working_directory"] == "/workspace/project"
 
-    def test_nullable_metadata_defaults_to_none(self, tmp_path, monkeypatch):
+    def test_nullable_metadata_defaults_to_none(self, tmp_path, monkeypatch, request):
         """Operator-launched terminals without optional metadata round-trip NULL."""
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
@@ -2266,6 +2272,7 @@ class TestTerminalMetadataRoundTrip:
         from cli_agent_orchestrator.clients import database as db_mod
 
         engine = create_engine(f"sqlite:///{tmp_path / 'rt2.db'}")
+        request.addfinalizer(engine.dispose)
         Base.metadata.create_all(bind=engine)
         monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
 
@@ -2278,7 +2285,9 @@ class TestTerminalMetadataRoundTrip:
         assert fetched["caller_id"] is None
         assert fetched["working_directory"] is None
 
-    def test_session_incarnation_round_trips_through_all_session_reads(self, tmp_path, monkeypatch):
+    def test_session_incarnation_round_trips_through_all_session_reads(
+        self, tmp_path, monkeypatch, request
+    ):
         """Durable session incarnation identity is returned by every session read."""
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
@@ -2286,6 +2295,7 @@ class TestTerminalMetadataRoundTrip:
         from cli_agent_orchestrator.clients import database as db_mod
 
         engine = create_engine(f"sqlite:///{tmp_path / 'incarnation.db'}")
+        request.addfinalizer(engine.dispose)
         Base.metadata.create_all(bind=engine)
         monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
 
@@ -2306,7 +2316,7 @@ class TestTerminalMetadataRoundTrip:
 
     @pytest.mark.parametrize("model_honored", [True, False])
     def test_launch_model_round_trips_through_terminal_record(
-        self, tmp_path, monkeypatch, model_honored
+        self, tmp_path, monkeypatch, model_honored, request
     ):
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
@@ -2314,6 +2324,7 @@ class TestTerminalMetadataRoundTrip:
         from cli_agent_orchestrator.clients import database as db_mod
 
         engine = create_engine(f"sqlite:///{tmp_path / 'model.db'}")
+        request.addfinalizer(engine.dispose)
         Base.metadata.create_all(bind=engine)
         monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
 
@@ -2347,7 +2358,7 @@ class TestProjectAliasMigration:
         from cli_agent_orchestrator.clients import database as db_mod
 
         db_file = tmp_path / "legacy.db"
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             conn.execute(
                 "CREATE TABLE project_aliases ("
                 "project_id TEXT NOT NULL, alias TEXT NOT NULL, kind TEXT NOT NULL, "
@@ -2363,7 +2374,7 @@ class TestProjectAliasMigration:
 
         db_mod._migrate_project_aliases_schema()
 
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             exists = conn.execute(
                 "SELECT name FROM sqlite_master " "WHERE type='table' AND name='project_aliases'"
             ).fetchone()
@@ -2376,7 +2387,7 @@ class TestProjectAliasMigration:
         from cli_agent_orchestrator.clients import database as db_mod
 
         db_file = tmp_path / "current.db"
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             conn.execute(
                 "CREATE TABLE project_aliases ("
                 "alias TEXT PRIMARY KEY, project_id TEXT NOT NULL, kind TEXT NOT NULL, "
@@ -2392,7 +2403,7 @@ class TestProjectAliasMigration:
 
         db_mod._migrate_project_aliases_schema()
 
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             rows = conn.execute("SELECT alias, project_id FROM project_aliases").fetchall()
         assert rows == [("a1", "p1")], "current-schema table must be left intact"
 
@@ -2424,7 +2435,7 @@ class TestMemoryScopeNullUniquenessMigration:
         engine = create_engine(f"sqlite:///{db_file}")
         Base.metadata.create_all(bind=engine)
         engine.dispose()
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             conn.execute("DROP INDEX IF EXISTS uq_memory_key_scope_null")
             for path in dupe_paths:
                 conn.execute(
@@ -2461,7 +2472,7 @@ class TestMemoryScopeNullUniquenessMigration:
         db_file = self._legacy_db(tmp_path, monkeypatch)
         db_mod._migrate_memory_scope_null_uniqueness()
 
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             names = {r[1] for r in conn.execute("PRAGMA index_list('memory_metadata')")}
         assert "uq_memory_key_scope_null" in names
 
@@ -2478,7 +2489,7 @@ class TestMemoryScopeNullUniquenessMigration:
 
         assert any("uq_memory_key_scope_null" in r.message for r in caplog.records)
         assert any("cao memory repair" in r.message for r in caplog.records)
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             names = {r[1] for r in conn.execute("PRAGMA index_list('memory_metadata')")}
             rows = conn.execute("SELECT COUNT(*) FROM memory_metadata").fetchone()[0]
         assert "uq_memory_key_scope_null" not in names
@@ -2501,7 +2512,7 @@ class TestMemoryScopeNullUniquenessMigration:
             "## 2026-07-15T01:00:00Z\ndurable body\n",
             encoding="utf-8",
         )
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             conn.execute(
                 "UPDATE memory_metadata SET file_path = ? WHERE file_path = '/1.md'",
                 (str(topic),),
@@ -2513,7 +2524,7 @@ class TestMemoryScopeNullUniquenessMigration:
             assert report.counts["dedupe_metadata"] == 1
         finally:
             engine.dispose()
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_file))) as conn:
             names = {r[1] for r in conn.execute("PRAGMA index_list('memory_metadata')")}
             rows = conn.execute("SELECT COUNT(*) FROM memory_metadata").fetchone()[0]
         assert rows == 1, "the canonical row survives the advertised repair"
@@ -2540,7 +2551,8 @@ class TestListTerminalsInSessions:
             "cli_agent_orchestrator.clients.database.SessionLocal",
             Local,
         )
-        return Local
+        yield Local
+        engine.dispose()
 
     @staticmethod
     def _add(Local, terminal_id, tmux_session, agent_profile="developer"):
