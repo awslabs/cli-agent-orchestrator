@@ -80,7 +80,7 @@ class RankingConfig(BaseModel):
 class MemoryConfig(BaseModel):
     enabled: bool = True
     explain_enabled: bool = True
-    non_accessing_inspection: bool = False
+    non_accessing_inspection: bool = True
     lifecycle: LifecycleConfig = Field(default_factory=LifecycleConfig)
     injection: InjectionConfig = Field(default_factory=InjectionConfig)
     ranking: RankingConfig = Field(default_factory=RankingConfig)
@@ -230,7 +230,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_WS_ALLOWED_ORIGINS": ("network.ws_allowed_origins", "list", []),
     "CAO_MEMORY_ENABLED": ("memory.enabled", "bool", True),
     "CAO_MEMORY_EXPLAIN_ENABLED": ("memory.explain_enabled", "bool", True),
-    "CAO_MEMORY_NON_ACCESSING_INSPECTION": ("memory.non_accessing_inspection", "bool", False),
+    "CAO_MEMORY_NON_ACCESSING_INSPECTION": ("memory.non_accessing_inspection", "bool", True),
     "CAO_MEMORY_LIFECYCLE_ENABLED": ("memory.lifecycle.enabled", "bool", False),
     "CAO_MEMORY_LINT_ENABLED": ("memory.lint_enabled", "bool", True),
     "CAO_MEMORY_COMPILE_MODE": ("memory.compile_mode", "str", "llm"),

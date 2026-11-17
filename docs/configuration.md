@@ -61,7 +61,7 @@ Every derived path resolves from this value, so one override moves everything â€
     "compile_mode": "llm",
     "flush_threshold": 0.85,
     "explain_enabled": true,
-    "non_accessing_inspection": false,
+    "non_accessing_inspection": true,
     "lifecycle": {"enabled": false},
     "compile_timeout_s": 120.0
   },
@@ -227,7 +227,7 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 | `injection.v1_fixes` | `true` | Enable project-alias traversal, per-scope clipping, and skip-oversized injection hygiene fixes. |
 | `injection.write_project_files` | `false` | Opt into legacy provider memory writes under the terminal working directory. By default, CAO delivers memory through the first-message or provider start-prompt route and cleans up its old project-file blocks. |
 | `ranking.default_sort` | `"recency"` | Default query recall ranking: `recency` preserves hybrid recall, while `bm25` opts into BM25-first results. No-query listings remain recency ordered. Nested under `memory.ranking`. |
-| `non_accessing_inspection` | `false` | CLI list/show and HTTP GET memory views skip access counters when on. MCP/internal recall still counts. Env override: `CAO_MEMORY_NON_ACCESSING_INSPECTION`; read errors leave it off. |
+| `non_accessing_inspection` | `true` | CLI list/show and HTTP GET memory views skip access counters when on. MCP recall still counts; internal recall defaults to counting but accepts `record_access=false`. Env override: `CAO_MEMORY_NON_ACCESSING_INSPECTION`; read errors leave non-accessing inspection on. |
 | `explain_enabled` | `true` | On-demand `cao memory list --query Q --explain` diagnostic. Env override: `CAO_MEMORY_EXPLAIN_ENABLED` (env > file > default). Does not alter recall defaults or gate `sort_by="relevance"`. |
 | `flush_threshold` | `0.85` | Context-usage fraction that triggers a memory flush. |
 | `compile_timeout_s` | `120.0` | Wall-clock timeout for the wiki compile call. |

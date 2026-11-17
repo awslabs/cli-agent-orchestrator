@@ -353,21 +353,53 @@ it does **not** undo score/relevance demotion. Supersedes cycles exclude both
 ends, and a persistent curator can still restate guidance recalled earlier.
 The diagnostic includes `lifecycle_enabled` to identify the active flag state.
 
-### Non-accessing operator inspection (opt-in)
+### Non-accessing operator inspection
 
-`cao config set memory.non_accessing_inspection true` or
-`CAO_MEMORY_NON_ACCESSING_INSPECTION=true` makes CLI list/show and HTTP
-`GET /memory`, `GET /memory/{key}` pass `record_access=False`. Environment
-beats file; the default and read-error fallback are false. Results and related
-expansion are unchanged, but these operator views no longer increase
-`access_count` or `last_accessed_at`. Agent feedback lessons therefore cannot
-become promotion-eligible merely from repeated operator inspection.
+CLI list/show and HTTP `GET /memory`, `GET /memory/{key}` pass
+`record_access=False` by default. Results and related expansion are unchanged,
+but these operator views do not increase `access_count` or `last_accessed_at`.
+Agent feedback lessons therefore cannot become promotion-eligible merely from
+repeated operator inspection.
 
-MCP `memory_recall` and `/internal/memory/recall` retain the default
-`record_access=True` regardless of this switch. CLI clear and HTTP DELETE are
-outside its scope. Disabling it restores existing operator access counting.
-The service's keyword-only `record_access` parameter defaults to true; explain
-continues to avoid access bookkeeping independently of this flag.
+Environment beats file; the default and read-error fallback are true.
+`cao config set memory.non_accessing_inspection false` or
+`CAO_MEMORY_NON_ACCESSING_INSPECTION=false` restores access counting for those
+operator views. MCP `memory_recall` still counts. `/internal/memory/recall`
+accepts an optional `record_access` boolean that defaults to true, so benchmarks
+can explicitly avoid reinforcement. CLI clear and HTTP DELETE are outside the
+setting's scope. The service's keyword-only `record_access` parameter also
+defaults to true; explain avoids access bookkeeping independently of this flag.
+
+### Fixture doctor
+
+`cao memory doctor --fixtures` finds known synthetic test residue and reports
+matching files plus the number and byte volume of matching audit events. It is
+a read-only dry-run unless `--apply` is present.
+
+Applying requires a separate backup directory:
+
+```bash
+cao memory doctor --fixtures --apply --backup /path/to/new-backup
+```
+
+CAO copies every matching fixture topic file to the backup before changing the
+memory home, then moves those files into `memory/.quarantine/`; it never deletes
+them. Audit-log day files under `logs/memory/` are report-only: their matching
+fixture events and bytes are counted in dry-run and apply output, but the files
+are never copied, moved, or otherwise changed because they may also contain real
+events. The detector recognises the `topic-x`/`topic-y` fixture keys, the
+synthetic retrospector lesson, `b-<hex8>` and `scope_id=project` relationship
+events, and `transformer` instruction-promotion events. For each quarantined
+native topic, apply also removes its `index.md` entry and SQLite metadata row;
+the backup and quarantined copy retain the original file.
+
+### Key truncation
+
+Memory keys remain capped at 60 characters. When an explicit `memory_store`
+key is cut to that limit, its success result adds `key_truncated: true` and
+`requested_key`; ordinary store results are unchanged. Link targets pass through
+the same key sanitiser, so a full long target resolves to its stored truncated
+key, and `cao memory lint` reports `related_keys` targets that needed truncation.
 
 ### On-demand relevance explain
 

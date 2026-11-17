@@ -43,6 +43,7 @@ def defaults(request, monkeypatch):
             monkeypatch.setenv(name, value)
         else:
             monkeypatch.delenv(name, raising=False)
+    return request.param
 
 
 def _guard_distinct_bm25_matches(monkeypatch):
@@ -341,7 +342,7 @@ class TestInjectionParity:
 
 class TestInspectionParity:
     @pytest.mark.parametrize("surface", ["list", "show", "http-list", "http-show"])
-    def test_operator_reads_bump_access(self, corpus, monkeypatch, surface):
+    def test_operator_reads_follow_inspection_setting(self, corpus, monkeypatch, surface, defaults):
         from cli_agent_orchestrator.api import main
         from cli_agent_orchestrator.cli.commands import memory
 
@@ -362,4 +363,4 @@ class TestInspectionParity:
                 params={"scope": "global"},
             )
             assert response.status_code == 200, response.text
-        assert _row(engine, "global-new").access_count == before + 1
+        assert _row(engine, "global-new").access_count == before + int(defaults == "explicit")
