@@ -96,7 +96,7 @@ CAO maps its concepts to herdr primitives:
 
 ### Event-driven inbox delivery
 
-`HerdrInboxService` connects to the herdr Unix socket at startup and subscribes to `pane.agent_status_changed` events for each managed pane. When a pane transitions to `idle` or `done`, pending inbox messages are delivered immediately.
+`HerdrInboxService` connects to the herdr Unix socket at startup and subscribes, in one `events.subscribe` call, to `pane.agent_status_changed` for each managed pane (validated against a live snapshot) plus a broadcast `pane.updated` for older herdr versions. When a pane transitions to `idle` or `done`, pending inbox messages are delivered immediately. herdr permits one `events.subscribe` per connection, so a pane registered later is picked up by an intentional reconnect; the subscribe response is read, and a rejected subscription fails the connection attempt loudly instead of silently degrading delivery to the 30s reconciliation sweep. Delivery log lines carry the trigger (`trigger: herdr-event`, `settled-sweep`, `reconcile-sweep`), so a dead event path is visible in the logs.
 
 ### Startup and reconnect behavior
 

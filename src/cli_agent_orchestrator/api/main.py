@@ -1940,8 +1940,8 @@ async def lifespan(app: FastAPI):
     backend = get_backend()
     if isinstance(backend, HerdrBackend):
 
-        def deliver_inbox(terminal_id: str) -> None:
-            inbox_service.deliver_pending(terminal_id, registry=registry)
+        def deliver_inbox(terminal_id: str, source: str = "herdr") -> None:
+            inbox_service.deliver_pending(terminal_id, registry=registry, source=source)
 
         svc = HerdrInboxService(
             herdr_session=backend.herdr_session,

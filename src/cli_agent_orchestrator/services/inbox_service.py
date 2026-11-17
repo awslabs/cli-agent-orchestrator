@@ -175,6 +175,7 @@ class InboxService:
         num_messages: int = 1,
         registry: PluginRegistry | None = None,
         after_dispatch: Optional[Callable[[], None]] = None,
+        source: Optional[str] = None,
     ) -> None:
         """Deliver pending message(s) to a ready terminal. Use num_messages=0 for all.
 
@@ -211,7 +212,9 @@ class InboxService:
 
         try:
             with self._delivery_lock(terminal_id):
-                self._deliver_pending_locked(terminal_id, num_messages, registry, notify)
+                self._deliver_pending_locked(
+                    terminal_id, num_messages, registry, notify, source=source
+                )
         finally:
             notify()
 
@@ -221,6 +224,7 @@ class InboxService:
         num_messages: int,
         registry: PluginRegistry | None,
         after_dispatch: Callable[[], None] = lambda: None,
+        source: Optional[str] = None,
     ) -> None:
         limit = num_messages if num_messages > 0 else 100
         messages = get_pending_messages(terminal_id, limit=limit)
@@ -305,7 +309,16 @@ class InboxService:
                         sender_id=sender_id,
                         orchestration_type=OrchestrationType.SEND_MESSAGE,
                     )
-                logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
+                # Name the trigger when the caller supplied one: an event-driven
+                # delivery and a reconciliation-sweep delivery are otherwise
+                # indistinguishable here, which is exactly how a dead event path
+                # (herdr 0.9.x pane.updated) went unnoticed.
+                logger.info(
+                    "Delivered %d message(s) to terminal %s%s",
+                    len(batch),
+                    terminal_id,
+                    f" (trigger: {source})" if source else "",
+                )
                 # The paste is in the pane: the immediate-delivery caller may
                 # answer now. Everything below is confirmation and recovery.
                 after_dispatch()
@@ -653,6 +666,7 @@ class InboxService:
         terminal_ids: Iterable[str],
         registry: PluginRegistry | None,
         failure_label: str,
+        source: Optional[str] = None,
     ) -> None:
         """Run ``deliver_pending`` for every receiver, in parallel, failures isolated.
 
@@ -667,7 +681,9 @@ class InboxService:
             return
         with ThreadPoolExecutor(max_workers=min(len(ids), INBOX_SWEEP_FANOUT)) as pool:
             futures = {
-                pool.submit(self.deliver_pending, terminal_id, registry=registry): terminal_id
+                pool.submit(
+                    self.deliver_pending, terminal_id, registry=registry, source=source
+                ): terminal_id
                 for terminal_id in ids
             }
             for future in as_completed(futures):
@@ -687,6 +703,7 @@ class InboxService:
             list_pending_receiver_ids_by_provider(ProviderType.OPENCODE_CLI.value),
             registry,
             "OpenCode inbox poll",
+            source="opencode-poll",
         )
 
     def reconcile_orphaned_messages(self, registry: PluginRegistry | None = None) -> None:
@@ -724,6 +741,7 @@ class InboxService:
             list_pending_receiver_ids_older_than(INBOX_RECONCILE_GRACE_SECONDS),
             registry,
             "Inbox reconciliation",
+            source="reconcile-sweep",
         )
 
 
