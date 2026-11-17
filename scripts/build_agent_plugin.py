@@ -204,9 +204,9 @@ CONTRIBUTOR = PackageConfig(
         # Authoring a new provider: the skill encodes the provider contract that is
         # otherwise only discoverable by reading providers/.
         "cao-provider",
-        # Authoring an *event* plugin. Packaged under whichever name M4 settles on,
-        # since the packaged folder name must equal the frontmatter `name`.
-        "cao-plugin",
+        # Authoring an *event* plugin (renamed from `cao-plugin`, decision M4); the
+        # packaged folder name must equal the frontmatter `name`.
+        "cao-event-plugin",
         # Working on CAO itself: the dev loop, the CI gate map, dependency and
         # lockfile rules, and PR discipline. Added once PR #448 merged (#1120).
         "cao-contributing",

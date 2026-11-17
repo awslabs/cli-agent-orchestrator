@@ -10,4 +10,4 @@ CAO plugins are observer-only extensions that react to server-side events (sessi
 
 ## Authoring Your Own
 
-To scaffold a new plugin from scratch, use the **cao-plugin** skill ([`skills/cao-plugin/SKILL.md`](../../skills/cao-plugin/SKILL.md)). For the plugin API and hook contract, see [docs/plugins.md § Authoring a plugin](../../docs/plugins.md#authoring-a-plugin).
+To scaffold a new plugin from scratch, use the **cao-event-plugin** skill ([`skills/cao-event-plugin/SKILL.md`](../../skills/cao-event-plugin/SKILL.md)). For the plugin API and hook contract, see [docs/plugins.md § Authoring a plugin](../../docs/plugins.md#authoring-a-plugin).
