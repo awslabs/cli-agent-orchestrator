@@ -224,9 +224,12 @@ class Proxy(BaseHTTPRequestHandler):
             return self._send(
                 200, (EXAMPLE / "ui" / "bundle" / "index.mjs").read_bytes(), "text/javascript"
             )
-        if path.startswith("/vendor/") and "/.." not in path:
-            f = VENDOR / path[len("/vendor/") :]
-            if f.is_file() and f.resolve().is_relative_to(VENDOR.resolve()):
+        if path.startswith("/vendor/"):
+            # look the name up among the files build_vendor wrote (a flat folder) instead of
+            # joining the request path onto a directory, so no request can name another file
+            built = {p.name: p for p in VENDOR.glob("*.mjs") if p.is_file()}
+            f = built.get(path[len("/vendor/") :])
+            if f is not None:
                 return self._send(200, f.read_bytes(), "text/javascript")
         self._send(404, b"not found", "text/plain")
 

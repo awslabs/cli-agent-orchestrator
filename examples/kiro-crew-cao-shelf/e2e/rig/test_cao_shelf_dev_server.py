@@ -149,3 +149,25 @@ def test_the_built_dev_vendor_exports_every_kit_name(tmp_path: Path, monkeypatch
     wanted = set(re.findall(r"'(\w+)'", KIT_NAMES.read_text()))
     assert len(wanted) == 13
     assert wanted <= exported, f"missing from the dev vendor: {sorted(wanted - exported)}"
+
+
+def test_vendor_serves_only_the_files_the_build_wrote(
+    dev: Tuple[int, List[Tuple[str, str]]], tmp_path: Path, monkeypatch: Any
+) -> None:
+    port, _ = dev
+    vendor = tmp_path / "dev-vendor"
+    vendor.mkdir()
+    (vendor / "react.mjs").write_text("export default 1\n")
+    (tmp_path / "outside.mjs").write_text("secret\n")
+    (vendor / "notes.txt").write_text("not a module\n")
+    monkeypatch.setattr(dev_server, "VENDOR", vendor)
+    host = {"Host": f"127.0.0.1:{port}"}
+    assert send(port, "GET", "/vendor/react.mjs", host) == 200
+    for path in (
+        "/vendor/../outside.mjs",
+        "/vendor/%2e%2e/outside.mjs",
+        "/vendor/sub/react.mjs",
+        "/vendor/notes.txt",
+        "/vendor/missing.mjs",
+    ):
+        assert send(port, "GET", path, host) == 404, path
