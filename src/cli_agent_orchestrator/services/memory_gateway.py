@@ -107,10 +107,14 @@ async def store_memory(
             "terminal_context": terminal_context,
         },
     )
-    from cli_agent_orchestrator.models.memory import Memory
+    from cli_agent_orchestrator.models.memory import Memory, SupersededMemory
 
     memory = Memory.model_validate(payload["memory"])
     memory.action = payload.get("action")
+    if isinstance(payload.get("superseded"), list):
+        memory.superseded = [
+            SupersededMemory.model_validate(item) for item in payload["superseded"]
+        ]
     return memory
 
 
@@ -124,6 +128,7 @@ async def recall_memory(
     search_mode: Optional[str],
     sort_by: Optional[str],
     include_related: bool,
+    include_superseded: bool = False,
 ):
     if not remote_memory_url():
         return await MemoryService().recall(
@@ -135,6 +140,7 @@ async def recall_memory(
             search_mode=search_mode,
             sort_by=sort_by,
             include_related=include_related,
+            include_superseded=include_superseded,
         )
     body = {
         key: value
@@ -150,6 +156,8 @@ async def recall_memory(
         }.items()
         if value is not None
     }
+    if include_superseded:
+        body["include_superseded"] = True
     payload = await asyncio.to_thread(
         _post,
         "/internal/memory/recall",
@@ -194,6 +202,20 @@ async def related_memory(
         if value is not None
     }
     return await asyncio.to_thread(_post, "/internal/memory/related", body)
+
+
+async def restore_memory(
+    *,
+    key: str,
+    scope: str,
+    terminal_context: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    if not remote_memory_url():
+        return await MemoryService().restore(key, scope=scope, terminal_context=terminal_context)
+    body: dict[str, Any] = {"key": key, "scope": scope}
+    if terminal_context is not None:
+        body["terminal_context"] = terminal_context
+    return await asyncio.to_thread(_post, "/internal/memory/restore", body)
 
 
 async def forget_memory(

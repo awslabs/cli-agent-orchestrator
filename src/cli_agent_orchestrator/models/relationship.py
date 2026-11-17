@@ -4,6 +4,7 @@ VALID_TYPES = frozenset({"relates_to", "contradiction", "supersedes"})
 VALID_STATUSES = frozenset({"active", "proposal", "rejected", "superseded", "deleted"})
 VALID_ORIGINS = frozenset(
     {
+        "auto_supersede",
         "compiler",
         "content_link",
         "wiki_lint",

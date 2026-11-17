@@ -821,6 +821,7 @@ def get_memory_settings() -> Dict[str, Any]:
         "non_accessing_inspection": True,
         "parser": {"lenient": True},
         "relationships": {"content_links": False},
+        "supersede": {"auto": True},
         "lifecycle": {"enabled": False},
         "injection": dict(MEMORY_INJECTION_DEFAULTS),
         "ranking": {"default_sort": "recency"},
@@ -1058,6 +1059,19 @@ def is_memory_content_links_enabled() -> bool:
     except Exception:
         logger.warning("Failed to read memory.relationships.content_links; defaulting to False")
         return False
+
+
+def is_memory_auto_supersede_enabled() -> bool:
+    """Automatic supersede with undo (#1335 change 5): nested file value > True."""
+    try:
+        supersede = get_memory_settings().get("supersede", {})
+        if not isinstance(supersede, dict):
+            return True
+        value = supersede.get("auto", True)
+        return value if isinstance(value, bool) else True
+    except Exception:
+        logger.warning("Failed to read memory.supersede.auto; defaulting to True")
+        return True
 
 
 def is_memory_lifecycle_enabled() -> bool:
@@ -1377,6 +1391,7 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``non_accessing_inspection`` (bool) — operator reads without access bumps.
         ``parser.lenient`` (bool) — parse valid native topics without canonical timestamps.
         ``relationships.content_links`` (bool) — parse authored links into relationship edges.
+        ``supersede.auto`` (bool) — supersede replaced notes automatically, with undo.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
         ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
         ``learning_enabled`` (bool) — workflow self-learning (outcome capture).
@@ -1433,6 +1448,7 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         "non_accessing_inspection",
         "parser.lenient",
         "relationships.content_links",
+        "supersede.auto",
     }:
         if not isinstance(value, bool):
             raise ValueError(f"{key} must be a bool, got {type(value).__name__}")
@@ -1481,6 +1497,11 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
             if not isinstance(relationships, dict):
                 relationships = {}
             memory["relationships"] = {**relationships, "content_links": coerced}
+        elif key == "supersede.auto":
+            supersede = memory.get("supersede", {})
+            if not isinstance(supersede, dict):
+                supersede = {}
+            memory["supersede"] = {**supersede, "auto": coerced}
         elif key == "ranking.default_sort":
             ranking = memory.get("ranking", {})
             if not isinstance(ranking, dict):

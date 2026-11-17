@@ -19,4 +19,8 @@ file value. Disabling does not purge existing edges, and `memory_related`
 continues to show any existing human, compiler, or content-link edges; see
 [Typed relationships](memory.md#typed-relationships).
 
+`memory.supersede.auto` defaults to `true`; set it to `false` to stop memory
+stores from superseding the notes they replace. See
+[Automatic supersede and undo](memory.md#automatic-supersede-and-undo).
+
 `memory.non_accessing_inspection` defaults to `true`; see [Operator inspection](memory.md#non-accessing-operator-inspection). `CAO_MEMORY_NON_ACCESSING_INSPECTION` overrides the file value.

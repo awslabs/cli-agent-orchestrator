@@ -85,12 +85,17 @@ class RelationshipsConfig(BaseModel):
     content_links: bool = False
 
 
+class SupersedeConfig(BaseModel):
+    auto: bool = True
+
+
 class MemoryConfig(BaseModel):
     enabled: bool = True
     explain_enabled: bool = True
     non_accessing_inspection: bool = True
     parser: MemoryParserConfig = Field(default_factory=MemoryParserConfig)
     relationships: RelationshipsConfig = Field(default_factory=RelationshipsConfig)
+    supersede: SupersedeConfig = Field(default_factory=SupersedeConfig)
     lifecycle: LifecycleConfig = Field(default_factory=LifecycleConfig)
     injection: InjectionConfig = Field(default_factory=InjectionConfig)
     ranking: RankingConfig = Field(default_factory=RankingConfig)
@@ -509,6 +514,8 @@ def _get_owned_section(path: str, default: Any) -> Any:
             )
         if key == "relationships.content_links":
             return settings_service.is_memory_content_links_enabled()
+        if key == "supersede.auto":
+            return settings_service.is_memory_auto_supersede_enabled()
         if key == "ranking.default_sort":
             ranking = settings_service.get_memory_settings().get("ranking", {})
             return ranking.get("default_sort", default) if isinstance(ranking, dict) else default
@@ -691,6 +698,7 @@ _ALL_PATHS = sorted(
         "memory.compile_timeout_s",
         "memory.parser.lenient",
         "memory.relationships.content_links",
+        "memory.supersede.auto",
         "memory.ranking.default_sort",
         "memory.vault",
         "terminal.keep_finished.enabled",
@@ -783,6 +791,7 @@ class ConfigService:
                 relationships=RelationshipsConfig(
                     content_links=settings_service.is_memory_content_links_enabled()
                 ),
+                supersede=SupersedeConfig(auto=settings_service.is_memory_auto_supersede_enabled()),
                 lifecycle=LifecycleConfig(enabled=settings_service.is_memory_lifecycle_enabled()),
                 injection=InjectionConfig(
                     **{

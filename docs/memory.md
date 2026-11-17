@@ -145,6 +145,11 @@ memory_store(
 )
 ```
 
+A successful result may include `superseded`: the versions this store replaced,
+each as `{key, scope, reason, undo}`. See
+[Automatic supersede and undo](#automatic-supersede-and-undo) below. The field is
+absent when nothing was superseded.
+
 > **Storing is MCP-only.** There is no `cao memory store` command — the CLI can
 > `list`/`show`/`delete`/`clear`/`lint`/`compact`/`heal`/`export`/`import`, but *writing* a
 > memory always goes through the `memory_store` MCP tool (`import` is the one
@@ -223,7 +228,8 @@ memory_recall(
   limit=10,                # optional, default 10, max 100
   search_mode=None,        # optional: "hybrid" (default), "bm25", "metadata"
   sort_by=None,            # optional: "recency" (default), "score", "usage", "relevance"
-  include_related=False    # optional, expand cross-referenced memories
+  include_related=False,   # optional, expand cross-referenced memories
+  include_superseded=False # optional, also list notes CAO superseded automatically
 )
 ```
 
@@ -309,6 +315,78 @@ memory_forget(
 )
 ```
 
+### `memory_restore`
+
+Undo an automatic supersede that a `memory_store` result reported.
+
+```
+memory_restore(
+  key="bridge-schedule-old",
+  scope="project"           # optional, default: "project"
+)
+```
+
+If another note superseded this one, the note is visible in recall again, and a
+later store doesn't supersede it again with the same note. The result has
+`restored: "superseded_note"` and `superseded_by`. If a newer entry under this key
+replaced its previous entry, the previous entry is appended again as the newest
+entry, and the result has `restored: "previous_version"` and `restored_from`, the
+timestamp of the entry it copied. Restore checks for a superseding note first, so
+a key that has both needs a second call to bring back its previous entry. An
+absent key returns `not_found`. A key with nothing to restore returns
+`nothing_to_restore`. The caller needs the same write access as `memory_store`.
+
+### Automatic supersede and undo
+
+When an agent stores a note that replaces an existing one, CAO switches recall to
+the new note at once. There is no proposal and no approval step. Nothing is
+deleted, and every switch can be undone with `memory_restore`.
+
+The two cases:
+
+- **Same key.** A new entry under an existing key already replaces the previous
+  entry in recall, which shows the newest entry. Every earlier entry stays in the
+  topic file under its own `## <timestamp>` heading. The store result lists the
+  key with `reason: "same_key"`, unless the new entry is identical to the
+  previous one. Compiled topics show their whole body, so they are not counted.
+- **A linked, similar note.** The new note links an existing same-scope note with
+  `[[key]]` or `## See Also`, and the two say nearly the same thing. CAO adds an
+  active `supersedes` edge from the new note to the old one, with the
+  `auto_supersede` origin and the similarity as its confidence. The result lists
+  the old key with `reason: "similar"`. Similarity is the unique-token Sørensen–Dice
+  score over each note's key and content, with link markup removed. It must be at
+  least 0.70. On the synthetic evaluation fixture, real revisions score 0.76–0.80
+  and notes that only cite each other score 0.11 or less. The links come from
+  `memory.relationships.content_links`, so this case needs that opt-in setting on
+  (off by default).
+
+  A link is required as well as similarity. Templated sibling notes, such as the
+  same sentence about different hosts, often score higher than real revisions,
+  so similarity alone would hide them. Nothing happens across scopes, for
+  vault-backed notes, while the new note is itself superseded, or when any
+  `supersedes` edge already exists from the new note to the old one. That last
+  rule covers an earlier undo and human curation.
+
+A note superseded this way is hidden from default recall, `cao memory list`,
+`memory_related` and injection. It is still there:
+`memory_recall(include_superseded=True)` lists it with
+`lifecycle_status: "superseded"`, and
+`cao memory relationships list --scope <scope>` shows its `supersedes` edge to
+operators.
+Forgetting the new note removes its edges, so the old note comes back.
+`memory_restore` sets the edge to `rejected` and keeps it.
+
+Every supersede and every undo writes one line to the memory audit log
+(`logs/memory/<date>.md`): `memory_superseded` or `memory_supersede_undone`,
+with the key, scope, reason and superseding key. The line never contains note
+content.
+
+`memory.supersede.auto` defaults to `true`. Set it to `false` to stop new
+supersedes, and to show notes that were already superseded in recall and
+injection again. Their edges stay. The setting doesn't change the opt-in
+`memory.lifecycle.enabled` rules below, which apply to every active `supersedes`
+edge.
+
 ### Injection eligibility sources
 
 The in-tree `services.memory_eligibility` registry provides batch lifecycle
@@ -316,6 +394,8 @@ verdicts keyed by `(key, scope, scope_id, source_kind)`. Each enabled source is
 queried once per new candidate batch; identities are memoized only within the
 current injection build or curator recall. There is no cross-call cache or
 automatic discovery of external sources. The built-in `lifecycle.supersedes` source is disabled by default.
+The built-in `supersede.auto` source excludes notes CAO superseded automatically.
+It is enabled only while `memory.supersede.auto` is on and such an edge exists.
 
 Native entries, vault candidates and related targets are checked before their
 caps; vault exclusions happen before body loading. The same check also covers
@@ -600,8 +680,8 @@ shift. A later memory-v2 phase adds BM25 as the default ranking mode.
 Memories are linked by typed, provenance-tagged edges (`relates_to`,
 `contradiction`, `supersedes`) held in a durable store rather than inferred at
 read time. Each edge records its `origin` — `compiler`, `wiki_lint`, `human`,
-`legacy_related_keys`, `external_import`, `vault`, or `content_link` — and a
-`status`.
+`legacy_related_keys`, `external_import`, `vault`, `content_link`, or
+`auto_supersede` — and a `status`.
 
 With `memory.relationships.content_links=true` (opt-in), native topic content
 is also a relationship producer. On store and repair, same-scope

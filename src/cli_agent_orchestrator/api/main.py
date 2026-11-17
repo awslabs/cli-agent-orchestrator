@@ -11424,6 +11424,13 @@ class InternalMemoryRecallRequest(BaseModel):
     sort_by: Optional[str] = None
     include_related: bool = False
     record_access: bool = True
+    include_superseded: bool = False
+
+
+class InternalMemoryRestoreRequest(BaseModel):
+    key: LenientMemoryKey  # see InternalMemoryStoreRequest.key
+    scope: MemoryScope = MemoryScope.PROJECT
+    terminal_context: Optional[InternalMemoryContext] = None
 
 
 class InternalMemoryRelatedRequest(BaseModel):
@@ -11471,10 +11478,13 @@ async def internal_memory_store(
         )
     except MemoryPartialWriteError as error:
         return _memory_partial_write_response(error)
-    return {
+    result: Dict[str, Any] = {
         "memory": memory.model_dump(mode="json"),
         "action": memory.action,
     }
+    if memory.superseded:
+        result["superseded"] = [item.model_dump(mode="json") for item in memory.superseded]
+    return result
 
 
 @app.post("/internal/memory/recall")
@@ -11496,6 +11506,7 @@ async def internal_memory_recall(
         sort_by=body.sort_by,
         include_related=body.include_related,
         record_access=body.record_access,
+        include_superseded=body.include_superseded,
     )
     # One serializer for both recall surfaces (this route and the MCP
     # memory_recall tool); see models/memory.py.
@@ -11552,6 +11563,30 @@ async def internal_memory_related(
     if result.get("error_kind") == "ambiguous_scope":
         return JSONResponse(status_code=409, content=result)
     return result
+
+
+@app.post("/internal/memory/restore")
+async def internal_memory_restore(
+    body: InternalMemoryRestoreRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Undo an automatic supersede for a remote CAO worker (#1335)."""
+    _require_memory_enabled()
+    try:
+        return cast(
+            Dict[str, Any],
+            await _get_memory_service().restore(
+                body.key,
+                scope=body.scope.value,
+                terminal_context=(
+                    body.terminal_context.model_dump(exclude_none=True)
+                    if body.terminal_context
+                    else None
+                ),
+            ),
+        )
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
 
 
 @app.post("/internal/memory/forget")

@@ -24,7 +24,7 @@ from typing import (
 
 logger = logging.getLogger(__name__)
 _TOKEN = re.compile(r"[a-z][a-z0-9_.-]{0,63}\Z")
-EligibilityPurpose = Literal["injected_context", "curated_recall"]
+EligibilityPurpose = Literal["injected_context", "curated_recall", "explicit_recall"]
 T = TypeVar("T")
 
 
@@ -258,4 +258,76 @@ class _SnapshotSupersedesSource(SupersedesSource):
         }
 
 
+AUTO_SUPERSEDE_ORIGIN = "auto_supersede"
+
+
+class AutoSupersedeSource:
+    """Targets of CAO's own active ``auto_supersede`` edges (#1335 change 5).
+
+    Enabled only while ``memory.supersede.auto`` is on AND such an edge exists,
+    so a store that never superseded anything keeps today's paths exactly. A
+    read failure disables the source quietly: the note stays visible.
+    """
+
+    name = "supersede.auto"
+
+    def __init__(self, session_factory: Optional[Callable[[], object]] = None):
+        self._session_factory = session_factory
+
+    def _service(self):
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.services.memory_relationship_service import (
+            MemoryRelationshipService,
+        )
+
+        return MemoryRelationshipService(self._session_factory or database.SessionLocal)
+
+    def is_enabled(self) -> bool:
+        from cli_agent_orchestrator.services.settings_service import (
+            is_memory_auto_supersede_enabled,
+        )
+
+        if not is_memory_auto_supersede_enabled():
+            return False
+        try:
+            return bool(self._service().has_active("supersedes", AUTO_SUPERSEDE_ORIGIN))
+        except Exception as error:  # noqa: BLE001 - fail open: keep the note visible
+            logger.debug("auto-supersede source disabled after a read error: %s", error)
+            return False
+
+    def excluded(
+        self, request: EligibilityRequest, candidates: Sequence[MemoryIdentity]
+    ) -> Mapping[MemoryIdentity, str]:
+        groups: dict[tuple[str, Optional[str]], list[MemoryIdentity]] = {}
+        for identity in candidates:
+            if identity.source_kind == "native":
+                groups.setdefault((identity.scope, identity.scope_id), []).append(identity)
+        result: dict[MemoryIdentity, str] = {}
+        service = self._service()
+        for (scope, scope_id), members in groups.items():
+            targets = service.superseded_targets(
+                scope,
+                scope_id,
+                [identity.key for identity in members],
+                origin=AUTO_SUPERSEDE_ORIGIN,
+            )
+            result.update(
+                {identity: "superseded" for identity in members if identity.key in targets}
+            )
+        return result
+
+
+def explicit_recall_check(
+    terminal_context: Optional[dict],
+    session_factory: Optional[Callable[[], object]] = None,
+) -> Optional[EligibilityCheck]:
+    """The check default explicit recall applies: auto-superseded notes only."""
+    source = AutoSupersedeSource(session_factory)
+    if not source.is_enabled():
+        return None
+    request = EligibilityRequest.from_context("explicit_recall", terminal_context)
+    return EligibilityCheck(request, [source])
+
+
 register_source(SupersedesSource())
+register_source(AutoSupersedeSource())

@@ -2042,6 +2042,8 @@ async def memory_store(
         if key is not None and MemoryService._key_was_truncated(key):
             result["key_truncated"] = True
             result["requested_key"] = key
+        if memory.superseded:
+            result["superseded"] = [item.model_dump(mode="json") for item in memory.superseded]
         return result
     except MemoryPartialWriteError as e:
         return {
@@ -2099,6 +2101,13 @@ async def memory_recall(
             "preserves the non-expanded recall behaviour."
         ),
     ),
+    include_superseded: bool = Field(
+        default=False,
+        description=(
+            "When True, also list notes CAO superseded automatically, labelled "
+            'lifecycle_status="superseded". Default False hides them.'
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Retrieve memories matching a query and optional filters.
 
@@ -2134,6 +2143,8 @@ async def memory_recall(
                 bool(include_related) if isinstance(include_related, bool) else False
             ),
         }
+        if include_superseded is True:
+            kwargs["include_superseded"] = True
         memories = (
             await recall_memory(**kwargs)
             if remote_memory_url()
@@ -2212,6 +2223,39 @@ async def memory_related(
             limit=limit,
             terminal_context=terminal_context,
         )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def memory_restore(
+    key: str = Field(description="Key of the superseded memory to bring back"),
+    scope: str = Field(
+        default="project",
+        description=(
+            'Scope of the memory: "global", "project", "session", "agent", or "federated"'
+        ),
+    ),
+) -> Dict[str, Any]:
+    """Undo an automatic supersede that a memory_store result reported.
+
+    A note another note superseded becomes visible in recall again, and stays
+    so. A key whose newest entry replaced its previous entry gets that
+    previous entry back as the newest. Nothing is deleted either way.
+    """
+    from cli_agent_orchestrator.services.memory_gateway import remote_memory_url, restore_memory
+    from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    if not is_memory_enabled():
+        return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
+    try:
+        terminal_context = _get_terminal_context_from_env()
+        if remote_memory_url():
+            return await restore_memory(key=key, scope=scope, terminal_context=terminal_context)
+        return await MemoryService().restore(key, scope=scope, terminal_context=terminal_context)
+    except MemoryDisabledError as e:
+        return {"success": False, "disabled": True, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
