@@ -19,13 +19,26 @@ AWSTemplateFormatVersion: "2010-09-09"
 # Cost while running: the EKS control plane, the Auto Mode nodes, the NAT
 # gateway and the EFS file system bill hourly. Delete the stack when done;
 # the image repository is emptied on delete, so nothing blocks it, and the
-# control-plane log group (30-day retention) goes with it.
+# control-plane log group goes with it.
 #
-# A stack created from an earlier version of this template, which did not
-# declare the log group, cannot add it on update while the cluster's own
-# /aws/eks/<ClusterName>/cluster group exists: delete that group first
-# (aws logs delete-log-group --log-group-name /aws/eks/<ClusterName>/cluster),
-# or delete the stack and create it again.
+# Upgrading a stack created from an earlier version of this template, which
+# did not declare the log group (the cluster created its own
+# /aws/eks/<ClusterName>/cluster):
+# 1. Import the group, which keeps its logs: take the deployed template
+#    (aws cloudformation get-template --stack-name <stack>
+#    --template-stage Original), add only ClusterLogGroup as below, and
+#    create a change set with --change-set-type IMPORT, --resources-to-import
+#    '[{"ResourceType":"AWS::Logs::LogGroup","LogicalResourceId":"ClusterLogGroup",
+#    "ResourceIdentifier":{"LogGroupName":"/aws/eks/<ClusterName>/cluster"}}]'
+#    and every parameter UsePreviousValue=true; check that it imports only that
+#    group, and execute it. An import keeps the group's current retention:
+#    aws logs put-retention-policy --log-group-name /aws/eks/<ClusterName>/cluster
+#    --retention-in-days 30
+# 2. Update the stack with this template, then restart the EFS driver's node
+#    pods and run ../deploy.sh right away (see WorkspaceFileSystem).
+# Alternatively, delete the group before the update (aws logs delete-log-group
+# --log-group-name /aws/eks/<ClusterName>/cluster), which loses its logs, or
+# delete the stack and create it again.
 
 Description: >-
   CAO remote runners on EKS Auto Mode: VPC, cluster, EFS workspace, runner
@@ -353,11 +366,12 @@ Resources:
             Resource: !GetAtt SecretsKey.Arn
 
   # EKS writes the control-plane logs (Logging below) to this group. Declared
-  # here so that delete-stack removes it and the logs expire; otherwise EKS
-  # creates it outside the stack, where it stays after delete-stack with no
-  # expiry. Creating the stack fails if a group of this name already exists
-  # (say, left by an earlier cluster of the same name, or created by this
-  # cluster before the stack declared it): delete that group first.
+  # here so that delete-stack removes it and the logs expire after 30 days;
+  # otherwise EKS creates it outside the stack (with no expiry), where it
+  # stays after delete-stack. Creating the stack fails if a group of this name
+  # already exists (say, left by an earlier cluster of the same name); a
+  # stack whose cluster already created it imports it instead (see the
+  # header), and the import keeps whatever retention the group has.
   ClusterLogGroup:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: Delete
@@ -521,7 +535,8 @@ Resources:
   # point and a mount target; the file system policy below cannot limit
   # mounts to this role (see there). Pod Identity sets a pod's
   # credentials when the pod is created, so node pods that started before
-  # this association must be restarted.
+  # this association must be restarted, and then the runner pods recreated
+  # (see the upgrade note at WorkspaceFileSystem).
   EfsCsiNodeRole:
     Type: AWS::IAM::Role
     Properties:
@@ -630,6 +645,13 @@ Resources:
       # including the workspace one (as uid/gid 1000, under /cao-workspace).
       # The workspace access point's ARN cannot be named here either: the
       # access point depends on this file system.
+      #
+      # Upgrade of a stack from before this policy: as soon as the update
+      # applies it, mounts made without `iam` (all of them, before) are
+      # anonymous and lose access, so running agents lose the workspace. Update
+      # when no agent runs, and right after it restart the driver's node pods
+      # (kubectl -n kube-system rollout restart daemonset efs-csi-node), then
+      # run ../deploy.sh, which recreates the runner pods with `iam` mounts.
       FileSystemPolicy:
         Version: "2012-10-17"
         Statement:

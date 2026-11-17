@@ -218,11 +218,17 @@ examples/cao-clusters/kubernetes/remote-runners/overlays/eks/deploy.sh cao-remot
   workspace one (there as uid/gid 1000 under `/cao-workspace`; through
   another access point as whatever that access point sets). Whoever can run
   pods as `efs-csi-node-sa` in `kube-system` (a cluster admin) can use the
-  node role. Pod Identity gives a pod its credentials when it starts: on a
-  cluster whose driver ran before the node role existed, restart the
-  driver's node pods
-  (`kubectl -n kube-system rollout restart daemonset efs-csi-node`) before
-  the next runner mounts the workspace.
+  node role. TLS is the EFS CSI driver's default, and the file system policy
+  refuses a mount without it.
+
+  **Upgrading a stack from before the file system policy:** as soon as the
+  stack update applies the policy, mounts made without `iam` (every mount
+  until then) are anonymous and lose access, so the workspace is unavailable
+  to running agents until the driver's node pods are restarted (Pod Identity
+  gives a pod its credentials when it starts) and the runner pods are
+  recreated. Update when no agent runs, in this order: the stack update, then
+  `kubectl -n kube-system rollout restart daemonset efs-csi-node`, then
+  `deploy.sh` right away, which recreates the runner pods.
 - **Auto Mode and NetworkPolicy:** cluster DNS runs on each node at the `.10`
   address of the service range, not in CoreDNS pods, and Pod Identity's agent
   answers on `169.254.170.23:80`. The overlay allows exactly those two, on top
@@ -238,11 +244,42 @@ examples/cao-clusters/kubernetes/remote-runners/overlays/eks/deploy.sh cao-remot
   while the stack exists); delete the `cao-remote` namespace first so Auto
   Mode releases its volumes and nodes. The stack declares that log group, so
   creating it fails while a group of that name exists, for example one left
-  by an earlier cluster of the same name. A stack created before the template
-  declared the group cannot add it on update either, since its cluster
-  already created the group: delete the group first with
-  `aws logs delete-log-group --log-group-name /aws/eks/<ClusterName>/cluster`
-  (its logs go with it), or delete and recreate the stack.
+  by an earlier cluster of the same name.
+- **Upgrading a stack created before the template declared the log group:**
+  its cluster already created the group, so the update cannot create it.
+  Import it into the stack first, which keeps its logs:
+  1. Save the deployed template
+     (`aws cloudformation get-template --stack-name <stack> --template-stage Original`)
+     and add only the `ClusterLogGroup` resource, exactly as
+     `iac/cfn-auto-mode.yaml` defines it.
+  2. Create an import change set and check that it imports only that group:
+
+     ```bash
+     aws cloudformation create-change-set --stack-name <stack> \
+       --change-set-name import-cluster-log-group --change-set-type IMPORT \
+       --resources-to-import '[{"ResourceType":"AWS::Logs::LogGroup","LogicalResourceId":"ClusterLogGroup","ResourceIdentifier":{"LogGroupName":"/aws/eks/<ClusterName>/cluster"}}]' \
+       --template-body file://<deployed template with ClusterLogGroup> \
+       --parameters ParameterKey=ClusterName,UsePreviousValue=true \
+         ParameterKey=KubernetesVersion,UsePreviousValue=true \
+         ParameterKey=VpcCidr,UsePreviousValue=true \
+         ParameterKey=ServiceIpv4Cidr,UsePreviousValue=true \
+         ParameterKey=PublicAccessCidrs,UsePreviousValue=true \
+         ParameterKey=BedrockModelPattern,UsePreviousValue=true \
+       --capabilities CAPABILITY_NAMED_IAM
+     aws cloudformation describe-change-set --stack-name <stack> \
+       --change-set-name import-cluster-log-group
+     ```
+
+  3. Execute it (`aws cloudformation execute-change-set`) and wait
+     (`aws cloudformation wait stack-import-complete`).
+  4. The import keeps the group's current retention; set the template's:
+     `aws logs put-retention-policy --log-group-name /aws/eks/<ClusterName>/cluster --retention-in-days 30`.
+  5. Update the stack with the new template, every parameter with
+     `UsePreviousValue`, then follow the workspace upgrade order above.
+
+  Alternatively, delete the group before the update
+  (`aws logs delete-log-group --log-group-name /aws/eks/<ClusterName>/cluster`),
+  which loses its logs, or delete and recreate the stack.
 
 ## Placement
 

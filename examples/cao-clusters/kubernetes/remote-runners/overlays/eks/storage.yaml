@@ -31,9 +31,10 @@ spec:
     name: cao-remote-workspace
   # iam: the driver's node pods mount as their Pod Identity role, whose
   # policy allows only the access point in the handle (the file system
-  # policy allows clients without IAM nothing); tls, which the file system
-  # policy requires (the driver adds it for an access point anyway).
-  mountOptions: [tls, iam]
+  # policy allows clients without IAM nothing). No `tls`: the driver
+  # deprecates it there, as TLS is its default; the file system policy
+  # refuses a mount without TLS.
+  mountOptions: [iam]
   csi:
     driver: efs.csi.aws.com
     volumeHandle: <workspace-volume-handle>

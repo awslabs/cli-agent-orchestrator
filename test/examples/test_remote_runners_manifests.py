@@ -657,7 +657,7 @@ def test_the_workspace_is_mounted_only_through_its_access_point():
     assert not [p for p in node_role["ManagedPolicyArns"] if "EFS" in p or "FileSystem" in p]
     # The volume mounts as that role (iam), over TLS, through the access point.
     (volume,) = [d for d in _docs([EKS / "storage.yaml"]) if d["kind"] == "PersistentVolume"]
-    assert set(volume["spec"]["mountOptions"]) == {"tls", "iam"}
+    assert volume["spec"]["mountOptions"] == ["iam"]  # tls is the driver's default
     assert volume["spec"]["csi"]["volumeHandle"] == "<workspace-volume-handle>"
     handle = _cfn()["Outputs"]["WorkspaceVolumeHandle"]["Value"]
     assert handle == f"${{{fs_name}}}::${{{ap_name}}}"
@@ -727,7 +727,7 @@ def test_the_rendered_eks_overlay_serves_wss_and_changes_only_what_eks_needs():
     assert state["spec"]["storageClassName"] == "cao-gp3"
     volume = _one(docs, "PersistentVolume", "cao-remote-workspace")
     assert volume["spec"]["csi"]["driver"] == "efs.csi.aws.com"
-    assert set(volume["spec"]["mountOptions"]) == {"tls", "iam"}
+    assert volume["spec"]["mountOptions"] == ["iam"]  # tls is the driver's default
     assert volume["spec"]["claimRef"] == {"namespace": "cao-remote", "name": "cao-remote-workspace"}
     account = _one(docs, "ServiceAccount", "cao-runner")
     assert account["automountServiceAccountToken"] is False
