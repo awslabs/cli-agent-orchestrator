@@ -36,13 +36,20 @@ def test_the_extension_did_not_survive_into_the_next_test():
 
 
 def test_the_same_list_object_is_restored_not_replaced():
-    """The middleware and ``api.main`` hold the list object, so identity matters.
+    """The origin checks read the live list object, so identity matters.
 
     Drives the real leak (``main()`` with uvicorn patched), then runs the
     fixture's own restore step and asserts the downgrade row of the origin
     matrix is rejected again on the very same list object.
+
+    The list is read from ``constants`` at call time, not from ``api.main``:
+    tests that ``importlib.reload(constants)`` (``test_constants.py``,
+    ``test_cursor_cli_unit.py``) rebind ``constants.CORS_ORIGINS`` to a new
+    list, after which ``api.main``'s imported name is stale. ``main()`` and the
+    origin checks both go through the module's current global, so that is the
+    list this test has to hold for it to pass in any run order.
     """
-    held = api_main.CORS_ORIGINS
+    held = constants.CORS_ORIGINS
     before = list(held)
     with (
         patch("argparse.ArgumentParser.parse_args") as args,
