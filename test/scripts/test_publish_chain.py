@@ -346,7 +346,6 @@ RELEASE_ACTIONS = {
     "actions/checkout",
     "actions/setup-python",
     "astral-sh/setup-uv",
-    "taiki-e/install-action",
     "softprops/action-gh-release",
 }
 
@@ -407,10 +406,7 @@ class TestNoJobCanDispatchAWorkflow:
         assert set(RELEASE["jobs"]) == {"preflight", "release"}
 
     def test_no_new_secret_is_introduced(self):
-        assert set(re.findall(r"secrets\.(\w+)", RELEASE_TEXT)) == {
-            "RELEASE_DEPLOY_KEY",
-            "GITHUB_TOKEN",
-        }
+        assert set(re.findall(r"secrets\.(\w+)", RELEASE_TEXT)) == {"RELEASE_DEPLOY_KEY"}
 
 
 class TestReleaseCheckoutPinsTheEventSha:
