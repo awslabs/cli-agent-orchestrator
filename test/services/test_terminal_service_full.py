@@ -1756,8 +1756,12 @@ class TestReplayDuringInitializationBehaviour:
 
         deleted = threading.Event()
         mock_db_delete.side_effect = lambda *a, **k: deleted.set()
+        replay_observed_row = asyncio.Event()
+        replay_created = False
 
         def get_row(terminal_id):
+            if replay_created:
+                replay_observed_row.set()
             if deleted.is_set():
                 raise ValueError(f"Terminal '{terminal_id}' not found")
             return dict(_PRIOR_ROW, id=terminal_id)
@@ -1784,16 +1788,27 @@ class TestReplayDuringInitializationBehaviour:
         original = asyncio.ensure_future(
             create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
         )
-        await asyncio.wait_for(committed.wait(), timeout=2)
+        await asyncio.wait_for(committed.wait(), timeout=30)
         replay = asyncio.ensure_future(
             create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
         )
-        await asyncio.sleep(0.1)
+        replay_created = True
+        await asyncio.wait_for(replay_observed_row.wait(), timeout=30)
         release_init.set()
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(original, timeout=2)
-        with pytest.raises(terminal_service.IdempotentCreateFailed) as exc_info:
-            await asyncio.wait_for(replay, timeout=2)
+        try:
+            async with asyncio.timeout(30):
+                with pytest.raises(
+                    TimeoutError, match="Grok CLI initialization timed out after 180.0 seconds"
+                ):
+                    await original
+        except TimeoutError:
+            pytest.fail("original create did not finish within 30 seconds")
+        try:
+            async with asyncio.timeout(30):
+                with pytest.raises(terminal_service.IdempotentCreateFailed) as exc_info:
+                    await replay
+        except TimeoutError:
+            pytest.fail("replay did not finish within 30 seconds")
 
         assert deleted.is_set() is not cleanup_deferred
         if cleanup_deferred:
