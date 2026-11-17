@@ -5,14 +5,14 @@ tags: [case-study, orchestration-patterns]
 description: I can only hold a few issues in my head, so I give all my attention to one agent, the conductor, and let CAO hold the rest. Here's one real day of it, and how it keeps running with the lights off.
 ---
 
-Few days ago, I ran my coding work from my phone. I gave one agent a few unrelated jobs in one conversation. All of it cost me a few one-line answers: yes, test it; yes, file it.
+A few days ago, I ran my coding work from my phone. I gave one agent a few unrelated jobs in one conversation. All of it cost me a few one-line answers: yes, test it; yes, file it.
 
-Well, I have to admit, it wasn't always like that. My agents running under CAO worked perfectly, everything run by clock, hundreds of commits are pushed, and 80+ PR raised, however, as a human, I found it is hard (impossilbe) to catch up
+Well, I have to admit, it wasn't always like that. My agents running under CAO worked perfectly. Everything ran on a clock, hundreds of commits were pushed, and 80+ PRs were raised. However, as a human, I found it hard (impossible) to keep up.
 
 {/* truncate */}
 
 :::tip TL;DR
-I can follow three, maybe five after having some real good coffee, agent sessions at once. Instead of talking to multiple agents and trying to memorise what they are busy with (things were getting even harder when those agents use handoff function to assign job ot other agents), I choose to talk to one conductor agent and let CAO run a PR shepherd and short-lived workers behind it. A Kiro Crew bot reviews other people's pull requests on its own (and I suggest it to take extra care and be humble with my own PR). That makes it a lot easier. The rules that matter are small scripts instead of prompts, and the kit starts in observe mode. Seven reviews said NOT-READY before one said READY, and it still runs as one OS user.
+I can follow three, maybe five (after some really good coffee), agent sessions at once. Instead of talking to multiple agents and trying to memorise what they are busy with (it got even harder when those agents used the handoff function to assign jobs to other agents), I choose to talk to one conductor agent and let CAO run a PR shepherd and short-lived workers behind it. A Kiro Crew bot reviews other people's pull requests on its own (and I ask it to take extra care and be humble with my own PRs). That makes it a lot easier. The rules that matter are small scripts instead of prompts, and the kit starts in observe mode. Seven reviews said NOT-READY before one said READY, and it still runs as one OS user.
 
 :::
 
@@ -22,17 +22,17 @@ When I run many agents, I can follow three to five sessions at once, and that's 
 
 Every agent needs me once in a while: a question here, an approval there. Ten agents meant twenty small interruptions, and none of them waited politely. Keeping up with all of them was impossible.
 
-And under all of it was a worry. If I let agents work while I was away, what would they do wrong without me watching? I still remeber the time an agent start to delete a worktree that I am still working to free some disk stroage. 
+And under all of it was a worry. If I let agents work while I was away, what would they do wrong without me watching? I still remember the time an agent started to delete a worktree that I was still working in, just to free some disk storage.
 
-## One conductor 
+## One conductor
 
-I stopped trying to watch every agent. Now all my attention goes to **one** agent, the conductor. It plans the work, hands each job to a short-lived helper agent (check the ephermeal agent feature in CAO!), checks what comes back, and is the only agent that ever asks me a question.
+I stopped trying to watch every agent. Now all my attention goes to **one** agent, the conductor. It plans the work, hands each job to a short-lived helper agent (check the ephemeral agent feature in CAO!), checks what comes back, and is the only agent that ever asks me a question.
 
-Everything else sits behind the conductor, and [CAO](https://github.com/awslabs/cli-agent-orchestrator), the open-source CLI agent orchestrator, is they key that make sure all this run by clock: the conductor gives each job to a helper sized to that job. A "shepherd" agent looks after my own pull requests. Reviews of other people's pull requests no longer go through the conductor: a Kiro Crew bot handles them. My standing permissions are written as data, not prose. And a loop that costs no model tokens keeps it going day and night.
+Everything else sits behind the conductor, and [CAO](https://github.com/awslabs/cli-agent-orchestrator), the open-source CLI agent orchestrator, is the key that makes sure all of this runs on a clock: the conductor gives each job to a helper sized to that job. A "shepherd" agent looks after my own pull requests. Reviews of other people's pull requests no longer go through the conductor: a Kiro Crew bot handles them. My standing permissions are written as data, not prose. And a loop that costs no model tokens keeps it going day and night.
 
 That's what I mean by a dark factory: a factory that runs with the lights off. I put it to the agent in one line: "This super agent is a piece of art, turn my daily coding work into a code dark-factory. Request/task in, quality code out."
 
-The whole setup is in the CAO repo as a sample, [`examples/super-agent`](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/super-agent): the three agent profiles, their playbooks, the scripts and the poll loop, with my names and paths taken out.
+The whole setup is in the CAO repo as a sample, [`examples/super-agent`](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/super-agent): the agent profiles, their playbooks, the scripts and the poll loop, with my names and paths taken out.
 
 ## Remote Herdr with Telegram bot
 
@@ -40,13 +40,13 @@ The day started with a handover. The conductor I'd been talking to had passed it
 
 Then I started handing it work. Get Kiro CLI version 3 ready to use, with a status comment on the issue that tracks it. And give me a guide an agent could follow to set up ephemeral agents (short-lived helpers) and the Jev decider (the example decider in CAO's setup page).
 
-The conductor gave each job to its own sephemeral agent and checked each result. Along the way it caught mistakes before they reached me.
+The conductor gave each job to its own ephemeral agent and checked each result. Along the way it caught mistakes before they reached me.
 
 ### A task, from request to done
 
 Every task takes the same path. I say what I want to the conductor. It writes the job as a brief file and hands it to a short-lived helper. The helper does the work and reports back in a fixed format. The conductor checks the result before anything goes public. Only then does it come back to me, with one question if it needs one.
 
-Take the guide for ephemeral agents. The guide I asked for already existed, so the conductor offered to test it instead of writing a new one. I said yes. A helper followed the guide end to end, like a real user would, and found two gaps. The conductor checked both, asked me once, and filed the issue. A second helper wrote the fix and a third tested it. The pull request went up when I said yes, and it was listed in GitHub and waiting for a review that evening.
+Take the guide for ephemeral agents. The guide I asked for already existed, so the conductor offered to test it instead of writing a new one. I said yes. A helper followed the guide end to end, like a real user would, and found two gaps. The conductor checked both, asked me once, and filed the issue. A second helper wrote the fix and a third tested it. The pull request went up when I said yes, and it was open on GitHub, waiting for a review, that evening.
 
 I answered two short questions. The conductor, the helpers and the checks did the rest.
 
@@ -113,7 +113,7 @@ A rule in a prompt only works while the agent keeps choosing to follow it, and a
 |---|---|
 | Every push, post and arm | Runs again right before the action. It stops the worker if I paused, if an OK was revoked or if the PR head moved. |
 | My permissions | Standing OKs are data records: who holds it, what action, what scope. Only the conductor edits them, and only on my words. |
-| Auto-merge | Gated by Github action and PR, only when the approval covers the last commit, every required check is green, and the PR is 1,500 lines or fewer. GitHub does the merge. |
+| Auto-merge | Gated by a GitHub Action and the PR. It arms only when the approval covers the last commit, every required check is green, and the PR is 1,500 lines or fewer. GitHub does the merge. |
 | Text from outside | PR comments, CI logs and web pages are data. They rank last and can never grant a permission. |
 
 Some things always need me: force-pushes, new pull requests or issues, closing anything, security decisions, releases and keys. A one-off OK from me covers one exact action and expires soon.
@@ -125,7 +125,7 @@ An always-on factory has a quiet cost: something has to notice when a pull reque
 
 It wakes the shepherd for feedback, CI that needs action, review decisions, conflicts and state changes on my PRs. It also wakes it for new commits, replies and state changes on PRs we reviewed. A PR falling behind main won't wake the agent, unless the PR is approved or already armed. Everything else goes into a digest that rides along with the next wake. If the digest's oldest line has waited more than 24 hours, it causes one wake itself.
 
-I tested the new wake rules on 118 recorded polls. The old rules woke the shepherd 25 times. The new rules woke it 26 times. The totals look the same, but the wakes are different. Four useless wakes are gone. The old rule missed 5 events while the new rule captured it, and we don't miss the new commit on a watching PR any more. This gave us 188 small updates went into the digest without even reach the agent.
+I tested the new wake rules on 118 recorded polls. The old rules woke the shepherd 25 times. The new rules woke it 26 times. The totals look the same, but the wakes are different. Four useless wakes are gone. Five events that the old rules missed are now caught, so we no longer miss a new commit on a PR we are watching. And 188 small updates went into the digest without waking the agent.
 
 ## Restarts, pauses and observe mode
 
@@ -194,7 +194,7 @@ You don't need the whole kit to feel the shift. Add one piece at a time:
 
 1. One conductor profile and one short-lived helper, using CAO's ephemeral agents. See what changes when you only talk to one agent.
 2. Add a pause switch that survives a restart.
-3. Only then add a shepherd, or a bot that reviews pull requests, and start it in observe mode. [AUTHOR: confirm this order, and which parts of your kit a reader can reuse today.]
+3. Only then add a shepherd, or a bot that reviews pull requests, and start it in observe mode.
 
 Each piece is in [`examples/super-agent`](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/super-agent), with a quick start. Its standing OKs ship as placeholders, and the shepherd starts in observe mode.
 
@@ -204,7 +204,7 @@ Each piece is in [`examples/super-agent`](https://github.com/awslabs/cli-agent-o
 - [CAO's ephemeral-agents docs](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/ephemeral-agents.md): an experimental feature (off by default) that lets an agent create a short-lived helper with a model tier and effort sized to the task.
 - DeepSeek's [super-agent prototype](https://github.com/deepseek-ai/dsh-superagent-prototype) and [design article](https://x.com/DeepSeekHarness/status/2116857257245987236): where several of the ideas above came from.
 
-For the phone half: [herdr-remote](https://github.com/dcolinmorgan/herdr-remote), an open-source (AGPL) dashboard for herdr that carries agent notifications and approvals over Telegram. [AUTHOR: confirm you run CAO's terminals on herdr; if so keep "CAO's agents run inside herdr, so their prompts reach my phone this way." and add it here, otherwise drop this paragraph.]
+For the phone half: [herdr-remote](https://github.com/dcolinmorgan/herdr-remote), an open-source (AGPL) dashboard for herdr that carries agent notifications and approvals over Telegram.
 
 ## Glossary
 
