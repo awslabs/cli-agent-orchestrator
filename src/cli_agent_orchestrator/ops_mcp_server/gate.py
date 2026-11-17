@@ -142,4 +142,7 @@ def install_ops_allowlist_middleware(mcp: Any) -> None:
         denied_reason=ops_tool_denied_reason,
         exempt_tools=FAIL_SAFE_EXEMPT_TOOLS,
         surface="cao-ops-mcp-server",
+        # The kill switch needs no grant, and only an operator can undo it, so a
+        # bound terminal that pulls it is named in the log.
+        audit_exempt_calls=True,
     )

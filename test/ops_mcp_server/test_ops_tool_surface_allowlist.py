@@ -360,6 +360,93 @@ class TestFailsClosed:
         assert reached == ["decision:off"]
 
 
+class TestTheFailSafeLeavesAnAuditRecord:
+    """An exempt call from a bound terminal is logged with the id it claims.
+
+    ``decisions_off`` needs no grant and only an operator can undo it, so the
+    operator who finds the node halted has to be able to see which terminal
+    pulled it. The middleware returned before any log line for an exempt tool,
+    and ``operator.off()`` does not log its caller (review of #1069).
+    """
+
+    GATE_LOGGER = "cli_agent_orchestrator.security.mcp_tool_gate"
+
+    def _audit_lines(self, caplog) -> List[str]:
+        return [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == self.GATE_LOGGER and "ungated MCP tool" in record.getMessage()
+        ]
+
+    def test_a_bound_caller_without_the_grant_is_named(self, reached, caplog):
+        with caplog.at_level("WARNING", logger=self.GATE_LOGGER):
+            with patch.dict(os.environ, BOUND), _as_bound(["@cao-mcp-server"]):
+                assert _dispatch("decisions_off", {}) is None
+        assert reached == ["decision:off"]
+        lines = self._audit_lines(caplog)
+        assert len(lines) == 1, lines
+        assert "cao-ops-mcp-server" in lines[0]
+        assert "'decisions_off'" in lines[0]
+        assert f"CAO_TERMINAL_ID {BOUND['CAO_TERMINAL_ID']!r}" in lines[0]
+        assert caplog.records[-1].levelname == "WARNING"
+
+    @pytest.mark.parametrize("claimed", ["", "not-a-terminal", "a1b2c3d4\nforged line"])
+    def test_an_unresolvable_claim_is_logged_as_claimed_and_still_dispatches(
+        self, claimed, reached, caplog
+    ):
+        """The id is logged, never resolved: a fail-safe must not need a lookup."""
+        with caplog.at_level("WARNING", logger=self.GATE_LOGGER):
+            with patch.dict(os.environ, {"CAO_TERMINAL_ID": claimed}):
+                with patch.object(
+                    mcp_utils, "get_json", side_effect=AssertionError("must not look up")
+                ):
+                    assert _dispatch("decisions_off", {}) is None
+        assert reached == ["decision:off"]
+        lines = self._audit_lines(caplog)
+        assert len(lines) == 1, lines
+        assert f"CAO_TERMINAL_ID {claimed!r}" in lines[0]
+        assert "\n" not in lines[0], "a claimed id must not be able to start a log line"
+
+    def test_an_operator_context_is_not_logged(self, reached, caplog):
+        with caplog.at_level("WARNING", logger=self.GATE_LOGGER):
+            with patch.dict(os.environ, _unbound_env(), clear=True):
+                assert _dispatch("decisions_off", {}) is None
+        assert reached == ["decision:off"]
+        assert self._audit_lines(caplog) == []
+
+    def test_a_gated_tool_does_not_produce_the_exempt_line(self, reached, caplog):
+        with caplog.at_level("WARNING", logger=self.GATE_LOGGER):
+            with patch.dict(os.environ, BOUND), _as_bound(["@cao-ops-mcp-server"]):
+                assert _dispatch("list_sessions", {}) is None
+        assert self._audit_lines(caplog) == []
+
+    def test_the_agent_surface_does_not_audit_its_callbacks(self):
+        """Every worker calls ``send_message``; a WARNING per call would be noise.
+
+        Read from the two call sites, so turning the option on for the agent
+        surface, or off for this one, is a decision someone has to make here.
+        """
+        import ast
+        import inspect
+
+        from cli_agent_orchestrator.mcp_server import server as agent_server
+
+        def audit_flag(function) -> Any:
+            tree = ast.parse(inspect.getsource(function).lstrip())
+            calls = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and getattr(node.func, "id", "") == "install_allowlist_middleware"
+            ]
+            assert len(calls) == 1, function
+            flags = [kw.value for kw in calls[0].keywords if kw.arg == "audit_exempt_calls"]
+            return ast.literal_eval(flags[0]) if flags else False
+
+        assert audit_flag(ops_gate.install_ops_allowlist_middleware) is True
+        assert audit_flag(agent_server._install_allowlist_middleware) is False
+
+
 class TestTheHaltLiftRuleIsEnforcedInsideTheMutation:
     """The reviewer's deterministic probe, as a test (#1062, independent review).
 

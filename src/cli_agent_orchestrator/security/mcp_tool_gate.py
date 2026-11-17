@@ -80,6 +80,17 @@ def caller_is_bound() -> bool:
     return "CAO_TERMINAL_ID" in os.environ
 
 
+def bound_caller_id() -> Optional[str]:
+    """The identity a bound caller claims, as claimed; ``None`` for an operator.
+
+    For AUDIT lines only. It is the raw environment value, unvalidated and
+    unresolved, so it must never be compared or authorized on: authorization
+    resolves the caller's recorded row (:func:`caller_context_or_denial`). Log
+    it with ``%r``, because a claimed value is the caller's to choose.
+    """
+    return os.environ.get("CAO_TERMINAL_ID")
+
+
 def caller_context_or_denial(
     tool_name: str, resolve: ContextResolver
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -176,6 +187,7 @@ def install_allowlist_middleware(
     denied_reason: DeniedReason,
     exempt_tools: FrozenSet[str],
     surface: str,
+    audit_exempt_calls: bool = False,
 ) -> None:
     """Gate every tool on ``mcp`` through ``denied_reason``, once.
 
@@ -188,6 +200,17 @@ def install_allowlist_middleware(
     ``denied_reason`` is the single source of the surface's policy; this function
     holds no policy of its own beyond ``exempt_tools``, which skips the policy
     entirely rather than passing it a tool it would have to special-case.
+
+    ``audit_exempt_calls`` logs one WARNING, naming the caller's claimed
+    ``CAO_TERMINAL_ID``, each time a BOUND caller uses an exempt tool. An exempt
+    call is still never refused or resolved; the line only records who made it.
+    The operations surface turns it on: its one exempt tool is the
+    ``decisions_off`` kill switch, which any bound terminal may pull and only an
+    operator can undo, so the operator who finds the node halted needs to see
+    which terminal pulled it (review of #1069). The agent surface leaves it off,
+    because its exempt tools are the callbacks every worker makes on every
+    assignment (``send_message``, ``complete_assignment``). An operator context
+    is not logged on either surface.
 
     Raises ``RuntimeError`` on a FastMCP build with no ``add_middleware``. Call
     sites are module-level, so that aborts import -- the loudest failure
@@ -208,6 +231,15 @@ def install_allowlist_middleware(
         async def on_call_tool(self, context: Any, call_next: Any) -> Any:
             tool_name = context.message.name
             if tool_name in exempt_tools:
+                if audit_exempt_calls and caller_is_bound():
+                    logger.warning(
+                        "%s: ungated MCP tool %r called by a bound terminal "
+                        "claiming CAO_TERMINAL_ID %r; the tool is exempt from the "
+                        "allowlist, so the caller was not resolved or authorized",
+                        surface,
+                        tool_name,
+                        bound_caller_id(),
+                    )
                 return await call_next(context)
             arguments = getattr(context.message, "arguments", None) or {}
             denied = await asyncio.to_thread(denied_reason, tool_name, arguments)
