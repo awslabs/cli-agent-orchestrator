@@ -244,7 +244,10 @@ deliberate rules:
 
 - `decisions_off` stays reachable without the grant. It is argument-free and
   off-only — the operator's kill switch — and a fail-safe that needs a grant is
-  not a fail-safe. See [Tool Restrictions](tool-restrictions.md).
+  not a fail-safe. A bound terminal that calls it is named, by the
+  `CAO_TERMINAL_ID` it claims, in a WARNING on the operations server's log, so
+  an operator who finds the node halted can see which terminal pulled it. See
+  [Tool Restrictions](tool-restrictions.md).
 - Lifting a halt is refused for any bound terminal, grant or not:
   `decisions_set_point` to `shadow` or `on` removes the halt marker, so allowing it
   over MCP would let a caller undo an operator's `cao decisions off`. It takes an

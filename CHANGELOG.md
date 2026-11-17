@@ -1718,9 +1718,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only to say so sooner. An operator MCP host, with
   no `CAO_TERMINAL_ID`, is unchanged on both counts. A caller that claims an identity CAO cannot
   resolve — including an explicitly empty `CAO_TERMINAL_ID` — is refused rather than treated as an
-  operator, and every provider that launches CAO's own MCP server now injects the launching
-  terminal's own id, overriding (and logging) a profile that tries to pin one; antigravity drops the
-  variable instead, because its config file is shared across that terminal's siblings (#940). The
+  operator, and a `CAO_TERMINAL_ID` that a profile or an agent plugin declares in a server's `env`
+  is no longer written into a provider's MCP configuration. The providers that write it at launch
+  inject the launching terminal's own id, overriding (and logging) a pinned one. Three have no id
+  to inject and drop
+  (and log) a pinned one instead, so the server takes the id of the terminal that launches it:
+  antigravity, because its config file is shared across that terminal's siblings (#940), and Kiro
+  CLI and OpenCode, because `cao install` writes theirs (`~/.kiro/agents/<agent>.json`,
+  `opencode.json`) before any terminal exists. Those two carried a pinned value verbatim until
+  review of this change; a file installed earlier keeps it until the next `cao install` of that
+  agent. A bound terminal that pulls the `decisions_off` kill switch is now named in a WARNING on
+  the operations server's log, since the call needs no grant and only an operator can undo it. The
   launching CAO's coordinates (`CAO_API_HOST`/`CAO_API_PORT`/`CAO_HOME_DIR`, #1075/#1089) are now
   gated on the same shape predicate as the identity: both are injected only into an entry that
   launches the bundled server (bare script, absolute path, `.exe`, module entrypoint, or the script
@@ -1750,7 +1758,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cao-ops`: `allowedTools: [..., "@cao-ops"]` becomes `[..., "@cao-ops", "@cao-ops-mcp-server"]`,
   and `@cao-ops` alone is now refused on every tool except `decisions_off`
   (`docs/agent-plugins.md`). A role-default profile that declares the server itself under another
-  key is refused the same way, because the entry appended for it is `@<that key>`. Profiles
+  key is refused the same way, because the entry appended for it is `@<that key>`. (3) Review
+  any profile that lists both servers and already grants a glob: `@cao-*` and `@*` cover
+  `@cao-ops-mcp-server`, so such a profile holds the control plane as well as delegation, not
+  delegation alone. Name `@cao-mcp-server` instead of the glob to withhold it. Profiles
   granting `*`, and operator MCP hosts outside CAO (no `CAO_TERMINAL_ID`, which is how a client runs
   the agent plugin itself), need no change.
 
