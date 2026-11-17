@@ -1,5 +1,6 @@
 """Tests for the herdr single-pane browser view."""
 
+import os
 from unittest.mock import patch
 
 import pytest
@@ -175,6 +176,28 @@ class TestReadScreen:
             "format": "ansi",
             "strip_ansi": False,
         }
+
+
+class TestSessionStateDir:
+    def test_creates_a_private_directory(self, tmp_path):
+        with patch.object(view.tempfile, "gettempdir", return_value=str(tmp_path)):
+            path = view.session_state_dir("cao")
+        assert path is not None
+        assert oct(os.stat(path).st_mode & 0o777) == oct(0o700)
+
+    def test_refuses_a_directory_others_can_write(self, tmp_path):
+        root = tmp_path / f"cao-herdr-web-view-{os.getuid()}"
+        root.mkdir()
+        root.chmod(0o777)
+        with patch.object(view.tempfile, "gettempdir", return_value=str(tmp_path)):
+            assert view.session_state_dir("cao") is None
+
+    def test_refuses_a_symlink(self, tmp_path):
+        target = tmp_path / "elsewhere"
+        target.mkdir(mode=0o700)
+        (tmp_path / f"cao-herdr-web-view-{os.getuid()}").symlink_to(target)
+        with patch.object(view.tempfile, "gettempdir", return_value=str(tmp_path)):
+            assert view.session_state_dir("cao") is None
 
 
 def test_herdr_call_raises_on_an_error_answer(tmp_path):

@@ -50,6 +50,7 @@ import re
 import select
 import signal
 import socket
+import stat
 import struct
 import sys
 import tempfile
@@ -248,13 +249,37 @@ def _write_all(fd: int, data: bytes) -> None:
         data = data[written:]
 
 
-def session_state_dir(herdr_session: str) -> str:
-    """Directory the views of one herdr session share, for the lock and chrome below."""
-    path = os.path.join(
-        tempfile.gettempdir(), f"cao-herdr-web-view-{os.getuid()}", herdr_session
+def _private_dir(path: str) -> bool:
+    """Create ``path`` as a 0700 directory, or accept it only if it already is one we own."""
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        return False
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and info.st_uid == os.getuid()
+        and stat.S_IMODE(info.st_mode) & 0o077 == 0
     )
-    os.makedirs(path, exist_ok=True)
-    return path
+
+
+def session_state_dir(herdr_session: str) -> Optional[str]:
+    """Private directory the views of one herdr session share, for the lock and chrome below.
+
+    It lives under the shared temp dir, so it is created 0700 and refused if
+    another user made it first, is a symlink, or is group/world accessible.
+    None means no usable directory: views then resize without the lock.
+    """
+    root = os.path.join(tempfile.gettempdir(), f"cao-herdr-web-view-{os.getuid()}")
+    path = os.path.join(root, herdr_session)
+    if _private_dir(root) and _private_dir(path):
+        return path
+    return None
 
 
 class _Sizer:
@@ -415,8 +440,8 @@ def run(herdr_session: str, socket_path: str, workspace_label: str, tab_label: s
     sizer = _Sizer(
         client_pid,
         client_fd,
-        lock_path=os.path.join(state_dir, "resize.lock"),
-        chrome_path=os.path.join(state_dir, "chrome.json"),
+        lock_path=os.path.join(state_dir, "resize.lock") if state_dir else None,
+        chrome_path=os.path.join(state_dir, "chrome.json") if state_dir else None,
     )
     sizer.resize(rows, cols)
     signal.signal(signal.SIGWINCH, lambda _signum, _frame: None)  # wakes select()
@@ -527,7 +552,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--herdr-session", required=True)
     parser.add_argument("--socket", required=True)
-    parser.add_argument("--workspace", required=True, help="CAO session name (herdr workspace label)")
+    parser.add_argument(
+        "--workspace", required=True, help="CAO session name (herdr workspace label)"
+    )
     parser.add_argument("--tab", required=True, help="CAO window name (herdr tab label)")
     args = parser.parse_args(argv)
     return run(args.herdr_session, args.socket, args.workspace, args.tab)
