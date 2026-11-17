@@ -129,7 +129,7 @@ async def create_session(
     ``inject_memory_at_start`` is the explicit interactive ``cao launch``
     signal. It defaults to false so callers that create first and send their
     task later retain task-aware first-message memory.
-    
+
     ``create_working_directory`` (#724): forwarded as-is to ``create_terminal``,
     which validates the directory against the path policy and creates it only
     once every check that can refuse the request has passed.
