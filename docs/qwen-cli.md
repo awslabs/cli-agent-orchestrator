@@ -100,8 +100,9 @@ this provider does not change the shared environment-boolean parser.
 - Recognized fatal CLI errors are `error`; unrecognized frames remain `unknown`.
 
 Startup polling and terminal calls yield the server's event loop. Theme/workspace
-setup retains the existing startup behavior; authentication pickers are never
-answered automatically. Authenticate in Qwen before creating CAO terminals.
+setup retains the existing startup behavior. A recognized Qwen 0.28 authentication
+picker fails initialization promptly with a diagnostic; it is never answered
+automatically. Check network connectivity and native login before retrying.
 One Enter submits bracketed-paste input. Response extraction removes tool panels
 and picker rows, and rejects thought-only/empty responses instead of returning
 raw terminal output as an answer.
