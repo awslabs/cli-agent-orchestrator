@@ -158,8 +158,8 @@ def build_message_not_delivered_message(
     if uncertain:
         return (
             f"[CAO delivery failed] Your message {message_id} to terminal {receiver_id} "
-            f"may not have been delivered: {reason}. Some or all of it may have reached the "
-            "terminal. Check the receiver's terminal before you send it again."
+            f"may not have been delivered: {reason}. Some or all of it may have arrived. "
+            "Check the receiver's terminal before you send it again."
         )
     return (
         f"[CAO delivery failed] Your message {message_id} to terminal {receiver_id} "
