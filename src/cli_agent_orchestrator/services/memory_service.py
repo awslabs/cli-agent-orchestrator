@@ -4212,7 +4212,7 @@ class MemoryService:
             body_lines.pop(0)
             while body_lines and not body_lines[0].strip():
                 body_lines.pop(0)
-        compiled = any(_COMPILED_MARKER_RE.fullmatch(line) for line in body_lines)
+        compiled = bool(body_lines and _COMPILED_MARKER_RE.fullmatch(body_lines[0]))
 
         def _entry_time(name: str) -> Optional[datetime]:
             value = entry.get(name)
@@ -4231,47 +4231,60 @@ class MemoryService:
                     return None
             return None
 
-        lenient = is_memory_parser_lenient()
-        heading_matches: list[re.Match[str]] = []
-        timestamps: list[datetime] = []
-        timestamp_matches = list(
-            (_CANONICAL_ENTRY_HEADING_RE if compiled else _LEGACY_ENTRY_TIMESTAMP_RE).finditer(
-                file_content
-            )
-        )
-        timestamp_texts = [match.group(1) for match in timestamp_matches]
-        use_legacy_split = False
-        if compiled:
-            timestamps = [
-                datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                for value in timestamp_texts
-            ]
-        elif not lenient:
-            if not timestamp_texts:
-                return None, None
-            timestamps = [
-                datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                for value in timestamp_texts
-            ]
-            use_legacy_split = True
-        elif not compiled and timestamp_texts:
-            timestamps = [
-                datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                for value in timestamp_texts
-            ]
-            use_legacy_split = True
-        else:
-            for match in _LENIENT_ENTRY_HEADING_RE.finditer(file_content):
-                value = match.group("timestamp")
+        def _timestamp_boundaries(
+            matches: list[re.Match[str]], group: int | str
+        ) -> tuple[list[re.Match[str]], list[datetime]]:
+            first_index: Optional[int] = None
+            first_match: Optional[re.Match[str]] = None
+            first_time: Optional[datetime] = None
+            for index, match in enumerate(matches):
+                value = match.group(group)
                 try:
-                    parsed = datetime.strptime(
+                    first_time = datetime.strptime(
                         value if len(value) == 20 else value.replace("Z", ":00Z"),
                         "%Y-%m-%dT%H:%M:%SZ",
                     ).replace(tzinfo=timezone.utc)
                 except ValueError:
                     continue
-                heading_matches.append(match)
-                timestamps.append(parsed)
+                first_index = index
+                first_match = match
+                break
+            if first_index is None or first_match is None or first_time is None:
+                return [], []
+
+            for match in reversed(matches[first_index + 1 :]):
+                value = match.group(group)
+                try:
+                    last_time = datetime.strptime(
+                        value if len(value) == 20 else value.replace("Z", ":00Z"),
+                        "%Y-%m-%dT%H:%M:%SZ",
+                    ).replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                return [first_match, match], [first_time, last_time]
+            return [first_match], [first_time]
+
+        lenient = is_memory_parser_lenient()
+        heading_matches: list[re.Match[str]] = []
+        timestamps: list[datetime] = []
+        timestamp_candidates = list(
+            (_CANONICAL_ENTRY_HEADING_RE if compiled else _LEGACY_ENTRY_TIMESTAMP_RE).finditer(
+                file_content
+            )
+        )
+        timestamp_matches, timestamps = _timestamp_boundaries(timestamp_candidates, 1)
+        use_legacy_split = False
+        if not compiled and not lenient:
+            if not timestamps:
+                return None, None
+            use_legacy_split = True
+        elif not compiled and timestamps:
+            use_legacy_split = True
+        elif not compiled:
+            heading_matches, timestamps = _timestamp_boundaries(
+                list(_LENIENT_ENTRY_HEADING_RE.finditer(file_content)),
+                "timestamp",
+            )
 
         if timestamps:
             created_at = (_entry_time("created_at") or timestamps[0]) if compiled else timestamps[0]
@@ -4307,9 +4320,10 @@ class MemoryService:
 
         history_range: Optional[tuple[int, int]] = None
         if compiled or not timestamps:
-            body_lines = [line for line in body_lines if not _COMPILED_MARKER_RE.fullmatch(line)]
-            while body_lines and not body_lines[0].strip():
+            if compiled:
                 body_lines.pop(0)
+                while body_lines and not body_lines[0].strip():
+                    body_lines.pop(0)
             if compiled and body_lines and _CANONICAL_ENTRY_HEADING_RE.fullmatch(body_lines[0]):
                 body_lines.pop(0)
                 while body_lines and not body_lines[0].strip():

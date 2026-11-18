@@ -15,7 +15,12 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel
-from cli_agent_orchestrator.services import memory_reconciliation, settings_service, wiki_compiler
+from cli_agent_orchestrator.services import (
+    memory_reconciliation,
+    memory_service,
+    settings_service,
+    wiki_compiler,
+)
 from cli_agent_orchestrator.services.memory_reconciliation import (
     MemoryReconciliationService,
     RepairAction,
@@ -279,6 +284,43 @@ def test_compiled_topic_uses_cao_owned_dates(
     assert memory.created_at == datetime(2026, 1, 1, tzinfo=timezone.utc)
     assert memory.updated_at == datetime(2026, 3, 1, tzinfo=timezone.utc)
     assert memory.created_at <= memory.updated_at
+
+
+def test_parser_checks_only_timestamp_boundaries_and_first_body_marker(
+    tmp_path: Path,
+    engine: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TrackingDateTime(datetime):
+        parse_calls = 0
+
+        @classmethod
+        def strptime(cls, value: str, date_format: str) -> datetime:
+            cls.parse_calls += 1
+            return super().strptime(value, date_format)
+
+    class TrackingMarker:
+        def __init__(self, pattern: re.Pattern[str]) -> None:
+            self.calls = 0
+            self.pattern = pattern
+
+        def fullmatch(self, value: str) -> re.Match[str] | None:
+            self.calls += 1
+            return self.pattern.fullmatch(value)
+
+    marker = TrackingMarker(memory_service._COMPILED_MARKER_RE)
+    monkeypatch.setattr(memory_service, "datetime", TrackingDateTime)
+    monkeypatch.setattr(memory_service, "_COMPILED_MARKER_RE", marker)
+    sections = "\n\n".join(f"## 2026-01-{day:02d}T00:00:00Z\nbody {day}" for day in range(1, 21))
+    path = _topic(tmp_path, "parse-cost", sections)
+
+    parsed = MemoryService(tmp_path, engine)._parse_wiki_file(
+        path, path.read_text(encoding="utf-8"), _entry("parse-cost")
+    )
+
+    assert parsed is not None
+    assert TrackingDateTime.parse_calls == 2
+    assert marker.calls == 1
 
 
 def test_recall_returns_previously_invisible_topic(tmp_path: Path, engine: Any) -> None:
