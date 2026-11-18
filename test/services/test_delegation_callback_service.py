@@ -13,6 +13,7 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients.database import (
     Base,
     close_delegation_edge,
+    close_edges_replied_by,
     create_delegation_edge,
     find_open_edge,
     list_open_edges_into,
@@ -69,10 +70,26 @@ class TestMessages:
 
 
 class TestSendMessageRules:
-    def test_reply_closes_owed_edge(self, db):
+    def test_reply_marks_owed_edge_in_flight_and_leaves_it_open(self, db):
+        """Spec scenario "Reply stored but not yet delivered" (rule 1, design D1)."""
         create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
         svc.on_send_message(sender_id="w1", receiver_id="sup", message_id=1, expect_reply=False)
-        assert list_open_edges_into("w1") == []
+        (edge,) = list_open_edges_into("w1")
+        assert (edge.state, edge.reply_message_id) == (EdgeState.OPEN, 1)
+
+    def test_later_reply_replaces_the_recorded_message(self, db):
+        create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
+        svc.on_send_message(sender_id="w1", receiver_id="sup", message_id=1, expect_reply=False)
+        svc.on_send_message(sender_id="w1", receiver_id="sup", message_id=2, expect_reply=False)
+        (edge,) = list_open_edges_into("w1")
+        assert edge.reply_message_id == 2
+
+    def test_reply_with_expect_reply_opens_no_reverse_edge(self, db):
+        """Rule 1 wins: a reply never also opens w1 -> sup."""
+        create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
+        svc.on_send_message(sender_id="w1", receiver_id="sup", message_id=1, expect_reply=True)
+        assert find_open_edge("w1", "sup") is None
+        assert list_open_edges_into("w1")[0].reply_message_id == 1
 
     @patch(f"{MOD}.get_terminal_metadata", return_value={"caller_id": "sup"})
     def test_caller_follow_up_to_own_child_opens_edge(self, _meta, db):
@@ -150,11 +167,38 @@ class TestEvaluateCompletion:
         assert svc.evaluate_completion("w1") == 0
         assert env["sent"] == []
 
-    def test_forwarded_after_sub_worker_replies(self, db, env):
+    def test_caller_held_while_its_sub_workers_reply_is_in_flight(self, db, env):
+        """Spec scenario "Caller idle while its worker's reply is queued"."""
+        _armed("sup", "w1")
+        _armed("w1", "w2")
+        svc.on_send_message(sender_id="w2", receiver_id="w1", message_id=3, expect_reply=False)
+        assert svc.evaluate_completion("w1") == 0
+        assert env["sent"] == []
+
+    def test_forwarded_after_sub_worker_reply_is_delivered(self, db, env):
         _armed("sup", "w1")
         create_delegation_edge("w1", "w2", EdgeSource.ASSIGN)
         svc.on_send_message(sender_id="w2", receiver_id="w1", message_id=3, expect_reply=False)
+        close_edges_replied_by([3])
         assert svc.evaluate_completion("w1") == 1
+
+    def test_worker_with_reply_in_flight_not_forwarded(self, db, env):
+        """Spec scenario "Worker idle after replying" (design D2)."""
+        _armed("sup", "w1")
+        svc.on_send_message(sender_id="w1", receiver_id="sup", message_id=4, expect_reply=False)
+        assert svc.evaluate_completion("w1") == 0
+        assert env["sent"] == []
+        (edge,) = list_open_edges_into("w1")
+        assert edge.reply_message_id == 4, "the evaluator must not claim the edge either"
+
+    def test_worker_forwarded_to_its_other_caller_while_one_reply_is_in_flight(self, db, env):
+        """Only the edge whose reply is in flight is held back."""
+        _armed("sup", "w1")
+        _armed("other", "w1")
+        svc.on_send_message(sender_id="w1", receiver_id="sup", message_id=4, expect_reply=False)
+        assert svc.evaluate_completion("w1") == 1
+        assert [(s, r) for s, r, _ in env["sent"]] == [("w1", "other")]
+        assert find_open_edge("sup", "w1").reply_message_id == 4
 
     def test_pending_inbox_blocks(self, db, env):
         _armed("sup", "w1")
@@ -217,8 +261,8 @@ class TestEvaluateCompletion:
         real_list = svc.list_open_edges_into
         inner = {}
 
-        def list_then_let_another_evaluator_run(terminal_id, armed_only=False):
-            edges = real_list(terminal_id, armed_only=armed_only)
+        def list_then_let_another_evaluator_run(terminal_id, **kwargs):
+            edges = real_list(terminal_id, **kwargs)
             if "forwarded" not in inner:
                 inner["forwarded"] = None  # set first, so the nested call does not recurse
                 inner["forwarded"] = svc.evaluate_completion(terminal_id)
@@ -251,6 +295,16 @@ class TestWorkerEnded:
         svc.handle_worker_ended("w1", "reached ERROR")
         assert env["sent"] == []
         assert list_open_edges_out_of("w1") == []
+
+    def test_reply_in_flight_gets_no_worker_ended_notice(self, db, env):
+        """Spec scenario "Worker deleted with its reply queued" (design D8)."""
+        _armed("sup", "w1")
+        _armed("other", "w1")
+        svc.on_send_message(sender_id="w1", receiver_id="sup", message_id=5, expect_reply=False)
+        svc.handle_worker_ended("w1", "was deleted")
+        assert [(s, r) for s, r, _ in env["sent"]] == [("w1", "other")]
+        (edge,) = list_open_edges_into("w1")
+        assert (edge.caller_id, edge.reply_message_id) == ("sup", 5)
 
 
 class TestSweep:
@@ -421,3 +475,356 @@ class TestWaitingOnUndeliveredEdge:
             assert svc.evaluate_completion("w1") == 0
         (outbound,) = warn.call_args.args[1]
         assert (warn.call_args.args[0], outbound.worker_id) == ("w1", "w2")
+
+
+# --- reply-delivery-failure phase B: notices and reply settlement over a real database ---
+
+C, S, W = "cccc0001", "ssss0002", "wwww0003"
+GONE = "gggg0009"  # a terminal with no row: ended
+
+
+def _msg(id=7, sender=W, receiver=S, text="final reply"):
+    from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
+
+    return InboxMessage(
+        id=id,
+        sender_id=sender,
+        receiver_id=receiver,
+        message=text,
+        status=MessageStatus.FAILED,
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+@pytest.fixture
+def live(isolated_memory_db, monkeypatch):
+    """Terminals C -> S -> W with real rows, a real inbox and edge rules; the pane is mocked.
+
+    ``delivered`` records every ``_deliver`` the service starts; nothing is
+    delivered from it, so notices stay readable as PENDING rows.
+    """
+    from unittest.mock import MagicMock
+
+    from cli_agent_orchestrator.clients.database import create_terminal
+    from cli_agent_orchestrator.services import inbox_service as inbox_module
+
+    create_terminal(C, "cao-s", "c", "claude_code", "conductor")
+    create_terminal(S, "cao-s", "s", "claude_code", "supervisor", caller_id=C)
+    create_terminal(W, "cao-s", "w", "claude_code", "forge", caller_id=S)
+
+    monitor = MagicMock()
+    monitor.get_status.return_value = TerminalStatus.IDLE
+    monitor.started_on_last_input.return_value = True
+    monkeypatch.setattr(svc, "status_monitor", monitor)
+    monkeypatch.setattr(inbox_module, "status_monitor", monitor)
+    monkeypatch.setattr(inbox_module, "INBOX_SUBMIT_CONFIRMATION", False)
+    screen = MagicMock()
+    screen.get_output.side_effect = lambda terminal_id, _mode: f"{terminal_id} SCREEN"
+    monkeypatch.setattr(svc, "terminal_service", screen)
+    paste = MagicMock()
+    paste.dispatch_input.return_value = 0
+    monkeypatch.setattr(inbox_module, "terminal_service", paste)
+    delivered = []
+    monkeypatch.setattr(svc, "_deliver", lambda r, s, registry: delivered.append((r, s, registry)))
+    return MagicMock(monitor=monitor, paste=paste, delivered=delivered)
+
+
+def _send(sender_id, receiver_id, text, expect_reply=False):
+    """The inbox POST's bookkeeping: store the message and apply the edge rules."""
+    from cli_agent_orchestrator.clients.database import create_inbox_message
+
+    message = create_inbox_message(sender_id, receiver_id, text)
+    svc.on_send_message(sender_id, receiver_id, message.id, expect_reply=expect_reply)
+    return message.id
+
+
+def _attempt(receiver_id, report_to_sender=None):
+    outcomes = []
+    InboxService().deliver_pending(
+        receiver_id,
+        on_outcome=lambda *a: outcomes.append(a),
+        report_to_sender=report_to_sender,
+    )
+    return outcomes
+
+
+def _inbox(receiver_id):
+    from cli_agent_orchestrator.clients.database import get_inbox_messages
+
+    return get_inbox_messages(receiver_id, limit=50)
+
+
+def _failure_notices(receiver_id):
+    return [m for m in _inbox(receiver_id) if m.message.startswith("[CAO delivery failed]")]
+
+
+def _not_sent(text):
+    from cli_agent_orchestrator.backends import base
+
+    return base.InputNotSentError(text)
+
+
+class TestMessagesFailed:
+    """inbox-delivery "Queued delivery failures are retried and reported": the sender notice."""
+
+    def test_queued_final_failure_tells_the_sender_once(self, live):
+        # Act
+        svc.handle_messages_failed(
+            S, [_msg(id=7)], "InputNotSentError: lost terminal.read", uncertain=False
+        )
+
+        # Assert
+        (notice,) = _failure_notices(W)
+        assert notice.sender_id == S
+        assert S in notice.message, "names the receiver"
+        assert "7" in notice.message, "names the message id"
+        assert "lost terminal.read" in notice.message, "names the error"
+        assert "may have" not in notice.message, "nothing was typed, so it did not arrive"
+        assert live.delivered == [(W, S, None)]
+
+    def test_uncertain_notice_says_the_text_may_have_arrived(self, live):
+        svc.handle_messages_failed(S, [_msg(id=7)], "lost terminal.send", uncertain=True)
+        (notice,) = _failure_notices(W)
+        assert "may have" in notice.message
+        assert "lost terminal.send" in notice.message
+
+    def test_message_reported_to_its_sender_gets_no_notice(self, live):
+        svc.handle_messages_failed(S, [_msg(id=7)], "lost", uncertain=False, reported_ids={7})
+        assert _inbox(W) == []
+        assert live.delivered == []
+
+    def test_only_the_unreported_message_of_a_batch_gets_a_notice(self, live):
+        svc.handle_messages_failed(
+            S,
+            [_msg(id=7, text="first"), _msg(id=8, text="second")],
+            "lost",
+            uncertain=False,
+            reported_ids={7},
+        )
+        (notice,) = _failure_notices(W)
+        assert "8" in notice.message and "7" not in notice.message.replace(S, "")
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "[CAO delivery failed] Your message 3 to terminal x was not delivered",
+            "[CAO auto-forward] Worker x (profile y) ...",
+            "[CAO worker ended] Worker x ...",
+        ],
+        ids=["delivery-failed", "auto-forward", "worker-ended"],
+    )
+    def test_failed_cao_notice_never_causes_another_notice(self, live, text):
+        """Plan note 12: two terminals cannot trade failure notices."""
+        svc.handle_messages_failed(S, [_msg(id=7, text=text)], "lost", uncertain=False)
+        assert _inbox(W) == []
+
+    def test_sender_that_ended_gets_no_notice(self, live):
+        svc.handle_messages_failed(S, [_msg(id=7, sender=GONE)], "lost", uncertain=False)
+        assert _inbox(GONE) == []
+        assert live.delivered == []
+
+    def test_message_that_opened_an_edge_closes_it_and_its_sender_is_told_once(self, live):
+        """handle_delivery_failed still runs; the caller of that edge is the sender."""
+        # Arrange: S follows up with its own child W, which opens S -> W.
+        message_id = _send(S, W, "follow-up")
+        assert find_open_edge(S, W).message_id == message_id
+
+        # Act
+        svc.handle_messages_failed(
+            W,
+            [_msg(id=message_id, sender=S, receiver=W, text="follow-up")],
+            "lost",
+            uncertain=False,
+        )
+
+        # Assert
+        assert find_open_edge(S, W) is None
+        assert len(_failure_notices(S)) == 1, "one notice, not the edge's plus the sender's"
+
+    def test_reported_message_that_opened_an_edge_closes_it_silently(self, live):
+        """Plan note 12: the sender already has the error from its own send_message."""
+        message_id = _send(S, W, "follow-up")
+        svc.handle_messages_failed(
+            W,
+            [_msg(id=message_id, sender=S, receiver=W, text="follow-up")],
+            "lost",
+            uncertain=False,
+            reported_ids={message_id},
+        )
+        assert find_open_edge(S, W) is None
+        assert _failure_notices(S) == []
+
+    def test_registry_reaches_the_notice_delivery(self, live):
+        registry = object()
+        svc.handle_messages_failed(S, [_msg(id=7)], "lost", uncertain=False, registry=registry)
+        assert live.delivered == [(W, S, registry)]
+
+
+class TestQueuedFailureNotices:
+    """The same spec requirement through the real deliver_pending, with no edges involved.
+
+    W -> C opens no edge: C is not waiting on W, and C was not created by W.
+    """
+
+    def test_failure_on_every_attempt_sends_one_notice_with_the_last_error(self, live):
+        """Spec scenario "Failure on every attempt"."""
+        from cli_agent_orchestrator.constants import INBOX_MAX_DELIVERY_ATTEMPTS
+
+        message_id = _send(W, C, "status update")
+        live.paste.dispatch_input.side_effect = [
+            _not_sent(f"lost terminal.read on attempt {n}")
+            for n in range(1, INBOX_MAX_DELIVERY_ATTEMPTS + 1)
+        ]
+        for _ in range(INBOX_MAX_DELIVERY_ATTEMPTS - 1):
+            _attempt(C)
+        assert _failure_notices(W) == [], "no notice while retries remain"
+
+        _attempt(C)
+
+        (notice,) = _failure_notices(W)
+        assert str(message_id) in notice.message
+        assert f"attempt {INBOX_MAX_DELIVERY_ATTEMPTS}" in notice.message
+        assert "may have" not in notice.message
+
+    def test_uncertain_queued_failure_notice_says_it_may_have_arrived(self, live):
+        """Spec scenario "Uncertain queued failure"."""
+        _send(W, C, "status update")
+        live.paste.dispatch_input.side_effect = RuntimeError("herdr-core lost terminal.send")
+        _attempt(C)
+        (notice,) = _failure_notices(W)
+        assert "may have" in notice.message
+        assert live.paste.dispatch_input.call_count == 1
+
+    def test_transient_failure_then_success_sends_no_notice(self, live):
+        """Spec scenario "Transient failure, then success"."""
+        _send(W, C, "status update")
+        live.paste.dispatch_input.side_effect = [_not_sent("lost terminal.read"), 0]
+        _attempt(C)
+        _attempt(C)
+        assert _failure_notices(W) == []
+        assert live.paste.dispatch_input.call_count == 2
+
+    def test_reported_failure_sends_no_notice(self, live):
+        """Spec "Immediate delivery fails before typing": the POST carries the error instead."""
+        message_id = _send(W, C, "status update")
+        live.paste.dispatch_input.side_effect = _not_sent("lost terminal.read")
+        _attempt(C, report_to_sender=message_id)
+        assert _failure_notices(W) == []
+
+
+class TestReplySettlement:
+    """delegation-callback: a reply ends the wait once it is delivered, not when stored."""
+
+    def _assign(self, caller, worker):
+        _armed(caller, worker)
+
+    def test_delivered_reply_closes_the_edge_as_replied(self, live):
+        """Spec scenario "Worker replies to its caller"."""
+        from cli_agent_orchestrator.clients.database import find_any_edge
+
+        self._assign(S, W)
+        _send(W, S, "final reply")
+        assert find_open_edge(S, W) is not None, "still open while only stored"
+
+        _attempt(S)
+
+        assert find_any_edge(S, W).state == EdgeState.REPLIED
+        assert svc.evaluate_completion(W) == 0, "W is not auto-forwarded on its next IDLE"
+        assert live.delivered == []
+
+    def test_delivery_of_a_replaced_reply_keeps_the_edge_open_until_the_latest(self, live):
+        from cli_agent_orchestrator.clients.database import find_any_edge
+
+        self._assign(S, W)
+        _send(W, S, "first reply")
+        latest = _send(W, S, "second reply")
+
+        _attempt(S)  # one message per attempt, oldest first: the replaced reply
+
+        assert find_open_edge(S, W).reply_message_id == latest
+        _attempt(S)
+        assert find_any_edge(S, W).state == EdgeState.REPLIED
+
+    def test_worker_deleted_with_reply_queued_closes_as_replied_on_delivery(self, live):
+        """Spec scenario "Worker deleted with its reply queued"."""
+        from cli_agent_orchestrator.clients.database import find_any_edge
+
+        self._assign(S, W)
+        _send(W, S, "final reply")
+
+        svc.handle_worker_ended(W, "was deleted")
+
+        assert [m for m in _inbox(S) if m.message.startswith("[CAO worker ended]")] == []
+        assert find_open_edge(S, W) is not None
+        _attempt(S)
+        assert find_any_edge(S, W).state == EdgeState.REPLIED
+
+    def test_queued_reply_failing_for_good_reopens_the_wait_and_tells_only_the_sender(self, live):
+        """Spec "A reply that fails for good reopens its edge" (sender alive, queued)."""
+        self._assign(C, S)
+        self._assign(S, W)
+        _send(W, S, "final reply")
+        live.paste.dispatch_input.side_effect = RuntimeError("herdr-core lost terminal.send")
+
+        _attempt(S)
+
+        edge = find_open_edge(S, W)
+        assert edge is not None and edge.reply_message_id is None
+        assert [m.message for m in _inbox(S)] == ["final reply"], "S received nothing new"
+        assert len(_failure_notices(W)) == 1
+        assert _inbox(C) == []
+
+    def test_reply_failing_after_its_sender_ended_tells_the_caller_with_the_reply(self, live):
+        """Spec scenario "Reply fails after its sender ended"."""
+        from cli_agent_orchestrator.clients.database import delete_terminal
+
+        self._assign(S, W)
+        _send(W, S, "final reply text")
+        svc.handle_worker_ended(W, "was deleted")
+        delete_terminal(W, end_reason="deleted")
+        live.paste.dispatch_input.side_effect = RuntimeError("herdr-core lost terminal.send")
+
+        _attempt(S)
+
+        (notice,) = _failure_notices(S)
+        assert notice.sender_id == W
+        assert W in notice.message, "names the worker"
+        assert "final reply text" in notice.message, "carries the stored reply"
+        assert find_open_edge(S, W) is None
+        assert (S, W, None) in live.delivered
+
+
+class TestIncident20261117:
+    """C -> S -> W: W's reply failed in mark_input_received, before anything was typed."""
+
+    def test_failed_reply_keeps_the_caller_waiting_and_unforwarded(self, live, monkeypatch):
+        # Arrange
+        self_ids = {"reply": None}
+        _armed(C, S)
+        _armed(S, W)
+        self_ids["reply"] = _send(W, S, "forge's final reply")
+        live.paste.dispatch_input.side_effect = _not_sent(
+            "TerminalBackendError: herdr-core lost terminal.read: sent nothing for 10.0s"
+        )
+
+        # Act: the POST's immediate attempt, reported back to W.
+        outcomes = _attempt(S, report_to_sender=self_ids["reply"])
+
+        # Assert: W was told through the POST; S is waiting on W again.
+        assert [o[1].value for o in outcomes] == ["failed"]
+        edge = find_open_edge(S, W)
+        assert edge is not None and edge.reply_message_id is None
+        assert [m.status.value for m in _inbox(S)] == ["failed"], "S has received nothing"
+        assert _failure_notices(W) == []
+
+        # Past the pickup timeout, with the failed attempt as S's last input,
+        # S is still not auto-forwarded to C.
+        live.monitor.started_on_last_input.return_value = False
+        live.monitor.last_input_at.return_value = 100.0
+        monkeypatch.setattr(
+            svc, "_monotonic", lambda: 100.0 + svc.DELEGATION_PICKUP_TIMEOUT_SECONDS + 1
+        )
+        assert svc.evaluate_completion(S) == 0
+        svc.sweep()
+        assert _inbox(C) == []
+        assert [d for d in live.delivered if d[0] == C] == []
