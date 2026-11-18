@@ -38,7 +38,8 @@
 #
 # Trust. Kiro Crew refuses to run code from a third party until you allow it, so `kirocrew app enable`
 # fails with `app_execution_denied` on a fresh install. There are two ways to allow it:
-#   --trust-app   adds only "cao-shelf" to agent.apps_trusted (the narrow grant; recommended)
+#   --trust-app   adds only "cao-shelf" to agent.apps_trusted and agent.apps_trusted_local
+#                 (the narrow grant; recommended)
 #   --trust-all   sets agent.apps_allow_third_party=true, which trusts EVERY third-party App (a shortcut)
 # Without either option the script changes no trust setting, tells you what is set, and tells you what
 # to run. You can also do it in the dashboard: Settings, Security, Third-party apps.
@@ -479,7 +480,7 @@ case "$TRUST" in
         run "$KC" config set agent.apps_allow_third_party true
         ;;
     app)
-        info "--trust-app: granting trust to ${APP_NAME} only (agent.apps_trusted)."
+        info "--trust-app: granting trust to ${APP_NAME} only (agent.apps_trusted and agent.apps_trusted_local)."
         set_app_grant agent.apps_trusted
         set_app_grant agent.apps_trusted_local
         ;;
