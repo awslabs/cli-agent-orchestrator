@@ -564,6 +564,11 @@ class HerdrAppBackend(TerminalBackend):
                 self._input_call(address, "terminal.keys", keys=names)
             return
         # force: CAO's own delivery gates decide when to type, as on tmux.
+        # ``submit_delay`` can't be honored: terminal.send has no gap parameter
+        # (hc 0.1.21 schema), and herdr-core presses Enter PASTE_GAP (200 ms)
+        # after the paste unless a template file sets paste_gap_ms (input.rs).
+        # Inbox deliveries catch a swallowed Enter instead
+        # (event_inbox_confirms_submit).
         self._input_call(address, "terminal.send", text=keys, force=True)
         for _ in range(enter_count - 1):
             self._input_call(address, "terminal.keys", keys=["enter"])
@@ -612,6 +617,13 @@ class HerdrAppBackend(TerminalBackend):
     # --- Status ---
 
     def supports_event_inbox(self) -> bool:
+        return True
+
+    def event_inbox_confirms_submit(self) -> bool:
+        # HerdrAppInboxService delivers in a worker thread (asyncio.to_thread),
+        # and herdr-core's fixed 200 ms paste-to-Enter gap (input.rs PASTE_GAP)
+        # is shorter than some providers' paste_submit_delay, so a swallowed
+        # Enter must be caught and resent here.
         return True
 
     def get_native_status(self, session_name: str, window_name: str) -> Optional[TerminalStatus]:
