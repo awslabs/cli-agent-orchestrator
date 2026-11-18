@@ -358,6 +358,12 @@ INBOX_RECONCILE_INTERVAL = 30  # seconds between reconciliation sweeps
 # and missed.
 INBOX_RECONCILE_GRACE_SECONDS = 30
 
+# Attempts a queued message gets when each one fails before anything is typed
+# (reply-delivery-failure D6). The reconcile sweep and status events retry it;
+# after the last one the sender is told. A failure that may have typed is
+# never retried.
+INBOX_MAX_DELIVERY_ATTEMPTS = 3
+
 # Inbox submit confirmation (issue #78). send_input delivers a message as
 # paste-buffer -> fixed submit delay -> Enter. That delay only GUESSES when the
 # receiving TUI is input-ready; when it guesses wrong the TUI swallows the Enter
