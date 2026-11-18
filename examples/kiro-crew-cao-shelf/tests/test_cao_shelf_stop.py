@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import random
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterator, List
 
@@ -94,6 +95,17 @@ def test_stale_plan_lists_nothing_that_is_not_stale_now(busy: ActionsRig) -> Non
     names = {s["name"] for s in plan["sessions"]}
     assert "payments-fix" not in names and "docs-refresh" not in names and "migrate-db" not in names
     assert len(names) == 9
+
+
+def test_stale_plan_offers_a_session_whose_only_terminal_completed_long_ago(
+    rig: ActionsRig,
+) -> None:
+    when = (sup.clock_of("busy") - timedelta(hours=300)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    rig.cao.add_session("finished-long-ago", [("abcdef01", "completed", when, None)])
+    rig.warm()
+    plan = plan_stale(rig)
+    listed = next(s for s in plan["sessions"] if s["name"] == "finished-long-ago")
+    assert listed["tier"] == "stale" and listed["working"] is False
 
 
 def test_stale_plan_rechecks_live_and_drops_a_session_that_woke_up(rig: ActionsRig) -> None:

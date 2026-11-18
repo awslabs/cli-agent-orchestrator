@@ -62,7 +62,10 @@ test suites in one change.
   ids that were read, and a helper whose caller could be in an unread session stays `false`.
 * **Tier** (first match wins):
   1. any terminal `waiting_user_answer` or `error` -> `needs_you` (`tier_reason` = that status);
-  2. any terminal `processing` or `completed` -> `live`;
+  2. any terminal `processing` -> `live`; any terminal `completed` while the youngest `last_active`
+     age is `< warm_hours` (default 1) -> `live` (`tier_reason` `completed`, "just completed").
+     CAO latches `completed` until new input, so past that window a `completed` terminal counts as
+     idle for the rules below;
   3. a terminal with a missing or unreadable `last_active` -> `parked`, `tier_reason`
      `age_unknown`, never `warm` and never `stale` (an unreadable clock is not "now", and it must
      not make a session eligible for clean-up either). The terminal's and the session's

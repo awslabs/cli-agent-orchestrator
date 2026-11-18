@@ -149,14 +149,19 @@ def classify(
     A session that has any terminal with an unreadable ``last_active`` (``age_known`` false) is
     never ``stale`` and never ``warm``: a clock that cannot be read must not look fresh, and it must
     not make a session eligible for clean-up either.
+
+    CAO latches ``completed`` until new input arms the terminal, so it means "at a prompt" as
+    ``idle`` does: it is ``live`` only while the youngest row is under ``warm_hours`` old (just
+    completed), and then tiered by age like ``idle``.
     """
     present = set(statuses)
     for status in ("waiting_user_answer", "error"):
         if status in present:
             return "needs_you", status, False
-    for status in ("processing", "completed"):
-        if status in present:
-            return "live", status, False
+    if "processing" in present:
+        return "live", "processing", False
+    if "completed" in present and age_known and youngest_age < warm_hours * 3600:
+        return "live", "completed", False
     if not age_known:
         return "parked", "age_unknown", False
     if youngest_age >= stale_hours * 3600:

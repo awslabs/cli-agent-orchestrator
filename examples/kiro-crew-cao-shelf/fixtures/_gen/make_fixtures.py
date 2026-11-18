@@ -179,10 +179,12 @@ def tier_of(terms: list[dict]) -> tuple[str, str]:
     for s in ("waiting_user_answer", "error"):
         if s in st:
             return "needs_you", s
-    for s in ("processing", "completed"):
-        if s in st:
-            return "live", s
+    if "processing" in st:
+        return "live", "processing"
     youngest = min(t["age"] for t in terms)
+    # CAO latches `completed`: Live only while just completed, then tiered by age like idle
+    if "completed" in st and youngest < PARKED_HOURS:
+        return "live", "completed"
     return (
         ("stale", "idle_over_stale_hours")
         if youngest >= STALE_HOURS

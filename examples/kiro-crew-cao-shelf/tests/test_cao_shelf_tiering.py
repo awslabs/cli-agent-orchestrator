@@ -111,9 +111,37 @@ def test_waiting_beats_processing_and_error_beats_live() -> None:
     assert [a["status"] for a in sess(err)["asks"]] == ["error"]
 
 
-def test_completed_is_live_and_idle_age_is_ignored_for_live() -> None:
-    s = sess(one([term("aaaaaaa1", "completed", age=300)]))
+def test_completed_is_live_only_while_it_just_completed() -> None:
+    s = sess(one([term("aaaaaaa1", "completed", age=0.1)]))
     assert s["tier"] == "live" and s["tier_reason"] == "completed"
+
+
+@pytest.mark.parametrize(
+    "age, tier, reason, warm",
+    [
+        (1.0, "parked", "idle_under_stale_hours", False),
+        (72.0, "stale", "idle_over_stale_hours", False),
+        (300.0, "stale", "idle_over_stale_hours", False),
+    ],
+)
+def test_completed_past_the_warm_window_is_tiered_by_age_like_idle(
+    age: float, tier: str, reason: str, warm: bool
+) -> None:
+    # CAO latches ``completed`` until new input, so it says only that the screen is at a prompt.
+    s = sess(one([term("aaaaaaa1", "completed", age=age)]))
+    assert (s["tier"], s["tier_reason"], s["warm"]) == (tier, reason, warm)
+
+
+def test_completed_with_an_unreadable_clock_is_parked_age_unknown() -> None:
+    t = term("aaaaaaa1", "completed")
+    t["last_active"] = "not a time"
+    s = sess(one([t]))
+    assert s["tier"] == "parked" and s["tier_reason"] == "age_unknown" and s["warm"] is False
+
+
+def test_processing_is_live_at_any_age() -> None:
+    s = sess(one([term("aaaaaaa1", "processing", age=300)]))
+    assert s["tier"] == "live" and s["tier_reason"] == "processing"
 
 
 def test_unknown_status_counts_as_idle_for_tiering() -> None:

@@ -37,7 +37,7 @@ export function HonestLine({ data }: { data: ShelfResponse }) {
       ) : null}
       {s.completed > 0 ? (
         <>
-          <b>{s.completed}</b> just completed,{' '}
+          <b>{s.completed}</b> completed,{' '}
         </>
       ) : null}
       {s.unknown > 0 ? (
