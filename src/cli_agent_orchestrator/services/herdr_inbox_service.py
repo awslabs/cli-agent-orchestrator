@@ -1048,6 +1048,15 @@ class HerdrInboxService:
             deleted,
         )
 
+        # A re-map changed a managed pane_id (herdr renumbered a live pane). The
+        # active subscription is keyed on the OLD pane_id, so without a recycle
+        # that terminal would get no agent-status events until some other
+        # terminal happened to register — the same silent fall-through to the
+        # reconcile sweep this fix exists to prevent. Request a resubscribe so
+        # the next cycle subscribes on the new pane_id.
+        if remapped:
+            self._request_resubscribe()
+
     async def _deliver_settled_panes(self) -> None:
         """Deliver to managed panes already settled in idle/done at subscribe time.
 
@@ -1081,10 +1090,11 @@ class HerdrInboxService:
                 continue
             if pane.get("agent_status") in ("idle", "done"):
                 self._working_since.pop(terminal_id, None)
-                self._deliver(terminal_id, source="settled-sweep")
                 # A pane already settled at connect time has the same flush-wait
-                # gap as a live event, and no event will follow, so carry it too.
-                self._arm_settle_retries(terminal_id)
+                # gap as a live event, and no event will follow, so carry it too
+                # — but only if the immediate attempt didn't already land.
+                if self._deliver(terminal_id, source="settled-sweep") == 0:
+                    self._arm_settle_retries(terminal_id)
                 delivered += 1
             self._note_activity(terminal_id, pane.get("agent_status"))
             # A transition missed while disconnected surfaces here as the
@@ -1398,11 +1408,14 @@ class HerdrInboxService:
         if status in ("idle", "done"):
             # Clear working timestamp
             self._working_since.pop(terminal_id, None)
-            # Trigger delivery now, then re-check across the flush-wait window:
-            # this single event is the only agent-status signal herdr sends for
-            # the transition, and the provider may not report ready yet.
-            self._deliver(terminal_id, source="herdr-event")
-            self._arm_settle_retries(terminal_id)
+            # Trigger delivery now; only arm the flush-wait re-check if nothing
+            # landed. This single event is the only agent-status signal herdr
+            # sends for the transition, so if the provider isn't ready yet
+            # (delivered 0) the retry loop carries it; if it already delivered,
+            # arming would just fire one redundant attempt (matches the loop's
+            # own > 0 stop rule).
+            if self._deliver(terminal_id, source="herdr-event") == 0:
+                self._arm_settle_retries(terminal_id)
 
         elif status == "working":
             # Track working start for kiro supplement check

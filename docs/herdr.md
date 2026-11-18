@@ -96,7 +96,9 @@ CAO maps its concepts to herdr primitives:
 
 ### Event-driven inbox delivery
 
-`HerdrInboxService` connects to the herdr Unix socket at startup and subscribes, in one `events.subscribe` call, to `pane.agent_status_changed` for each managed pane (validated against a live snapshot) plus a broadcast `pane.updated` for older herdr versions. When a pane transitions to `idle` or `done`, pending inbox messages are delivered immediately. herdr permits one `events.subscribe` per connection, so a pane registered later is picked up by an intentional reconnect; the subscribe response is read, and a rejected subscription fails the connection attempt loudly instead of silently degrading delivery to the 30s reconciliation sweep. Delivery log lines carry the trigger (`trigger: herdr-event`, `settled-sweep`, `reconcile-sweep`), so a dead event path is visible in the logs.
+`HerdrInboxService` connects to the herdr Unix socket at startup and subscribes, in one `events.subscribe` call, to `pane.agent_status_changed` for each managed pane (validated against a live snapshot) plus a broadcast `pane.updated` for older herdr versions. When a pane transitions to `idle` or `done`, pending inbox messages are delivered immediately. herdr permits one `events.subscribe` per connection, so a pane registered later is picked up by an intentional reconnect; the subscribe response is read, and a rejected subscription fails the connection attempt loudly instead of silently degrading delivery to the 30s reconciliation sweep. Delivery log lines carry the trigger (`trigger: herdr-event`, `herdr-settle`, `settled-sweep`, `reconcile-sweep`, `opencode-poll`), so a dead event path is visible in the logs.
+
+> Note on `pane.updated`: as of herdr 0.9.x it is still emitted for other pane changes (e.g. agent name/title), but no longer on agent-status transitions, which is why the per-pane `pane.agent_status_changed` subscription is the one that carries delivery. The broadcast subscription is kept only for herdr ≤0.8, where it did carry status.
 
 ### Startup and reconnect behavior
 

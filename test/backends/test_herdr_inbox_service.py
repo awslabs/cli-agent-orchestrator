@@ -1519,6 +1519,29 @@ class TestHerdrInboxServiceSettleRetries:
         # Stopped at tick 2, did NOT run all 9 ticks.
         assert ticks["n"] == 2
 
+    def test_event_delivery_landing_does_not_arm_a_retry(self):
+        """If the immediate event delivery already lands (callback returns >0),
+        no settle-retry loop is armed — arming would just fire one redundant
+        attempt (fanhongy P3; matches the loop's own >0 stop rule)."""
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock",
+            delivery_callback=lambda tid, source: 1,  # delivered
+        )
+        service._pane_to_terminal = {"w1:p1": "tid1"}
+        frame = {
+            "event": "pane.agent_status_changed",
+            "data": {"pane_id": "w1:p1", "agent_status": "idle"},
+        }
+
+        async def run():
+            service._loop = asyncio.get_running_loop()
+            service._resubscribe_requested = asyncio.Event()
+            with patch.object(service, "_record_agent_status", new=AsyncMock()):
+                await service._dispatch_event(frame)
+
+        _run_async(run())
+        assert service._settle_tasks == {}, "a settle-retry was armed despite delivery landing"
+
     def test_second_event_does_not_stack_a_second_loop(self):
         """A terminal that flaps done→working→done fires several events, but only
         ONE retry loop runs at a time (no multiplied readiness checks)."""
@@ -2360,6 +2383,50 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
         assert service._terminal_to_pane.get("tid1") == "pane-new"
         # Old (renumbered-away) pane_id is gone from the map.
         assert "pane-old" not in service._pane_to_terminal
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_reconcile_remap_requests_resubscribe(
+        self, mock_meta, mock_delete, mock_snap, mock_run, mock_get_backend
+    ):
+        """A re-map changes a managed pane_id, so the active subscription (keyed
+        on the old pane_id) must be refreshed — otherwise that terminal gets no
+        agent-status events until another registers (fanhongy P3). The re-map
+        must request a resubscribe."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid1", "pane-old")
+        mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-1"}
+        mock_snap.return_value = {
+            "panes": [{"pane_id": "pane-new"}],
+            "tabs": [{"label": "win-1", "workspace_id": "ws-1"}],
+            "workspaces": [],
+        }
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({"result": {"tabs": [{"label": "win-1", "workspace_id": "ws-1"}]}}),
+            stderr="",
+        )
+        mock_backend = MagicMock()
+        mock_backend.get_pane_id.return_value = "pane-new"
+        mock_get_backend.return_value = mock_backend
+
+        async def run():
+            # start() wiring: a loop + event must exist for the request to land.
+            service._loop = asyncio.get_running_loop()
+            service._resubscribe_requested = asyncio.Event()
+            await service._reconcile()
+            # _request_resubscribe schedules the set via call_soon_threadsafe;
+            # let the loop tick so the scheduled callback runs.
+            await asyncio.sleep(0)
+            return service._resubscribe_requested.is_set()
+
+        assert _run_async(run()) is True, (
+            "a reconcile re-map did not request a resubscribe; the re-mapped "
+            "terminal would silently lose its per-pane subscription"
+        )
 
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")

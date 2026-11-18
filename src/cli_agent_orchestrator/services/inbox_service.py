@@ -343,17 +343,19 @@ class InboxService:
                 # its pickup timeout tells the caller if it never starts.
                 if INBOX_SUBMIT_CONFIRMATION and not eager:
                     if get_backend().supports_event_inbox():
-                        # Event-inbox backends (herdr) push delivery synchronously
+                        # Event-inbox backends (herdr) push live-event delivery
                         # inline on their single asyncio event loop thread
-                        # (herdr_inbox_service.py's _event_loop -> _deliver, with
-                        # no asyncio.to_thread offload -- see the TODO at
-                        # herdr_inbox_service.py:1276-1277). _confirm_submitted's
-                        # blocking time.sleep() would stall that whole session's
-                        # event processing for up to
+                        # (herdr_inbox_service.py's _event_loop -> _deliver). The
+                        # settle-retry path is offloaded via asyncio.to_thread,
+                        # but this on-event path is not, so _confirm_submitted's
+                        # blocking time.sleep() here would stall that whole
+                        # session's event processing for up to
                         # INBOX_SUBMIT_CONFIRM_TIMEOUT * (1 + INBOX_SUBMIT_MAX_RESUBMITS)
-                        # seconds. Skip confirmation there until that offload
-                        # exists -- the drop stays undetected on herdr, same as
-                        # before this fix, instead of freezing the session.
+                        # seconds. Skip confirmation there until the live-event
+                        # path is driven off-loop too (tracked as a follow-up to
+                        # the delivery-ready-signal work) -- the drop stays
+                        # undetected on herdr, same as before this fix, instead
+                        # of freezing the session.
                         logger.debug(
                             "Skipping inbox submit confirmation for terminal %s: "
                             "event-inbox backend delivery runs on the API event loop",
