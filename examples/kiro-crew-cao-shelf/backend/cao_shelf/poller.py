@@ -558,11 +558,11 @@ class Poller:
     def _cao_info(self, now: float) -> Dict[str, Any]:
         st = self._st
         err = st.failure or st.partial
-        reachable = not (
-            st.failure is not None and st.failure.code in ("cao_unreachable", "cao_timeout")
-        )
+        # Any failure of the whole read (unreachable, timeout, 401/403, an unknown shape, another
+        # CAO error) means the page has no current data: it shows the banner and turns actions off.
+        # A partial read (one session failed) still lists the rest, so it stays reachable.
         return {
-            "reachable": reachable,
+            "reachable": st.failure is None,
             "base_url": self._client.base_url if self._client else self._settings()["cao_url"],
             "version": st.version,
             "terminal_backend": st.backend,

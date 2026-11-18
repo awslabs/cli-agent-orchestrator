@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -290,20 +291,63 @@ def test_no_snapshot_and_cao_down_is_not_an_empty_shelf(rig: Rig) -> None:
 
 
 @pytest.mark.parametrize(
-    "mode,code,reachable",
+    "mode,code",
     [
-        ("401", "cao_auth_required", True),
-        ("badshape", "cao_incompatible", True),
-        ("slow", "cao_timeout", False),
+        ("401", "cao_auth_required"),
+        ("badshape", "cao_incompatible"),
+        ("500", "cao_error"),
+        ("slow", "cao_timeout"),
     ],
 )
-def test_other_failures_are_named(rig: Rig, mode: str, code: str, reachable: bool) -> None:
+def test_other_failures_are_named(rig: Rig, mode: str, code: str) -> None:
+    # any failure of the whole read is "not reachable" to the page: banner on, actions off
     rig.ticks(2)
     rig.cao.mode = mode
     rig.tick()
     shelf = rig.poller.shelf()
-    assert shelf["cao"]["error"]["code"] == code and shelf["cao"]["reachable"] is reachable
+    assert shelf["cao"]["error"]["code"] == code and shelf["cao"]["reachable"] is False
     assert shelf["stale_snapshot"] is True
+
+
+@pytest.mark.parametrize(
+    "mode,code", [("401", "cao_auth_required"), ("badshape", "cao_incompatible")]
+)
+def test_a_failed_first_read_is_not_an_empty_reachable_shelf(
+    rig: Rig, mode: str, code: str
+) -> None:
+    rig.cao.mode = mode
+    rig.tick()
+    shelf = rig.poller.shelf()
+    assert shelf["sessions"] == [] and shelf["stale_snapshot"] is False
+    assert shelf["cao"]["reachable"] is False and shelf["cao"]["error"]["code"] == code
+
+
+# The page's trouble tests render these files (ui/test/app.test.tsx), so the backend and the page
+# cannot disagree on what a failed read looks like. Rewrite them with CAO_SHELF_WRITE_PAYLOADS=1.
+PAYLOADS = Path(__file__).resolve().parent / "payloads"
+TROUBLE = {
+    "auth-first-read": ("401", 0),
+    "auth-after-good-reads": ("401", 3),
+    "incompatible-first-read": ("badshape", 0),
+    "error-after-good-reads": ("500", 3),
+}
+
+
+@pytest.mark.parametrize("name", sorted(TROUBLE))
+def test_trouble_payloads_are_what_the_backend_serves(tmp_path: Path, name: str) -> None:
+    mode, good_ticks = TROUBLE[name]
+    r = Rig(tmp_path, "quiet")
+    r.ticks(good_ticks)
+    r.cao.mode = mode
+    r.now += 180
+    r.tick()
+    shelf = r.poller.shelf()
+    sup.validate("shelf.schema.json", shelf)
+    path = PAYLOADS / f"{name}.shelf.json"
+    if os.environ.get("CAO_SHELF_WRITE_PAYLOADS") == "1":
+        path.write_text(json.dumps(shelf, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    assert shelf == sup.load(path)
+    assert shelf["cao"]["reachable"] is False
 
 
 def test_one_bad_session_does_not_stop_the_others_and_is_reported(rig: Rig) -> None:

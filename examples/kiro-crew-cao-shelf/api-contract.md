@@ -97,7 +97,10 @@ test suites in one change.
 * **`in_flight`** is set when the conductor is `processing` and a helper whose `caller_id` is the
   conductor is `processing` or `waiting_user_answer`. It does not distinguish a blocking handoff
   from an assign; the UI says "waiting on helper", not "handoff".
-* **Unreachable CAO.** `GET /api/shelf` still answers `200`. With a last good snapshot:
+* **Unreachable CAO.** `cao.reachable` is false whenever the whole read failed, whatever the code
+  (`cao_unreachable`, `cao_timeout`, `cao_auth_required`, `cao_incompatible`, `cao_error`); a read
+  where only some sessions failed stays `reachable=true` with `cao.error` set. In both failed cases
+  `GET /api/shelf` still answers `200`. With a last good snapshot:
   `stale_snapshot=true`, `last_good_at` (when CAO was last read), `cao.reachable=false`, `cao.error`
   filled. Without one: `sessions=[]`, all counts 0, `history_total=null`, `last_good_at=null`. The UI
   must not render the empty list as "no sessions".

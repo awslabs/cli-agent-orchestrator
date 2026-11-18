@@ -2,7 +2,7 @@ import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import App from '../src/App'
-import { busy, history, mockBackend, quiet } from './helpers'
+import { backendPayload, busy, history, mockBackend, quiet } from './helpers'
 import { resetStub, stubState } from './sdk-stub'
 
 const prompt = {
@@ -214,16 +214,37 @@ describe('trouble (AC9)', () => {
     expect(screen.getByTestId('empty-state-subtitle')).toHaveTextContent('Start it with cao-server')
   })
 
-  it('AC9.2 explains an auth-enabled CAO', async () => {
-    await renderApp({ 'GET /shelf': unreachable(quiet(), 'cao_auth_required') })
-    expect(await screen.findByRole('alert')).toHaveTextContent(/authentication/)
-    expect(screen.getByRole('alert')).toHaveTextContent(/cannot sign in/)
+  // payloads the backend itself served for these failures (tests/test_cao_shelf_poller.py writes and pins them)
+  const served = (name: string) => backendPayload(name)
+
+  it('AC9.2 explains an auth-enabled CAO on the first read, and does not say "no sessions"', async () => {
+    await renderApp({ 'GET /shelf': served('auth-first-read') })
+    expect(await screen.findByText('This CAO needs a sign-in.')).toBeInTheDocument()
+    expect(screen.getByTestId('empty-state-subtitle')).toHaveTextContent(/authentication/)
+    expect(screen.queryByText(/No CAO sessions/)).toBeNull()
   })
 
-  it('names the problem for an incompatible CAO', async () => {
-    const q = quiet()
-    await renderApp({ 'GET /shelf': { ...unreachable(q, 'cao_incompatible'), cao: { ...q.cao, reachable: false, error: { code: 'cao_incompatible', message: 'missing terminals', retryable: false } } } })
-    expect(await screen.findByRole('alert')).toHaveTextContent('missing terminals')
+  it('AC9.2 a 401 after good reads keeps the old cards under a banner, actions off', async () => {
+    await renderApp({ 'GET /shelf': served('auth-after-good-reads') })
+    const banner = await screen.findByRole('alert')
+    expect(banner).toHaveTextContent(/authentication/)
+    expect(banner).toHaveTextContent(/cannot sign in/)
+    for (const b of screen.getAllByRole('button', { name: 'Ask' })) expect(b).toBeDisabled()
+    for (const b of screen.getAllByRole('button', { name: 'Stop...' })) expect(b).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Start session' })).toBeDisabled()
+  })
+
+  it('names the problem for an incompatible CAO on the first read', async () => {
+    await renderApp({ 'GET /shelf': served('incompatible-first-read') })
+    expect(await screen.findByTestId('empty-state-subtitle')).toHaveTextContent('/sessions is not a list')
+    expect(screen.queryByText(/No CAO sessions/)).toBeNull()
+  })
+
+  it('names another CAO error after good reads, actions off', async () => {
+    await renderApp({ 'GET /shelf': served('error-after-good-reads') })
+    expect(await screen.findByRole('alert')).toHaveTextContent('CAO answered 500')
+    expect(screen.getByRole('button', { name: 'Start session' })).toBeDisabled()
+    for (const b of screen.getAllByRole('button', { name: 'Ask' })) expect(b).toBeDisabled()
   })
 
   it('AC9.3 does not poll while hidden', async () => {

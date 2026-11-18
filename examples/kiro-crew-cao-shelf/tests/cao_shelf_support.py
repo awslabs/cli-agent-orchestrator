@@ -108,7 +108,7 @@ class FakeCao:
         self.outputs: Dict[str, str] = {}
         self.calls: List[Tuple[str, str, Dict[str, str]]] = []
         self.bodies: List[Optional[bytes]] = []
-        self.mode = "ok"  # ok | down | slow | 401 | badshape
+        self.mode = "ok"  # ok | down | slow | 401 | 500 | badshape
         self.profiles: List[Dict[str, Any]] = [
             {"name": "developer", "description": "writes code", "source": "built-in"},
             {"name": "supervisor", "description": "coordinates"},
@@ -191,6 +191,8 @@ class FakeCao:
             self.bodies.append(body)
             if self.mode == "401":
                 return 401, {"detail": "auth"}
+            if self.mode == "500":
+                return 500, {"detail": "internal"}
             if self.mode == "badshape":
                 return 200, {"unexpected": True} if path != "/sessions" else {"not": "a list"}
             return self._route(method, path, query, body)

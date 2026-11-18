@@ -9,6 +9,9 @@ export const load = <T = any,>(p: string): T => JSON.parse(readFileSync(fx(p), '
 export const quiet = () => load<ShelfResponse>('quiet.shelf.json')
 export const busy = () => load<ShelfResponse>('busy.shelf.json')
 export const history = (day: 'quiet' | 'busy', name: string) => load<any>(`${day}/history.${name}.json`)
+/** A shelf the backend served for a failed read; tests/test_cao_shelf_poller.py writes and pins it. */
+export const backendPayload = (name: string): ShelfResponse =>
+  JSON.parse(readFileSync(resolve(process.cwd(), '../tests/payloads', `${name}.shelf.json`), 'utf8')) as ShelfResponse
 
 export interface Call {
   method: string
