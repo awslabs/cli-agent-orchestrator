@@ -36,7 +36,11 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 import requests
 from pydantic import ValidationError
 
-from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome
+from cli_agent_orchestrator.backends.base import (
+    InputNotSentError,
+    TerminalCleanupOutcome,
+    TerminalNotFoundError,
+)
 from cli_agent_orchestrator.backends.registry import get_backend
 
 # Compatibility/test seam: creation no longer bulk-deletes with this helper, but older
@@ -6360,11 +6364,27 @@ def dispatch_input(
     not logged. It is last and defaulted so existing positional callers (notably
     ``agent_step.run_agent_step``, which passes exactly two arguments) are
     unaffected.
+
+    Raises:
+        ValueError: The terminal has no metadata row.
+        TerminalInputBlockedError: The terminal refused input (a prompt, a
+            pending identity check, or a provider that exited).
+        TerminalNotFoundError: The backend could not resolve the pane.
+        InputNotSentError: Any other failure before the backend's send call,
+            so nothing was typed (reply-delivery-failure D4); the original
+            exception is its ``__cause__``. A backend may raise it from the
+            send call too, when it proves nothing was written.
+        Exception: Any other failure in or after the send call, when some or
+            all of the text may have reached the terminal.
     """
+    # Set just before the backend's send call: a failure before it typed nothing.
+    sending = False
+    missing_row: ValueError | None = None
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
-            raise ValueError(f"Terminal '{terminal_id}' not found")
+            missing_row = ValueError(f"Terminal '{terminal_id}' not found")
+            raise missing_row
 
         # A Kiro terminal is typed into only once its row records that its
         # identity check passed (#1074). Until then the pane may be kiro-cli's
@@ -6505,13 +6525,16 @@ def dispatch_input(
                 provider.mark_input_received()
             provider.record_dispatched_message(message)
 
-        get_backend().send_keys(
+        backend = get_backend()
+        submit_delay = provider.paste_submit_delay if provider else 0.3
+        sending = True
+        backend.send_keys(
             metadata["tmux_session"],
             metadata["tmux_window"],
             message,
             enter_count=enter_count,
             force_bracketed_paste=True,
-            submit_delay=provider.paste_submit_delay if provider else 0.3,
+            submit_delay=submit_delay,
         )
 
         update_last_active(terminal_id)
@@ -6548,6 +6571,18 @@ def dispatch_input(
 
     except Exception as e:
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
+        # Nothing reached the pane before send_keys (reply-delivery-failure D4).
+        # Refusals, an unresolved pane and a missing row keep their own types:
+        # their callers branch on them (POST /terminals/{id}/input maps the
+        # missing row's ValueError to 404).
+        if (
+            not sending
+            and e is not missing_row
+            and not isinstance(
+                e, (TerminalInputBlockedError, TerminalNotFoundError, InputNotSentError)
+            )
+        ):
+            raise InputNotSentError(f"{type(e).__name__}: {e}") from e
         raise
 
 

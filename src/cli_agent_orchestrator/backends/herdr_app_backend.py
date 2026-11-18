@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from cli_agent_orchestrator.backends.base import (
+    InputNotSentError,
     TerminalBackend,
     TerminalBackendError,
     TerminalCleanupOutcome,
@@ -27,6 +28,7 @@ from cli_agent_orchestrator.backends.base import (
 )
 from cli_agent_orchestrator.clients.hc_rpc import (
     CALLER_CORE_ENV,
+    HcNotSentError,
     HcProtocolError,
     HcRpcClient,
     HcRpcError,
@@ -43,6 +45,11 @@ DOC_WRITE_ATTEMPTS = 5
 DOC_RETRY_DELAY_S = 0.1
 MANAGED = {"cao.managed": "1"}
 RPC_TIMEOUT_S = 10.0
+# herdr-core error kinds that answer terminal.send before typing anything: a
+# send waiting on a fresh terminal's output gives `unavailable` (see the
+# comment above INPUT_TIMEOUT_S), and bad parameters are rejected before
+# input.rs types. A missing terminal has nothing to type into.
+_NOTHING_TYPED_KINDS = frozenset({"unavailable", "invalid_params", "not_found"})
 # herdr-core types terminal.send and terminal.keys only once 3 s have passed
 # since a person's last key in that terminal (HC_QUIET_MS; no wait if nobody
 # typed), and terminal.send also waits for their unfinished draft (up to 60 s
@@ -564,7 +571,12 @@ class HerdrAppBackend(TerminalBackend):
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
     ) -> None:
-        address = self._address(session_name, window_name)
+        try:
+            address = self._address(session_name, window_name)
+        except TerminalNotFoundError:
+            raise
+        except TerminalBackendError as exc:
+            raise InputNotSentError(f"could not find the terminal to type into: {exc}") from exc
         if enter_count <= 0:
             # hc has no paste-without-Enter; short menu answers go key by key.
             if len(keys) > 64 or not keys.isprintable():
@@ -583,7 +595,14 @@ class HerdrAppBackend(TerminalBackend):
         # after the paste unless a template file sets paste_gap_ms (input.rs).
         # Inbox deliveries catch a swallowed Enter instead
         # (event_inbox_confirms_submit).
-        self._input_call(address, "terminal.send", text=keys, force=True)
+        try:
+            self._input_call(address, "terminal.send", text=keys, force=True)
+        except HcNotSentError as exc:
+            raise InputNotSentError(str(exc)) from exc
+        except HcRpcError as exc:
+            if exc.kind in _NOTHING_TYPED_KINDS:
+                raise InputNotSentError(str(exc)) from exc
+            raise
         for _ in range(enter_count - 1):
             self._input_call(address, "terminal.keys", keys=["enter"])
 
