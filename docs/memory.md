@@ -534,8 +534,14 @@ cao memory relationships reject <relationship-id>     # -> rejected (survives re
 
 A native topic with a valid metadata header and non-empty body remains recallable even when
 it has no canonical `## YYYY-MM-DDTHH:MM:SSZ` entry heading. This lenient parser is enabled by
-default. It also recognizes timestamps in headings at minute precision. Header-only files
-remain invisible.
+default. Compiled topics use only CAO's exact canonical heading. Other topics first use the
+legacy unanchored `## YYYY-MM-DDTHH:MM:SSZ` match; only when no such match exists does the
+lenient grammar recognize a timestamp, at minute or second precision, anywhere in a level-2
+or deeper heading. Header-only files remain invisible.
+
+In the default mode, recall content omits the derived `## See Also` block for every topic,
+including topics with canonical entry headings. To load related topics with the recalled
+results, call `memory_recall(include_related=true)`.
 
 Set `memory.parser.lenient` to `false` to restore the legacy behavior, where a topic without
 a canonical entry heading is skipped:
