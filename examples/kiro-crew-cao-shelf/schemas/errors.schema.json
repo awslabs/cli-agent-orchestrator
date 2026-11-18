@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/cao-shelf/errors.schema.json",
+  "title": "Error envelope returned with every non-2xx response",
+  "type": "object", "additionalProperties": false, "required": ["error"],
+  "properties": {"error": {"$ref": "#/$defs/error"}},
+  "$defs": {
+    "error": {
+      "type": "object", "additionalProperties": false, "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": {"enum": ["cao_unreachable", "cao_timeout", "cao_auth_required", "cao_incompatible", "cao_error",
+                          "not_found", "not_waiting", "conflict_changed", "plan_expired", "invalid_request",
+                          "forbidden_host", "too_many", "internal",
+                          "no_conductor", "relay_exists", "relay_cao_mismatch", "risk_not_acknowledged",
+                          "gateway_unavailable", "gateway_refused"]},
+        "message": {"type": "string", "maxLength": 300, "description": "Never contains terminal output or message bodies."},
+        "retryable": {"type": "boolean"},
+        "detail": {"type": "object", "description": "Optional machine fields, e.g. {status: 'idle'} for not_waiting."}
+      }
+    }
+  }
+}

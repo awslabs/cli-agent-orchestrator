@@ -128,6 +128,9 @@ provider override while keeping the same sequence.
   CLI, operations MCP server, or plugins.
 - [Web UI](docs/web-ui.md) and [MCP Apps](docs/mcp-apps.md): browser and
   host-rendered fleet interfaces.
+- [Kiro Crew](docs/kiro-crew.md): see, steer, start, and stop CAO sessions
+  from the Kiro Crew dashboard with the CAO Shelf App, and remote control a
+  session from a Kiro Crew chat.
 - [Flows](docs/flows.md) and [workflows](docs/workflows.md): scheduled runs and
   multi-step pipelines.
 - [Launch decisions](docs/decisions.md): local routing settings and content-free records.
