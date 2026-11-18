@@ -178,7 +178,9 @@ class HerdrBackend(TerminalBackend):
     - pane_id → compact ID resolved via herdr pane list before each operation
     """
 
-    def __init__(self, send_delay_ms: int = 0, herdr_session: str = "cao") -> None:
+    def __init__(
+        self, send_delay_ms: int = 0, herdr_session: str = "cao", auto_start: bool = True
+    ) -> None:
         """Initialize HerdrBackend.
 
         Args:
@@ -187,9 +189,12 @@ class HerdrBackend(TerminalBackend):
             herdr_session: Name of the herdr session CAO operates in.
                 Maps to ``herdr --session <name>``. Defaults to ``"cao"`` so CAO
                 runs isolated from the user's personal herdr session.
+            auto_start: Whether to start a missing herdr server. Defaults to true
+                for backwards compatibility; disable when a service manager owns it.
         """
         self._send_delay_ms = send_delay_ms
         self._herdr_session = herdr_session
+        self._auto_start = auto_start
         # Resolution cache: terminal_id → (pane_id, timestamp)
         self._pane_cache: Dict[str, tuple[str, float]] = {}
         # Durable map: terminal_id → pane_id, rebuilt from `api snapshot`.
@@ -1053,16 +1058,25 @@ class HerdrBackend(TerminalBackend):
         return f"{config_home}/herdr/sessions/{self._herdr_session}/herdr.sock"
 
     def _ensure_session_running(self) -> None:
-        """Start the herdr session server if its socket does not exist.
+        """Ensure the herdr session server is available.
 
-        Checks for the session socket file. If absent, starts the server
-        headlessly and waits up to 5 seconds for the socket to appear.
-        Logs a warning if the socket never appears but does not raise —
-        the first actual herdr operation will produce a clear error.
+        Checks for the session socket file. If absent and auto-start is enabled,
+        starts the server headlessly and waits up to 5 seconds for the socket.
+        Otherwise, fails immediately so a service-managed herdr is never
+        inherited by CAO's process tree. When auto-start is enabled but the
+        socket never appears, logs a warning and lets the first herdr operation
+        surface its own error.
         """
         socket_path = self._session_socket_path()
         if os.path.exists(socket_path):
             return
+
+        if not self._auto_start:
+            raise TerminalBackendError(
+                f"herdr isn't running for session '{self._herdr_session}', and "
+                "herdr.auto_start is false. Start the herdr server that owns this "
+                "session (for example, its systemd service), then retry."
+            )
 
         logger.info(
             f"Herdr session '{self._herdr_session}' not running "

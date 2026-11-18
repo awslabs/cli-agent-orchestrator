@@ -7,9 +7,11 @@ and clear the relevant CAO_* env vars so each test is isolated.
 """
 
 import json
+from unittest.mock import patch
 
 import pytest
 
+from cli_agent_orchestrator.backends.base import TerminalBackendError
 from cli_agent_orchestrator.backends.factory import BackendFactory, ConfigurationError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
@@ -85,6 +87,23 @@ class TestBackendFactoryHerdr:
         ):
             backend = BackendFactory.create()
         assert isinstance(backend, HerdrBackend)
+
+    def test_disabled_auto_start_reaches_herdr_backend(self, _isolated_settings):
+        """Factory-launched herdr must honor the service-manager setting."""
+        _isolated_settings.write_text(
+            json.dumps({"terminal": {"backend": "herdr"}, "herdr": {"auto_start": False}})
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+                return_value=False,
+            ),
+            patch("subprocess.Popen") as mock_popen,
+            pytest.raises(TerminalBackendError, match="herdr isn't running for session 'cao'"),
+        ):
+            BackendFactory.create()
+
+        mock_popen.assert_not_called()
 
 
 class TestBackendFactoryOverride:

@@ -20,8 +20,10 @@ Choose herdr if you want lower-latency inter-agent messaging and native agent li
 
 1. **herdr installed** and available on `$PATH`. See [herdr.dev](https://herdr.dev/) for installation instructions.
 2. **herdr server** for the configured session. CAO starts it automatically if
-   the session socket is absent, so pre-starting is optional. To start (or
-   attach to) it yourself:
+   the session socket is absent, so pre-starting is optional. Set
+   `herdr.auto_start` to `false` when systemd manages herdr; CAO then refuses a
+   missing socket instead of starting its own server. To start (or attach to) it
+   yourself:
 
 ```bash
 herdr                        # default session name

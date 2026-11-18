@@ -1058,6 +1058,24 @@ class TestEnsureSessionRunning:
         cmd = mock_popen.call_args[0][0]
         assert cmd == ["herdr", "--session", "cao", "server"]
 
+    def test_refuses_missing_socket_when_auto_start_disabled(self):
+        """A system-managed server must never be spawned by this backend."""
+        with patch(
+            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+            return_value=False,
+        ):
+            with patch("subprocess.Popen") as mock_popen:
+                with pytest.raises(TerminalBackendError) as exc_info:
+                    HerdrBackend(herdr_session="systemd-cao", auto_start=False)
+
+        assert (
+            str(exc_info.value)
+            == "herdr isn't running for session 'systemd-cao', and herdr.auto_start is false. "
+            "Start the herdr server that owns this session (for example, its systemd service), "
+            "then retry."
+        )
+        mock_popen.assert_not_called()
+
     def test_logs_warning_when_socket_never_appears(self):
         """If socket never appears within 15s, a warning is logged and no error raised."""
         # Simulate clock: first call returns 0.0 (sets deadline=15.0),

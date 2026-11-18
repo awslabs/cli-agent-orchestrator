@@ -78,11 +78,12 @@ class BackendFactory:
             from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 
             herdr_session = ConfigService.get("terminal.herdr_session", default="cao")
+            herdr_auto_start = ConfigService.get("herdr.auto_start", default=True)
             logger.info(
                 "[EXPERIMENTAL] terminal_backend='herdr' is experimental. "
                 "Report issues at https://github.com/awslabs/cli-agent-orchestrator/issues"
             )
-            return HerdrBackend(herdr_session=herdr_session)
+            return HerdrBackend(herdr_session=herdr_session, auto_start=herdr_auto_start)
         else:
             raise ConfigurationError(
                 f"Unknown terminal_backend: '{backend_name}'. "

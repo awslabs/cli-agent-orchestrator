@@ -101,6 +101,12 @@ class TerminalConfig(BaseModel):
     keep_finished: KeepFinishedConfig = Field(default_factory=KeepFinishedConfig)
 
 
+class HerdrConfig(BaseModel):
+    """Settings specific to the experimental herdr backend."""
+
+    auto_start: bool = True
+
+
 class AppsConfig(BaseModel):
     enabled: bool = False
     static_dir: Optional[str] = None
@@ -153,6 +159,7 @@ class CAOConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     terminal: TerminalConfig = Field(default_factory=TerminalConfig)
+    herdr: HerdrConfig = Field(default_factory=HerdrConfig)
     apps: AppsConfig = Field(default_factory=AppsConfig)
     network: NetworkConfig = Field(default_factory=NetworkConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
@@ -180,6 +187,7 @@ _LEGACY_KEY_MAP: Dict[str, Tuple[str, ...]] = {
 _OWNED_DEFAULTS: Dict[str, Any] = {
     "terminal.backend": "tmux",
     "terminal.herdr_session": "cao",
+    "herdr.auto_start": True,
     "terminal.spawn_mode": "window",
     "terminal.pane_window": "cao-agents",
     "terminal.pane_layout": "tiled",
@@ -207,6 +215,7 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
 ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_TERMINAL_BACKEND": ("terminal.backend", "str", "tmux"),
     "CAO_HERDR_SESSION": ("terminal.herdr_session", "str", "cao"),
+    "CAO_HERDR_AUTO_START": ("herdr.auto_start", "bool", True),
     "CAO_TERMINAL_SPAWN_MODE": ("terminal.spawn_mode", "str", "window"),
     "CAO_TERMINAL_PANE_WINDOW": ("terminal.pane_window", "str", "cao-agents"),
     "CAO_TERMINAL_PANE_LAYOUT": ("terminal.pane_layout", "str", "tiled"),
@@ -750,6 +759,7 @@ class ConfigService:
                 pane_layout=_get_value("terminal.pane_layout", default="tiled"),
                 keep_finished=_keep_finished_config(),
             ),
+            herdr=HerdrConfig(auto_start=_get_value("herdr.auto_start", default=True)),
             apps=AppsConfig(
                 enabled=_get_value("apps.enabled", default=False),
                 static_dir=_get_value("apps.static_dir", default=None),
