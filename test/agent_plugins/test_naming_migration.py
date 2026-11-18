@@ -112,6 +112,9 @@ _UNSCOPED_DOCS = [
     # `chore(agent-plugin): repin packages to vX.Y.Z` commit, and the doc quotes that
     # subject so an operator can recognise it. CAO's own noun, inside a code span.
     "RELEASING.md",
+    # Remote CAO guide: the only occurrences are AWS's own `session-manager-plugin`
+    # program, inside code spans. No CAO plugin system is mentioned.
+    "remote.md",
 ]
 
 #: Docs whose H1 scopes the noun ("# Event Plugins", "# Agent Plugins"), so bare
