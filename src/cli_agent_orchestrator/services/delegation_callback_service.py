@@ -12,13 +12,15 @@ import functools
 import logging
 import time
 from datetime import datetime, timezone
-from typing import List, Optional, Set
+from typing import Collection, List, Optional, Set
 
 from cli_agent_orchestrator.clients.database import (
+    clear_reply_in_flight,
     close_delegation_edge,
     close_delegation_edge_with_message,
     close_open_edges_for_terminal,
     create_delegation_edge,
+    create_inbox_message,
     find_open_edge,
     get_pending_messages,
     get_terminal_metadata,
@@ -35,6 +37,7 @@ from cli_agent_orchestrator.models.delegation import (
     EdgeSource,
     EdgeState,
 )
+from cli_agent_orchestrator.models.inbox import InboxMessage
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.services import terminal_service
@@ -122,11 +125,58 @@ def build_worker_ended_message(
     )
 
 
-def build_delivery_failed_message(worker_id: str, profile: Optional[str], reason: str) -> str:
+def build_delivery_failed_message(
+    worker_id: str,
+    profile: Optional[str],
+    reason: str,
+    message_id: Optional[int] = None,
+    *,
+    uncertain: bool = False,
+) -> str:
+    """The notice for a caller whose message to its worker failed for good.
+
+    ``uncertain`` says the failure came while sending, so some or all of the
+    text may have reached the worker.
+    """
+    message = f"Your message {message_id}" if message_id is not None else "Your message"
+    if uncertain:
+        outcome = f"may not have been delivered: {reason}. Some or all of it may have arrived. "
+    else:
+        outcome = f"was not delivered: {reason}. "
     return (
-        f"[CAO delivery failed] Your message to worker {worker_id} "
-        f"(profile {profile or 'unknown'}) was not delivered: {reason}. "
+        f"[CAO delivery failed] {message} to worker {worker_id} "
+        f"(profile {profile or 'unknown'}) {outcome}"
         "Check the worker's terminal before you send it again."
+    )
+
+
+def build_message_not_delivered_message(
+    receiver_id: str, message_id: int, reason: str, uncertain: bool
+) -> str:
+    """The notice for a sender whose queued message failed for good (design D6)."""
+    if uncertain:
+        return (
+            f"[CAO delivery failed] Your message {message_id} to terminal {receiver_id} "
+            f"may not have been delivered: {reason}. Some or all of it may have reached the "
+            "terminal. Check the receiver's terminal before you send it again."
+        )
+    return (
+        f"[CAO delivery failed] Your message {message_id} to terminal {receiver_id} "
+        f"was not delivered: {reason}. Nothing was typed into the terminal. "
+        "Send it again when you are ready."
+    )
+
+
+def build_reply_lost_message(
+    worker_id: str, profile: Optional[str], reason: str, reply: Optional[str]
+) -> str:
+    """The notice for a caller whose ended worker's reply failed for good (design D7)."""
+    return (
+        f"[CAO delivery failed] Worker {worker_id} (profile {profile or 'unknown'}) "
+        f"replied, but the reply could not be delivered ({reason}), and the worker has "
+        "ended. Its reply, from the stored message:\n"
+        "---\n"
+        f"{reply if reply else _UNREADABLE}"
     )
 
 
@@ -350,6 +400,8 @@ def handle_delivery_failed(
     message_ids: List[int],
     reason: str,
     registry: PluginRegistry | None = None,
+    *,
+    uncertain: bool = False,
 ) -> None:
     """Close the edges of messages whose delivery failed for good, and tell each caller.
 
@@ -358,16 +410,89 @@ def handle_delivery_failed(
     work, and stop a follow-up from opening a fresh edge. Each edge is closed
     as worker_ended in the same commit that queues the caller's
     ``[CAO delivery failed]`` notice, so the caller hears back, as it would
-    for a worker that ended.
+    for a worker that ended. The notice names the message that opened the
+    edge and, when ``uncertain``, says its text may have arrived.
     """
     edges = list_open_message_edges(message_ids)
     if not edges:
         return
     profile = (get_terminal_metadata(worker_id) or {}).get("agent_profile")
-    text = build_delivery_failed_message(worker_id, profile, reason)
-    notified = [e for e in edges if _close_and_notify(e, EdgeState.WORKER_ENDED, worker_id, text)]
+    notified = [
+        e
+        for e in edges
+        if _close_and_notify(
+            e,
+            EdgeState.WORKER_ENDED,
+            worker_id,
+            build_delivery_failed_message(
+                worker_id, profile, reason, e.message_id, uncertain=uncertain
+            ),
+        )
+    ]
     for edge in notified:
         _deliver(edge.caller_id, worker_id, registry)
+
+
+def handle_messages_failed(
+    receiver_id: str,
+    messages: List[InboxMessage],
+    reason: str,
+    *,
+    uncertain: bool = False,
+    reported_ids: Collection[int] = (),
+    registry: PluginRegistry | None = None,
+) -> None:
+    """Settle edges and tell the right terminal about messages failed for good.
+
+    ``reported_ids`` are messages whose failure the sender already has from its
+    own send_message (design D5); nobody else is told about them, and an edge
+    such a message opened is closed without a notice. For the rest: an edge a
+    message opened is closed and its caller, the sender, told once
+    (``handle_delivery_failed``); a reply a message carried is no longer in
+    flight, so its caller waits on the worker again (D7), and is told with the
+    stored reply only when the worker has ended; and any other sender gets
+    ``[CAO delivery failed]`` (D6). A failed CAO notice never causes another
+    notice, so two terminals cannot trade failure notices.
+
+    Args:
+        receiver_id: The terminal the messages were for.
+        messages: The messages marked FAILED for good.
+        reason: One line naming the failure.
+        uncertain: True when some or all of the text may have been typed.
+        reported_ids: Messages whose outcome went back to their sender.
+        registry: Plugin registry for the notices' delivery.
+    """
+    reported = set(reported_ids)
+    ids = [m.id for m in messages]
+    unreported = [i for i in ids if i not in reported]
+    told = {e.message_id for e in list_open_message_edges(unreported)}
+    if unreported:
+        handle_delivery_failed(receiver_id, unreported, reason, registry, uncertain=uncertain)
+    for edge in list_open_message_edges([i for i in ids if i in reported]):
+        close_delegation_edge(edge.id, EdgeState.WORKER_ENDED)
+
+    by_id = {m.id: m for m in messages}
+    for edge in clear_reply_in_flight(ids):
+        if get_terminal_metadata(edge.worker_id) is not None:
+            continue  # the worker is alive: it was told, or will be, and can resend
+        reply = by_id.get(edge.reply_message_id) if edge.reply_message_id is not None else None
+        text = build_reply_lost_message(
+            edge.worker_id, None, reason, reply.message if reply else None
+        )
+        if _close_and_notify(edge, EdgeState.WORKER_ENDED, edge.worker_id, text):
+            _deliver(edge.caller_id, edge.worker_id, registry)
+
+    for message in messages:
+        if message.id in reported or message.id in told or message.message.startswith("[CAO "):
+            continue
+        if get_terminal_metadata(message.sender_id) is None:
+            continue
+        notice = build_message_not_delivered_message(receiver_id, message.id, reason, uncertain)
+        try:
+            create_inbox_message(receiver_id, message.sender_id, notice)
+        except ValueError:
+            continue  # the sender's row went away in between
+        _deliver(message.sender_id, receiver_id, registry)
 
 
 def handle_task_never_delivered(worker_id: str) -> int:
