@@ -1059,6 +1059,108 @@ class TestClaimSkipsAReplyInFlight:
         assert live.delivered == []
 
 
+class TestPlainClosesSkipAReplyInFlight:
+    """F3 residual: closes that filter only on OPEN must also skip an edge marked since listing."""
+
+    @staticmethod
+    def _worker_ends_while_s_waits_and_w_replies(monkeypatch):
+        """Drive handle_worker_ended(W) into close_open_edges_for_terminal's window.
+
+        handle_worker_ended's own listing runs first and sees no edge into W, so
+        no notice is claimed. Then S -> W is opened (an assign that landed in
+        between) and W's reply to S is stored; close_open_edges_for_terminal lists
+        S -> W unmarked, and the mark lands before its close.
+        """
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.clients.database import create_inbox_message
+
+        state = {"reply": None}
+        real_svc_list = svc.list_open_edges_into
+        real_db_list = database.list_open_edges_into
+
+        def svc_list(terminal_id, **kwargs):
+            edges = real_svc_list(terminal_id, **kwargs)
+            if terminal_id == W and state["reply"] is None:
+                state["reply"] = -1
+                _armed(S, W)
+                state["reply"] = create_inbox_message(W, S, "final reply text").id
+            return edges
+
+        def db_list(terminal_id, **kwargs):
+            edges = real_db_list(terminal_id, **kwargs)
+            if terminal_id == W and kwargs.get("exclude_reply_in_flight"):
+                for edge in edges:
+                    if edge.caller_id == S:
+                        database.mark_reply_in_flight(edge.id, state["reply"])
+            return edges
+
+        monkeypatch.setattr(svc, "list_open_edges_into", svc_list)
+        monkeypatch.setattr(database, "list_open_edges_into", db_list)
+        state["restore"] = lambda: (
+            monkeypatch.setattr(svc, "list_open_edges_into", real_svc_list),
+            monkeypatch.setattr(database, "list_open_edges_into", real_db_list),
+        )
+        return state
+
+    def test_worker_end_close_leaves_a_newly_marked_edge_open(self, live, monkeypatch):
+        """(a) close_open_edges_for_terminal via handle_worker_ended."""
+        state = self._worker_ends_while_s_waits_and_w_replies(monkeypatch)
+
+        svc.handle_worker_ended(W, "was deleted")
+
+        edge = find_open_edge(S, W)
+        assert edge is not None, "the close must skip an edge whose reply is in flight"
+        assert edge.reply_message_id == state["reply"]
+        assert [m for m in _inbox(S) if m.message.startswith("[CAO ")] == []
+
+    def test_reported_message_close_leaves_a_newly_marked_edge_open(self, live, monkeypatch):
+        """(b) handle_messages_failed's close of an edge a reported message opened."""
+        follow_up = _send(S, W, "follow-up")  # W's recorded caller is S: opens S -> W
+        real_list = svc.list_open_message_edges
+        state = {"reply": None}
+
+        def list_then_reply(message_ids):
+            edges = real_list(message_ids)
+            if follow_up in message_ids and edges and state["reply"] is None:
+                state["reply"] = -1
+                state["reply"] = _send(W, S, "answer")  # marks S -> W
+            return edges
+
+        monkeypatch.setattr(svc, "list_open_message_edges", list_then_reply)
+
+        svc.handle_messages_failed(
+            W,
+            [_msg(id=follow_up, sender=S, receiver=W, text="follow-up")],
+            "lost",
+            uncertain=False,
+            reported_ids={follow_up},
+        )
+
+        edge = find_open_edge(S, W)
+        assert edge is not None, "the close must skip an edge whose reply is in flight"
+        assert edge.reply_message_id == state["reply"]
+        assert _failure_notices(S) == []
+
+    def test_reply_that_then_fails_after_the_worker_ended_reaches_the_caller(
+        self, live, monkeypatch
+    ):
+        """(c) after (a): the reply fails for good, W is gone, and the sweep tells S."""
+        from cli_agent_orchestrator.clients import database
+
+        state = self._worker_ends_while_s_waits_and_w_replies(monkeypatch)
+        svc.handle_worker_ended(W, "was deleted")
+        state["restore"]()  # the window is over; the listings run unwrapped from here
+        database.delete_terminal(W, end_reason="deleted")
+        _set_status(state["reply"], "failed")
+
+        svc.sweep()
+
+        (notice,) = _failure_notices(S)
+        assert W in notice.message
+        assert "final reply text" in notice.message
+        assert find_open_edge(S, W) is None
+
+
 class TestExceptionAfterThePaste:
     """F4: a failure in the confirmation leaves a typed message DELIVERED and settled."""
 
