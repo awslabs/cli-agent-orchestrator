@@ -28,6 +28,7 @@
     "braces": "file:braces-compat",
     "clsx": "^2.0.0",
     "patch-package": "8.0.1",
+    "picomatch": "npm:@ryotsu/picomatch@4.0.7-a",
     "prism-react-renderer": "^2.3.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
@@ -62,6 +63,7 @@
     "image-size": "npm:image-size-safe@2.0.3",
     "js-yaml": "^4.3.2",
     "nanoid": "^3.3.17",
+    "picomatch": "$picomatch",
     "postcss": "^8.5.23",
     "postcss-selector-parser": "^7.1.6",
     "qs": "^6.16.1",

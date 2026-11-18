@@ -257,6 +257,27 @@ of each weekly dependency-scan review and before a release**:
 
 These are explicit maintainer review checkpoints, not automated notifications.
 
+#### Guarded picomatch parser
+
+The docs, web UI, MCP Apps, and AG-UI operator dashboard use the MIT-licensed
+[`@ryotsu/picomatch@4.0.7-a`](https://www.npmjs.com/package/@ryotsu/picomatch/v/4.0.7-a)
+instead of upstream picomatch 2.x and 4.x. This is a third-party fix for
+[CVE-2026-112366](https://github.com/advisories/GHSA-fc5q-39xc-vjpf), not an upstream release.
+Its [published source](https://github.com/ryotsu-kankichi/secured-picomatch/tree/3ab5a7627d480259e3d9ca67fbc14c125d374f0e)
+changes how the parser compiles repeated extglobs. Some complex patterns become literal and
+capture results can change; do not disable its `maxExtglobRecursion` guard.
+Each npm lock pins the registry tarball by SHA-512. `test:dependencies` checks the actual
+parser bytes loaded from every consumer, not just the package version.
+
+The three projects with v2 consumers also apply
+[`picomatch+4.0.7-a.patch`](patches/picomatch+4.0.7-a.patch) to preserve Windows paths and
+captures in the old API. This changes only the platform option handling, not the parser.
+The dashboard uses only v4 consumers and still installs with scripts disabled.
+
+As with the braces fork, upstream advisories do not automatically match the scoped package.
+At weekly dependency reviews and before releases, check the upstream advisory and the fork.
+Return to upstream once a released fix covers the consumers and the compatibility checks pass.
+
 #### Additional upstream security releases
 
 The lockfiles include these published fixes across all affected toolchains:

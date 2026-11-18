@@ -16,6 +16,7 @@ const path = require('node:path');
 const {test} = require('node:test');
 
 const root = path.resolve(__dirname, '..');
+require('../../../../scripts/test-picomatch-security.cjs')(root);
 const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
 const lock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
 const packages = Object.entries(lock.packages).filter(([location]) => location);
