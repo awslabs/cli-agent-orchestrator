@@ -64,6 +64,23 @@ def test_home_isolated(cao_server: CaoServer) -> None:
     assert (cao_root / "logs").exists()
 
 
+def test_run_step_uses_the_initialized_canonical_app(cao_server: CaoServer, tmp_path: Path) -> None:
+    """A real step imports api.main again; it must see the lifespan's engine."""
+    response = requests.post(
+        f"{cao_server.url}/terminals/run-step",
+        json={
+            "provider": "mock_cli",
+            "agent": "developer",
+            "prompt": "canonical-app-state-check",
+            "timeout": 30,
+            "working_directory": str(tmp_path),
+        },
+        timeout=45,
+    )
+    assert response.status_code == 200, response.text
+    assert "canonical-app-state-check" in response.json()["last_message"]
+
+
 def test_omp_e2e_state_is_non_secret_and_complete(cao_server: CaoServer) -> None:
     home = cao_server.home_dir
     assert (home / ".omp" / "agent" / "config.yml").read_text(

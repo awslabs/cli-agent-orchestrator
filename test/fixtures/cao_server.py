@@ -540,8 +540,11 @@ def _start_cao_server(
     process = subprocess.Popen(
         [
             sys.executable,
-            "-m",
-            "cli_agent_orchestrator.api.main",
+            "-c",
+            # Match the console entry point. ``-m ...api.main`` creates a
+            # second app under __main__; the step substrate imports api.main
+            # and then sees an uninitialized decision_engine on that other app.
+            "from cli_agent_orchestrator.api.main import main; main()",
             "--host",
             "127.0.0.1",
             "--port",
