@@ -4,6 +4,7 @@ import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
+from test.fixtures.app_state import app_state_items
 from unittest.mock import Mock
 
 import frontmatter
@@ -17,8 +18,6 @@ from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.utils import agent_profiles
-
-from test.fixtures.app_state import app_state_items
 
 CALLER = "abcd1234"
 SPEC = {"spec_version": 1, "purpose": "log_triage", "brief": "Inspect logs.", "tools": ["fs_read"]}

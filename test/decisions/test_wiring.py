@@ -3,10 +3,10 @@
 import asyncio
 from dataclasses import replace
 from datetime import datetime
-from test.fixtures.app_state import app_state_items
 from test.decisions.test_engine import (  # noqa: F401  # pytest fixture, injected by name into the tests below
     setup_engine,
 )
+from test.fixtures.app_state import app_state_items
 from unittest.mock import AsyncMock
 
 import pytest

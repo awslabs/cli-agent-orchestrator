@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import replace
+from test.fixtures.app_state import app_state_items
 from unittest.mock import Mock
 
 import pytest
@@ -7,8 +8,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
-
-from test.fixtures.app_state import app_state_items
 
 
 @pytest.fixture

@@ -14,6 +14,7 @@ import json
 import os
 from contextlib import ExitStack
 from pathlib import Path
+from test.fixtures.app_state import app_state_items
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,8 +23,6 @@ from cli_agent_orchestrator.api.main import app, lifespan
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.utils import server_lock
 from cli_agent_orchestrator.utils.server_lock import ServerLockHeldError, acquire_server_lock
-
-from test.fixtures.app_state import app_state_items
 
 
 async def _fake_flow_daemon() -> None:

@@ -19,6 +19,7 @@ import time
 import tty
 from contextlib import contextmanager
 from pathlib import Path
+from test.fixtures.app_state import app_state_items
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -43,8 +44,6 @@ from cli_agent_orchestrator.services.agui.handoff_approval import (
     DeliveryError,
     TerminalServiceAnswerDelivery,
 )
-
-from test.fixtures.app_state import app_state_items
 
 _TID = "1e293d67"
 _FAILURE = {"phase": "deferred_init", "kind": "provider_init_error", "untrusted_runtime": True}

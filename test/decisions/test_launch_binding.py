@@ -1,10 +1,10 @@
 """Terminal-layer plan precedence, capability fallback and deferred binding."""
 
 import asyncio
-from test.fixtures.app_state import app_state_items
 from test.decisions.test_engine import (  # noqa: F401  # pytest fixture, injected by name into the tests below
     setup_engine,
 )
+from test.fixtures.app_state import app_state_items
 from unittest.mock import AsyncMock, Mock
 
 import pytest

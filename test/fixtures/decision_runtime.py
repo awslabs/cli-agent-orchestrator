@@ -2,11 +2,10 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+from test.fixtures.app_state import app_state_items
 from typing import NoReturn
 
 import pytest
-
-from test.fixtures.app_state import app_state_items
 
 
 @dataclass
