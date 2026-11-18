@@ -462,7 +462,11 @@ class TestRun:
         with _FakeHerdr(str(env.tmp_path / "h.sock"), self.ROWS, self.COLS) as herdr:
 
             def _type_then_close():
-                self._until(lambda: b"hello from the agent" in env.out)
+                # The fake client opens its input file only once its terminal
+                # is raw; typing before that would have CR turned into LF.
+                self._until(
+                    lambda: b"hello from the agent" in env.out and env.client_input.exists()
+                )
                 os.write(env.master, b"typed\r")
                 self._until(
                     lambda: env.client_input.exists()
