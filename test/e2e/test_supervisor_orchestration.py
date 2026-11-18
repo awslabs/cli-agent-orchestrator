@@ -920,7 +920,6 @@ class TestMiniMaxCodeSupervisorOrchestration:
         _run_supervisor_assign_test(provider="mcode")
 
 
-
 # ---------------------------------------------------------------------------
 # Qwen Code provider
 # ---------------------------------------------------------------------------

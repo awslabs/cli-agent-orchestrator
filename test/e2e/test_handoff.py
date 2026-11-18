@@ -484,7 +484,6 @@ class TestMiniMaxCodeHandoff:
         _run_second_task_same_terminal_test(provider="mcode", agent_profile="developer")
 
 
-
 # ---------------------------------------------------------------------------
 # Qwen Code provider
 # ---------------------------------------------------------------------------

@@ -21,6 +21,11 @@ WHICH_QWEN = "cli_agent_orchestrator.providers.qwen_cli.shutil.which"
 LOAD_PROFILE = "cli_agent_orchestrator.providers.qwen_cli.load_agent_profile"
 
 
+@pytest.fixture(autouse=True)
+def isolate_qwen_journals(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_agent_orchestrator.providers.qwen_cli.CAO_HOME_DIR", tmp_path)
+
+
 def load_fixture(name: str) -> str:
     return (FIXTURES_DIR / name).read_text(encoding="utf-8")
 
@@ -167,33 +172,36 @@ def test_screen_status_unknown_when_no_markers():
 # --------------------------------------------------------------------------- #
 
 
-@patch("cli_agent_orchestrator.providers.qwen_cli.time.sleep", return_value=None)
+@pytest.mark.asyncio
+@patch("cli_agent_orchestrator.providers.qwen_cli.asyncio.sleep", return_value=None)
 @patch("cli_agent_orchestrator.providers.qwen_cli.get_backend")
-def test_handle_startup_dialog_dismisses_then_returns_on_ready(mock_backend, _sleep):
+async def test_handle_startup_dialog_dismisses_then_returns_on_ready(mock_backend, _sleep):
     backend = mock_backend.return_value
     backend.get_history.side_effect = [
         "Do you trust the files in this folder?  > Yes, proceed",  # dialog
         "  YOLO mode (shift + tab to cycle)",  # ready input box
     ]
-    make_provider()._handle_startup_dialog(timeout=5.0)
+    await make_provider()._handle_startup_dialog(timeout=5.0)
     # Accepted the pre-selected option with Enter.
     backend.send_special_key.assert_called_once()
     assert backend.send_special_key.call_args.args[2] == "Enter"
 
 
-@patch("cli_agent_orchestrator.providers.qwen_cli.time.sleep", return_value=None)
+@pytest.mark.asyncio
+@patch("cli_agent_orchestrator.providers.qwen_cli.asyncio.sleep", return_value=None)
 @patch("cli_agent_orchestrator.providers.qwen_cli.get_backend")
-def test_handle_startup_dialog_noop_when_already_ready(mock_backend, _sleep):
+async def test_handle_startup_dialog_noop_when_already_ready(mock_backend, _sleep):
     backend = mock_backend.return_value
     backend.get_history.return_value = "  YOLO mode (shift + tab to cycle)"
-    make_provider()._handle_startup_dialog(timeout=5.0)
+    await make_provider()._handle_startup_dialog(timeout=5.0)
     backend.send_special_key.assert_not_called()
 
 
 @patch("cli_agent_orchestrator.providers.qwen_cli.get_server_settings")
-@patch("cli_agent_orchestrator.providers.qwen_cli.time.sleep", return_value=None)
+@pytest.mark.asyncio
+@patch("cli_agent_orchestrator.providers.qwen_cli.asyncio.sleep", return_value=None)
 @patch("cli_agent_orchestrator.providers.qwen_cli.get_backend")
-def test_handle_startup_dialog_default_timeout_and_empty_output(
+async def test_handle_startup_dialog_default_timeout_and_empty_output(
     mock_backend, _sleep, mock_settings
 ):
     # timeout=None resolves the server setting; an empty first poll falls through
@@ -201,7 +209,7 @@ def test_handle_startup_dialog_default_timeout_and_empty_output(
     mock_settings.return_value = {"startup_prompt_handler_timeout": 5.0}
     backend = mock_backend.return_value
     backend.get_history.side_effect = [None, "  YOLO mode (shift + tab to cycle)"]
-    make_provider()._handle_startup_dialog()
+    await make_provider()._handle_startup_dialog()
     mock_settings.assert_called_once()
     backend.send_special_key.assert_not_called()
 
@@ -246,6 +254,15 @@ def test_extract_completed_response():
     assert (
         make_provider().extract_last_message_from_script(load_fixture("qwen_cli_completed.txt"))
         == "2 + 2 equals 4."
+    )
+
+
+def test_extract_completed_qwen_0_28_response():
+    assert (
+        make_provider().extract_last_message_from_script(
+            load_fixture("qwen_cli_0_28_completed.txt")
+        )
+        == "19 + 23 equals 42."
     )
 
 
@@ -316,7 +333,7 @@ def test_build_command_includes_yolo_and_model():
     with patch(WHICH_QWEN, return_value="/usr/local/bin/qwen"):
         cmd = make_provider(model="qwen3-coder-plus")._build_qwen_command()
     assert cmd.startswith("qwen --approval-mode yolo")
-    assert "--model" in cmd and "qwen3-coder-plus" in cmd
+    assert "--model qwen3-coder-plus" in cmd
 
 
 def test_build_command_excludes_native_send_message():
@@ -400,7 +417,7 @@ def test_build_command_includes_skill_catalog():
     assert "Available Skills" in cmd
 
 
-def test_profile_model_overrides_constructor_model():
+def test_constructor_model_overrides_profile_default():
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
     profile = AgentProfile(
@@ -416,8 +433,8 @@ def test_profile_model_overrides_constructor_model():
         cmd = make_provider(
             agent_profile="reviewer_qwen", model="qwen3-coder-plus"
         )._build_qwen_command()
-    assert "qwen3-max" in cmd  # profile wins
-    assert "qwen3-coder-plus" not in cmd
+    assert "--model qwen3-coder-plus" in cmd
+    assert "qwen3-max" not in cmd
 
 
 def test_build_command_raises_on_bad_profile():
@@ -560,7 +577,7 @@ def test_get_idle_pattern_for_log():
 
 
 def test_paste_enter_count_is_valid():
-    assert make_provider().paste_enter_count in (1, 2)
+    assert make_provider().paste_enter_count == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -614,6 +631,8 @@ class TestInitialize:
         provider = make_provider()
         with pytest.raises(TimeoutError, match="Qwen Code initialization timed out"):
             await provider.initialize()
+        assert provider._output is None
+        assert not provider._output_path.exists()
 
     @pytest.mark.asyncio
     @patch(WHICH_QWEN, return_value="/usr/local/bin/qwen")

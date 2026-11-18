@@ -4,7 +4,7 @@ Qwen Code (https://github.com/QwenLM/qwen-code) is Alibaba's terminal-native AI
 coding agent — a fork of Google's Gemini CLI. The CLI is invoked via the
 ``qwen`` binary (``npm install -g @qwen-code/qwen-code``).
 
-Key characteristics (observed on ``qwen`` 0.19.x, full-screen Ink TUI):
+Key characteristics (Qwen 0.19.x fixtures and a Qwen 0.28 smoke test):
 
 - Command: ``qwen --approval-mode yolo`` to auto-approve tool calls so
   orchestrated (handoff / assign) flows do not block on per-tool approval
@@ -45,6 +45,8 @@ provider opts in to pyte rendered-screen detection (see
 ``supports_screen_detection`` / ``get_status_from_screen``).
 """
 
+import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -56,10 +58,17 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.constants import SECURITY_PROMPT
+from cli_agent_orchestrator.constants import CAO_HOME_DIR, SECURITY_PROMPT
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import (
+    BaseProvider,
+    OutputExtractionError,
+    OutputExtractionRejected,
+)
+from cli_agent_orchestrator.providers.qwen_output import QwenOutput
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
@@ -90,7 +99,9 @@ PROCESSING_FOOTER_PATTERN = r"esc to cancel"
 # input; older/newer builds may also show "? for shortcuts". Any of these means
 # the input box is present (PROCESSING is checked first, so a live spinner is
 # already excluded by the time this runs).
-IDLE_FOOTER_PATTERN = r"(?:shift \+ tab to cycle|Type your message or @|\?\s*for shortcuts)"
+IDLE_FOOTER_PATTERN = (
+    r"(?:shift \+ tab to cycle|Type your (?:message or @|request, or /)|\?\s*for shortcuts)"
+)
 # Same hint for log-file pre-checks (no ANSI involved).
 IDLE_FOOTER_PATTERN_LOG = IDLE_FOOTER_PATTERN
 
@@ -107,6 +118,8 @@ QUERY_PROMPT_PATTERN = r"^\s*>\s+\S"
 # content (unlike a plain chrome glyph) — the leading bullet is stripped during
 # extraction and the text kept.
 RESPONSE_BULLET_PATTERN = r"^\s*●\s?"
+_FINAL_BULLET_PATTERN = r"^\s*◆[\ufe0e\ufe0f]?\s+"
+_THOUGHT_PATTERN = r"^\s*∴[\ufe0e\ufe0f]?\s+(?:Thought|Thinking)\b"
 
 # Full-width horizontal rule (U+2500) delimiting the input box / transcript
 # sections. Anchored to a full line; tolerates surrounding whitespace.
@@ -131,9 +144,11 @@ WAITING_USER_ANSWER_PATTERN = (
 # in _handle_startup_dialog(). With OpenAI-compatible credentials configured qwen
 # skips the auth dialog, so this is typically a no-op.
 STARTUP_DIALOG_PATTERN = (
-    r"(?:Select Theme|Choose.*theme|How would you like to (?:theme|authenticate))"
+    r"(?:Select Theme|Choose.*theme|How would you like to theme)"
     r"|(?:trust (?:this )?folder|Do you trust the files in this folder)"
-    r"|(?:Get started|Sign in with)"
+)
+AUTH_PICKER_PATTERN = (
+    r"(?s)Connect a Provider.*(?:Qwen Account with Subscription|Third-party Providers)"
 )
 
 # Hard-error patterns surfaced by a crashed binary. A transient "✕ [API Error
@@ -154,6 +169,8 @@ FOOTER_TAIL_WINDOW = 2048
 _BANNER_PATTERN = r"(?:Qwen Code \(?v?\d|▀|▄|█|╚|╝|╔|╗|║)"
 _TIP_PATTERN = r"^\s*Tips?:"
 _FOOTER_LINE_PATTERN = r"(?:\? for shortcuts|esc to cancel|shift \+ tab to cycle|Type your message or @|YOLO mode|Auto mode|plan mode|Accepting edits|➜ )"
+_TOOL_CALL_PATTERN = r"^\s*●\s+\S+\s{2,}(?:[\w_-]+\s*\(|mcp__)"
+_PICKER_OPTION_PATTERN = r"^\s*(?:●\s*)?\d+\.\s+(?:Yes|No|Allow|Deny)\b"
 
 # qwen-code ships a native ``send_message`` tool (its team / background-task
 # messaging feature — class ``_SendMessageTool``, described as "Send a message
@@ -204,8 +221,8 @@ class QwenCliProvider(BaseProvider):
             allowed_tools: Optional list of CAO tool names the agent may use.
                 When restricted (not wildcard), the security prompt is appended
                 to the injected system prompt for soft enforcement.
-            model: Optional model override forwarded as ``--model``. The
-                profile's ``model`` field takes precedence when set.
+            model: Optional model override forwarded as ``--model``. An explicit
+                launch model takes precedence over the profile default.
             skill_prompt: Optional skill catalog text built by the service
                 layer. Appended to the system prompt at launch.
         """
@@ -224,6 +241,32 @@ class QwenCliProvider(BaseProvider):
         # send_input(). This keeps the handoff/assign "wait for IDLE before
         # sending the task" contract working right after init.
         self._turns: int = 0
+        self._output: Optional[QwenOutput] = None
+        # Durable terminal identity lets a restarted CAO reconnect to the
+        # still-running CLI's journal without restarting the Qwen conversation.
+        key = hashlib.sha256(terminal_id.encode("utf-8")).hexdigest()
+        self._output_path = CAO_HOME_DIR / "tmp" / "qwen" / key / "events.jsonl"
+        if self._output_path.is_file():
+            self._output = QwenOutput(self._output_path)
+
+    @property
+    def paste_enter_count(self) -> int:
+        """One Enter submits Qwen's bracketed-paste input."""
+        return 1
+
+    @property
+    def allow_raw_transcript_fallback(self) -> bool:
+        return False  # A terminal pane can contain private reasoning.
+
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional[AgentProfile],
+        requested_model: Optional[str],
+    ) -> bool:
+        """Apply the explicit per-launch override before the profile default."""
+        return True
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
@@ -257,20 +300,18 @@ class QwenCliProvider(BaseProvider):
                 cfg = dict(server_config)
             else:
                 cfg = server_config.model_dump(exclude_none=True)
-            entry = {
-                "command": cfg.get("command", ""),
-                "args": cfg.get("args", []),
-            }
-            env = dict(cfg.get("env", {}))
+            entry = {key: value for key, value in cfg.items() if value is not None}
+            entry["args"] = cfg.get("args") or []
+            env = dict(cfg.get("env") or {})
             env["CAO_TERMINAL_ID"] = self.terminal_id
             entry["env"] = env
             servers[server_name] = entry
 
         fd, path_str = tempfile.mkstemp(prefix="cao_qwen_mcp_", suffix=".json")
-        with os.fdopen(fd, "w") as f:
-            json.dump({"mcpServers": servers}, f, indent=2)
         path = Path(path_str)
         self._tmp_paths.append(path)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"mcpServers": servers}, f, indent=2)
         return path
 
     def _build_qwen_command(self) -> str:
@@ -307,40 +348,43 @@ class QwenCliProvider(BaseProvider):
             "--exclude-tools",
             QWEN_CONFLICTING_NATIVE_TOOL,
         ]
+        self._output_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        # Building the command is a fresh CLI launch; restored providers only
+        # read the existing journal and do not call this method.
+        self._output_path.unlink(missing_ok=True)
+        fd = os.open(self._output_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+        self._output = QwenOutput(self._output_path)
+        command_parts.extend(["--json-file", str(self._output.path)])
 
         profile = None
         if self._agent_profile is not None:
             try:
-                profile = load_agent_profile(self._agent_profile)
+                profile = _with_plugin_mcp(load_agent_profile(self._agent_profile), "qwen_cli")
             except Exception as exc:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {exc}")
 
-        # Model: profile.model wins over the constructor-provided override.
-        model = self._model
-        if profile is not None and profile.model:
-            model = profile.model
+        # Explicit launch override wins over the profile default, as in other providers.
+        model = self._model or (profile.model if profile is not None else None)
         if model:
             command_parts.extend(["--model", model])
 
         # System prompt injection via --append-system-prompt (layers the CAO
         # role on top of qwen's own agent prompt; interactive-safe).
-        if profile is not None:
-            system_prompt = profile.system_prompt or ""
-            system_prompt = self._apply_skill_prompt(system_prompt)
-            # Soft tool restriction: when the profile is not allowed every tool
-            # (e.g. the read-only reviewer), append the security prompt. qwen
-            # honors a clear instruction not to use disallowed tools.
-            if self._allowed_tools and "*" not in self._allowed_tools:
-                system_prompt = (
-                    f"{system_prompt}\n\n{SECURITY_PROMPT}" if system_prompt else SECURITY_PROMPT
-                )
-            if system_prompt:
-                command_parts.extend(["--append-system-prompt", system_prompt])
+        system_prompt = self._apply_skill_prompt((profile.system_prompt or "") if profile else "")
+        # Advisory only: yolo does not enforce a restricted CAO policy.
+        if self._allowed_tools is not None and "*" not in self._allowed_tools:
+            system_prompt = (
+                f"{system_prompt}\n\n{SECURITY_PROMPT}" if system_prompt else SECURITY_PROMPT
+            )
+            system_prompt += "\nAllowed CAO tools: " + ", ".join(self._allowed_tools)
+        if system_prompt:
+            command_parts.extend(["--append-system-prompt", system_prompt])
 
-            # MCP servers (cao-mcp-server etc.) → per-terminal --mcp-config file.
-            if profile.mcpServers:
-                mcp_path = self._write_mcp_config(profile.mcpServers)
-                command_parts.extend(["--mcp-config", str(mcp_path)])
+        # MCP servers (cao-mcp-server etc.) → per-terminal --mcp-config file.
+        if profile is not None and profile.mcpServers:
+            mcp_path = self._write_mcp_config(profile.mcpServers)
+            command_parts.extend(["--mcp-config", str(mcp_path)])
 
         return shlex.join(command_parts)
 
@@ -358,7 +402,14 @@ class QwenCliProvider(BaseProvider):
         if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
-        command = self._build_qwen_command()
+        try:
+            return await self._initialize_cli()
+        except BaseException:
+            self.cleanup()
+            raise
+
+    async def _initialize_cli(self) -> bool:
+        command = await asyncio.to_thread(self._build_qwen_command)
 
         # Arm the StatusMonitor stickiness gate so the launch drives a fresh
         # PROCESSING transition past any stale ready latch. Imported lazily to
@@ -366,13 +417,15 @@ class QwenCliProvider(BaseProvider):
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         status_monitor.notify_input_sent(self.terminal_id)
-        get_backend().send_keys(self.session_name, self.window_name, command)
+        await asyncio.to_thread(
+            get_backend().send_keys, self.session_name, self.window_name, command
+        )
 
         # Dismiss the first-run theme / trust dialog if qwen shows one. With
         # OpenAI-compatible credentials in the environment qwen skips the auth
         # dialog and lands directly on the input prompt, but a fresh install may
         # still show a theme picker or a folder-trust gate that blocks IDLE.
-        self._handle_startup_dialog()
+        await self._handle_startup_dialog()
 
         # qwen startup + first MCP connection (cao-mcp-server is fetched via uvx
         # from git on first use) can take a while.
@@ -386,7 +439,7 @@ class QwenCliProvider(BaseProvider):
         self._initialized = True
         return True
 
-    def _handle_startup_dialog(self, timeout: Optional[float] = None) -> None:
+    async def _handle_startup_dialog(self, timeout: Optional[float] = None) -> None:
         """Dismiss qwen's blocking first-run dialogs (theme / folder-trust).
 
         Mirrors AntigravityCliProvider._handle_startup_dialog / KimiCliProvider.
@@ -399,11 +452,19 @@ class QwenCliProvider(BaseProvider):
             timeout = get_server_settings()["startup_prompt_handler_timeout"]
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            output = get_backend().get_history(self.session_name, self.window_name)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            output = await asyncio.to_thread(
+                get_backend().get_history, self.session_name, self.window_name
+            )
             if output:
                 clean = strip_terminal_escapes(output)
+                if re.search(AUTH_PICKER_PATTERN, clean):
+                    raise ProviderError(
+                        "Qwen authentication needs attention: check the network and native "
+                        "login in qwen outside CAO, then retry this launch. "
+                        "The provider did not answer the authentication picker."
+                    )
                 # Ready input box with no dialog pending → done.
                 if re.search(IDLE_FOOTER_PATTERN, clean) and not re.search(
                     STARTUP_DIALOG_PATTERN, clean
@@ -412,14 +473,27 @@ class QwenCliProvider(BaseProvider):
                 if re.search(STARTUP_DIALOG_PATTERN, clean):
                     logger.info("Qwen Code startup dialog detected, accepting default")
                     status_monitor.notify_input_sent(self.terminal_id)
-                    get_backend().send_special_key(self.session_name, self.window_name, "Enter")
-                    time.sleep(1.0)
+                    await asyncio.to_thread(
+                        get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+                    )
+                    await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
                     continue
-            time.sleep(1.0)
+            await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
     # ------------------------------------------------------------------ #
     # Status detection
     # ------------------------------------------------------------------ #
+
+    def _ready_status(self) -> TerminalStatus:
+        if self._output is not None:
+            try:
+                if not self._output.has_current_user():
+                    return TerminalStatus.UNKNOWN
+                if self._output.user_turns > 0:
+                    return TerminalStatus.COMPLETED
+            except OutputExtractionError:
+                return TerminalStatus.ERROR
+        return TerminalStatus.COMPLETED if self._turns > 0 else TerminalStatus.IDLE
 
     def get_status(self, output: Optional[str]) -> TerminalStatus:
         """Detect qwen status from the terminal output buffer.
@@ -451,10 +525,14 @@ class QwenCliProvider(BaseProvider):
 
         clean = strip_terminal_escapes(output)
         tail = clean[-FOOTER_TAIL_WINDOW:]
+        if not re.search(IDLE_FOOTER_PATTERN, tail) and re.search(AUTH_PICKER_PATTERN, clean):
+            return TerminalStatus.WAITING_USER_ANSWER
 
         # Interactive prompt blocking on user input takes precedence over a
         # plain processing state.
-        if re.search(WAITING_USER_ANSWER_PATTERN, tail):
+        if not re.search(IDLE_FOOTER_PATTERN, tail) and re.search(
+            WAITING_USER_ANSWER_PATTERN, tail
+        ):
             return TerminalStatus.WAITING_USER_ANSWER
 
         if re.search(PROCESSING_FOOTER_PATTERN, tail) or any(
@@ -465,7 +543,7 @@ class QwenCliProvider(BaseProvider):
         # IDLE / COMPLETED: ready input box present. Fresh spawn (no delivered
         # turn) is IDLE; a finished turn is COMPLETED.
         if re.search(IDLE_FOOTER_PATTERN, tail):
-            return TerminalStatus.COMPLETED if self._turns > 0 else TerminalStatus.IDLE
+            return self._ready_status()
 
         if re.search(ERROR_PATTERN, clean, re.MULTILINE):
             return TerminalStatus.ERROR
@@ -479,6 +557,7 @@ class QwenCliProvider(BaseProvider):
     # pins the terminal to PROCESSING forever. A composited pyte viewport
     # resolves the in-place redraw, leaving only the live frame.
     supports_screen_detection = True
+    status_recheck_uses_screen = True
 
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect qwen status from a pyte-composited viewport (escape-free rows).
@@ -502,8 +581,12 @@ class QwenCliProvider(BaseProvider):
         # response text from matching while still covering the spinner.
         bottom_rows = rows[-15:]
         bottom = "\n".join(bottom_rows)
+        if not re.search(IDLE_FOOTER_PATTERN, bottom) and re.search(AUTH_PICKER_PATTERN, joined):
+            return TerminalStatus.WAITING_USER_ANSWER
 
-        if re.search(WAITING_USER_ANSWER_PATTERN, bottom):
+        if not re.search(IDLE_FOOTER_PATTERN, bottom) and re.search(
+            WAITING_USER_ANSWER_PATTERN, bottom
+        ):
             return TerminalStatus.WAITING_USER_ANSWER
 
         if re.search(PROCESSING_FOOTER_PATTERN, bottom) or any(
@@ -512,7 +595,7 @@ class QwenCliProvider(BaseProvider):
             return TerminalStatus.PROCESSING
 
         if re.search(IDLE_FOOTER_PATTERN, bottom):
-            return TerminalStatus.COMPLETED if self._turns > 0 else TerminalStatus.IDLE
+            return self._ready_status()
 
         if re.search(ERROR_PATTERN, joined, re.MULTILINE):
             return TerminalStatus.ERROR
@@ -549,6 +632,8 @@ class QwenCliProvider(BaseProvider):
         Raises:
             ValueError: When no response boundary is detected.
         """
+        if self._output is not None:
+            return self._output.response()
         clean = strip_terminal_escapes(script_output)
         lines = clean.split("\n")
 
@@ -558,7 +643,9 @@ class QwenCliProvider(BaseProvider):
             if re.search(QUERY_PROMPT_PATTERN, line):
                 last_query_idx = i
         if last_query_idx is None:
-            raise ValueError("No Qwen Code user query found - no '> <text>' line detected")
+            raise OutputExtractionError(
+                "No Qwen Code user query found - no '> <text>' line detected"
+            )
 
         # Response ends at the first separator after the query (input-box top).
         end_idx = len(lines)
@@ -579,20 +666,39 @@ class QwenCliProvider(BaseProvider):
             )
 
         body = lines[last_query_idx + 1 : end_idx]
+        # Qwen 0.28 distinguishes final prose (◆) from thought panels (∴).
+        # Once present, use only the final response region, including its
+        # continuation lines. Never return the preceding thought/tool panels.
+        finals = [i for i, line in enumerate(body) if re.search(_FINAL_BULLET_PATTERN, line)]
+        if finals:
+            body = body[finals[-1] :]
+        elif any(re.search(_THOUGHT_PATTERN, line) for line in body):
+            raise OutputExtractionRejected("Qwen turn contains reasoning but no final answer")
         response_lines: list[str] = []
+        in_tool_output = False
         for line in body:
             if not line.strip():
                 continue
             if _is_chrome(line):
                 continue
+            if re.search(_TOOL_CALL_PATTERN, line) or re.search(_PICKER_OPTION_PATTERN, line):
+                in_tool_output = True
+                continue
+            if re.search(RESPONSE_BULLET_PATTERN, line):
+                in_tool_output = False
+            if in_tool_output:
+                continue
             # Strip the assistant/tool bullet ("● ") but keep the text.
-            text = re.sub(RESPONSE_BULLET_PATTERN, "", line).strip()
+            text = re.sub(_FINAL_BULLET_PATTERN, "", line)
+            text = re.sub(RESPONSE_BULLET_PATTERN, "", text).strip()
             if text:
                 response_lines.append(text)
 
         response = "\n".join(response_lines).strip()
         if not response:
-            raise ValueError("Empty Qwen Code response - no content found after query")
+            raise OutputExtractionRejected(
+                "Empty Qwen Code response - no content found after query"
+            )
         return response
 
     # ------------------------------------------------------------------ #
@@ -611,9 +717,24 @@ class QwenCliProvider(BaseProvider):
             except OSError:
                 pass
         self._tmp_paths = []
+        if self._output is not None:
+            self._output.path.unlink(missing_ok=True)
+            try:
+                self._output.path.parent.rmdir()
+            except FileNotFoundError:
+                pass
+            self._output = None
         self._initialized = False
 
     def mark_input_received(self) -> None:
         """Record that a turn was delivered (IDLE → COMPLETED on next status)."""
         super().mark_input_received()
+        if self._output is not None:
+            self._output.begin_dispatch()
         self._turns += 1
+
+    def mark_redelivery_received(self) -> None:
+        """A retry is a new paste attempt, not a new logical turn."""
+        super().mark_input_received()
+        if self._output is not None:
+            self._output.begin_dispatch()

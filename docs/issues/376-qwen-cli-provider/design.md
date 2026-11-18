@@ -1,3 +1,8 @@
+> Historical design from PR #412 (Qwen 0.19.x). The current implementation
+> also recognizes Qwen 0.28 final answers, uses async startup polling, preserves
+> MCP fields, gates approval detection on the absence of a ready composer, and
+> gives explicit launch models precedence. See [the current provider guide](../../qwen-cli.md).
+
 # Qwen Code (`qwen_cli`) Provider — Design
 
 Issue: [#376](https://github.com/awslabs/cli-agent-orchestrator/issues/376) — *[Feat] Qwen Code (qwen) provider adapter*

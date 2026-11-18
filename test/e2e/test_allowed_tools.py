@@ -1005,7 +1005,6 @@ class TestMiniMaxCodeAllowedTools:
         )
 
 
-
 # ---------------------------------------------------------------------------
 # Qwen Code provider — soft enforcement via SECURITY_PROMPT
 # ---------------------------------------------------------------------------

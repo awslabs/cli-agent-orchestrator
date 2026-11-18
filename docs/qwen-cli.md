@@ -1,124 +1,135 @@
-# Qwen Code Provider
+# Qwen Code provider
 
-## Overview
+CAO can launch Qwen Code with `--provider qwen_cli`. This continues the work
+in [PR #412](https://github.com/awslabs/cli-agent-orchestrator/pull/412)
+by SparkyWen, tracked in
+[issue #376](https://github.com/awslabs/cli-agent-orchestrator/issues/376).
 
-The Qwen Code provider enables CAO to work with [Qwen Code](https://github.com/QwenLM/qwen-code) (`qwen`), Alibaba's terminal-native AI coding agent — a fork of Google's Gemini CLI. `qwen` runs as an interactive full-screen Ink TUI that keeps scrollback history in tmux.
+## Install and authenticate
 
-## Prerequisites
+Install Qwen Code following its
+[official installation guide](https://qwenlm.github.io/qwen-code-docs/en/users/quickstart/).
+Use Qwen **0.28 or later** (`--json-file` is required).
+Check `qwen --version`, start `qwen` outside CAO, and complete the interactive
+login and first-run setup before launching agents. The provider uses the
+existing native login; it neither copies credentials nor replaces `HOME`.
 
-- **Qwen Code**: Install via `npm install -g @qwen-code/qwen-code` (Node.js 20+).
-- **Authentication** (inherited from Qwen Code — no CAO-specific setup): CAO does **not** manage qwen credentials. Exactly like the `claude_code` provider inherits your `claude` login, `qwen_cli` inherits qwen's own OpenAI-compatible credentials. Configure `qwen` **once** — the same way you would to use it standalone — and every CAO-spawned qwen worker picks it up automatically (no `export` before `cao-server`, no `--env`).
+Qwen account authentication, including **Qwen Subscription**, and
+OpenAI-compatible API authentication are handled by Qwen itself. A Qwen account
+subscription and an Alibaba Coding Plan API key are different authentication
+paths. An API key is not required when a working native subscription login is
+already selected. See the
+[Qwen authentication documentation](https://qwenlm.github.io/qwen-code-docs/en/users/configuration/auth/).
 
-  **Simplest path — a one-time `~/.qwen/.env` file.** `qwen` loads it natively (bundled `dotenv`):
+The original fixtures were recorded on Qwen 0.19.x. Qwen 0.28 uses a different
+final-response marker; the provider recognizes its `◆` final answers and excludes
+`∴` thought panels. Native JSON output is used for response extraction.
 
-  ```bash
-  # ~/.qwen/.env      (chmod 600 — it holds your API key)
-  OPENAI_API_KEY=sk-...
-  OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1   # your region — see table below
-  ```
-
-  That is the whole setup. `OPENAI_MODEL` is **optional** — set the model in the agent profile (`model: qwen3-coder-plus`) instead, so the only secret you ever plug in is the **API key**. (`qwen` also reads these from `~/.env`, a project-level `.qwen/.env`, or `~/.qwen/settings.json` → `security.auth.apiKey`; a value already present in the process environment always wins over the file, which is what makes the overrides below work.)
-
-  When an API key + base URL are present, `qwen` auto-selects `openai` auth and skips the interactive auth dialog. (`qwen-oauth` browser login also works interactively but **cannot complete headless/in-container**, so it is unsuitable for CAO-spawned sessions.)
-
-  **Choose your region / endpoint.** The endpoint *is* the `OPENAI_BASE_URL`, so switching region is just switching that one value — pick the region your account is provisioned for.
-
-  *Shared DashScope endpoints* (simplest — no workspace needed):
-
-  | Endpoint | `OPENAI_BASE_URL` |
-  |----------|-------------------|
-  | Mainland China (Beijing) | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
-  | International (Singapore) | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` |
-
-  *Model Studio (百炼) workspace gateway* — a per-workspace host of the form `https://<workspace-id>.<region>.maas.aliyuncs.com/compatible-mode/v1`. Copy the exact host from your Model Studio console; the region code is one of:
-
-  | Region | Region code |
-  |--------|-------------|
-  | North China (Beijing) | `cn-beijing` |
-  | Singapore | `ap-southeast-1` |
-  | US (Virginia) | `us-east-1` |
-  | Germany (Frankfurt) | `eu-central-1` |
-  | Japan (Tokyo) | `ap-northeast-1` |
-
-  Any other OpenAI-compatible `/v1` endpoint (custom / self-hosted gateway) works too. The model ids in [Quick Start](#quick-start) must be ones your chosen endpoint exposes.
-
-  **Overrides** (optional — take precedence over `~/.qwen/.env`; handy for CI or targeting a different region per session):
-  - Per session, forwarded to the supervisor **and** every handoff-spawned worker: `cao launch … --env OPENAI_API_KEY=… --env OPENAI_BASE_URL=…` (values travel in the request body, not the URL).
-  - Or process-wide: `export OPENAI_API_KEY=… OPENAI_BASE_URL=…` before starting `cao-server`.
-- **tmux 3.2+**
-
-Verify installation:
+## Launch
 
 ```bash
-qwen --version
+cao install developer --provider qwen_cli
+cao launch --agents developer --provider qwen_cli --auto-approve
 ```
 
-## Backend Support
+Use the **tmux** backend. This provider has not been validated on herdr.
+A profile can select Qwen directly:
 
-The provider currently requires the **tmux** backend (`cao-server --terminal tmux`, the default). It opts into screen-based status detection (`supports_screen_detection = True`), which is driven by the FIFO / pyte pipeline that tmux provides.
+```yaml
+---
+name: qwen-developer
+description: Implement and verify the assigned task
+provider: qwen_cli
+role: developer
+# Optional: use an id available to your selected native authentication.
+# model: qwen4-max
+mcpServers:
+  cao-mcp-server:
+    type: stdio
+    command: cao-mcp-server
+    args: []
+---
+Implement the assigned task and report changes and verification results.
+```
 
-The **herdr** backend is **not yet supported**: herdr uses an event inbox and skips the FIFO pipeline for providers it has no native status integration for, so `qwen`'s state is never observed and terminals time out. Generic herdr FIFO support for non-native providers is tracked as a follow-up; until then, run `qwen_cli` on the tmux backend.
+An explicit launch model overrides the profile model. If neither is set, Qwen
+uses its native selection. CAO does not change the authentication method or
+reasoning settings. Use Qwen's own supported configuration for those settings.
 
-## Quick Start
+## Profiles, skills, and MCP
+
+CAO appends the role, skill catalog and advisory tool policy with
+`--append-system-prompt`; it does not replace Qwen's built-in coding prompt.
+Native global Qwen settings and skills remain available. Project context follows
+Qwen's configuration; configure the context filenames if your projects use
+`AGENTS.md` rather than Qwen's default `QWEN.md`.
+
+Each terminal gets a private, mode-0600 `--mcp-config` file. Server fields are
+preserved, optional `args` and `env` are normalized, and `CAO_TERMINAL_ID` is
+injected. CAO Agent Plugin **stdio** MCP servers are merged into that file.
+Remote MCP configured natively in Qwen remains Qwen's responsibility; remote
+transport delivery through CAO's plugin mapper is not declared by this adapter.
+Configuration files are removed on cleanup and on failed initialization.
+
+Qwen has a native team `send_message` tool. Its name collides with CAO's MCP
+`send_message`; launch excludes the native tool with `--exclude-tools send_message`.
+Agents should use `mcp__cao-mcp-server__send_message` for CAO callbacks.
+
+## Status and response handling
+
+Every launch also gets a private mode-0600 `--json-file` journal under
+`CAO_HOME_DIR/tmp/qwen/<terminal-id-hash>/` (mode 0700). The durable path lets
+a restarted CAO reconnect to a CLI that is still running; it does not restart
+the CLI or start another conversation. Final output comes from native assistant text blocks; thinking, tool
+results and nested-agent events are excluded. New dispatches checkpoint the
+journal before paste, so the previous answer cannot satisfy a new turn. Partial
+JSON records wait for a newline; a missing/corrupt journal fails closed. Raw
+terminal output is never substituted as the final answer. The journal can contain
+private context and is deleted with the terminal; do not publish it as a fixture.
+
+The provider uses the composed terminal screen for readiness, including processing rechecks,
+so a stale spinner in the raw append-only log does not keep a finished turn busy.
+Keep `CAO_PYTE_STATUS=true` (the default). The literal value `true` is required;
+this provider does not change the shared environment-boolean parser.
+
+- A ready composer before the first input is `idle`; after a native user event
+  acknowledges the current dispatch and the composer returns, it is `completed`.
+- An active `esc to cancel` indicator is `processing`.
+- An approval prompt without the normal ready composer is `waiting_user_answer`.
+  Phrases such as “Do you want to proceed” in a finished answer are not dialogs.
+- Recognized fatal CLI errors are `error`; unrecognized frames remain `unknown`.
+
+Startup polling and terminal calls yield the server's event loop. Theme/workspace
+setup retains the existing startup behavior; authentication pickers are never
+answered automatically. Authenticate in Qwen before creating CAO terminals.
+One Enter submits bracketed-paste input. Response extraction removes tool panels
+and picker rows, and rejects thought-only/empty responses instead of returning
+raw terminal output as an answer.
+
+## Tool restrictions and limits
+
+The CLI is launched with `--approval-mode yolo`. CAO `allowedTools` restrictions
+are **prompt-only**, not an enforced sandbox. A restricted role on this provider
+must be treated as having unrestricted tool access. See
+[tool restrictions](tool-restrictions.md#provider-enforcement).
+
+Native `qwen --resume` exists, but Qwen session resume is not exposed through
+CAO's HTTP resume contract.
+
+## Development checks
 
 ```bash
-# Launch with CAO
-cao launch --agents developer --provider qwen_cli
+uv sync --locked --all-extras --dev
+uv run pytest test/providers/test_qwen_cli_unit.py test/providers/test_qwen_cli_regressions.py -o addopts=
+# Use the ONE native auth store; put test conversations in a separate directory.
+export QWEN_HOME="${QWEN_HOME:-$HOME/.qwen}"
+export QWEN_RUNTIME_DIR="$(mktemp -d)"
+uv run pytest test/e2e/ -k QwenCli -m e2e -o addopts=
 ```
 
-Set a model in the agent profile (`model:` field) or via `OPENAI_MODEL`. Model names are the ids your endpoint exposes, e.g. `qwen3-coder-plus`, `qwen3-max`.
-
-## Launch Command
-
-```
-qwen --approval-mode yolo [--model "<model>"] [--append-system-prompt "<system prompt>"] [--mcp-config "<file>"]
-```
-
-- `--approval-mode yolo` auto-approves tool calls so orchestrated (handoff / assign) flows do not block on per-tool approval prompts.
-- `--model` selects the model (profile `model:` wins over a constructor override); omit it to use `OPENAI_MODEL`.
-- `--append-system-prompt` layers the agent profile's system prompt (+ skill catalog, + security prompt when tool-restricted) on top of qwen's built-in agent prompt. Unlike Gemini CLI's `-i`, this is a true system prompt, so no "acknowledge and wait" guard is needed.
-- `--mcp-config` points at a per-terminal MCP config file (see [MCP Servers](#mcp-servers)).
-
-## Status Detection
-
-The provider classifies `qwen` states from the tmux output buffer (footer-anchored, render-stable):
-
-| Status | Pattern | Description |
-|--------|---------|-------------|
-| **PROCESSING** | Spinner line `esc to cancel` (with an elapsed timer) | Response streaming or tool executing |
-| **IDLE** | Ready input box (`YOLO mode (shift + tab to cycle)` / `Type your message or @…` / `? for shortcuts`), no turn delivered yet | Ready for first input |
-| **COMPLETED** | Ready input box, ≥1 turn delivered | Turn finished (a transient `✕ [API Error …]` turn also returns here — it is retryable, not a fatal state) |
-| **WAITING_USER_ANSWER** | Approval / picker prompt (`Allow execution`, `Do you want to proceed`, `[y/n]`, …) | Blocked on user input |
-| **ERROR** | `Error:`, `panic:`, `Traceback` patterns | Hard error (crashed binary) |
-
-The TUI is identical for IDLE and COMPLETED, so the two are split on an internal turn counter (`mark_input_received`), exactly as the Antigravity CLI provider does. This preserves the "wait for IDLE before delivering the task" contract right after initialization.
-
-Because `qwen` redraws the spinner/footer in place, the raw append-only pipe-pane stream keeps a stale `esc to cancel` after a turn ends. The provider therefore opts into pyte rendered-screen detection (`supports_screen_detection = True` / `get_status_from_screen`), which resolves the in-place redraw so only the live frame is classified.
-
-> **`qwen_cli` requires pyte detection.** Without it the stale spinner pins the terminal to PROCESSING forever, so a completed turn is never detected and orchestrated `handoff` / `assign` calls block until they time out. Pyte detection is **on by default** (`CAO_PYTE_STATUS`, which accepts `1` / `true` / `yes` / `on`); set `CAO_PYTE_STATUS=false` (or `0`) only to deliberately fall back to the raw-stream path. Set the value in the environment where you start `cao-server`.
-
-### TUI Structure
-
-```
-> <user question>
-  ● <assistant response>            (filled bullet marks assistant/tool output)
-────────────────────────────────   (input box top rule, full-width U+2500)
-*   Type your message or @path/to/file
-────────────────────────────────   (input box bottom rule)
-  ➜ <dir> · <model>
-  YOLO mode (shift + tab to cycle)
-```
-
-Response extraction returns the text between the last echoed `> <query>` line and the next full-width separator, stripping the assistant bullet (`●`) and filtering TUI chrome (banner, separators, footer, tips, spinner).
-
-## MCP Servers
-
-The provider writes a **per-terminal** MCP config file (`{"mcpServers": {...}}`) to a temp path and passes it via `--mcp-config`. It forwards `CAO_TERMINAL_ID` into each server's `env` so `cao-mcp-server` can resolve the current terminal for handoff / assign. The file is removed on `cleanup()`. A per-instance file (rather than mutating the shared `~/.qwen/settings.json`) avoids cross-terminal write races when many terminals launch concurrently.
-
-## Tool Restrictions
-
-`qwen_cli` is in `SOFT_ENFORCEMENT_PROVIDERS`: tool restrictions are advisory. Under `--approval-mode yolo` there is no native CAO tool denylist, so when a profile is not allowed every tool (e.g. the read-only reviewer), the security prompt is appended to the injected system prompt. There is no native hard-block flag.
-
-## Exit
-
-`qwen` exits on the `/quit` slash command.
+Live tests start a separate CAO server with disposable CAO state. They explicitly
+reuse `QWEN_HOME` and isolate conversations/runtime with `QWEN_RUNTIME_DIR`.
+Native Qwen configuration (including hooks and MCP) applies. Use an authenticated
+account configured for these tests. **Do not copy subscription credentials**:
+refresh tokens can rotate, leaving the original store stale; file symlinks are
+also rejected by Qwen. No credential contents enter the test fixtures or logs.

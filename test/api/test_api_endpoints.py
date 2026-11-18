@@ -171,13 +171,14 @@ class TestAgentProviders:
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data) == 12
+        assert len(data) == 13
         names = [p["name"] for p in data]
         assert "kiro_cli" in names
         assert "claude_code" in names
         assert "codex" in names
         assert "hermes" in names
         assert "kimi_cli" in names
+        assert "qwen_cli" in names
         assert "copilot_cli" in names
         assert "opencode_cli" in names
         assert "cursor_cli" in names
@@ -236,6 +237,7 @@ class TestAgentProviders:
         assert providers_dict["omp"]["binary"] == "omp"
         assert providers_dict["grok_cli"]["binary"] == "grok"
         assert providers_dict["mcode"]["binary"] == "mcode"
+        assert providers_dict["qwen_cli"]["binary"] == "qwen"
 
     def test_list_providers_preserves_common_wire_contract(self, client):
         """Provider discovery has the same shape consumed by the web and Rust clients."""

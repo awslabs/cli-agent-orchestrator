@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add the Qwen Code (`qwen_cli`) provider with profile, skill, MCP and model support.
+
 - **Memory inspection and fixture hygiene are safer by default** (#1329).
   This resolves #861 Q3: CLI list/show and REST list/show no longer increment
   `access_count` unless `memory.non_accessing_inspection=false`; MCP recall
@@ -902,7 +904,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The release job now promotes the hand-written `## [Unreleased]` section to the dated
+- The release job now promotes the hand-written `## [Unreleased]
+
+- Add the Qwen Code (`qwen_cli`) provider with profile, skill, MCP and model support.` section to the dated
   release section and inserts a fresh empty one instead of replacing the changelog with
   commit subjects through git-cliff (#1353).
 - The `memory_store` and `memory_forget` MCP tools now honor the caller's local memory switch

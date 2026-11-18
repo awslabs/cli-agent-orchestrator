@@ -699,6 +699,7 @@ def test_create_provider_effort_is_ignored_by_other_providers(provider_type):
 
     assert manager.get_provider("t-effort-other") is provider
 
+
 def test_create_provider_qwen_cli_stores_mapping():
     from cli_agent_orchestrator.providers.qwen_cli import QwenCliProvider
 
@@ -715,5 +716,3 @@ def test_create_provider_qwen_cli_stores_mapping():
     assert isinstance(provider, QwenCliProvider)
     assert provider._model == "qwen3-coder-plus"
     assert manager.get_provider("t1") is provider
-
-

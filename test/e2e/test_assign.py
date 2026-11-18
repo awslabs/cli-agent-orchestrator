@@ -183,7 +183,7 @@ def _run_assign_test(provider: str, agent_profile: str, task_message: str, conte
 def _create_terminal_in_session(session_name: str, provider: str, agent_profile: str):
     """Create a terminal in an existing session."""
     resp = requests.post(
-        f"{API_BASE_URL}/sessions/{session_name}/terminals",
+        f"{API_BASE_URL}/sessions/{session_name}/terminals:operator",
         params={"provider": provider, "agent_profile": agent_profile},
     )
     assert resp.status_code in (
@@ -732,7 +732,6 @@ class TestMiniMaxCodeAssign:
 
     def test_assign_with_callback(self, require_minimax_code):
         _run_assign_with_callback_test(provider="mcode")
-
 
 
 # ---------------------------------------------------------------------------
