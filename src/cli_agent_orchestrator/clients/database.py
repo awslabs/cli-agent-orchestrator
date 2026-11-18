@@ -4511,7 +4511,7 @@ def record_delivery_failure(message_id: int, error: str) -> int:
         row = db.query(InboxModel).filter(InboxModel.id == message_id).first()
         if row is None:
             return 0
-        attempts = (row.delivery_attempts or 0) + 1
+        attempts = int(row.delivery_attempts or 0) + 1
         row.delivery_attempts = attempts
         row.last_error = error
         db.commit()
