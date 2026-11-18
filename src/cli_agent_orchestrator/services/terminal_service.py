@@ -6325,6 +6325,15 @@ def _refuse_if_provider_gone(terminal_id: str, provider: Any, metadata: Dict[str
         )
 
 
+class TerminalRowMissingError(InputNotSentError, ValueError):
+    """``dispatch_input`` found no metadata row for the terminal.
+
+    Nothing was typed, and a later attempt cannot find the terminal either, so
+    the inbox fails such a message at once (reply-delivery-failure F5). It is
+    also a ``ValueError``, so POST /terminals/{id}/input still answers 404.
+    """
+
+
 def dispatch_input(
     terminal_id: str,
     message: str,
@@ -6366,7 +6375,8 @@ def dispatch_input(
     unaffected.
 
     Raises:
-        ValueError: The terminal has no metadata row.
+        TerminalRowMissingError: The terminal has no metadata row. It is both
+            a ``ValueError`` and an ``InputNotSentError``.
         TerminalInputBlockedError: The terminal refused input (a prompt, a
             pending identity check, or a provider that exited).
         TerminalNotFoundError: The backend could not resolve the pane.
@@ -6379,12 +6389,10 @@ def dispatch_input(
     """
     # Set just before the backend's send call: a failure before it typed nothing.
     sending = False
-    missing_row: ValueError | None = None
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
-            missing_row = ValueError(f"Terminal '{terminal_id}' not found")
-            raise missing_row
+            raise TerminalRowMissingError(f"Terminal '{terminal_id}' not found")
 
         # A Kiro terminal is typed into only once its row records that its
         # identity check passed (#1074). Until then the pane may be kiro-cli's
@@ -6572,15 +6580,10 @@ def dispatch_input(
     except Exception as e:
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
         # Nothing reached the pane before send_keys (reply-delivery-failure D4).
-        # Refusals, an unresolved pane and a missing row keep their own types:
-        # their callers branch on them (POST /terminals/{id}/input maps the
-        # missing row's ValueError to 404).
-        if (
-            not sending
-            and e is not missing_row
-            and not isinstance(
-                e, (TerminalInputBlockedError, TerminalNotFoundError, InputNotSentError)
-            )
+        # Refusals and an unresolved pane keep their own types: their callers
+        # branch on them. A missing row is already an InputNotSentError.
+        if not sending and not isinstance(
+            e, (TerminalInputBlockedError, TerminalNotFoundError, InputNotSentError)
         ):
             raise InputNotSentError(f"{type(e).__name__}: {e}") from e
         raise

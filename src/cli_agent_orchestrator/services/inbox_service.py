@@ -51,6 +51,7 @@ from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.terminal_service import TerminalRowMissingError
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
@@ -403,8 +404,6 @@ class InboxService:
         for sender_id, group in groupby(messages, key=lambda m: m.sender_id):
             batch = list(group)
             combined = "\n".join(m.message for m in batch)
-            # Set once the paste is in the pane: a later failure is never "nothing typed".
-            dispatched = False
             try:
                 pre_dispatch_status = (
                     status_monitor.get_status(terminal_id) if native_confirm else None
@@ -447,64 +446,72 @@ class InboxService:
                     terminal_id,
                     f" (trigger: {source})" if source else "",
                 )
-                dispatched = True
                 delivered_count += len(batch)
-                # The paste is in the pane: the immediate-delivery caller may
-                # answer now. Everything below is confirmation and recovery.
-                after_dispatch()
                 for message in batch:
                     report(message.id, DeliveryOutcome.DELIVERED, None)
-                # Delegation edges opened by this batch are armed only after the
-                # submit confirmation has run. An edge armed on the paste alone
-                # could be evaluated while the receiver's screen still holds
-                # the previous answer, before it shows the new turn. They are armed even
-                # when the confirmation gives up, because pickup can lag
-                # delivery by more than that wait. The evaluator's own check
-                # that the receiver started on its last input keeps an
-                # unpicked delivery from forwarding the previous answer, and
-                # its pickup timeout tells the caller if it never starts.
-                if confirm:
-                    if get_backend().supports_event_inbox() and not native_confirm:
-                        # The herdr TUI backend pushes live-event delivery
-                        # inline on its single asyncio event loop thread
-                        # (herdr_inbox_service.py's _event_loop -> _deliver). The
-                        # settle-retry path is offloaded via asyncio.to_thread,
-                        # but this on-event path is not, so _confirm_submitted's
-                        # blocking time.sleep() here would stall that whole
-                        # session's event processing for up to
-                        # INBOX_SUBMIT_CONFIRM_TIMEOUT * (1 + INBOX_SUBMIT_MAX_RESUBMITS)
-                        # seconds. Skip confirmation there until the live-event
-                        # path is driven off-loop too (tracked as a follow-up to
-                        # the delivery-ready-signal work) -- the drop stays
-                        # undetected on herdr, same as before this fix, instead
-                        # of freezing the session.
-                        logger.debug(
-                            "Skipping inbox submit confirmation for terminal %s: "
-                            "event-inbox backend delivery runs on the API event loop",
-                            terminal_id,
-                        )
-                    else:
-                        # Still holding the per-terminal delivery lock,
-                        # deliberately: the pile-up in #78 ({MSG1}{MSG2} in one
-                        # composer) is a second delivery landing while the first
-                        # sits unsubmitted. The lock only DELAYS that second
-                        # delivery until this confirmation ends; what prevents
-                        # the pile-up is a recovery that submits the first paste
-                        # (bare Enter), which needs the provider to read its
-                        # composer -- see _confirm_submitted. Other terminals
-                        # are not held: each delivery runs on its own thread.
-                        # Eager delivery is excluded because its receiver was
-                        # already PROCESSING -- "left the ready state" proves
-                        # nothing there.
-                        self._confirm_submitted(
-                            terminal_id,
-                            combined,
-                            boundary,
-                            registry=registry,
-                            sender_id=sender_id,
-                            native=native_confirm,
-                            pre_dispatch_status=pre_dispatch_status,
-                        )
+                # The text is typed: nothing below can make it undelivered. A
+                # failure in the caller's callback or in the confirmation is
+                # logged, and the batch stays DELIVERED, armed and settled.
+                try:
+                    # The paste is in the pane: the immediate-delivery caller may
+                    # answer now. Everything below is confirmation and recovery.
+                    after_dispatch()
+                    # Delegation edges opened by this batch are armed only after the
+                    # submit confirmation has run. An edge armed on the paste alone
+                    # could be evaluated while the receiver's screen still holds
+                    # the previous answer, before it shows the new turn. They are armed even
+                    # when the confirmation gives up, because pickup can lag
+                    # delivery by more than that wait. The evaluator's own check
+                    # that the receiver started on its last input keeps an
+                    # unpicked delivery from forwarding the previous answer, and
+                    # its pickup timeout tells the caller if it never starts.
+                    if confirm:
+                        if get_backend().supports_event_inbox() and not native_confirm:
+                            # The herdr TUI backend pushes live-event delivery
+                            # inline on its single asyncio event loop thread
+                            # (herdr_inbox_service.py's _event_loop -> _deliver). The
+                            # settle-retry path is offloaded via asyncio.to_thread,
+                            # but this on-event path is not, so _confirm_submitted's
+                            # blocking time.sleep() here would stall that whole
+                            # session's event processing for up to
+                            # INBOX_SUBMIT_CONFIRM_TIMEOUT * (1 + INBOX_SUBMIT_MAX_RESUBMITS)
+                            # seconds. Skip confirmation there until the live-event
+                            # path is driven off-loop too (tracked as a follow-up to
+                            # the delivery-ready-signal work) -- the drop stays
+                            # undetected on herdr, same as before this fix, instead
+                            # of freezing the session.
+                            logger.debug(
+                                "Skipping inbox submit confirmation for terminal %s: "
+                                "event-inbox backend delivery runs on the API event loop",
+                                terminal_id,
+                            )
+                        else:
+                            # Still holding the per-terminal delivery lock,
+                            # deliberately: the pile-up in #78 ({MSG1}{MSG2} in one
+                            # composer) is a second delivery landing while the first
+                            # sits unsubmitted. The lock only DELAYS that second
+                            # delivery until this confirmation ends; what prevents
+                            # the pile-up is a recovery that submits the first paste
+                            # (bare Enter), which needs the provider to read its
+                            # composer -- see _confirm_submitted. Other terminals
+                            # are not held: each delivery runs on its own thread.
+                            # Eager delivery is excluded because its receiver was
+                            # already PROCESSING -- "left the ready state" proves
+                            # nothing there.
+                            self._confirm_submitted(
+                                terminal_id,
+                                combined,
+                                boundary,
+                                registry=registry,
+                                sender_id=sender_id,
+                                native=native_confirm,
+                                pre_dispatch_status=pre_dispatch_status,
+                            )
+                except Exception as exc:  # noqa: BLE001 - the paste already landed
+                    logger.warning(
+                        f"Delivered {len(batch)} message(s) to terminal {terminal_id}, "
+                        f"but the step after the paste failed: {exc}"
+                    )
                 self._arm_message_edges(terminal_id, batch)
                 self._settle_reply_edges(terminal_id, batch)
             except TerminalNotFoundError as e:
@@ -565,8 +572,9 @@ class InboxService:
                     terminal_id,
                     batch,
                     e,
-                    not_sent=isinstance(e, InputNotSentError) and not dispatched,
-                    retryable=True,
+                    not_sent=isinstance(e, InputNotSentError),
+                    # A terminal with no row cannot take a later attempt either.
+                    retryable=not isinstance(e, TerminalRowMissingError),
                     report_to_sender=report_to_sender,
                     hand_off=hand_off,
                     report=report,
