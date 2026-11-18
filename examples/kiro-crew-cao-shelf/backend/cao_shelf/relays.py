@@ -501,6 +501,8 @@ class Relays:
             prior = self._by_start_key(key)
             if prior is not None:
                 return self.summary(prior)  # a retry of a start that already has its relay
+            # a relay that would be refused must not leave a started session behind
+            self._check_cao_target()
             # the Start path, its validation and its idempotency memo, with the handshake first
             result = self._actions.start({**start, "message": HANDSHAKE})
             session = check_name(result["session"])

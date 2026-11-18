@@ -388,6 +388,18 @@ def test_a_retry_after_a_failed_attach_starts_no_second_session(rig: RelayRig) -
     assert len(rig.relays.list()["relays"]) == 1
 
 
+def test_start_is_refused_before_starting_when_the_ops_server_points_at_another_cao(
+    tmp_path: Path,
+) -> None:
+    rig = RelayRig(tmp_path, ops_target="http://127.0.0.1:9990")
+    rig.warm()
+    with pytest.raises(ShelfError) as err:
+        rig.relays.create({"acknowledge_risk": True, "start": start_body("elsewhere")})
+    assert err.value.code == "relay_cao_mismatch"
+    assert not [c for c in rig.cao.calls if c[0] == "POST" and c[1] == "/sessions"]
+    assert rig.gw.calls == [] and rig.relays.list()["relays"] == []
+
+
 def test_start_and_attach_refuses_a_first_message(rig: RelayRig) -> None:
     with pytest.raises(ShelfError) as err:
         rig.relays.create(
