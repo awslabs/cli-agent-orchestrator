@@ -420,6 +420,33 @@ class TestBodySpoofingEscaped:
         report = backend.import_bundle(bundle, "global", "skip", False)
         assert report.bodies_escaped == 0
 
+    @pytest.mark.parametrize(
+        "body_heading",
+        [
+            "## 2027-06-01T00:00Z",
+            "### Notes 2027-06-01T00:00:00Z",
+        ],
+    )
+    def test_lenient_body_heading_does_not_change_imported_topic(
+        self, svc, backend, bundle, body_heading
+    ):
+        body = f"Body line.\n{body_heading}\ntail text"
+        _write_topic(
+            bundle,
+            "lenient-body-heading",
+            body,
+            fm_extra="timestamp: 2026-01-01T00:00:00Z\n",
+        )
+
+        report = backend.import_bundle(bundle, "global", "skip", False)
+        memories = _run(svc.recall(scope="global", limit=10, scan_all=True))
+
+        assert report.imported == 1
+        assert report.bodies_escaped == 0
+        assert len(memories) == 1
+        assert memories[0].updated_at == datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert memories[0].content == body
+
 
 class TestReportEchoesResolvedScope:
     """Design test 13: dry-run report carries the resolved project id."""

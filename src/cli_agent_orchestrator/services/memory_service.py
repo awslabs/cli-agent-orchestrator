@@ -4184,10 +4184,40 @@ class MemoryService:
 
         from cli_agent_orchestrator.services.settings_service import is_memory_parser_lenient
 
+        lines = file_content.splitlines()
+        header_index = next(
+            (index for index, line in enumerate(lines) if TOPIC_HEADER_RE.fullmatch(line)),
+            -1,
+        )
+        body_lines = lines[header_index + 1 :] if header_index >= 0 else lines
+        while body_lines and not body_lines[0].strip():
+            body_lines.pop(0)
+        if body_lines and body_lines[0].startswith("# "):
+            body_lines.pop(0)
+            while body_lines and not body_lines[0].strip():
+                body_lines.pop(0)
+        compiled = any(_COMPILED_MARKER_RE.fullmatch(line) for line in body_lines)
+
         lenient = is_memory_parser_lenient()
         heading_matches: list[re.Match[str]] = []
         timestamps: list[datetime] = []
-        if lenient:
+        timestamp_texts = _LEGACY_ENTRY_TIMESTAMP_RE.findall(file_content)
+        use_legacy_split = False
+        if not lenient:
+            if not timestamp_texts:
+                return None
+            timestamps = [
+                datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                for value in timestamp_texts
+            ]
+            use_legacy_split = True
+        elif not compiled and timestamp_texts:
+            timestamps = [
+                datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                for value in timestamp_texts
+            ]
+            use_legacy_split = True
+        else:
             for match in _LENIENT_ENTRY_HEADING_RE.finditer(file_content):
                 value = match.group("timestamp")
                 try:
@@ -4199,14 +4229,6 @@ class MemoryService:
                     continue
                 heading_matches.append(match)
                 timestamps.append(parsed)
-        else:
-            timestamp_texts = _LEGACY_ENTRY_TIMESTAMP_RE.findall(file_content)
-            if not timestamp_texts:
-                return None
-            timestamps = [
-                datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                for value in timestamp_texts
-            ]
 
         if timestamps:
             created_at = timestamps[0]
@@ -4257,20 +4279,6 @@ class MemoryService:
             created_at = _entry_time("created_at") or file_time
             updated_at = _entry_time("updated_at") or file_time
 
-        lines = file_content.splitlines()
-        header_index = next(
-            (index for index, line in enumerate(lines) if TOPIC_HEADER_RE.fullmatch(line)),
-            -1,
-        )
-        body_lines = lines[header_index + 1 :] if header_index >= 0 else lines
-        while body_lines and not body_lines[0].strip():
-            body_lines.pop(0)
-        if body_lines and body_lines[0].startswith("# "):
-            body_lines.pop(0)
-            while body_lines and not body_lines[0].strip():
-                body_lines.pop(0)
-
-        compiled = any(_COMPILED_MARKER_RE.fullmatch(line) for line in body_lines)
         if compiled or not timestamps:
             body_lines = [line for line in body_lines if not _COMPILED_MARKER_RE.fullmatch(line)]
             while body_lines and not body_lines[0].strip():
@@ -4280,7 +4288,7 @@ class MemoryService:
                 while body_lines and not body_lines[0].strip():
                     body_lines.pop(0)
             latest_content = self._strip_existing_see_also("\n".join(body_lines)).strip()
-        elif lenient:
+        elif not use_legacy_split:
             latest_content = self._strip_existing_see_also(
                 file_content[heading_matches[-1].end("timestamp") :]
             ).strip()

@@ -197,6 +197,55 @@ def test_legacy_heading_shapes_preserve_dates_and_latest_content(
     assert memory.content == expected_content
 
 
+def test_canonical_topic_ignores_timestamped_subheading(tmp_path: Path, engine: Any) -> None:
+    path = _topic(
+        tmp_path,
+        "canonical-subheading",
+        "Incident summary\n### Timeline 2026-01-15T10:00:00Z\ndetails",
+        timestamp="## 2026-02-01T00:00:00Z\n",
+    )
+
+    memory = MemoryService(tmp_path, engine)._parse_wiki_file(
+        path, path.read_text(encoding="utf-8"), _entry("canonical-subheading")
+    )
+
+    expected = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    assert memory is not None
+    assert memory.created_at == expected
+    assert memory.updated_at == expected
+    assert memory.content == ("Incident summary\n### Timeline 2026-01-15T10:00:00Z\ndetails")
+
+
+@pytest.mark.parametrize(
+    "body_heading",
+    [
+        "## 2027-06-01T00:00Z",
+        "### Notes 2027-06-01T00:00:00Z",
+    ],
+)
+def test_stored_body_heading_does_not_change_topic(
+    tmp_path: Path,
+    engine: Any,
+    body_heading: str,
+) -> None:
+    body = f"Body line.\n{body_heading}\ntail text"
+    service = MemoryService(tmp_path, engine)
+
+    asyncio.run(
+        service.store(
+            content=body,
+            scope="global",
+            key="body-heading",
+            occurred_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+    )
+    memories = asyncio.run(service.recall(scope="global", scan_all=True))
+
+    assert len(memories) == 1
+    assert memories[0].updated_at == datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert memories[0].content == body
+
+
 def test_recall_returns_previously_invisible_topic(tmp_path: Path, engine: Any) -> None:
     path = _topic(tmp_path, "visible-now", "The rarevisibilitytoken is searchable.")
     index = tmp_path / "global" / "wiki" / "index.md"
