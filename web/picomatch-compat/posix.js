@@ -1,3 +1,3 @@
 'use strict';
 
-module.exports = require('@ryotsu/picomatch/posix');
+module.exports = require('cao-picomatch-guard/posix');

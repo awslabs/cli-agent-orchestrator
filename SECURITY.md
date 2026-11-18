@@ -259,25 +259,31 @@ These are explicit maintainer review checkpoints, not automated notifications.
 
 #### Guarded picomatch parser
 
-The docs, web UI, MCP Apps, and AG-UI operator dashboard use the MIT-licensed
-[`@ryotsu/picomatch@4.0.7-a`](https://www.npmjs.com/package/@ryotsu/picomatch/v/4.0.7-a)
-instead of upstream picomatch 2.x and 4.x. This is a third-party fix for
-[CVE-2026-112366](https://github.com/advisories/GHSA-fc5q-39xc-vjpf), not an upstream release.
-Its [published source](https://github.com/ryotsu-kankichi/secured-picomatch/tree/3ab5a7627d480259e3d9ca67fbc14c125d374f0e)
-changes how the parser compiles repeated extglobs. Some complex patterns become literal and
-capture results can change; do not disable its `maxExtglobRecursion` guard.
-Each npm lock pins the registry tarball under its real scoped name and SHA-512.
-Private project adapters forward the `picomatch` imports to that package. An npm alias
-alone makes GitHub Dependency Review report the wrong upstream name.
-`test:dependencies` checks the actual module and parser bytes loaded from every consumer.
+The docs, web UI, MCP Apps, and AG-UI operator dashboard use `cao-picomatch-guard@4.0.7-cao.1`
+instead of upstream picomatch 2.x and 4.x. This is a private, MIT-licensed backport based
+on the **published 4.0.7 release**, not upstream `master` or an official security release.
+The [vendored archive and rebuild instructions](vendor/README.md#guarded-picomatch-backport)
+identify the release, the source of the single-branch fix for
+[CVE-2026-112366](https://github.com/advisories/GHSA-fc5q-39xc-vjpf), and the complete patch.
+
+The parser drops redundant repetition around simple star-containing branches. Separately,
+it uses the existing literal fallback for repeated alternatives with ambiguous literal
+boundaries. Plain literal choices that are prefix-free or suffix-free retain normal matching.
+The guard is conservative: some patterns that used to match filenames
+now match the glob text itself, and capture groups can differ. This is not a general
+resource bound for arbitrary regexes. Do not disable `maxExtglobRecursion`.
+
+Each npm lock pins the same local archive and SHA-512. Private project adapters forward
+`picomatch` imports to its real package name. `test:dependencies` checks package identity,
+parser and constants bytes, and the compiled guard behavior through every installed consumer.
 
 The three projects with v2 consumers also apply
-[`@ryotsu+picomatch+4.0.7-a.patch`](patches/@ryotsu+picomatch+4.0.7-a.patch) to preserve Windows paths and
+[`cao-picomatch-guard+4.0.7-cao.1.patch`](patches/cao-picomatch-guard+4.0.7-cao.1.patch) to preserve Windows paths and
 captures in the old API. This changes only the platform option handling, not the parser.
 The dashboard uses only v4 consumers and still installs with scripts disabled.
 
-As with the braces fork, upstream advisories do not automatically match the scoped package.
-At weekly dependency reviews and before releases, check the upstream advisory and the fork.
+As with the braces fork, upstream advisories do not automatically match the private package.
+At weekly dependency reviews and before releases, check upstream advisories against the vendored code.
 Return to upstream once a released fix covers the consumers and the compatibility checks pass.
 
 #### Additional upstream security releases

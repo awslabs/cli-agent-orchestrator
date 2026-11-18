@@ -25,7 +25,6 @@
   },
   "devDependencies": {
     "@playwright/test": "1.65.0",
-    "@ryotsu/picomatch": "4.0.7-a",
     "@testing-library/dom": "10.4.2",
     "@testing-library/react": "16.3.3",
     "@types/node": "26.6.6",
@@ -33,6 +32,7 @@
     "@types/react-dom": "19.3.0",
     "@vitejs/plugin-react": "6.3.0",
     "@vitest/coverage-v8": "5.1.0",
+    "cao-picomatch-guard": "file:../../../vendor/cao-picomatch-guard-4.0.7-cao.1.tgz",
     "jsdom": "31.0.0",
     "picomatch": "file:picomatch-compat",
     "typescript": "7.0.2",

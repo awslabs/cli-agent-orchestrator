@@ -1,0 +1,175 @@
+--- a/lib/parse.js
++++ b/lib/parse.js
+@@ -139,26 +139,20 @@
+   return value.replace(/\\(.)/g, '$1');
+ };
+
+-const hasRepeatedCharPrefixOverlap = branches => {
+-  const values = branches.map(normalizeSimpleBranch).filter(Boolean);
+-
+-  for (let i = 0; i < values.length; i++) {
+-    for (let j = i + 1; j < values.length; j++) {
+-      const a = values[i];
+-      const b = values[j];
+-      const char = a[0];
+-
+-      if (!char || a !== char.repeat(a.length) || b !== char.repeat(b.length)) {
+-        continue;
+-      }
+-
+-      if (a === b || a.startsWith(b) || b.startsWith(a)) {
+-        return true;
+-      }
+-    }
+-  }
+-
+-  return false;
++const hasLiteralOverlap = (branches, options) => {
++  const ignoreCase = options.flags ? options.flags.includes('i') : options.nocase;
++  const values = branches.map(normalizeSimpleBranch).filter(Boolean)
++    .map(value => ignoreCase ? value.toUpperCase() : value);
++
++  // A literal and all its extensions are adjacent in lexicographic order.
++  const hasPrefix = words => words.sort().some((word, i, sorted) =>
++    i > 0 && word.startsWith(sorted[i - 1]));
++  if (!hasPrefix(values)) return false;
++
++  // Suffix-free literal alternatives are uniquely decodable from the other end.
++  // Don't discard their normal matches just because they share a prefix.
++  return values.length !== branches.length ||
++    hasPrefix(values.map(value => value.split('').reverse().join('')));
+ };
+
+ const parseRepeatedExtglob = (pattern, requireEnd = true) => {
+@@ -270,6 +264,74 @@
+   return chars;
+ };
+
++// A segment with an unrestricted star is closed under concatenation: repeating
++// it cannot match more strings than a single copy. Only collapse syntax whose
++// stars can absorb every character matched by the surrounding literals.
++const analyzeStarBranch = branch => {
++  let escaped = false;
++  let bracket = false;
++  let quote = false;
++  let groups = 0;
++  let star = false;
++  let collapsible = true;
++
++  for (let i = 0; i < branch.length; i++) {
++    const ch = branch[i];
++
++    if (escaped === true) {
++      if (ch === '/' || ch === '\\') collapsible = false;
++      escaped = false;
++      continue;
++    }
++
++    if (ch === '\\') {
++      escaped = true;
++      continue;
++    }
++
++    if (ch === '/') collapsible = false;
++
++    if (quote === true) {
++      if (ch === '"') quote = false;
++      continue;
++    }
++
++    if (bracket === true) {
++      if (ch === '[') collapsible = false;
++      if (ch === ']') bracket = false;
++      continue;
++    }
++
++    if (ch === '"') {
++      quote = true;
++      continue;
++    }
++
++    if (ch === '[') {
++      bracket = true;
++      continue;
++    }
++
++    if (ch === '@' && branch[i + 1] === '(') {
++      groups++;
++      i++;
++      continue;
++    }
++
++    if (ch === ')' && groups > 0) {
++      groups--;
++      continue;
++    }
++
++    if (ch === '*' && branch[i + 1] !== '(') star = true;
++    if (/[/(){}|!+@]/.test(ch) || (ch === '*' && branch[i + 1] === '(')) {
++      collapsible = false;
++    }
++  }
++
++  return { star, collapsible: collapsible && !escaped && !bracket && !quote && groups === 0 };
++};
++
+ const repeatedExtglobRecursion = pattern => {
+   let depth = 0;
+   let value = pattern.trim();
+@@ -300,7 +362,7 @@
+     if (
+       branches.some(branch => branch === '') ||
+       branches.some(branch => /^[*?]+$/.test(branch)) ||
+-      hasRepeatedCharPrefixOverlap(branches)
++      hasLiteralOverlap(branches, options)
+     ) {
+       return { risky: true };
+     }
+@@ -343,6 +405,13 @@
+       : { risky: true };
+   }
+
++  if (branches.length === 1) {
++    const branch = analyzeStarBranch(branches[0]);
++    if (branch.star) {
++      return branch.collapsible ? { risky: false, collapse: true } : { risky: true };
++    }
++  }
++
+   return { risky: false };
+ };
+
+@@ -565,6 +634,12 @@
+       return;
+     }
+
++    // Repeating a star-containing segment introduces nested quantifiers. The
++    // analyzer proves when one occurrence (or zero for `*`) is equivalent.
++    if (analysis.collapse === true && (token.type === 'plus' || token.type === 'star')) {
++      token.close = token.type === 'plus' ? ')' : ')?';
++    }
++
+     let output = token.close + (opts.capture ? ')' : '');
+     let rest;
+
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+-  "name": "picomatch",
+-  "description": "Blazing fast and accurate glob matcher written in JavaScript, with no dependencies and full support for standard and extended Bash glob features, including braces, extglobs, POSIX brackets, and regular expressions.",
+-  "version": "4.0.7",
++  "name": "cao-picomatch-guard",
++  "description": "CAO backport of picomatch 4.0.7 with repeated-extglob guards",
++  "version": "4.0.7-cao.1",
+   "homepage": "https://github.com/micromatch/picomatch",
+   "author": "Jon Schlinkert (https://github.com/jonschlinkert)",
+   "funding": "https://github.com/sponsors/jonschlinkert",
+@@ -79,5 +79,6 @@
+       "nanomatch",
+       "picomatch"
+     ]
+-  }
++  },
++  "private": true
+ }

@@ -1,3 +1,3 @@
 'use strict';
 
-module.exports = require('@ryotsu/picomatch/lib/utils');
+module.exports = require('cao-picomatch-guard/lib/utils');

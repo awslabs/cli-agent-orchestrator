@@ -29,8 +29,12 @@ const INSTALL_SCRIPT_ALLOWED = new Map([
 
 const EXACT = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/;
 
+// The shared matcher check verifies this archive's path, version, license and SHA-512.
+const matcherName = 'cao-picomatch-guard';
+const matcherArchive = 'file:../../../vendor/cao-picomatch-guard-4.0.7-cao.1.tgz';
 const directSpecs = Object.values({...manifest.dependencies, ...manifest.devDependencies});
-const localPackages = new Map(directSpecs.filter(spec => spec.startsWith('file:')).map(spec => {
+const localDirs = directSpecs.filter(spec => spec.startsWith('file:') && spec !== matcherArchive);
+const localPackages = new Map(localDirs.map(spec => {
   const dir = spec.slice('file:'.length);
   assert.equal(path.basename(dir), dir, 'local packages must be direct project directories');
   assert.equal(path.dirname(fs.realpathSync(path.join(root, dir))), root);
@@ -44,6 +48,7 @@ test('every external direct dependency is pinned to an exact version', () => {
   for (const pkg of [manifest, ...localPackages.values()]) {
     for (const field of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
       for (const [name, spec] of Object.entries(pkg[field] ?? {})) {
+        if (name === matcherName && spec === matcherArchive) continue;
         if (spec.startsWith('file:') && localPackages.has(spec.slice(5))) continue;
         assert.match(spec, EXACT, `${pkg.name}: ${field}.${name} is "${spec}", not an exact version`);
       }
@@ -52,7 +57,7 @@ test('every external direct dependency is pinned to an exact version', () => {
 });
 
 test('the app and its local packages declare no install lifecycle scripts', () => {
-  for (const pkg of [manifest, ...localPackages.values()]) {
+  for (const pkg of [manifest, ...localPackages.values(), require(`${matcherName}/package.json`)]) {
     for (const hook of ['preinstall', 'install', 'postinstall', 'prepare', 'prepublish']) {
       assert.equal(pkg.scripts?.[hook], undefined, `${pkg.name} declares a ${hook} script`);
     }
@@ -71,7 +76,7 @@ test('the lockfile matches package.json', () => {
   }
 });
 
-test('external packages have registry integrity; links resolve to private project packages', () => {
+test('packages have registry integrity, a verified archive, or a private project link', () => {
   for (const [dir, pkg] of localPackages) {
     assert.equal(lock.packages[dir].name ?? path.basename(dir), pkg.name);
     assert.equal(lock.packages[dir].version, pkg.version);
@@ -82,10 +87,12 @@ test('external packages have registry integrity; links resolve to private projec
       continue;
     }
     if (localPackages.has(location)) continue;
-    assert.ok(
-      entry.resolved?.startsWith('https://registry.npmjs.org/'),
-      `${location} resolves to ${entry.resolved}`,
-    );
+    if (location === `node_modules/${matcherName}`) {
+      assert.equal(entry.resolved, matcherArchive);
+    } else {
+      assert.ok(entry.resolved?.startsWith('https://registry.npmjs.org/'),
+        `${location} resolves to ${entry.resolved}`);
+    }
     assert.match(entry.integrity ?? '', /^sha512-/, `${location} has no sha512 integrity`);
   }
 });
