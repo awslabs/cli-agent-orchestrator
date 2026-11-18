@@ -21,8 +21,8 @@ def handler_path(setup_engine, monkeypatch):
     from cli_agent_orchestrator.plugins import PluginRegistry
 
     engine, req, decider, store, events, settings = setup_engine
-    monkeypatch.setattr(api.app.state, "decision_engine", engine, raising=False)
-    monkeypatch.setattr(api.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    monkeypatch.setitem(api.app.state._state, "decision_engine", engine)
+    monkeypatch.setitem(api.app.state._state, "plugin_registry", PluginRegistry())
     monkeypatch.setattr(api, "_record_job_state", AsyncMock())
     from cli_agent_orchestrator.utils import agent_profiles
 

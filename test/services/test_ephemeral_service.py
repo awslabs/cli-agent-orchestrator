@@ -638,7 +638,7 @@ def test_future_profile_source_contract(create_store, monkeypatch, case):
         monkeypatch.setattr(terminal_service, "get_max_terminals", lambda: None)
         monkeypatch.setattr(terminal_service, "get_backend", lambda: Mock())
         monkeypatch.setattr(terminal_service, "generate_terminal_id", fail_create)
-        monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+        monkeypatch.setitem(main.app.state._state, "plugin_registry", PluginRegistry())
         monkeypatch.setattr(agent_profiles, "resolve_env_vars", lambda text: text)
         for value in ("missing", "malformed"):
             with pytest.raises(ValueError) as create_error:

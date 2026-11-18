@@ -47,7 +47,7 @@ async def test_api_delete_records_deleted(release_runtime, monkeypatch):
     from cli_agent_orchestrator.api import main
     from cli_agent_orchestrator.plugins.registry import PluginRegistry
 
-    monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    monkeypatch.setitem(main.app.state._state, "plugin_registry", PluginRegistry())
     await launch_runtime(release_runtime)
 
     response = TestClient(main.app, base_url="http://localhost").delete("/terminals/" + CHILD)

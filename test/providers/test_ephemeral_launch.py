@@ -158,7 +158,7 @@ def test_launch_routes_map_ephemeral_policy_refusals(stores, monkeypatch, route,
 
     from cli_agent_orchestrator.plugins.registry import PluginRegistry
 
-    monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    monkeypatch.setitem(main.app.state._state, "plugin_registry", PluginRegistry())
     monkeypatch.setattr(main.session_service, "create_session", launch)
     monkeypatch.setattr(main, "run_agent_step", launch)
     from cli_agent_orchestrator.clients import database

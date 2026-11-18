@@ -728,7 +728,7 @@ def decided(kiro, tmp_path, monkeypatch):
             on_timeout_ms=timeout["ms"],
         ),
     )
-    monkeypatch.setattr(main.app.state, "decision_engine", engine, raising=False)
+    monkeypatch.setitem(main.app.state._state, "decision_engine", engine)
 
     async def run(**kwargs):
         claimed = claim(kiro.env, kiro.name)["claim_id"]

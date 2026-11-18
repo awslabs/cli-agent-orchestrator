@@ -160,7 +160,7 @@ def e5(launch_http, case, monkeypatch, tmp_path):
         settings_loader=lambda: settings,
         honors_model=lambda *a: True,
     )
-    monkeypatch.setattr(main.app.state, "decision_engine", engine, raising=False)
+    monkeypatch.setitem(main.app.state._state, "decision_engine", engine)
     # A persistent portal keeps shadow work on the request loop without app lifespan.
     with start_blocking_portal() as portal:
         launch_http[1].portal = portal

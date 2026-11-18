@@ -15,7 +15,7 @@ def terminal_path(setup_engine, monkeypatch, tmp_path):
     from cli_agent_orchestrator.services import terminal_service as service
 
     engine, req, decider, store, events, settings = setup_engine
-    monkeypatch.setattr(app.state, "decision_engine", engine, raising=False)
+    monkeypatch.setitem(app.state._state, "decision_engine", engine)
     from test.fixtures.terminal_launch import install_launch_stubs
 
     provider, backend, providers = install_launch_stubs(monkeypatch, tmp_path)

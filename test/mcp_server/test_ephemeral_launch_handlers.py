@@ -79,7 +79,7 @@ def launch_http(release_runtime, monkeypatch):
     from cli_agent_orchestrator.plugins.registry import PluginRegistry
 
     monkeypatch.setenv("CAO_TERMINAL_ID", CALLER)
-    monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    monkeypatch.setitem(main.app.state._state, "plugin_registry", PluginRegistry())
     monkeypatch.setattr(agent_step, "wait_until_status", AsyncMock(return_value=True))
     monkeypatch.setattr(agent_step, "_wait_for_completion", AsyncMock())
     monkeypatch.setattr(agent_step.frozen_run_memory, "frozen_memory_for", lambda *a: None)
@@ -435,7 +435,7 @@ def askable_decisions(launch_http, tmp_path, monkeypatch):
         ]["state"]
         == "on"
     )
-    monkeypatch.setattr(app.state, "decision_engine", engine, raising=False)
+    monkeypatch.setitem(app.state._state, "decision_engine", engine)
     yield req, store
     db.dispose()
 

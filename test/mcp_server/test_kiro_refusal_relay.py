@@ -33,7 +33,7 @@ pytestmark = pytest.mark.parametrize("create_store", ["file"], indirect=True)
 def helper_http(kiro, monkeypatch):
     monkeypatch.setenv("CAO_TERMINAL_ID", CALLER)
     monkeypatch.setattr(kiro.service.secrets, "token_hex", lambda n: "c" * (2 * n))
-    monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    monkeypatch.setitem(main.app.state._state, "plugin_registry", PluginRegistry())
     with TestClient(main.app, base_url="http://localhost") as client:
 
         def call(method, url, **kwargs):

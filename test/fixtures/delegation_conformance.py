@@ -43,8 +43,8 @@ class DelegationAdapter(EngineAdapter):
         from cli_agent_orchestrator.utils import orchestration as o
 
         patch = self.monkeypatch
-        patch.setattr(api.app.state, "decision_engine", self.engine, raising=False)
-        patch.setattr(api.app.state, "plugin_registry", PluginRegistry(), raising=False)
+        patch.setitem(api.app.state._state, "decision_engine", self.engine)
+        patch.setitem(api.app.state._state, "plugin_registry", PluginRegistry())
         patch.setattr(api, "_record_job_state", AsyncMock())
         patch.setattr(api, "resolve_provider", lambda *a, **k: self.provider)
         patch.setattr(o, "resolve_provider", lambda *a, **k: self.provider)

@@ -534,7 +534,7 @@ async def test_the_route_deletes_a_kept_child_that_is_working_again(keep, monkey
     from cli_agent_orchestrator.api import main
     from cli_agent_orchestrator.plugins.registry import PluginRegistry
 
-    monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    monkeypatch.setitem(main.app.state._state, "plugin_registry", PluginRegistry())
     await launch_runtime(release_runtime_of(keep))
     keep.setting()
     keep_service.keep_finished(CHILD, reason="handoff")

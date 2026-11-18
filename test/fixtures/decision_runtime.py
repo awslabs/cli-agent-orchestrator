@@ -39,6 +39,7 @@ def default_decision_runtime(tmp_path, monkeypatch):
     from cli_agent_orchestrator.api.main import app
 
     runtime, guard = isolated_runtime(tmp_path)
-    monkeypatch.setattr(app.state, "decision_engine", runtime, raising=False)
+    # Starlette stores these attributes in _state, not the instance __dict__ that pytest restores.
+    monkeypatch.setitem(app.state._state, "decision_engine", runtime)
     yield runtime
     guard.check()
