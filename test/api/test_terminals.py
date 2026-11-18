@@ -1095,6 +1095,20 @@ class TestDeleteTerminalEndpoint:
             assert "Failed to delete terminal" in response.json()["detail"]
 
 
+class TestSendInputToAMissingTerminal:
+    """F5 keeps POST /terminals/{id}/input's 404 through the real dispatch_input."""
+
+    def test_missing_terminal_row_answers_404(self, client):
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+            return_value=None,
+        ):
+            response = client.post("/terminals/abcd1234/input", params={"message": "hello"})
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"]
+
+
 class TestCreateInboxMessageEndpoint:
     """Test POST /terminals/{receiver_id}/inbox/messages endpoint."""
 

@@ -329,6 +329,47 @@ def test_complete_assignment_keeps_worker_when_delivery_fails(monkeypatch):
     post.assert_not_called()
 
 
+def _elastic_env(monkeypatch):
+    monkeypatch.setenv("CAO_ELASTIC_WORKER_ID", "deadbeef")
+    monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890")
+    monkeypatch.setenv("CAO_ELASTIC_RELEASE_TOKEN", "release-token")
+
+
+def test_complete_assignment_uncertain_result_keeps_worker_and_says_check_first(monkeypatch):
+    """F2: the result may have reached the supervisor; releasing or resending blindly is wrong."""
+    _elastic_env(monkeypatch)
+    sent = {"success": False, "delivery": "uncertain", "error": "lost terminal.send"}
+    with (
+        patch.object(server, "_send_message_impl", return_value=sent),
+        patch.object(server.requests, "post") as post,
+    ):
+        result = asyncio.run(server.complete_assignment("Done"))
+
+    assert result["success"] is False
+    assert result["delivery"] == "uncertain"
+    assert "may have arrived" in result["error"]
+    assert "check" in result["error"].lower() and "resend" in result["error"].lower()
+    post.assert_not_called()
+
+
+def test_complete_assignment_failed_result_is_unchanged(monkeypatch):
+    """F2: ``failed`` keeps today's answer."""
+    _elastic_env(monkeypatch)
+    sent = {"success": False, "delivery": "failed", "error": "lost terminal.read"}
+    with (
+        patch.object(server, "_send_message_impl", return_value=sent),
+        patch.object(server.requests, "post") as post,
+    ):
+        result = asyncio.run(server.complete_assignment("Done"))
+
+    assert result == {
+        "success": False,
+        "delivered": sent,
+        "error": "result delivery failed; worker was not released",
+    }
+    post.assert_not_called()
+
+
 # --- readiness: the caller waits on the Service, not on pod readiness --------
 #
 # The broker used to hold POST /workers open until the worker pod reported Ready,

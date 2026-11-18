@@ -2768,18 +2768,21 @@ class TestDeliveryOutcome:
         assert outcomes == [(7, delivered, None), (8, delivered, None)]
         self.settle.assert_called_once_with([7, 8])
 
-    def test_failure_after_the_paste_landed_is_not_reported_a_second_time(self):
-        """The confirmation runs after DELIVERED was reported (plan note 7)."""
+    @pytest.mark.parametrize("step", ["_confirm_submitted", "_wait_for_pickup"])
+    def test_exception_after_the_paste_keeps_the_message_delivered(self, step):
+        """F4: the text was typed, so a failure in the confirmation fails nothing."""
         with (
             patch("cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", True),
             patch("cli_agent_orchestrator.services.inbox_service.get_backend") as backend,
-            patch.object(
-                InboxService, "_confirm_submitted", side_effect=RuntimeError("monitor gone")
-            ),
+            patch.object(InboxService, step, side_effect=RuntimeError("monitor gone")),
         ):
             backend.return_value.supports_event_inbox.return_value = False
             outcomes = self._deliver(report_to_sender=7)
         assert outcomes == [(7, self._outcome().DELIVERED, None)]
+        assert self._statuses(7) == [MessageStatus.DELIVERED]
+        self.settle.assert_called_once_with([7])
+        self.record.assert_not_called()
+        self.failed.assert_not_called()
 
     def test_reply_settlement_failure_leaves_the_message_delivered(self):
         self.settle.side_effect = RuntimeError("database unavailable")
@@ -2823,11 +2826,34 @@ class TestDeliveryOutcome:
         assert self._statuses(7)[-1] == MessageStatus.FAILED
         assert self.failed.call_args.kwargs["uncertain"] is True
 
-    def test_missing_terminal_row_is_uncertain(self):
-        """Plan note 6: dispatch_input keeps ValueError, which is not proof of nothing typed."""
-        self.term.dispatch_input.side_effect = ValueError("Terminal 'term-1' not found")
+    @staticmethod
+    def _missing_row():
+        """What dispatch_input raises when the receiver's terminal row is gone.
+
+        Taken from the real dispatch_input, so the test follows whatever type
+        it uses to keep POST /terminals/{id}/input answering 404.
+        """
+        from cli_agent_orchestrator.services import terminal_service as real
+
+        with patch.object(real, "get_terminal_metadata", return_value=None):
+            try:
+                real.dispatch_input("term-1", "hello")
+            except Exception as exc:  # noqa: BLE001 - captured for the fake
+                return exc
+        raise AssertionError("dispatch_input accepted a terminal with no row")
+
+    def test_missing_terminal_row_is_failed(self):
+        """F5: nothing can have been typed into a terminal that has no row."""
+        self.term.dispatch_input.side_effect = self._missing_row()
         outcomes = self._deliver(report_to_sender=7)
-        assert [(o[0], o[1]) for o in outcomes] == [(7, self._outcome().UNCERTAIN)]
+        assert [(o[0], o[1]) for o in outcomes] == [(7, self._outcome().FAILED)]
+        assert self._statuses(7)[-1] == MessageStatus.FAILED
+
+    def test_missing_terminal_row_is_not_retried_when_queued(self):
+        self.term.dispatch_input.side_effect = self._missing_row()
+        outcomes = self._deliver()
+        assert [o[1] for o in outcomes] == [self._outcome().FAILED]
+        assert MessageStatus.PENDING not in self._statuses(7)
 
     def test_each_sender_run_reports_its_own_outcome(self):
         first = _make_message(id=7).model_copy(update={"sender_id": "w1"})
