@@ -4496,6 +4496,39 @@ def clear_reply_in_flight(message_ids: List[int]) -> List[DelegationEdge]:
         return edges
 
 
+def list_reply_in_flight_edges() -> List[DelegationEdge]:
+    """OPEN edges that carry a reply in flight, oldest first (the sweep's input)."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+                DelegationEdgeModel.reply_message_id.isnot(None),
+            )
+            .order_by(DelegationEdgeModel.id)
+            .all()
+        )
+        return [_edge_from_row(r) for r in rows]
+
+
+def get_inbox_message(message_id: int) -> Optional[InboxMessage]:
+    """The inbox message with id ``message_id``, or None when its row is gone."""
+    with SessionLocal() as db:
+        row = db.query(InboxModel).filter(InboxModel.id == message_id).first()
+        if row is None:
+            return None
+        return InboxMessage(
+            id=row.id,
+            sender_id=row.sender_id,
+            receiver_id=row.receiver_id,
+            message=row.message,
+            status=MessageStatus(row.status),
+            created_at=row.created_at,
+            delivery_attempts=row.delivery_attempts or 0,
+            last_error=row.last_error,
+        )
+
+
 def record_delivery_failure(message_id: int, error: str) -> int:
     """Count one failed delivery attempt for ``message_id`` and keep ``error``.
 
@@ -4569,6 +4602,10 @@ def close_delegation_edge_with_message(
     receiver would see no open edge out of it and no pending message, and
     could forward the receiver's previous answer before it had read this one.
     The message is skipped when the receiver row no longer exists.
+
+    An edge with a reply in flight is never claimed this way: the worker has
+    answered, so no auto-forward or worker-ended notice may go out for it, even
+    when the reply was marked after the caller listed the edge (design D2, D8).
     """
     with SessionLocal() as db:
         count = (
@@ -4576,6 +4613,7 @@ def close_delegation_edge_with_message(
             .filter(
                 DelegationEdgeModel.id == edge_id,
                 DelegationEdgeModel.state == EdgeState.OPEN.value,
+                DelegationEdgeModel.reply_message_id.is_(None),
             )
             .update(
                 {DelegationEdgeModel.state: state.value, DelegationEdgeModel.closed_at: _utcnow()},

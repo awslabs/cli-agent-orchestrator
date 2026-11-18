@@ -18,16 +18,19 @@ from cli_agent_orchestrator.clients.database import (
     clear_reply_in_flight,
     close_delegation_edge,
     close_delegation_edge_with_message,
+    close_edges_replied_by,
     close_open_edges_for_terminal,
     create_delegation_edge,
     create_inbox_message,
     find_open_edge,
+    get_inbox_message,
     get_pending_messages,
     get_terminal_metadata,
     list_armed_worker_ids,
     list_open_edges_into,
     list_open_edges_out_of,
     list_open_message_edges,
+    list_reply_in_flight_edges,
     list_unarmed_assign_edges,
     mark_reply_in_flight,
 )
@@ -38,7 +41,7 @@ from cli_agent_orchestrator.models.delegation import (
     EdgeSource,
     EdgeState,
 )
-from cli_agent_orchestrator.models.inbox import InboxMessage
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.services import terminal_service
@@ -203,6 +206,10 @@ def on_send_message(sender_id: str, receiver_id: str, message_id: int, expect_re
         # (reply-delivery-failure D1): inbox_service closes these as replied.
         for edge in owed:
             mark_reply_in_flight(edge.id, message_id)
+        # A delivery that ran before the mark existed could not settle it.
+        # Only DELIVERED is settled here; a failed or missing reply is left to
+        # the sweep, which also handles a sender that has ended.
+        _settle_reply_mark(receiver_id, message_id, None, delivered_only=True)
         return
 
     if find_open_edge(sender_id, receiver_id) is not None:
@@ -480,14 +487,8 @@ def handle_messages_failed(
 
     by_id = {m.id: m for m in messages}
     for edge in clear_reply_in_flight(ids):
-        if get_terminal_metadata(edge.worker_id) is not None:
-            continue  # the worker is alive: it was told, or will be, and can resend
         reply = by_id.get(edge.reply_message_id) if edge.reply_message_id is not None else None
-        text = build_reply_lost_message(
-            edge.worker_id, None, reason, reply.message if reply else None
-        )
-        if _close_and_notify(edge, EdgeState.WORKER_ENDED, edge.worker_id, text):
-            _deliver(edge.caller_id, edge.worker_id, registry)
+        _tell_caller_if_replier_ended(edge, reason, reply.message if reply else None, registry)
 
     for message in messages:
         if message.id in reported or message.id in told or message.message.startswith("[CAO "):
@@ -500,6 +501,71 @@ def handle_messages_failed(
         except ValueError:
             continue  # the sender's row went away in between
         _deliver(message.sender_id, receiver_id, registry)
+
+
+def _tell_caller_if_replier_ended(
+    edge: DelegationEdge, reason: str, reply: Optional[str], registry: PluginRegistry | None
+) -> None:
+    """For a reply mark just cleared: if its sender has ended, close the edge and tell the caller.
+
+    A live worker can resend, so its caller waits on it again and is told
+    nothing (design D7). An ended worker never will, so the caller gets the
+    stored reply text instead of a wait that cannot end.
+    """
+    if get_terminal_metadata(edge.worker_id) is not None:
+        return
+    text = build_reply_lost_message(edge.worker_id, None, reason, reply)
+    if _close_and_notify(edge, EdgeState.WORKER_ENDED, edge.worker_id, text):
+        _deliver(edge.caller_id, edge.worker_id, registry)
+
+
+def _settle_reply_mark(
+    caller_id: str,
+    message_id: int,
+    registry: PluginRegistry | None,
+    *,
+    delivered_only: bool = False,
+) -> None:
+    """Settle reply marks naming ``message_id`` once that message is final.
+
+    DELIVERED closes the edges as replied; FAILED, or a message row that is
+    gone, clears the mark (reply-delivery-failure F1). A PENDING reply is still
+    in flight and is left alone. The caller's delivery lock is held, without
+    waiting, while the status is read: a delivery marks its message DELIVERED
+    before it types it, so the status is final only while no delivery to the
+    caller runs. A delivery in flight settles the mark itself, or a later
+    sweep does. ``delivered_only`` settles DELIVERED and leaves the rest.
+    """
+    with inbox_service.hold_delivery_if_idle(caller_id) as held:
+        if not held:
+            return
+        message = get_inbox_message(message_id)
+        if message is not None and message.status == MessageStatus.PENDING:
+            return
+        if message is not None and message.status == MessageStatus.DELIVERED:
+            close_edges_replied_by([message_id])
+            return
+        if delivered_only:
+            return
+        cleared = clear_reply_in_flight([message_id])
+    reason = (message.last_error if message else None) or "the reply was not delivered"
+    for edge in cleared:
+        _tell_caller_if_replier_ended(edge, reason, message.message if message else None, registry)
+
+
+def settle_stale_reply_marks(registry: PluginRegistry | None = None) -> None:
+    """Settle reply marks that no delivery outcome will settle (sweep, F1).
+
+    A mark outlives its message's outcome when the server restarted between
+    the paste and the settlement, or when the settlement itself failed.
+    """
+    for edge in list_reply_in_flight_edges():
+        if edge.reply_message_id is None:
+            continue
+        try:
+            _settle_reply_mark(edge.caller_id, edge.reply_message_id, registry)
+        except Exception as exc:  # noqa: BLE001 - one edge must not stop the sweep
+            logger.debug("delegation: could not settle reply mark of edge %d: %s", edge.id, exc)
 
 
 def handle_task_never_delivered(worker_id: str) -> int:
@@ -543,7 +609,11 @@ def _log_cycles(worker_ids: List[str]) -> None:
 
 
 def sweep(registry: PluginRegistry | None = None) -> None:
-    """Evaluate every armed worker. Covers missed events, herdr, and restarts."""
+    """Settle stale reply marks, then evaluate every armed worker.
+
+    Covers missed events, herdr, and restarts.
+    """
+    settle_stale_reply_marks(registry)
     for worker_id in list_armed_worker_ids():
         try:
             evaluate_completion(worker_id, registry)
