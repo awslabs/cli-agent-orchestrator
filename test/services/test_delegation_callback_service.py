@@ -982,6 +982,33 @@ class TestStaleReplyMark:
         assert after is not None and after.reply_message_id is None
         assert _inbox(S) == []
 
+    @pytest.mark.parametrize("mark", ["failed", "missing_row"])
+    def test_stale_mark_of_an_ended_worker_tells_the_caller_and_closes(self, live, mark):
+        """Spec "Reply fails after its sender ended", reached through the sweep."""
+        from cli_agent_orchestrator.clients import database
+
+        # Arrange: W replied, then ended; the reply's outcome was never settled.
+        _armed(S, W)
+        if mark == "failed":
+            reply = _send(W, S, "final reply text")
+            _set_status(reply, "failed")
+        else:
+            database.mark_reply_in_flight(find_open_edge(S, W).id, 999_999)
+        svc.handle_worker_ended(W, "was deleted")
+        database.delete_terminal(W, end_reason="deleted")
+
+        # Act
+        svc.sweep()
+
+        # Assert
+        (notice,) = _failure_notices(S)
+        assert W in notice.message, "names the worker"
+        if mark == "failed":
+            assert "final reply text" in notice.message, "carries the stored reply"
+        assert find_open_edge(S, W) is None
+        assert (S, W, None) in live.delivered, "the notice delivery was started"
+        assert [m for m in _inbox(S) if m.message.startswith("[CAO worker ended]")] == []
+
     def test_pending_reply_keeps_its_mark(self, live):
         """A reply still queued is in flight, not stale."""
         _armed(S, W)
