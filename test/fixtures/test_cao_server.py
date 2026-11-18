@@ -13,7 +13,6 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import json
-import shutil
 import socket
 import subprocess
 import sys
