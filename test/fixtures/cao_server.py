@@ -322,6 +322,7 @@ class _JWKSServer:
             def do_GET(self) -> None:  # noqa: N802 — stdlib API name
                 if self.path != target_path:
                     self.send_response(404)
+                    self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
                 self.send_response(200)

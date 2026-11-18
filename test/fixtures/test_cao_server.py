@@ -14,6 +14,7 @@ import concurrent.futures
 import contextlib
 import json
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -287,8 +288,10 @@ def test_second_server_on_same_home_is_refused(
             "     Stop it, or run this instance with a different CAO_HOME_DIR and --port." in lines
         )
         # The second server never bound its port and the first still serves.
-        with pytest.raises(requests.ConnectionError):
-            requests.get(f"http://127.0.0.1:{second_port}/health", timeout=1.0)
+        # Check the listener directly: an HTTP proxy can return a synthetic
+        # 502 for a closed loopback port instead of raising ConnectionError.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            assert probe.connect_ex(("127.0.0.1", second_port)) != 0
         assert requests.get(f"{first.url}/health", timeout=2.0).status_code == 200
         assert json.loads((cao_home / "server.lock").read_text()) == diagnostics
     finally:
@@ -398,12 +401,13 @@ def test_auth_accepts_valid_token(cao_server_with_auth: AuthCaoServer) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "cao_terminal", [{"provider": "mock_cli", "agent_profile": "developer"}], indirect=True
+)
 def test_cao_terminal_create_and_get(
     cao_server: CaoServer,
     cao_terminal: str,
 ) -> None:
-    if not shutil.which("kiro-cli"):
-        pytest.skip("kiro-cli not available — default cao_terminal provider needs it")
     assert isinstance(cao_terminal, str) and cao_terminal
     # The terminal endpoint should be reachable while the fixture holds the
     # session open. The status field is provider-dependent — we only assert

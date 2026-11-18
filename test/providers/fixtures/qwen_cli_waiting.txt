@@ -18,6 +18,3 @@
     3. No, suggest changes (esc)
 
   Waiting for user confirmation...
-
-
-
