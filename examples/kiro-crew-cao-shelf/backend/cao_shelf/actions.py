@@ -259,13 +259,17 @@ class Actions:
         return self._conductor_of(writer, rows)
 
     def _conductor_of(self, writer: CaoWriter, rows: List[Dict[str, Any]]) -> Optional[str]:
-        """The conductor of these rows, never a helper. A caller the poller has not read yet is
-        read here, so a stale or empty cache cannot send an Ask to a helper."""
+        """The conductor of these rows, never a helper. Every caller of these rows that the poller
+        has not read yet is read here: ``pick_conductor`` takes a missing caller for "no caller",
+        so one unread helper row would be named conductor. A failed read raises, and nothing is
+        sent."""
         callers = dict(self._poller.caller_ids())
-        first = str(rows[0]["id"])
-        if first not in callers:
-            caller = writer.get_terminal(first).get("caller_id")
-            callers[first] = caller if isinstance(caller, str) and _valid_text_id(caller) else None
+        for row in rows:
+            tid = str(row["id"])
+            if tid not in callers:
+                caller = writer.get_terminal(tid).get("caller_id")
+                is_id = isinstance(caller, str) and _valid_text_id(caller)
+                callers[tid] = caller if is_id else None
         return tiering.pick_conductor(rows, callers, self._poller.role_live_ids())
 
     @staticmethod

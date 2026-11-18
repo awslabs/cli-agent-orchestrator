@@ -133,6 +133,34 @@ def test_f2_poller_reads_the_first_terminals_caller_and_ask_refuses(tmp_path: Pa
     assert len(r.cao.writes()) == before
 
 
+# CAO PR 1383 review, finding 5: a caller not read yet is not "no caller"
+def two_helpers_of_a_deleted_conductor(rig: ActionsRig) -> None:
+    when = iso(2.0)
+    rig.cao.add_session(
+        "orph2",
+        [("aaaaaaa1", "idle", when, "dead0001"), ("bbbbbbb1", "idle", when, "dead0001")],
+    )
+    rig.warm(2)
+    rig.poller._st.callers.clear()  # the poller has not read these callers yet
+
+
+def test_ask_reads_every_missing_caller_and_refuses_a_helper(tmp_path: Path) -> None:
+    r = ActionsRig(tmp_path, "quiet").warm()
+    two_helpers_of_a_deleted_conductor(r)
+    assert r.actions.conductor_of_session("orph2") is None
+    e = err(r.actions.ask, "orph2", {"message": "hello", "conductor_id": "bbbbbbb1"})
+    assert e.code == "conflict_changed" and e.detail == {"conductor_id": None}
+    assert r.cao.writes() == []
+
+
+def test_relay_attach_reads_every_missing_caller_and_refuses_a_helper(tmp_path: Path) -> None:
+    r = sup.RelayRig(tmp_path, "quiet").warm()
+    two_helpers_of_a_deleted_conductor(r)
+    e = err(r.attach, "orph2")
+    assert e.code == "no_conductor"
+    assert r.gw.calls == [] and r.cao.writes() == []
+
+
 def test_f2_ask_reads_the_caller_itself_when_the_cache_does_not_have_it(tmp_path: Path) -> None:
     r = ActionsRig(tmp_path, "quiet").warm()
     when = iso(2.0)
