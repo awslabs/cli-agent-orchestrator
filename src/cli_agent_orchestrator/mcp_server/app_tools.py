@@ -60,7 +60,7 @@ from cli_agent_orchestrator.services.ui_state_service import (
     build_dashboard_snapshot,
 )
 from cli_agent_orchestrator.utils.init_allowance import synchronous_create_timeout
-from cli_agent_orchestrator.utils.orchestration import _mcp_timeout
+from cli_agent_orchestrator.utils.orchestration import _inbox_post_timeout, _mcp_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +157,8 @@ def _post_json(
     ``timeout``: ``None`` (default) uses ``_mcp_timeout()``, right for every
     mutation the server answers immediately. ``POST /sessions`` is the exception
     -- it does not answer until ``provider.initialize()`` returns -- and passes
-    ``synchronous_create_timeout`` instead (issue #710).
+    ``synchronous_create_timeout`` instead (issue #710). The inbox POST waits
+    for its delivery outcome and passes ``_inbox_post_timeout`` (F6).
     """
 
     response = requests.post(
@@ -449,8 +450,20 @@ def _route_command(kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                     "sender_id": payload.get("sender_id") or "operator",
                     "message": message,
                 },
+                # The POST waits up to INBOX_DELIVERY_OUTCOME_WAIT for the
+                # delivery outcome (reply-delivery-failure D5).
+                timeout=_inbox_post_timeout(),
             )
-            return {"success": True, "kind": kind, "result": result}
+            # The POST's own verdict: a message reported failed or uncertain is
+            # not a success the operator should trust.
+            outcome = result if isinstance(result, dict) else {}
+            return {
+                "success": outcome.get("success", True) is not False,
+                "kind": kind,
+                "delivery": outcome.get("delivery"),
+                "error": outcome.get("error"),
+                "result": result,
+            }
 
         if kind == "assign":
             terminal_id = payload.get("terminal_id")
