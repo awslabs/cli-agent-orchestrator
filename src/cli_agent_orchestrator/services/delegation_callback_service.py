@@ -29,6 +29,7 @@ from cli_agent_orchestrator.clients.database import (
     list_open_edges_out_of,
     list_open_message_edges,
     list_unarmed_assign_edges,
+    mark_reply_in_flight,
 )
 from cli_agent_orchestrator.constants import DELEGATION_PICKUP_TIMEOUT_SECONDS
 from cli_agent_orchestrator.models.delegation import (
@@ -192,13 +193,16 @@ def on_send_message(sender_id: str, receiver_id: str, message_id: int, expect_re
     """Apply the edge rules for one send_message. Best-effort.
 
     Rules, first match wins: a reply to a terminal that is waiting on the
-    sender closes that edge; a message to a terminal this sender created opens
+    sender marks that edge's reply in flight, and the edge closes as replied
+    once the reply is delivered; a message to a terminal this sender created opens
     an edge; ``expect_reply`` opens an edge for any other terminal.
     """
     owed = [e for e in list_open_edges_into(sender_id) if e.caller_id == receiver_id]
     if owed:
+        # The reply ends the wait once it is delivered, not when it is stored
+        # (reply-delivery-failure D1): inbox_service closes these as replied.
         for edge in owed:
-            close_delegation_edge(edge.id, EdgeState.REPLIED)
+            mark_reply_in_flight(edge.id, message_id)
         return
 
     if find_open_edge(sender_id, receiver_id) is not None:
@@ -315,7 +319,9 @@ def evaluate_completion(terminal_id: str, registry: PluginRegistry | None = None
         Safe to call concurrently for the same terminal from the status-event
         consumer and the sweep.
     """
-    inbound = list_open_edges_into(terminal_id, armed_only=True)
+    # An edge whose reply is in flight is not forwarded: the worker's real
+    # answer is on its way (reply-delivery-failure D2).
+    inbound = list_open_edges_into(terminal_id, armed_only=True, exclude_reply_in_flight=True)
     if not inbound:
         return 0
     with inbox_service.hold_delivery_if_idle(terminal_id) as held:
@@ -375,9 +381,10 @@ def handle_worker_ended(
     """Close edges touching an ended worker and notify callers waiting on it.
 
     ``may_be_running`` is set for ERROR, whose terminal is kept (see
-    ``build_worker_ended_message``).
+    ``build_worker_ended_message``). An inbound edge with a reply in flight is
+    left open with no notice: the reply's delivery outcome settles it (D8).
     """
-    inbound = list_open_edges_into(terminal_id)
+    inbound = list_open_edges_into(terminal_id, exclude_reply_in_flight=True)
     notified: List[DelegationEdge] = []
     if inbound:
         profile = (get_terminal_metadata(terminal_id) or {}).get("agent_profile")
