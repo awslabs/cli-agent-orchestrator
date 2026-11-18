@@ -881,3 +881,217 @@ class TestIncident20261117:
         svc.sweep()
         assert _inbox(C) == []
         assert [d for d in live.delivered if d[0] == C] == []
+
+
+# --- review round 1 ---
+
+
+def _set_status(message_id, status_value):
+    from cli_agent_orchestrator.clients.database import update_message_status
+    from cli_agent_orchestrator.models.inbox import MessageStatus
+
+    update_message_status(message_id, MessageStatus(status_value))
+
+
+def _edge_state(caller, worker):
+    from cli_agent_orchestrator.clients.database import find_any_edge
+
+    return find_any_edge(caller, worker)
+
+
+class TestStaleReplyMark:
+    """F1, spec "Stale reply mark after a restart": the sweep settles marks nothing else will.
+
+    W stays PROCESSING so the sweep's ordinary evaluation never forwards it:
+    only the settling of the mark is observed.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _worker_busy(self, live):
+        live.monitor.get_status.return_value = TerminalStatus.PROCESSING
+
+    def test_restart_after_the_paste_closes_the_edge_as_replied(self, live):
+        # Arrange: the reply was typed (DELIVERED), the server died before settling.
+        _armed(S, W)
+        reply = _send(W, S, "final reply")
+        _set_status(reply, "delivered")
+
+        # Act
+        svc.sweep()
+
+        # Assert
+        assert _edge_state(S, W).state == EdgeState.REPLIED
+
+    def test_settle_that_raised_is_settled_by_the_sweep(self, live, monkeypatch):
+        from cli_agent_orchestrator.services import inbox_service as inbox_module
+
+        _armed(S, W)
+        reply = _send(W, S, "final reply")
+        live.monitor.get_status.side_effect = lambda t: (
+            TerminalStatus.IDLE if t == S else TerminalStatus.PROCESSING
+        )
+        with patch.object(
+            inbox_module, "close_edges_replied_by", side_effect=RuntimeError("database locked")
+        ):
+            _attempt(S)
+        assert [m.status.value for m in _inbox(S)] == ["delivered"]
+        assert find_open_edge(S, W).reply_message_id == reply, "the settle failed"
+
+        svc.sweep()
+
+        assert _edge_state(S, W).state == EdgeState.REPLIED
+
+    def test_reply_delivered_before_its_mark_closes_the_edge_at_once(self, live):
+        """The concurrent race: the delivery settled before on_send_message marked."""
+        from cli_agent_orchestrator.clients.database import create_inbox_message
+
+        _armed(S, W)
+        reply = create_inbox_message(W, S, "final reply").id
+        live.monitor.get_status.side_effect = lambda t: (
+            TerminalStatus.IDLE if t == S else TerminalStatus.PROCESSING
+        )
+        _attempt(S)  # typed and settled; no edge carried the mark yet
+        assert [m.status.value for m in _inbox(S)] == ["delivered"]
+
+        svc.on_send_message(sender_id=W, receiver_id=S, message_id=reply, expect_reply=False)
+
+        assert _edge_state(S, W).state == EdgeState.REPLIED
+
+    def test_failed_reply_mark_is_cleared_without_a_notice(self, live):
+        _armed(S, W)
+        reply = _send(W, S, "final reply")
+        _set_status(reply, "failed")
+
+        svc.sweep()
+
+        edge = find_open_edge(S, W)
+        assert edge is not None and edge.reply_message_id is None
+        assert _failure_notices(S) == []
+        assert [m.message for m in _inbox(S)] == ["final reply"], "S received nothing"
+
+    def test_mark_whose_message_row_is_gone_is_cleared(self, live):
+        from cli_agent_orchestrator.clients import database
+
+        _armed(S, W)
+        edge = find_open_edge(S, W)
+        database.mark_reply_in_flight(edge.id, 999_999)
+
+        svc.sweep()
+
+        after = find_open_edge(S, W)
+        assert after is not None and after.reply_message_id is None
+        assert _inbox(S) == []
+
+    def test_pending_reply_keeps_its_mark(self, live):
+        """A reply still queued is in flight, not stale."""
+        _armed(S, W)
+        reply = _send(W, S, "final reply")
+
+        svc.sweep()
+
+        assert find_open_edge(S, W).reply_message_id == reply
+
+
+class TestClaimSkipsAReplyInFlight:
+    """F3: a reply marked between the listing and the claim makes the claim fail."""
+
+    def _mark_after_listing(self, monkeypatch):
+        """List as usual, then let W's reply to S be marked before the claim."""
+        real_list = svc.list_open_edges_into
+        state = {"marked": None}
+
+        def list_then_reply(terminal_id, **kwargs):
+            edges = real_list(terminal_id, **kwargs)
+            if state["marked"] is None and terminal_id == W:
+                state["marked"] = -1  # on_send_message lists too: mark only once
+                state["marked"] = _send(W, S, "final reply")
+            return edges
+
+        monkeypatch.setattr(svc, "list_open_edges_into", list_then_reply)
+        return state
+
+    def test_no_auto_forward(self, live, monkeypatch):
+        _armed(S, W)
+        state = self._mark_after_listing(monkeypatch)
+
+        forwarded = svc.evaluate_completion(W)
+
+        assert forwarded == 0
+        assert [m.message for m in _inbox(S)] == ["final reply"], "no [CAO auto-forward]"
+        assert find_open_edge(S, W).reply_message_id == state["marked"]
+        assert live.delivered == []
+
+    def test_no_worker_ended_notice(self, live, monkeypatch):
+        _armed(S, W)
+        state = self._mark_after_listing(monkeypatch)
+
+        svc.handle_worker_ended(W, "was deleted")
+
+        assert [m.message for m in _inbox(S)] == ["final reply"], "no [CAO worker ended]"
+        assert find_open_edge(S, W).reply_message_id == state["marked"]
+        assert live.delivered == []
+
+
+class TestExceptionAfterThePaste:
+    """F4: a failure in the confirmation leaves a typed message DELIVERED and settled."""
+
+    @pytest.fixture
+    def confirmation_raises(self, live, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from cli_agent_orchestrator.services import inbox_service as inbox_module
+
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        monkeypatch.setattr(inbox_module, "INBOX_SUBMIT_CONFIRMATION", True)
+        monkeypatch.setattr(inbox_module, "get_backend", lambda: backend)
+        monkeypatch.setattr(
+            InboxService,
+            "_confirm_submitted",
+            lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("status monitor gone")),
+        )
+
+    def test_reply_closes_as_replied_and_nobody_is_told(self, live, confirmation_raises):
+        _armed(S, W)
+        reply = _send(W, S, "final reply")
+
+        outcomes = _attempt(S, report_to_sender=reply)
+
+        assert [(o[0], o[1].value) for o in outcomes] == [(reply, "delivered")]
+        assert [m.status.value for m in _inbox(S)] == ["delivered"]
+        assert _edge_state(S, W).state == EdgeState.REPLIED
+        assert _failure_notices(W) == []
+
+    def test_edge_the_message_opened_is_armed(self, live, confirmation_raises):
+        message_id = _send(C, S, "follow-up")  # S's recorded caller is C: opens C -> S
+
+        _attempt(S)
+
+        edge = find_open_edge(C, S)
+        assert edge is not None and edge.message_id == message_id
+        assert edge.delivered_at is not None, "armed"
+        assert [m.status.value for m in _inbox(S)] == ["delivered"]
+        assert _failure_notices(C) == []
+
+
+class TestPermanentRefusalOfAQueuedMessage:
+    """Spec scenario "Permanent refusal of a queued message"."""
+
+    def test_failed_at_once_and_the_sender_told_once(self, live):
+        from cli_agent_orchestrator.models.terminal import (
+            ProviderExitedInputBlockedError,
+            TerminalInputBlockedReason,
+        )
+
+        message_id = _send(W, C, "status")  # W -> C opens no edge
+        live.paste.dispatch_input.side_effect = ProviderExitedInputBlockedError(
+            "provider exited", reason=TerminalInputBlockedReason.PROVIDER_ERROR
+        )
+
+        _attempt(C)
+        _attempt(C)
+
+        assert [m.status.value for m in _inbox(C)] == ["failed"]
+        assert live.paste.dispatch_input.call_count == 1, "never retried"
+        (notice,) = _failure_notices(W)
+        assert re.search(rf"\b{message_id}\b", notice.message)

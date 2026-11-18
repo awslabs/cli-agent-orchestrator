@@ -182,9 +182,10 @@ def test_failure_after_send_keys_is_not_not_sent(seams):
 def test_missing_terminal_keeps_its_value_error(seams):
     """Plan note 6: POST /terminals/{id}/input maps ValueError to 404."""
     seams.mocks["get_terminal_metadata"].return_value = None
-    with pytest.raises(ValueError, match="not found") as raised:
+    # A ValueError for the 404, whatever else it is: F5 lets the inbox classify
+    # it as "nothing typed", so it may also be an InputNotSentError.
+    with pytest.raises(ValueError, match="not found"):
         terminal_service.dispatch_input("t1", "hello")
-    assert not isinstance(raised.value, _not_sent())
     _assert_nothing_typed(seams)
 
 
