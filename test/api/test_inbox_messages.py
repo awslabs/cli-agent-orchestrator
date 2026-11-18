@@ -380,22 +380,49 @@ class TestCreateInboxMessageResponseTiming:
         others = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         await asyncio.gather(*others, return_exceptions=True)
 
+    async def _post(self, deliver, **patches):
+        """POST message 7 with ``deliver_pending`` replaced by ``deliver``; return the body."""
+        from cli_agent_orchestrator.api.main import create_inbox_message_endpoint
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message",
+                return_value=self._stored_message(),
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.inbox_service.deliver_pending",
+                side_effect=deliver,
+            ) as mock_deliver,
+            patch("cli_agent_orchestrator.api.main.delegation_callback_service.on_send_message"),
+        ):
+            body = await create_inbox_message_endpoint(
+                self._request(), "abcdef12", "sender01", "hello", _scopes=[]
+            )
+            await self._drain_background_tasks()
+        self.deliver_call = mock_deliver.call_args
+        return body
+
+    @staticmethod
+    def _outcome():
+        from cli_agent_orchestrator.models.inbox import DeliveryOutcome
+
+        return DeliveryOutcome
+
     @pytest.mark.asyncio
-    async def test_responds_after_the_paste_while_confirmation_is_still_running(self):
+    async def test_responds_delivered_while_confirmation_is_still_running(self):
+        """Spec scenario "Immediate delivery succeeds"; the confirmation is not waited for."""
         import threading
 
         from cli_agent_orchestrator.api.main import create_inbox_message_endpoint
 
-        release = threading.Event()  # held by the test: the confirmation never ends on its own
+        release = threading.Event()  # the confirmation; only the test ends it
         finished = threading.Event()
+        delivered = self._outcome().DELIVERED
 
-        def deliver(receiver_id, registry=None, after_dispatch=None):
+        def deliver(receiver_id, **kwargs):
             try:
-                after_dispatch()  # the paste reached the pane
-                # Deadlock guard only: the test sets release; a timeout here means
-                # a mutant made the endpoint wait for the whole delivery, and the
-                # finished/not-finished assertion below reports it.
-                release.wait(10)  # ...and the confirmation wait begins
+                kwargs["on_outcome"](kwargs["report_to_sender"], delivered, None)
+                release.wait(10)  # deadlock guard only
             finally:
                 finished.set()
 
@@ -413,31 +440,101 @@ class TestCreateInboxMessageResponseTiming:
                 body = await create_inbox_message_endpoint(
                     self._request(), "abcdef12", "sender01", "hello", _scopes=[]
                 )
-                # The response is here and the delivery provably has not
-                # finished: it is blocked on an Event nobody has set.
-                assert body["message_id"] == 7
-                assert not release.is_set()
-                assert not finished.is_set()
+                assert (body["success"], body["delivery"], body["error"]) == (
+                    True,
+                    "delivered",
+                    None,
+                )
+                assert not finished.is_set(), "answered before the confirmation ended"
             finally:
                 release.set()
             await self._drain_background_tasks()
         assert finished.is_set()
 
     @pytest.mark.asyncio
-    async def test_responds_within_the_budget_when_the_paste_itself_is_delayed(self):
-        """The receiver's lock is held by another delivery: answer anyway, the
-        attempt keeps running in the background and still completes."""
+    async def test_delivery_is_asked_to_report_this_message(self):
+        def deliver(receiver_id, **kwargs):
+            return None
+
+        await self._post(deliver)
+        assert self.deliver_call.args[0] == "abcdef12"
+        assert self.deliver_call.kwargs["report_to_sender"] == 7
+        assert callable(self.deliver_call.kwargs["on_outcome"])
+
+    @pytest.mark.asyncio
+    async def test_failed_before_typing_returns_the_error(self):
+        """Spec scenario "Immediate delivery fails before typing"."""
+        failed = self._outcome().FAILED
+
+        def deliver(receiver_id, **kwargs):
+            kwargs["on_outcome"](7, failed, "InputNotSentError: lost terminal.read")
+
+        body = await self._post(deliver)
+        assert (body["success"], body["delivery"]) == (False, "failed")
+        assert body["error"] == "InputNotSentError: lost terminal.read"
+        assert body["message_id"] == 7
+
+    @pytest.mark.asyncio
+    async def test_uncertain_returns_the_error(self):
+        uncertain = self._outcome().UNCERTAIN
+
+        def deliver(receiver_id, **kwargs):
+            kwargs["on_outcome"](7, uncertain, "lost terminal.send")
+
+        body = await self._post(deliver)
+        assert (body["success"], body["delivery"], body["error"]) == (
+            False,
+            "uncertain",
+            "lost terminal.send",
+        )
+
+    @pytest.mark.asyncio
+    async def test_receiver_not_ready_is_queued(self):
+        """Spec scenario "Receiver busy": the attempt leaves message 7 alone."""
+
+        def deliver(receiver_id, **kwargs):
+            return None
+
+        body = await self._post(deliver)
+        assert (body["success"], body["delivery"], body["error"]) == (True, "queued", None)
+
+    @pytest.mark.asyncio
+    async def test_older_message_delivered_is_queued_for_this_one(self):
+        """Spec scenario "Older messages ahead"."""
+        delivered = self._outcome().DELIVERED
+
+        def deliver(receiver_id, **kwargs):
+            kwargs["on_outcome"](6, delivered, None)
+
+        body = await self._post(deliver)
+        assert (body["success"], body["delivery"]) == (True, "queued")
+
+    @pytest.mark.asyncio
+    async def test_first_outcome_for_this_message_decides(self):
+        """A failure after the paste landed (plan note 7) does not turn delivered into failed."""
+        outcome = self._outcome()
+
+        def deliver(receiver_id, **kwargs):
+            kwargs["on_outcome"](7, outcome.DELIVERED, None)
+            kwargs["on_outcome"](7, outcome.UNCERTAIN, "confirmation broke")
+
+        body = await self._post(deliver)
+        assert (body["success"], body["delivery"], body["error"]) == (True, "delivered", None)
+
+    @pytest.mark.asyncio
+    async def test_bound_reached_is_in_progress(self):
         import threading
 
         from cli_agent_orchestrator.api.main import create_inbox_message_endpoint
 
-        release = threading.Event()  # the other delivery's lock, held by the test
-        pasted = threading.Event()
+        release = threading.Event()
+        reported = threading.Event()
+        failed = self._outcome().FAILED
 
-        def deliver(receiver_id, registry=None, after_dispatch=None):
-            release.wait(10)  # blocked on the per-terminal lock, no paste yet (guard, see above)
-            after_dispatch()
-            pasted.set()
+        def deliver(receiver_id, **kwargs):
+            release.wait(10)  # blocked on the receiver's lock; guard only
+            kwargs["on_outcome"](7, failed, "too late to matter")
+            reported.set()
 
         with (
             patch(
@@ -448,51 +545,235 @@ class TestCreateInboxMessageResponseTiming:
                 "cli_agent_orchestrator.api.main.inbox_service.deliver_pending",
                 side_effect=deliver,
             ),
-            # Any budget works: the delivery is blocked on an Event only the
-            # test sets, so the response can only come from the budget expiring.
-            patch("cli_agent_orchestrator.api.main.INBOX_IMMEDIATE_DELIVERY_WAIT", 0.05),
+            patch("cli_agent_orchestrator.api.main.INBOX_DELIVERY_OUTCOME_WAIT", 0.05),
         ):
             try:
                 body = await create_inbox_message_endpoint(
                     self._request(), "abcdef12", "sender01", "hello", _scopes=[]
                 )
-                assert body["success"] is True
-                assert not pasted.is_set(), "the attempt was still running when we answered"
-                assert not release.is_set()
+                assert (body["success"], body["delivery"], body["error"]) == (
+                    True,
+                    "in_progress",
+                    None,
+                )
+                assert not reported.is_set()
             finally:
                 release.set()
-            # Answering early did not abandon the attempt.
             await self._drain_background_tasks()
-        assert pasted.is_set()
+        assert reported.is_set(), "answering early did not abandon the attempt"
 
     @pytest.mark.asyncio
-    async def test_delivery_failure_in_the_background_is_logged_not_raised(self):
-        from cli_agent_orchestrator.api.main import create_inbox_message_endpoint
+    async def test_unexpected_delivery_error_is_logged_and_queued(self):
+        """Plan note 11."""
 
-        def deliver(receiver_id, registry=None, after_dispatch=None):
+        def deliver(receiver_id, **kwargs):
             raise RuntimeError("pane gone")
 
+        with patch("cli_agent_orchestrator.api.main.logger") as mock_logger:
+            body = await self._post(deliver)
+        assert (body["success"], body["delivery"], body["error"]) == (True, "queued", None)
+        assert any(
+            "Immediate delivery attempt failed" in str(c)
+            for c in mock_logger.warning.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_edge_rules_run_before_the_delivery_starts(self):
+        """The reply mark must exist when the delivery settles reply edges."""
+        from cli_agent_orchestrator.api.main import create_inbox_message_endpoint
+
+        order = []
         with (
             patch(
                 "cli_agent_orchestrator.api.main.create_inbox_message",
                 return_value=self._stored_message(),
             ),
             patch(
-                "cli_agent_orchestrator.api.main.inbox_service.deliver_pending",
-                side_effect=deliver,
+                "cli_agent_orchestrator.api.main.delegation_callback_service.on_send_message",
+                side_effect=lambda **_kw: order.append("edges"),
             ),
-            patch("cli_agent_orchestrator.api.main.logger") as mock_logger,
+            patch(
+                "cli_agent_orchestrator.api.main.inbox_service.deliver_pending",
+                side_effect=lambda *_a, **_kw: order.append("deliver"),
+            ),
         ):
             body = await create_inbox_message_endpoint(
                 self._request(), "abcdef12", "sender01", "hello", _scopes=[]
             )
-            assert body["success"] is True
-            # The done callback runs when the delivery task completes; awaiting
-            # that task is the barrier (its callback was registered first, so it
-            # has run by the time gather returns).
             await self._drain_background_tasks()
+        assert order == ["edges", "deliver"]
+        assert body["delivery"] == "queued"
 
-        assert any(
-            "Immediate delivery attempt failed" in str(c)
-            for c in mock_logger.warning.call_args_list
+
+C, S, W = "cccc0001", "ssss0002", "wwww0003"
+
+
+@pytest.fixture
+def live(isolated_memory_db, monkeypatch):
+    """C -> S -> W with real rows, the real inbox POST, delivery and edge rules; pane mocked."""
+    from unittest.mock import MagicMock
+
+    from cli_agent_orchestrator.clients.database import create_terminal
+    from cli_agent_orchestrator.models.terminal import TerminalStatus
+    from cli_agent_orchestrator.services import delegation_callback_service as svc
+    from cli_agent_orchestrator.services import inbox_service as inbox_module
+
+    create_terminal(C, "cao-s", "c", "claude_code", "conductor")
+    create_terminal(S, "cao-s", "s", "claude_code", "supervisor", caller_id=C)
+    create_terminal(W, "cao-s", "w", "claude_code", "forge", caller_id=S)
+
+    monitor = MagicMock()
+    monitor.get_status.return_value = TerminalStatus.IDLE
+    monitor.started_on_last_input.return_value = True
+    monkeypatch.setattr(svc, "status_monitor", monitor)
+    monkeypatch.setattr(inbox_module, "status_monitor", monitor)
+    monkeypatch.setattr(inbox_module, "INBOX_SUBMIT_CONFIRMATION", False)
+    monkeypatch.setattr(inbox_module, "EAGER_INBOX_DELIVERY", False)
+    screen = MagicMock()
+    screen.get_output.side_effect = lambda terminal_id, _mode: f"{terminal_id} SCREEN"
+    monkeypatch.setattr(svc, "terminal_service", screen)
+    paste = MagicMock()
+    paste.dispatch_input.return_value = 0
+    monkeypatch.setattr(inbox_module, "terminal_service", paste)
+    delivered = []
+    monkeypatch.setattr(svc, "_deliver", lambda r, s, registry: delivered.append((r, s)))
+    return MagicMock(monitor=monitor, paste=paste, delivered=delivered, svc=svc)
+
+
+def _edge(caller, worker, armed=True):
+    from cli_agent_orchestrator.clients.database import (
+        create_delegation_edge,
+        mark_assign_edges_delivered,
+    )
+    from cli_agent_orchestrator.models.delegation import EdgeSource
+
+    create_delegation_edge(caller, worker, EdgeSource.ASSIGN)
+    if armed:
+        mark_assign_edges_delivered(worker)
+
+
+def _inbox(receiver_id):
+    from cli_agent_orchestrator.clients.database import get_inbox_messages
+
+    return get_inbox_messages(receiver_id, limit=50)
+
+
+def _not_sent(text):
+    from cli_agent_orchestrator.backends import base
+
+    return base.InputNotSentError(text)
+
+
+class TestInboxPostOverRealDelivery:
+    """send_message's immediate outcome over a real database and the real deliver_pending."""
+
+    async def _post(self, sender_id, receiver_id, text):
+        from cli_agent_orchestrator.api.main import create_inbox_message_endpoint
+
+        body = await create_inbox_message_endpoint(
+            TestCreateInboxMessageResponseTiming._request(),
+            receiver_id,
+            sender_id,
+            text,
+            _scopes=[],
         )
+        await TestCreateInboxMessageResponseTiming._drain_background_tasks()
+        return body
+
+    @pytest.mark.asyncio
+    async def test_reply_delivered_by_the_post_closes_its_edge_as_replied(self, live):
+        from cli_agent_orchestrator.clients.database import find_any_edge
+        from cli_agent_orchestrator.models.delegation import EdgeState
+
+        _edge(S, W)
+        body = await self._post(W, S, "final reply")
+        assert (body["success"], body["delivery"]) == (True, "delivered")
+        assert find_any_edge(S, W).state == EdgeState.REPLIED
+
+    @pytest.mark.asyncio
+    async def test_busy_receiver_is_queued_without_typing(self, live):
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+        live.monitor.get_status.return_value = TerminalStatus.PROCESSING
+        body = await self._post(W, C, "status")
+        assert (body["success"], body["delivery"], body["error"]) == (True, "queued", None)
+        live.paste.dispatch_input.assert_not_called()
+        assert [m.status.value for m in _inbox(C)] == ["pending"]
+
+    @pytest.mark.asyncio
+    async def test_older_pending_message_goes_first_and_this_one_is_queued(self, live):
+        from cli_agent_orchestrator.clients.database import create_inbox_message
+
+        older = create_inbox_message(S, C, "older")
+        body = await self._post(W, C, "newer")
+        assert (body["success"], body["delivery"]) == (True, "queued")
+        statuses = {m.message: m.status.value for m in _inbox(C)}
+        assert statuses == {"older": "delivered", "newer": "pending"}
+        assert live.paste.dispatch_input.call_args.args[1] == "older"
+        assert older.id != body["message_id"]
+
+    @pytest.mark.asyncio
+    async def test_failed_message_is_not_retried_and_its_sender_gets_no_notice(self, live):
+        """Spec: a message reported failed is marked failed and never retried by the server."""
+        from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+        live.paste.dispatch_input.side_effect = [_not_sent("lost terminal.read"), 0, 0]
+
+        body = await self._post(W, C, "status")
+        inbox_service.deliver_pending(C)  # what a later sweep or status event does
+        inbox_service.reconcile_orphaned_messages()
+
+        assert (body["success"], body["delivery"]) == (False, "failed")
+        assert "lost terminal.read" in body["error"]
+        assert live.paste.dispatch_input.call_count == 1
+        assert [m.status.value for m in _inbox(C)] == ["failed"]
+        assert _inbox(W) == [], "the POST carried the error; no notice"
+
+    @pytest.mark.asyncio
+    async def test_failure_while_sending_is_uncertain_and_not_retried(self, live):
+        from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+        live.paste.dispatch_input.side_effect = [RuntimeError("lost terminal.send"), 0]
+        body = await self._post(W, C, "status")
+        inbox_service.deliver_pending(C)
+        assert (body["success"], body["delivery"]) == (False, "uncertain")
+        assert "lost terminal.send" in body["error"]
+        assert live.paste.dispatch_input.call_count == 1
+        assert _inbox(W) == []
+
+
+class TestIncident20261117OverThePost:
+    """C -> S -> W: W's reply POST to S failed in mark_input_received, before typing."""
+
+    @pytest.mark.asyncio
+    async def test_failed_reply_post_returns_the_error_and_keeps_s_waiting(self, live, monkeypatch):
+        from cli_agent_orchestrator.clients.database import find_open_edge
+
+        # Arrange
+        _edge(C, S)
+        _edge(S, W)
+        live.paste.dispatch_input.side_effect = _not_sent(
+            "TerminalBackendError: herdr-core lost terminal.read: herdr-core sent nothing for 10.0s"
+        )
+
+        # Act
+        body = await TestInboxPostOverRealDelivery()._post(W, S, "forge's final reply")
+
+        # Assert: W learns it failed, from its own send_message.
+        assert (body["success"], body["delivery"]) == (False, "failed")
+        assert "lost terminal.read" in body["error"]
+        edge = find_open_edge(S, W)
+        assert edge is not None and edge.reply_message_id is None
+        assert _inbox(W) == []
+
+        # Past the pickup timeout S is still not forwarded to C, and C has nothing.
+        svc = live.svc
+        live.monitor.started_on_last_input.return_value = False
+        live.monitor.last_input_at.return_value = 100.0
+        monkeypatch.setattr(
+            svc, "_monotonic", lambda: 100.0 + svc.DELEGATION_PICKUP_TIMEOUT_SECONDS + 1
+        )
+        assert svc.evaluate_completion(S) == 0
+        svc.sweep()
+        assert _inbox(C) == []
+        assert [d for d in live.delivered if d[0] == C] == []
