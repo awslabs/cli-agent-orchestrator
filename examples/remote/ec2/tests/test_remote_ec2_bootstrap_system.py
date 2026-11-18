@@ -467,6 +467,18 @@ def test_no_start_only_enables_services(sandbox) -> None:
     assert "--no-start: enabled services but did not start them" in result.stdout
 
 
+def test_tmux_mode_uses_its_user_and_never_installs_herdr(sandbox) -> None:
+    settings = {k: v for k, v in BOOTSTRAP_SETTINGS.items() if k not in {"BOX_USER", "BOX_HOME"}}
+    result = dry_run(sandbox, FakeSystem(sandbox), ATTACH_MODE="tmux", **settings)
+    assert result.returncode == 0, result.stderr
+    assert "user cao-tmux (uid" in result.stdout
+    assert "/home/cao-tmux" in result.stdout
+    assert "packages: git sqlite3 curl unzip jq xz-utils ca-certificates tmux" in result.stdout
+    assert "herdr-cao.service" not in result.stdout
+    assert "herdr-linux-aarch64" not in result.stdout
+    assert "cao-tmux.service cao-server.service cao-backup.timer" in result.stdout
+
+
 @pytest.mark.skipif(
     Path("/etc/cao-box/box.env").exists(),
     reason=(

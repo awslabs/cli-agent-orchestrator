@@ -241,6 +241,27 @@ re-run. It accepts only one normal OpenSSH public-key line, never options or
 a private key. As a fallback, add the public key by hand as `cao-herdr`;
 never let root write in the box user's home.
 
+### tmux mode
+
+The default is still `ATTACH_MODE=herdr`. To use CAO's native tmux backend
+instead, omit the herdr pins and set these settings:
+
+```text
+ATTACH_MODE=tmux
+BOX_UID=1001
+# BOX_USER=cao-tmux and BOX_HOME=/home/cao-tmux are the tmux defaults.
+```
+
+Setup installs tmux 3.3 or newer, does not install herdr or `herdr-cao`, and
+starts `cao-tmux.service` before `cao-server.service`. `cao-tmux.service`
+owns tmux's normal per-user socket in its own cgroup, so restarting
+`cao-server.service` cannot kill running agent sessions. There is no
+`PrivateTmp`, allowing the same user to attach from SSH:
+
+```bash
+ssh -t cao-box tmux attach
+```
+
 ### 7. Connect the laptop
 
 Add [`ssh/config.snippet`](ssh/config.snippet) to the laptop's

@@ -17,7 +17,7 @@ from remote_ec2_support import (
 
 THIS_FILE = Path(__file__).resolve()
 # Placeholder or test-fixture user names that may follow /Users/ or /home/.
-ALLOWED_USERS = r"(?:<you>|<user>|cao-herdr|ubuntu|other|@BOX_)"
+ALLOWED_USERS = r"(?:<you>|<user>|cao-herdr|cao-tmux|ubuntu|other|@BOX_)"
 
 PATTERNS = {
     "a real /Users/<name> path": re.compile(rf"/Users/(?!{ALLOWED_USERS})[A-Za-z0-9]"),
