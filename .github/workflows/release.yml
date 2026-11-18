@@ -95,11 +95,6 @@ jobs:
           fetch-depth: 0
           ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
-      - name: Install git-cliff
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
-        with:
-          tool: git-cliff
-
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -112,10 +107,9 @@ jobs:
       # Bumps pyproject.toml, uv.lock and the devcontainer feature together, then the
       # changelog. publish-to-pypi.yml refuses a tag unless all three agree; release.yml
       # used to skip uv.lock, which is why 2.5.3 and 2.5.4 were bumped by hand (#899, #946).
-      - name: Bump version and generate changelog
+      - name: Bump version and promote the changelog
         id: bump
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Validated by the preflight for both events: one of patch, minor, major.
           BUMP: ${{ needs.preflight.outputs.bump }}
         run: |
