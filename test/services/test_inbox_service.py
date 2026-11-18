@@ -3024,6 +3024,8 @@ class TestQueuedRetry:
             self._outcome().RETRYING,
             self._outcome().DELIVERED,
         ]
-        assert self._stored().status == MessageStatus.DELIVERED
+        stored = self._stored()
+        assert stored.status == MessageStatus.DELIVERED
+        assert stored.delivery_attempts == 1, "counts the failed attempt only"
         assert self._attempt() == [], "delivered once"
         assert self.term.dispatch_input.call_count == 2

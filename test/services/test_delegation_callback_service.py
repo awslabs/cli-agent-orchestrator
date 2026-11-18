@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -639,7 +640,8 @@ class TestMessagesFailed:
 
         # Assert
         assert find_open_edge(S, W) is None
-        assert len(_failure_notices(S)) == 1, "one notice, not the edge's plus the sender's"
+        (notice,) = _failure_notices(S)  # one notice, not the edge's plus the sender's
+        assert re.search(rf"\b{message_id}\b", notice.message), "names the message id"
 
     def test_reported_message_that_opened_an_edge_closes_it_silently(self, live):
         """Plan note 12: the sender already has the error from its own send_message."""
@@ -710,6 +712,57 @@ class TestQueuedFailureNotices:
         live.paste.dispatch_input.side_effect = _not_sent("lost terminal.read")
         _attempt(C, report_to_sender=message_id)
         assert _failure_notices(W) == []
+
+
+class TestQueuedEdgeOpeningFailureNotice:
+    """Ruling: the edge notice is the only notice, and it carries the message id.
+
+    C -> S opens an edge (S's recorded caller is C), so a failure of that message
+    is reported through ``handle_delivery_failed``'s notice to C.
+    """
+
+    def test_failing_on_every_attempt_sends_one_notice_with_the_message_id(self, live):
+        # Arrange
+        from cli_agent_orchestrator.constants import INBOX_MAX_DELIVERY_ATTEMPTS
+
+        message_id = _send(C, S, "follow-up")
+        assert find_open_edge(C, S).message_id == message_id
+        live.paste.dispatch_input.side_effect = _not_sent("herdr-core lost terminal.read")
+
+        # Act
+        for _ in range(INBOX_MAX_DELIVERY_ATTEMPTS):
+            _attempt(S)
+
+        # Assert
+        (notice,) = _failure_notices(C)
+        assert notice.sender_id == S
+        assert S in notice.message, "names the receiver"
+        assert re.search(rf"\b{message_id}\b", notice.message), "names the message id"
+        assert "lost terminal.read" in notice.message, "names the error"
+        assert "may have arrived" not in notice.message
+        assert find_open_edge(C, S) is None
+
+    def test_no_notice_while_retries_remain(self, live):
+        from cli_agent_orchestrator.constants import INBOX_MAX_DELIVERY_ATTEMPTS
+
+        _send(C, S, "follow-up")
+        live.paste.dispatch_input.side_effect = _not_sent("herdr-core lost terminal.read")
+        for _ in range(INBOX_MAX_DELIVERY_ATTEMPTS - 1):
+            _attempt(S)
+        assert _failure_notices(C) == []
+        assert find_open_edge(C, S) is not None, "the edge waits for the retry"
+
+    def test_uncertain_failure_notice_says_the_text_may_have_arrived(self, live):
+        message_id = _send(C, S, "follow-up")
+        live.paste.dispatch_input.side_effect = RuntimeError("herdr-core lost terminal.send")
+
+        _attempt(S)
+
+        (notice,) = _failure_notices(C)
+        assert re.search(rf"\b{message_id}\b", notice.message)
+        assert "lost terminal.send" in notice.message
+        assert "may have arrived" in notice.message
+        assert find_open_edge(C, S) is None
 
 
 class TestReplySettlement:
