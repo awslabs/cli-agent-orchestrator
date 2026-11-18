@@ -10,18 +10,26 @@ exactly one herdr pane and nothing of herdr's own UI:
 
 - **Output.** The pane's visible screen is read over herdr's socket API
   (``pane.read``, ANSI format) and repainted when it changes.
-- **Size.** herdr gives every pane of a session one size, taken from the
-  client that attached or resized last, minus its own sidebar and tab bar.
-  The view sizes its hidden client (below) to the browser terminal plus that
-  chrome, measured from herdr's layout after each resize, so the agent's pane
-  is exactly as large as the browser pane showing it. Only a view whose own
-  size changed recalibrates, so views parked in the browser's pool never take
-  the size back.
+- **Size.** herdr sizes each tab separately, from the tab's geometry
+  controller: one client, whose terminal size minus herdr's sidebar and tab
+  bar becomes the tab's size. Every client views the focused tab, and a
+  client resize changes only the tab it views, and only if it controls it.
+  So each view, holding the herdr session's focus lock (see
+  ``focus_lock_path``), focuses its own tab, makes its hidden client (below)
+  that tab's controller (a terminal focus report, as a real terminal sends),
+  and sizes the client to the browser terminal plus herdr's chrome. It then
+  reads herdr's layout to correct its chrome estimate, which is valid only
+  while its own tab is focused. herdr keeps each tab at its controller's size
+  across later focus changes, so a tab keeps its view's size while the view
+  is parked in the browser's pool, and only a view whose own size changed
+  redoes this. (The agent's pane is one column narrower than the browser
+  pane while herdr shows its scrollbar gutter.)
 - **Input.** Keystrokes go, byte for byte, to a hidden herdr client this
   process owns, so herdr's own key handling applies (Enter, Escape, arrows,
   Ctrl keys, bracketed paste). cao-server focuses this view's tab before it
-  writes each input frame and serialises input per herdr session
-  (``HerdrBackend.prepare_web_attach_input``), so the keys reach this pane.
+  writes each input frame, holding the same focus lock until the view has
+  read the frame (``HerdrBackend.focus_web_input``), so the keys reach this
+  pane and a view's resize never moves the focus under them.
 - **Scrolling.** The view turns on mouse reporting and passes wheel events
   to its hidden client, moved past herdr's sidebar and tab bar so they land
   on the pane. herdr then does what its own UI does with a wheel: it scrolls
@@ -30,10 +38,9 @@ exactly one herdr pane and nothing of herdr's own UI:
   dropped. (Text selection in the browser then needs Shift, as in any
   terminal app that uses the mouse.)
 
-The pane is found by its workspace and tab labels (the CAO session and window
-names) on every lookup, because herdr renumbers pane ids when a pane in the
-workspace closes. When the tab is gone the view says so and exits, so the
-browser sees the connection close, as with tmux.
+The pane is found by its workspace and tab labels, because those are what CAO
+knows: the CAO session and window names. When the tab is gone the view says
+so and exits, so the browser sees the connection close, as with tmux.
 
 Run as ``python -m cli_agent_orchestrator.backends.herdr_web_view``.
 """
@@ -63,14 +70,22 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 POLL_INTERVAL_S = 0.1
 RESOLVE_INTERVAL_S = 2.0
 SOCKET_TIMEOUT_S = 5.0
-# How long herdr takes to lay out again after its client is resized, how many
-# times a view corrects its estimate of herdr's chrome, and how long it waits
-# for another view that is in the middle of the same sequence.
+# A resize, holding the focus lock: wait out input that may still be on its
+# way into herdr (a lone Escape waits up to this long in a herdr client,
+# HerdrBackend's escape hold), focus this view's tab and let every client
+# follow it, then claim the tab and resize, and let herdr lay out again.
+INPUT_GRACE_S = 0.3
+FOCUS_SETTLE_S = 0.15
 RESIZE_SETTLE_S = 0.4
+# How many times a view checks the result and corrects its estimate of
+# herdr's chrome, and how long it waits for the lock another view holds.
 CALIBRATION_ATTEMPTS = 4
 LOCK_RETRY_S = 0.2
 # herdr 0.9.5 defaults: a 26-column sidebar and a one-row tab bar.
 DEFAULT_CHROME = (1, 26)
+# Focus lost, then gained, as a real terminal reports it. herdr acts only on
+# a change, and a gain makes the client the controller of the tab it views.
+FOCUS_REPORT = b"\x1b[O\x1b[I"
 
 # Alternate screen, cursor hidden, no autowrap (long lines are cut, not
 # wrapped), and SGR mouse reporting so the wheel reaches the view.
@@ -119,28 +134,32 @@ def herdr_call(socket_path: str, method: str, params: Dict[str, Any]) -> Dict[st
 @dataclass
 class PaneInfo:
     pane_id: str
-    # The tab's layout area: what herdr gives the pane after its own chrome.
+    # herdr's layout area after its own chrome. herdr reports the foreground
+    # client's area for every tab, so it is this tab's size only while the
+    # tab is focused (``focused``) and this view's client is the foreground.
     area_rows: Optional[int]
     area_cols: Optional[int]
+    tab_id: str = ""
+    focused: bool = False
 
 
 def resolve_pane(socket_path: str, workspace_label: str, tab_label: str) -> Optional[PaneInfo]:
     """The pane of tab ``tab_label`` in workspace ``workspace_label``, or None."""
     snapshot = herdr_call(socket_path, "session.snapshot", {}).get("snapshot", {})
-    workspace_ids = {
-        w.get("workspace_id")
+    workspaces = {
+        w.get("workspace_id"): w.get("focused") is True
         for w in snapshot.get("workspaces", [])
         if isinstance(w, dict) and w.get("label") == workspace_label
     }
-    tab_ids = {
-        t.get("tab_id")
+    tabs = {
+        t.get("tab_id"): workspaces[t.get("workspace_id")] and t.get("focused") is True
         for t in snapshot.get("tabs", [])
         if isinstance(t, dict)
-        and t.get("workspace_id") in workspace_ids
+        and t.get("workspace_id") in workspaces
         and t.get("label") == tab_label
     }
     for pane in snapshot.get("panes", []):
-        if not (isinstance(pane, dict) and pane.get("tab_id") in tab_ids and pane.get("pane_id")):
+        if not (isinstance(pane, dict) and pane.get("tab_id") in tabs and pane.get("pane_id")):
             continue
         area: Dict[str, Any] = {}
         for layout in snapshot.get("layouts", []):
@@ -150,8 +169,15 @@ def resolve_pane(socket_path: str, workspace_label: str, tab_label: str) -> Opti
             pane_id=str(pane["pane_id"]),
             area_rows=area.get("height"),
             area_cols=area.get("width"),
+            tab_id=str(pane["tab_id"]),
+            focused=tabs[pane["tab_id"]],
         )
     return None
+
+
+def focus_tab(socket_path: str, tab_id: str) -> None:
+    """Move herdr's focus, and with it every client's view, to ``tab_id``."""
+    herdr_call(socket_path, "tab.focus", {"tab_id": tab_id})
 
 
 def read_screen(socket_path: str, pane_id: str) -> str:
@@ -269,11 +295,11 @@ def _private_dir(path: str) -> bool:
 
 
 def session_state_dir(herdr_session: str) -> Optional[str]:
-    """Private directory the views of one herdr session share, for the lock and chrome below.
+    """Private directory one herdr session's views and cao-server share (lock, chrome).
 
     It lives under the shared temp dir, so it is created 0700 and refused if
     another user made it first, is a symlink, or is group/world accessible.
-    None means no usable directory: views then resize without the lock.
+    None means no usable directory: focus changes then go unserialised.
     """
     root = os.path.join(tempfile.gettempdir(), f"cao-herdr-web-view-{os.getuid()}")
     path = os.path.join(root, herdr_session)
@@ -282,16 +308,47 @@ def session_state_dir(herdr_session: str) -> Optional[str]:
     return None
 
 
-class _Sizer:
-    """Keeps herdr's pane size equal to this view's size (see the module docstring).
+def focus_lock_path(herdr_session: str) -> Optional[str]:
+    """The lock held by whatever moves herdr's focus in this herdr session.
 
-    One pane size is shared by the whole herdr session, so views must not resize
-    at the same time: a view that reads the layout while another is resizing
-    would read the other view's size and mis-correct its chrome estimate. Each
-    view therefore holds a lock around its whole apply-and-verify sequence, and
-    saves what it measured for the next view to start from. Layout changes size
-    every visible pane to the same cell, so the view that finishes last leaves
-    the size right for all of them.
+    cao-server holds it from focusing a view's tab until the view has read the
+    input frame; a view holds it for its whole resize (see ``_Sizer``). So a
+    resize never moves the focus while keys are on their way to a tab.
+    """
+    state_dir = session_state_dir(herdr_session)
+    return os.path.join(state_dir, "focus.lock") if state_dir else None
+
+
+def try_lock(path: str) -> Optional[int]:
+    """The open, exclusively locked ``path``; None if another holder has it.
+
+    Raises ``OSError`` when the file cannot be opened at all.
+    """
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def unlock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+class _Sizer:
+    """Keeps this view's tab at this view's size (see the module docstring).
+
+    One sequence, with the focus lock held throughout: wait out input still on
+    its way into herdr, focus this view's tab, claim it for the hidden client
+    and resize the client, then check herdr's layout and correct the chrome
+    estimate until it fits. The layout is only this tab's while the tab is
+    focused, so a check that finds another tab focused starts over instead of
+    finishing. What a view measured is saved for the next view to start from.
     """
 
     def __init__(
@@ -300,17 +357,19 @@ class _Sizer:
         client_fd: int,
         lock_path: Optional[str] = None,
         chrome_path: Optional[str] = None,
+        focus_own_tab: Optional[Callable[[], None]] = None,
     ) -> None:
         self.client_pid = client_pid
         self.client_fd = client_fd
         self.lock_path = lock_path
         self.chrome_path = chrome_path
+        self.focus_own_tab = focus_own_tab or (lambda: None)
         self.chrome_rows, self.chrome_cols = self._load_chrome()
         self.rows = 0
         self.cols = 0
         self.attempts = 0
         self.next_at = 0.0
-        self._applied = False
+        self._phase = "grace"
         self._lock_fd: Optional[int] = None
 
     # --- chrome, shared between the views of one herdr session ---
@@ -340,14 +399,11 @@ class _Sizer:
         if not self.lock_path:
             return True
         try:
-            fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            fd = try_lock(self.lock_path)
         except OSError:
             self.lock_path = None  # unlockable: resize unserialised rather than not at all
             return True
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(fd)
+        if fd is None:
             return False
         self._lock_fd = fd
         return True
@@ -355,11 +411,8 @@ class _Sizer:
     def _release(self) -> None:
         if self._lock_fd is None:
             return
-        try:
-            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-        finally:
-            os.close(self._lock_fd)
-            self._lock_fd = None
+        fd, self._lock_fd = self._lock_fd, None
+        unlock(fd)
 
     def wheel_report(self, button: int, column: int, row: int) -> bytes:
         """A wheel report at a view cell, moved to the same cell of herdr's pane area."""
@@ -370,37 +423,74 @@ class _Sizer:
         self.rows, self.cols = rows, cols
         self.attempts = CALIBRATION_ATTEMPTS
         self.next_at = 0.0
-        self._applied = False
+        self._phase = "grace"
 
     def due(self) -> bool:
         return self.attempts > 0 and time.monotonic() >= self.next_at
 
-    def step(self, read_area: "Callable[[], Optional[Tuple[int, int]]]") -> None:
-        """One step of the sequence: take the lock, apply this view's size, verify it."""
+    def step(self, read_state: "Callable[[], Optional[Tuple[int, int, bool]]]") -> None:
+        """One step of the sequence (see the class docstring).
+
+        ``read_state`` answers herdr's layout area and whether this view's tab
+        is focused, ``(rows, cols, focused)``, or None if it cannot be read.
+        """
         if not self._acquire():
-            self.next_at = time.monotonic() + LOCK_RETRY_S  # another view is resizing
+            self.next_at = time.monotonic() + LOCK_RETRY_S  # another view or an input turn
             return
-        if not self._applied:
-            self._applied = True
+        if self._phase == "grace":
+            self._phase = "focus"
+            self.next_at = time.monotonic() + INPUT_GRACE_S
+            return
+        if self._phase == "focus":
+            try:
+                self.focus_own_tab()
+            except HerdrSocketError:
+                # Let input through meanwhile, and try again from the start.
+                self.attempts -= 1
+                self._phase = "grace"
+                self._release()
+                self.next_at = time.monotonic() + LOCK_RETRY_S
+                if self.attempts <= 0:
+                    self._finish()
+                raise
+            self._phase = "claim"
+            self.next_at = time.monotonic() + FOCUS_SETTLE_S
+            return
+        if self._phase == "claim":
+            self._phase = "verify"
             self._apply()
             return
-        area = read_area()
+        state = read_state()
         self.attempts -= 1
-        if area == (self.rows, self.cols):
+        if state is None:
+            self._finish()
+            return
+        rows, cols, focused = state
+        if focused and (rows, cols) == (self.rows, self.cols):
             self._save_chrome()
             self._finish()
             return
-        if self.attempts <= 0 or area is None:
+        if self.attempts <= 0:
             self._finish()
             return
-        self.chrome_rows = max(self.chrome_rows + self.rows - area[0], 0)
-        self.chrome_cols = max(self.chrome_cols + self.cols - area[1], 0)
+        if not focused:
+            # The layout is another tab's: take the focus back before trusting it.
+            self._phase = "focus"
+            self.next_at = 0.0
+            return
+        self.chrome_rows = max(self.chrome_rows + self.rows - rows, 0)
+        self.chrome_cols = max(self.chrome_cols + self.cols - cols, 0)
         self._apply()
 
     def _apply(self) -> None:
+        """Size the hidden client, and make it the controller of the tab it views."""
         _set_window_size(self.client_fd, self.rows + self.chrome_rows, self.cols + self.chrome_cols)
         try:
             os.kill(self.client_pid, signal.SIGWINCH)
+        except OSError:
+            pass
+        try:
+            _write_all(self.client_fd, FOCUS_REPORT)
         except OSError:
             pass
         self.next_at = time.monotonic() + RESIZE_SETTLE_S
@@ -428,7 +518,11 @@ def run(herdr_session: str, socket_path: str, workspace_label: str, tab_label: s
     _take_controlling_terminal(stdin_fd)
     rows, cols = _window_size(stdout_fd)
 
-    pane = resolve_pane(socket_path, workspace_label, tab_label)
+    try:
+        pane = resolve_pane(socket_path, workspace_label, tab_label)
+    except HerdrSocketError as e:
+        os.write(stdout_fd, f"Cannot reach herdr session '{herdr_session}': {e}\r\n".encode())
+        return 1
     if pane is None:
         os.write(stdout_fd, f"No herdr tab '{tab_label}' in '{workspace_label}'.\r\n".encode())
         return 1
@@ -437,14 +531,23 @@ def run(herdr_session: str, socket_path: str, workspace_label: str, tab_label: s
         herdr_session, rows + DEFAULT_CHROME[0], cols + DEFAULT_CHROME[1]
     )
     state_dir = session_state_dir(herdr_session)
+    current: PaneInfo = pane
+
+    def _focus_own_tab() -> None:
+        focus_tab(socket_path, current.tab_id)
+
     sizer = _Sizer(
         client_pid,
         client_fd,
-        lock_path=os.path.join(state_dir, "resize.lock") if state_dir else None,
+        lock_path=focus_lock_path(herdr_session),
         chrome_path=os.path.join(state_dir, "chrome.json") if state_dir else None,
+        focus_own_tab=_focus_own_tab,
     )
     sizer.resize(rows, cols)
-    signal.signal(signal.SIGWINCH, lambda _signum, _frame: None)  # wakes select()
+    # Python retries select() after a handler returns (PEP 475), so SIGWINCH
+    # does not wake the loop; it only must not end the process. The loop
+    # checks the size on every pass, at least every POLL_INTERVAL_S.
+    signal.signal(signal.SIGWINCH, lambda _signum, _frame: None)
     saved_tty = None
     try:
         saved_tty = termios.tcgetattr(stdin_fd)
@@ -466,10 +569,7 @@ def run(herdr_session: str, socket_path: str, workspace_label: str, tab_label: s
                 last_screen = None
 
             timeout = max(0.0, next_poll - time.monotonic())
-            try:
-                readable, _, _ = select.select([stdin_fd, client_fd], [], [], timeout)
-            except InterruptedError:
-                continue
+            readable, _, _ = select.select([stdin_fd, client_fd], [], [], timeout)
 
             if stdin_fd in readable:
                 try:
@@ -498,20 +598,20 @@ def run(herdr_session: str, socket_path: str, workspace_label: str, tab_label: s
                 continue
             next_poll = now + POLL_INTERVAL_S
 
-            def _read_area() -> Optional[Tuple[int, int]]:
-                """herdr's current pane area, re-resolved; None if it cannot be read."""
-                nonlocal pane, last_resolve
+            def _read_state() -> Optional[Tuple[int, int, bool]]:
+                """herdr's layout area and whether this tab is focused; None if unreadable."""
+                nonlocal current, last_resolve
                 last_resolve = time.monotonic()
                 found = resolve_pane(socket_path, workspace_label, tab_label)
                 if found is not None:
-                    pane = found
+                    current = found
                 if found is None or found.area_rows is None or found.area_cols is None:
                     return None
-                return found.area_rows, found.area_cols
+                return found.area_rows, found.area_cols, found.focused
 
             try:
                 if sizer.due():
-                    sizer.step(_read_area)
+                    sizer.step(_read_state)
                 if now - last_resolve >= RESOLVE_INTERVAL_S:
                     last_resolve = now
                     found = resolve_pane(socket_path, workspace_label, tab_label)
@@ -520,8 +620,8 @@ def run(herdr_session: str, socket_path: str, workspace_label: str, tab_label: s
                             stdout_fd, (_LEAVE + "The agent's herdr tab closed.\r\n").encode()
                         )
                         return 0
-                    pane = found
-                screen = read_screen(socket_path, pane.pane_id)
+                    current = found
+                screen = read_screen(socket_path, current.pane_id)
             except HerdrSocketError:
                 last_resolve = 0.0  # look the pane up again on the next poll
                 continue
@@ -529,6 +629,7 @@ def run(herdr_session: str, socket_path: str, workspace_label: str, tab_label: s
                 last_screen = screen
                 _write_all(stdout_fd, render(screen, rows).encode("utf-8", "replace"))
     finally:
+        sizer._finish()
         if saved_tty is not None:
             try:
                 termios.tcsetattr(stdin_fd, termios.TCSADRAIN, saved_tty)

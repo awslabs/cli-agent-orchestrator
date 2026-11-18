@@ -1,6 +1,7 @@
 """Unit tests for HerdrBackend — pane_id resolution and command construction."""
 
 import json
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -21,7 +22,9 @@ def backend():
     # Patch os.path.exists so _ensure_session_running finds the socket immediately,
     # avoiding the 5-second poll timeout in unit tests.
     with patch("cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True):
-        yield HerdrBackend(send_delay_ms=0)
+        backend = HerdrBackend(send_delay_ms=0)
+        yield backend
+    backend.release_web_input("")  # a focus test's lock, so the next test can take it
 
 
 def _make_pane_list_response(panes):
@@ -207,6 +210,79 @@ class TestHerdrBackendCommands:
     def test_focus_web_input_rejects_malformed_target(self, backend):
         with pytest.raises(TerminalBackendError):
             backend.focus_web_input("not-json")
+
+    @pytest.fixture
+    def lock_path(self, tmp_path):
+        path = str(tmp_path / "focus.lock")
+        with patch(
+            "cli_agent_orchestrator.backends.herdr_web_view.focus_lock_path", return_value=path
+        ):
+            yield path
+
+    def _focus(self, backend, focused=True):
+        with (
+            patch.object(backend, "_resolve_workspace_id", return_value="w1"),
+            patch.object(
+                backend,
+                "_run_herdr",
+                side_effect=[_completed(self._snapshot(True, focused)), _completed()],
+            ),
+            patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep"),
+        ):
+            backend.focus_web_input(json.dumps(["cao-test", "developer-abcd"]))
+
+    def test_focus_web_input_holds_the_focus_lock_until_released(self, backend, lock_path):
+        """A web view must not move herdr's focus while this frame is on its way."""
+        from cli_agent_orchestrator.backends import herdr_web_view
+
+        self._focus(backend)
+        assert herdr_web_view.try_lock(lock_path) is None
+
+        backend.release_web_input("")
+        fd = herdr_web_view.try_lock(lock_path)
+        assert fd is not None
+        herdr_web_view.unlock(fd)
+
+    def test_focus_web_input_waits_for_a_view_resizing(self, backend, lock_path):
+        from cli_agent_orchestrator.backends import herdr_web_view
+
+        view_fd = herdr_web_view.try_lock(lock_path)
+        timer = threading.Timer(0.2, herdr_web_view.unlock, args=(view_fd,))
+        timer.start()
+        started = time.monotonic()
+        self._focus(backend)
+        timer.join()
+        assert time.monotonic() - started >= 0.15
+        backend.release_web_input("")
+
+    def test_focus_web_input_gives_up_rather_than_race_a_resize(self, backend, lock_path):
+        from cli_agent_orchestrator.backends import herdr_backend, herdr_web_view
+
+        view_fd = herdr_web_view.try_lock(lock_path)
+        try:
+            with (
+                patch.object(herdr_backend, "_HERDR_WEB_FOCUS_LOCK_TIMEOUT_S", 0.1),
+                pytest.raises(TerminalBackendError, match="focus lock"),
+            ):
+                self._focus(backend)
+        finally:
+            herdr_web_view.unlock(view_fd)
+
+    def test_a_failed_focus_releases_the_lock(self, backend, lock_path):
+        from cli_agent_orchestrator.backends import herdr_web_view
+
+        with (
+            patch.object(backend, "_resolve_workspace_id", side_effect=TerminalBackendError("x")),
+            pytest.raises(TerminalBackendError),
+        ):
+            backend.focus_web_input(json.dumps(["cao-test", "developer-abcd"]))
+        fd = herdr_web_view.try_lock(lock_path)
+        assert fd is not None
+        herdr_web_view.unlock(fd)
+
+    def test_release_without_a_turn_is_harmless(self, backend):
+        backend.release_web_input("")
+        backend.release_web_input("")
 
     def test_prepare_web_attach_propagates_tab_not_found(self, backend):
         """Browser attachment propagates a missing requested Herdr tab."""

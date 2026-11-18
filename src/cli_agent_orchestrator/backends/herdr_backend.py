@@ -51,6 +51,11 @@ _HERDR_WEB_INPUT_ESCAPE_HOLD_S = 0.3
 # Wait after a browser terminal moves herdr's focus to its tab, before its input
 # is written (see HerdrBackend.focus_web_input).
 _HERDR_WEB_FOCUS_SETTLE_S = 0.15
+# Longest wait for the herdr session's focus lock, which a web view holds for
+# one resize (at most about 2.5 s; see herdr_web_view._Sizer). Past it the
+# input frame is dropped rather than sent while the focus may move.
+_HERDR_WEB_FOCUS_LOCK_TIMEOUT_S = 5.0
+_HERDR_WEB_FOCUS_LOCK_POLL_S = 0.02
 
 # Herdr CLI subcommands that _run_herdr is allowed to invoke.
 _HERDR_ALLOWED_SUBCOMMANDS = frozenset(
@@ -209,6 +214,8 @@ class HerdrBackend(TerminalBackend):
         self._pane_id_map_ts: float = 0.0
         # Workspace cache: session_name → (workspace_id, timestamp)
         self._workspace_cache: Dict[str, tuple[str, float]] = {}
+        # The focus lock held for one web input turn (see focus_web_input).
+        self._web_focus_lock_fd: Optional[int] = None
         self._ensure_session_running()
 
     @property
@@ -920,7 +927,7 @@ class HerdrBackend(TerminalBackend):
         The view's keystrokes go through a herdr client, which types into the
         server's focused tab. The scope is the herdr session, because every
         CAO session's tabs share that one focus; the target names the tab by
-        its labels, because herdr renumbers ids when a tab closes.
+        its labels, the CAO session and window names, as the view finds it.
         """
         argv = self.prepare_web_attach(session_name, window_name)
         return argv, (f"herdr:{self._herdr_session}", json.dumps([session_name, window_name]))
@@ -930,19 +937,68 @@ class HerdrBackend(TerminalBackend):
         return _HERDR_WEB_INPUT_ESCAPE_HOLD_S
 
     def focus_web_input(self, target: str) -> None:
-        """Focus the tab named by ``target`` (from ``prepare_web_attach_input``)."""
+        """Focus the tab named by ``target`` (from ``prepare_web_attach_input``).
+
+        Takes the herdr session's focus lock first and keeps it until
+        ``release_web_input``, so no web view moves herdr's focus for a resize
+        while this input frame is on its way (``herdr_web_view.focus_lock_path``).
+        """
         try:
             session_name, window_name = json.loads(target)
         except (TypeError, ValueError) as e:
             raise TerminalBackendError(f"Malformed herdr web input target: {target!r}") from e
-        workspace_id = self._resolve_workspace_id(session_name)
-        tab_id, focused = self._web_tab_focus_state(session_name, workspace_id, window_name)
-        if focused:
+        self._acquire_web_focus_lock()
+        try:
+            workspace_id = self._resolve_workspace_id(session_name)
+            tab_id, focused = self._web_tab_focus_state(session_name, workspace_id, window_name)
+            if focused:
+                return
+            self._run_herdr(["tab", "focus", tab_id])
+            # herdr's clients pick up a focus change asynchronously: a key written
+            # straight after `tab focus` returns is lost, so let the switch land.
+            time.sleep(_HERDR_WEB_FOCUS_SETTLE_S)
+        except BaseException:
+            self.release_web_input(target)
+            raise
+
+    def release_web_input(self, target: str) -> None:
+        """Release the focus lock taken by ``focus_web_input``; harmless if not held."""
+        fd, self._web_focus_lock_fd = self._web_focus_lock_fd, None
+        if fd is None:
             return
-        self._run_herdr(["tab", "focus", tab_id])
-        # herdr's clients pick up a focus change asynchronously: a key written
-        # straight after `tab focus` returns is lost, so let the switch land.
-        time.sleep(_HERDR_WEB_FOCUS_SETTLE_S)
+        from cli_agent_orchestrator.backends import herdr_web_view
+
+        herdr_web_view.unlock(fd)
+
+    def _acquire_web_focus_lock(self) -> None:
+        """Hold the herdr session's focus lock, waiting out a web view's resize.
+
+        cao-server runs one input turn per herdr session at a time, so this
+        process holds the lock at most once. No lock file (no private state
+        directory) means focus changes go unserialised, as before the lock.
+        """
+        # Imported here: the view module needs POSIX terminal modules.
+        from cli_agent_orchestrator.backends import herdr_web_view
+
+        self.release_web_input("")  # a turn that ended without releasing
+        path = herdr_web_view.focus_lock_path(self._herdr_session)
+        if path is None:
+            return
+        deadline = time.monotonic() + _HERDR_WEB_FOCUS_LOCK_TIMEOUT_S
+        while True:
+            try:
+                fd = herdr_web_view.try_lock(path)
+            except OSError:
+                return
+            if fd is not None:
+                self._web_focus_lock_fd = fd
+                return
+            if time.monotonic() >= deadline:
+                raise TerminalBackendError(
+                    f"herdr session '{self._herdr_session}' focus lock held for over "
+                    f"{_HERDR_WEB_FOCUS_LOCK_TIMEOUT_S:.0f}s"
+                )
+            time.sleep(_HERDR_WEB_FOCUS_LOCK_POLL_S)
 
     def _web_tab_focus_state(
         self, session_name: str, workspace_id: str, window_name: str
