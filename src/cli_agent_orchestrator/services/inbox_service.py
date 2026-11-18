@@ -660,18 +660,7 @@ class InboxService:
         try:
             from cli_agent_orchestrator.services import delegation_callback_service
 
-            handle_messages_failed = getattr(
-                delegation_callback_service, "handle_messages_failed", None
-            )
-            if handle_messages_failed is None:
-                # ponytail: reply-delivery-failure Task 4 adds handle_messages_failed
-                # and removes this fallback. Until then a failed message closes the
-                # edges it opened and tells their callers, as before this change.
-                delegation_callback_service.handle_delivery_failed(
-                    terminal_id, [m.id for m in messages], reason, registry
-                )
-                return
-            handle_messages_failed(
+            delegation_callback_service.handle_messages_failed(
                 terminal_id,
                 messages,
                 reason,
