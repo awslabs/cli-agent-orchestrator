@@ -94,6 +94,15 @@ class RecallPool:
 
 
 @dataclass(frozen=True)
+class WikiContentSplit:
+    """Parser-owned latest-content and history boundaries for one topic."""
+
+    latest_section: str
+    latest_start: int
+    history_range: Optional[tuple[int, int]]
+
+
+@dataclass(frozen=True)
 class RelevanceScore:
     """Content-free, per-call values used by ordering and explain."""
 
@@ -4156,12 +4165,19 @@ class MemoryService:
 
     def _parse_wiki_file(self, wiki_file: Path, file_content: str, entry: dict) -> Optional[Memory]:
         """Parse a wiki topic file into a Memory object."""
+        memory, _ = self._parse_wiki_file_with_split(wiki_file, file_content, entry)
+        return memory
+
+    def _parse_wiki_file_with_split(
+        self, wiki_file: Path, file_content: str, entry: dict
+    ) -> tuple[Optional[Memory], Optional[WikiContentSplit]]:
+        """Parse a wiki topic and expose the content split used by recall."""
         if self._native_identity_is_migration_dormant(
             entry["key"],
             entry.get("scope", "global"),
             entry.get("scope_id"),
         ):
-            return None
+            return None, None
         # Extract id from comment
         id_match = re.search(r"<!-- id: ([a-f0-9\-]+)", file_content)
         memory_id = id_match.group(1) if id_match else str(uuid.uuid4())
@@ -4218,11 +4234,12 @@ class MemoryService:
         lenient = is_memory_parser_lenient()
         heading_matches: list[re.Match[str]] = []
         timestamps: list[datetime] = []
-        timestamp_texts = (
-            _CANONICAL_ENTRY_HEADING_RE.findall(file_content)
-            if compiled
-            else _LEGACY_ENTRY_TIMESTAMP_RE.findall(file_content)
+        timestamp_matches = list(
+            (_CANONICAL_ENTRY_HEADING_RE if compiled else _LEGACY_ENTRY_TIMESTAMP_RE).finditer(
+                file_content
+            )
         )
+        timestamp_texts = [match.group(1) for match in timestamp_matches]
         use_legacy_split = False
         if compiled:
             timestamps = [
@@ -4231,7 +4248,7 @@ class MemoryService:
             ]
         elif not lenient:
             if not timestamp_texts:
-                return None
+                return None, None
             timestamps = [
                 datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
                 for value in timestamp_texts
@@ -4272,13 +4289,13 @@ class MemoryService:
                 None,
             )
             if header_match is None:
-                return None
+                return None, None
             try:
                 uuid.UUID(header_match.group("id"))
                 MemoryScope(header_match.group("scope").strip())
                 MemoryType(header_match.group("type").strip())
             except ValueError:
-                return None
+                return None, None
             memory_id = header_match.group("id")
             scope = header_match.group("scope").strip()
             memory_type = header_match.group("type").strip()
@@ -4288,6 +4305,7 @@ class MemoryService:
             created_at = _entry_time("created_at") or file_time
             updated_at = _entry_time("updated_at") or file_time
 
+        history_range: Optional[tuple[int, int]] = None
         if compiled or not timestamps:
             body_lines = [line for line in body_lines if not _COMPILED_MARKER_RE.fullmatch(line)]
             while body_lines and not body_lines[0].strip():
@@ -4296,15 +4314,27 @@ class MemoryService:
                 body_lines.pop(0)
                 while body_lines and not body_lines[0].strip():
                     body_lines.pop(0)
-            latest_content = self._strip_existing_see_also("\n".join(body_lines)).strip()
+            latest_section = "\n".join(body_lines).strip()
+            latest_content = self._strip_existing_see_also(latest_section).strip()
+            latest_start = (
+                timestamp_matches[-1].end()
+                if timestamp_matches
+                else file_content.find(body_lines[0]) if body_lines else len(file_content)
+            )
         elif not use_legacy_split:
-            latest_content = self._strip_existing_see_also(
-                file_content[heading_matches[-1].end("timestamp") :]
-            ).strip()
+            latest_start = heading_matches[-1].end("timestamp")
+            latest_section = file_content[latest_start:].strip()
+            latest_content = self._strip_existing_see_also(latest_section).strip()
+            if len(heading_matches) > 1:
+                history_range = (heading_matches[0].start(), heading_matches[-1].start())
         else:
-            timestamp_text = timestamps[-1].strftime("%Y-%m-%dT%H:%M:%SZ")
-            last_section = file_content.rsplit(f"## {timestamp_text}", 1)
-            latest_content = last_section[-1].strip() if len(last_section) > 1 else ""
+            latest_start = timestamp_matches[-1].end()
+            latest_section = file_content[latest_start:].strip()
+            latest_content = (
+                self._strip_existing_see_also(latest_section).strip() if lenient else latest_section
+            )
+            if len(timestamp_matches) > 1:
+                history_range = (timestamp_matches[0].start(), timestamp_matches[-1].start())
 
         # A timestamp is sufficient structural evidence that this is a stored
         # topic.  In lenient mode the derived See-Also projection is stripped
@@ -4312,9 +4342,9 @@ class MemoryService:
         # just as it was under the legacy parser.  Headingless header-only files
         # still have neither content nor timestamps and remain invisible.
         if not latest_content and not timestamps:
-            return None
+            return None, None
 
-        return Memory(
+        memory = Memory(
             id=memory_id,
             key=entry["key"],
             memory_type=memory_type,
@@ -4328,6 +4358,12 @@ class MemoryService:
             updated_at=updated_at,
             content=latest_content,
         )
+        split = WikiContentSplit(
+            latest_section=latest_section,
+            latest_start=latest_start,
+            history_range=history_range,
+        )
+        return memory, split
 
     # -------------------------------------------------------------------------
     # Forget

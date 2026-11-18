@@ -6,7 +6,9 @@ run against a real service in tmp dirs for the end-to-end CLI path.
 """
 
 import asyncio
+import re
 import tarfile
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -84,6 +86,37 @@ class TestExportCommand:
         assert result.exit_code == 0, result.output
         assert "exported: 1" in result.output
         assert (dest / "cli-topic.md").exists()
+
+    def test_export_headingless_topic_exits_zero(self, runner, tmp_path):
+        svc = _real_svc(tmp_path)
+        asyncio.run(
+            svc.store(
+                content="headingless CLI fact",
+                scope="global",
+                key="cli-headingless",
+                occurred_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+        )
+        path = svc.get_wiki_path("global", None, "cli-headingless")
+        text = path.read_text(encoding="utf-8")
+        path.write_text(
+            re.sub(
+                r"^## 2026-01-01T00:00:00Z$",
+                "## Overview",
+                text,
+                count=1,
+                flags=re.MULTILINE,
+            ),
+            encoding="utf-8",
+        )
+        dest = tmp_path / "bundle"
+
+        with patch(FACTORY, return_value=svc):
+            result = runner.invoke(export_cmd, ["--scope", "global", "-o", str(dest)])
+
+        assert result.exit_code == 0, result.output
+        assert "exported: 1" in result.output
+        assert (dest / "cli-headingless.md").exists()
 
     def test_export_empty_scope_yields_valid_bundle(self, runner, tmp_path):
         svc = _real_svc(tmp_path)
