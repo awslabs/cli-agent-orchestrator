@@ -29,17 +29,33 @@ const INSTALL_SCRIPT_ALLOWED = new Map([
 
 const EXACT = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/;
 
-test('every direct dependency is pinned to an exact version', () => {
-  for (const field of ['dependencies', 'devDependencies', 'optionalDependencies']) {
-    for (const [name, spec] of Object.entries(manifest[field] ?? {})) {
-      assert.match(spec, EXACT, `${field}.${name} is "${spec}", not an exact version`);
+const directSpecs = Object.values({...manifest.dependencies, ...manifest.devDependencies});
+const localPackages = new Map(directSpecs.filter(spec => spec.startsWith('file:')).map(spec => {
+  const dir = spec.slice('file:'.length);
+  assert.equal(path.basename(dir), dir, 'local packages must be direct project directories');
+  assert.equal(path.dirname(fs.realpathSync(path.join(root, dir))), root);
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, dir, 'package.json'), 'utf8'));
+  assert.equal(pkg.private, true);
+  assert.match(pkg.version, EXACT);
+  return [dir, pkg];
+}));
+
+test('every external direct dependency is pinned to an exact version', () => {
+  for (const pkg of [manifest, ...localPackages.values()]) {
+    for (const field of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+      for (const [name, spec] of Object.entries(pkg[field] ?? {})) {
+        if (spec.startsWith('file:') && localPackages.has(spec.slice(5))) continue;
+        assert.match(spec, EXACT, `${pkg.name}: ${field}.${name} is "${spec}", not an exact version`);
+      }
     }
   }
 });
 
-test('the app declares no install lifecycle scripts', () => {
-  for (const hook of ['preinstall', 'install', 'postinstall', 'prepare', 'prepublish']) {
-    assert.equal(manifest.scripts?.[hook], undefined, `package.json declares a ${hook} script`);
+test('the app and its local packages declare no install lifecycle scripts', () => {
+  for (const pkg of [manifest, ...localPackages.values()]) {
+    for (const hook of ['preinstall', 'install', 'postinstall', 'prepare', 'prepublish']) {
+      assert.equal(pkg.scripts?.[hook], undefined, `${pkg.name} declares a ${hook} script`);
+    }
   }
 });
 
@@ -55,9 +71,17 @@ test('the lockfile matches package.json', () => {
   }
 });
 
-test('every locked package comes from the npm registry with an integrity hash', () => {
+test('external packages have registry integrity; links resolve to private project packages', () => {
+  for (const [dir, pkg] of localPackages) {
+    assert.equal(lock.packages[dir].name ?? path.basename(dir), pkg.name);
+    assert.equal(lock.packages[dir].version, pkg.version);
+  }
   for (const [location, entry] of packages) {
-    if (entry.link) continue;
+    if (entry.link) {
+      assert.ok(localPackages.has(entry.resolved), `${location} is not a project package link`);
+      continue;
+    }
+    if (localPackages.has(location)) continue;
     assert.ok(
       entry.resolved?.startsWith('https://registry.npmjs.org/'),
       `${location} resolves to ${entry.resolved}`,

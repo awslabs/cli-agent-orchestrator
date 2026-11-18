@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@dieub/braces-depth-guard": "file:../vendor/dieub-braces-depth-guard-3.0.3-pn.3.tgz",
+    "@ryotsu/picomatch": "4.0.7-a",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "braces": "file:braces-compat",
@@ -22,7 +23,7 @@
     "graphology-layout": "^0.6.1",
     "lucide-react": "^1.71.0",
     "patch-package": "8.0.1",
-    "picomatch": "npm:@ryotsu/picomatch@4.0.7-a",
+    "picomatch": "file:picomatch-compat",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "sigma": "^4.0.5",

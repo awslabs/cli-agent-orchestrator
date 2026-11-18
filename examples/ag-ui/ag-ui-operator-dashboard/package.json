@@ -25,6 +25,7 @@
   },
   "devDependencies": {
     "@playwright/test": "1.65.0",
+    "@ryotsu/picomatch": "4.0.7-a",
     "@testing-library/dom": "10.4.2",
     "@testing-library/react": "16.3.3",
     "@types/node": "26.6.6",
@@ -33,11 +34,12 @@
     "@vitejs/plugin-react": "6.3.0",
     "@vitest/coverage-v8": "5.1.0",
     "jsdom": "31.0.0",
+    "picomatch": "file:picomatch-compat",
     "typescript": "7.0.2",
     "vite": "8.3.7",
     "vitest": "5.1.0"
   },
   "overrides": {
-    "picomatch": "npm:@ryotsu/picomatch@4.0.7-a"
+    "picomatch": "$picomatch"
   }
 }

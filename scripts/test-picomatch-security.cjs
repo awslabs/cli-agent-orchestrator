@@ -19,10 +19,12 @@ module.exports = function registerTests(project) {
     assert.ok(consumers.length, 'no transitive consumers to verify');
     for (const [location] of consumers) {
       const from = createRequire(path.join(project, location, 'package.json'));
-      const manifest = from('picomatch/package.json');
+      assert.equal(from('picomatch/package.json').private, true, location);
+      assert.equal(from('picomatch'), local('@ryotsu/picomatch'), location);
+      const manifest = from('@ryotsu/picomatch/package.json');
       assert.equal(manifest.name, '@ryotsu/picomatch', location);
       assert.equal(manifest.version, '4.0.7-a', location);
-      const parser = readFileSync(from.resolve('picomatch/lib/parse.js'));
+      const parser = readFileSync(from.resolve('@ryotsu/picomatch/lib/parse.js'));
       assert.equal(createHash('sha256').update(parser).digest('hex'),
         'a59b25c67cce014f5226836f8391cb1f323dc76224dc82b85c6826d10b33922a', location);
     }

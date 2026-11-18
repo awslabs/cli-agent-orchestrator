@@ -1,7 +1,7 @@
-diff --git a/node_modules/picomatch/index.js b/node_modules/picomatch/index.js
+diff --git a/node_modules/@ryotsu/picomatch/index.js b/node_modules/@ryotsu/picomatch/index.js
 index a753b1d..411c559 100644
---- a/node_modules/picomatch/index.js
-+++ b/node_modules/picomatch/index.js
+--- a/node_modules/@ryotsu/picomatch/index.js
++++ b/node_modules/@ryotsu/picomatch/index.js
 @@ -3,15 +3,20 @@
  const pico = require('./lib/picomatch');
  const utils = require('./lib/utils');
@@ -30,10 +30,10 @@ index a753b1d..411c559 100644
 +  picomatch[name] = (input, pattern, options, ...rest) => pico[name](input, pattern, platformOptions(options), ...rest);
 +}
  module.exports = picomatch;
-diff --git a/node_modules/picomatch/lib/utils.js b/node_modules/picomatch/lib/utils.js
+diff --git a/node_modules/@ryotsu/picomatch/lib/utils.js b/node_modules/@ryotsu/picomatch/lib/utils.js
 index 9c97cae..bf1ff50 100644
---- a/node_modules/picomatch/lib/utils.js
-+++ b/node_modules/picomatch/lib/utils.js
+--- a/node_modules/@ryotsu/picomatch/lib/utils.js
++++ b/node_modules/@ryotsu/picomatch/lib/utils.js
 @@ -14,7 +14,8 @@ exports.isRegexChar = str => str.length === 1 && exports.hasRegexChars(str);
  exports.escapeRegex = str => str.replace(REGEX_SPECIAL_CHARS_GLOBAL, '\\$1');
  exports.toPosixSlashes = str => str.replace(REGEX_BACKSLASH, '/');
