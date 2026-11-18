@@ -8,7 +8,7 @@
 #
 # Run it as BOX_USER: herdr keeps its state per user, so as another user (the
 # admin shell) the herdr check looks at that user's herdr, not the box's.
-#   sudo -u <you> -i /usr/local/lib/cao-box/box-resume.sh
+#   sudo -u cao-herdr -i /usr/local/lib/cao-box/box-resume.sh
 set -uo pipefail
 
 cao_url="${CAO_URL:-http://127.0.0.1:9889}"

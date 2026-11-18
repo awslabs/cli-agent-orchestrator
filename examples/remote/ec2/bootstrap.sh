@@ -15,11 +15,11 @@
 # them), and never logs in to anything. See README.md for the full flow.
 #
 # Required settings (in the --settings file, or environment variables):
-#   BOX_USER        the Linux user that owns the agents.
+#   BOX_USER        the Linux user that owns the agents. Default: cao-herdr.
 #   BOX_UID         that user's uid (and gid). Use the SAME value on every
 #                   rebuild so the data volume's files keep their owner.
-#   BOX_HOME        that user's home, for example /Users/<you> (your laptop's
-#                   home path, so absolute paths keep working) or /home/<you>.
+#   BOX_HOME        that user's home. Default: /home/cao-herdr. Set it to
+#                   /Users/<you> if kits or memory hold laptop paths.
 #   HERDR_VERSION   the herdr version your laptop runs, for example v0.9.3.
 #   HERDR_SHA256    sha256 of that release's herdr-linux-aarch64 asset.
 #   CAO_REF         the CAO commit to install (a full sha is best).
@@ -28,7 +28,8 @@
 #   DATA_VOLUME_ID  the EBS data volume (vol-...). Found through its NVMe
 #                   serial in /dev/disk/by-id, never by device name.
 #   DATA_DEVICE     only a cross-check: must resolve to the same disk.
-#   DATA_MOUNT      where the volume is mounted. Default: BOX_HOME's parent.
+#   DATA_MOUNT      where the volume is mounted. Default: BOX_HOME itself;
+#                   never /home, which would hide ubuntu's home.
 #   INSTALL_DOCKER  yes to install Docker and add BOX_USER to the docker
 #                   group. Default no. The docker group is root-equivalent.
 #   BACKUP_S3_URI, BACKUP_KMS_KEY_ARN   nightly backup target and its key.
@@ -210,9 +211,9 @@ SETTINGS_REAL=""
 if [ -n "$SETTINGS_FILE" ]; then read_settings "$SETTINGS_FILE"; fi
 
 PATH_RE='^/[A-Za-z0-9._/-]+$'
-BOX_USER="${BOX_USER:-}"
+BOX_USER="${BOX_USER:-cao-herdr}"
 BOX_UID="${BOX_UID:-}"
-BOX_HOME="${BOX_HOME:-}"
+BOX_HOME="${BOX_HOME:-/home/cao-herdr}"
 HERDR_VERSION="${HERDR_VERSION:-}"
 HERDR_SHA256="${HERDR_SHA256:-}"
 CAO_REF="${CAO_REF:-}"
@@ -231,14 +232,14 @@ case "$BOX_HOME" in */|*/../*|*/..) die "BOX_HOME must not be /, end in /, or co
 
 DATA_VOLUME_ID="${DATA_VOLUME_ID:-}"
 DATA_DEVICE="${DATA_DEVICE:-}"
-DATA_MOUNT="${DATA_MOUNT:-$(dirname "$BOX_HOME")}"
+DATA_MOUNT="${DATA_MOUNT:-$BOX_HOME}"
 if [ -n "$DATA_VOLUME_ID" ]; then
   [[ "$DATA_VOLUME_ID" =~ ^vol-[0-9a-f]{17}$ ]] || die "DATA_VOLUME_ID looks like vol- and 17 hex characters"
 elif [ -n "$DATA_DEVICE" ]; then
   die "DATA_DEVICE alone is not accepted: set DATA_VOLUME_ID (device names are not stable)"
 fi
-if ! [[ "$DATA_MOUNT" =~ $PATH_RE ]] || [ "$DATA_MOUNT" = "/" ]; then
-  die "DATA_MOUNT must be an absolute path other than /"
+if ! [[ "$DATA_MOUNT" =~ $PATH_RE ]] || [ "$DATA_MOUNT" = "/" ] || [ "$DATA_MOUNT" = "/home" ]; then
+  die "DATA_MOUNT must be an absolute path other than / or /home"
 fi
 INSTALL_DOCKER="${INSTALL_DOCKER:-no}"
 case "$INSTALL_DOCKER" in yes|no) ;; *) die "INSTALL_DOCKER is yes or no" ;; esac

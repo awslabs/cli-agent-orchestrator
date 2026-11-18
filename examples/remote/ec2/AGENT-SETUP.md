@@ -68,7 +68,8 @@ Each step ends with a check, so a failure shows up at that step instead of three
    "Secrets and the instance role", "What's left").
 
 **Placeholders.** `<...>` marks a value you fill in from the answers file: for example
-`<region>`, `<instance-id>`, `<vol-id>`, `<you>` (the box user). Add `--profile <aws-profile>`
+`<region>`, `<instance-id>`, `<vol-id>` and other account-specific values. The
+box user is always `cao-herdr`. Add `--profile <aws-profile>`
 to every `aws` command on the laptop; it is left out below to keep the lines short.
 
 **User steps** are marked like this:
@@ -253,9 +254,9 @@ time, and add a `KEY=value` line for each answer.
 | `INSTANCE_TYPE` | Which box size? | `m8g.4xlarge` (Graviton4, 16 vCPU, 64 GiB). Alternatives: `c8g.4xlarge` (32 GiB), `r8g.4xlarge` (128 GiB), and `m7g.4xlarge` (Graviton3) as the fallback. Graviton, 16 vCPU or more ([`README.md`](README.md), "The box"). |
 | `AWS_PROFILE_NAME` | Which AWS CLI profile on the laptop may create these resources? | No default; on a new laptop, the one from step 0h. Store the profile's **name** only. |
 | `VPC_ID`, `SUBNET_ID` | Which VPC and subnet? | The subnet needs outbound internet (a NAT gateway, or a public IP with no inbound rules) or VPC endpoints for SSM, Bedrock and S3 (README quick start, step 5). |
-| `BOX_USER` | The Linux user name for the agents? | A plain Linux name: `^[a-z_][a-z0-9_-]{0,31}$` (`bootstrap.sh` step 0). |
+| `BOX_USER` | The Linux user name for the agents? | `cao-herdr` (the fixed name for this attach mode). |
 | `BOX_UID` | Its uid? | A number from 1000 to 59999. A macOS uid such as 501 is refused. Pick one and never change it: rebuilds must reuse it so the data volume's files keep their owner (`bootstrap.sh` header and step 0). |
-| `BOX_HOME` | The home path? | The laptop's home path (`/Users/<you>`), so absolute paths in kits keep working, or the ordinary `/home/<you>`. With `/home/<you>`, also set `DATA_MOUNT=/home/<you>` ([`README.md`](README.md), "The home path"). |
+| `BOX_HOME` | The home path? | `/home/cao-herdr`, with `DATA_MOUNT=/home/cao-herdr`. If kits, prompts or memory hold absolute laptop paths, use `BOX_HOME=/Users/<you>` and matching `DATA_MOUNT` instead ([`README.md`](README.md), "The home path"). |
 | `INSTALL_DOCKER` | Docker on the box? | `no`. Say this before they answer: with `yes`, the box user joins the `docker` group, and that makes every agent root on the box (`docker run -v /:/host ...`). Rootless Docker avoids that ([`README.md`](README.md), "Tools on linux-arm64"). |
 | `BACKUPS` | Nightly backups to S3? | Optional; see step 11. The backups hold message text, so treat the bucket like the box ([`README.md`](README.md), "Backups and restore"). |
 | `SSH_KEY` | Which SSH key pair on the laptop? | A path under `~/.ssh/` (step 0g). Only the **public** half ever goes to AWS or the box (README, "Before you start"). |
@@ -467,7 +468,8 @@ user exists. Show the user the lines before you add them, and back the file up f
 cp ~/.ssh/config ~/.ssh/config.bak.$(date +%s) 2>/dev/null || true
 ```
 
-Fill in `<instance-id>`, `<box-user>` and `<your-key>`. In another region, change
+Fill in `<instance-id>` and `<your-key>`; the sample's SSH entries use
+`cao-herdr`. In another region, change
 `--region ap-southeast-2` in each `ProxyCommand`. If the user's AWS profile isn't the default,
 add `--profile <aws-profile>` to each `ProxyCommand` (**check before use**). The admin entry is
 the `cao-box` entry with a different user. Ubuntu's images log in as `ubuntu`
@@ -563,9 +565,10 @@ sources it, and refuses any name that isn't one of its settings:
 ```bash
 sudo install -m 0600 /dev/null /opt/cao-box-src/box-settings.env
 sudo tee /opt/cao-box-src/box-settings.env > /dev/null <<'EOF'
-BOX_USER=<you>
-BOX_UID=<uid>
-BOX_HOME=<box-home>
+BOX_USER=cao-herdr
+BOX_UID=1001
+BOX_HOME=/home/cao-herdr
+DATA_MOUNT=/home/cao-herdr
 DATA_VOLUME_ID=<vol-id>
 HERDR_VERSION=<herdr-version>
 HERDR_SHA256=<sha256>
@@ -582,8 +585,8 @@ AWS_CLI_SHA256=<sha256>
 EOF
 ```
 
-- With `BOX_HOME=/home/<you>`, add `DATA_MOUNT=/home/<you>` ([`README.md`](README.md), "The home
-  path").
+- To retain absolute laptop paths, use `BOX_HOME=/Users/<you>` and
+  `DATA_MOUNT=/Users/<you>` ([`README.md`](README.md), "The home path").
 - Leave out `BACKUP_S3_URI` and `BACKUP_KMS_KEY_ARN` until step 11. `bootstrap.sh` wants both or
   neither (step 0).
 - Leave out a tool's pins if the dry run says that tool is already present.
@@ -617,8 +620,8 @@ sudo bash bootstrap.sh --settings /opt/cao-box-src/box-settings.env --format-new
 **Check:** it ends with `Next steps (you run these; see README.md):`. Then:
 
 ```bash
-findmnt -no SOURCE,TARGET <data-mount>                         # the data volume, at BOX_HOME's parent or DATA_MOUNT
-id <you>                                                       # uid=<uid> gid=<uid>
+findmnt -no SOURCE,TARGET /home/cao-herdr                      # the data volume, at the box home
+id cao-herdr                                                   # uid=1001 gid=1001
 cat /etc/cao-box/box.env                                       # two non-secret lines: the session, cao-<instance-id>
 systemctl is-enabled herdr-cao.service cao-server.service cao-backup.timer   # enabled x3
 ```
@@ -631,11 +634,11 @@ systemctl is-enabled herdr-cao.service cao-server.service cao-backup.timer   # e
 Do it as the box user, so root never writes in the home:
 
 ```bash
-sudo -u <you> sh -c 'install -d -m 0700 "$1/.ssh" && cat >> "$1/.ssh/authorized_keys" && chmod 0600 "$1/.ssh/authorized_keys"' \
-  sh <box-home> < <file-with-the-public-key>
+sudo -u cao-herdr sh -c 'install -d -m 0700 "$1/.ssh" && cat >> "$1/.ssh/authorized_keys" && chmod 0600 "$1/.ssh/authorized_keys"' \
+  sh /home/cao-herdr < <file-with-the-public-key>
 ```
 
-**Check:** `sudo -u <you> stat -c '%U %a' <box-home>/.ssh/authorized_keys` prints `<you> 600`, and the
+**Check:** `sudo -u cao-herdr stat -c '%U %a' /home/cao-herdr/.ssh/authorized_keys` prints `cao-herdr 600`, and the
 file has the one public key line (a public key is not a secret, but don't paste private keys
 anywhere).
 
@@ -660,10 +663,10 @@ ss -ltn | grep 9889     # 127.0.0.1:9889, never 0.0.0.0:9889
 ```
 
 **6b. The read-only resume check, as the box user** (README, "The phases", phase 1). herdr keeps
-its state per user, so run it as `<you>`:
+its state per user, so run it as `cao-herdr`:
 
 ```bash
-sudo -u <you> -i /usr/local/lib/cao-box/box-resume.sh
+sudo -u cao-herdr -i /usr/local/lib/cao-box/box-resume.sh
 ```
 
 **Check:** every line starts with `ok`, and it ends with `All up.` (it exits 1 on any `FAIL`;
