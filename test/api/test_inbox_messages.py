@@ -777,3 +777,155 @@ class TestIncident20261117OverThePost:
         svc.sweep()
         assert _inbox(C) == []
         assert [d for d in live.delivered if d[0] == C] == []
+
+
+def _stored(receiver_id):
+    (message,) = _inbox(receiver_id)
+    return message
+
+
+def _failure_notices(receiver_id):
+    return [m for m in _inbox(receiver_id) if m.message.startswith("[CAO delivery failed]")]
+
+
+class TestPostHandOffAfterTheBound:
+    """Ruling on in_progress: exactly one of the POST or the queued path reports a failure.
+
+    If the POST has given up waiting (answered ``in_progress``) before the
+    failure is classified, the message is handled as queued: a failure before
+    typing is retried with the attempt counted, an uncertain one notifies the
+    sender. If the failure was classified first, the POST reports it and no
+    notice is sent. Only the POST and deliver_pending's observable effects are
+    asserted; how report_to_sender carries the hand-off is forge's choice.
+
+    W -> C opens no edge (C is not waiting on W and was not created by W), so
+    any notice is the sender notice.
+    """
+
+    BOUND = 0.05
+
+    async def _post_with(self, dispatch):
+        from cli_agent_orchestrator.api.main import create_inbox_message_endpoint
+
+        with patch("cli_agent_orchestrator.api.main.INBOX_DELIVERY_OUTCOME_WAIT", self.BOUND):
+            body = await create_inbox_message_endpoint(
+                TestCreateInboxMessageResponseTiming._request(), C, W, "status", _scopes=[]
+            )
+        return body
+
+    @staticmethod
+    def _failure(kind):
+        if kind == "before_typing":
+            return _not_sent("herdr-core lost terminal.read")
+        return RuntimeError("herdr-core lost terminal.send")
+
+    async def _abandon_then_fail(self, live, kind):
+        """The attempt fails only after the POST has answered."""
+        import threading
+
+        answered = threading.Event()
+
+        def dispatch(*_args, **_kwargs):
+            assert answered.wait(10), "the POST never answered"
+            raise self._failure(kind)
+
+        live.paste.dispatch_input.side_effect = dispatch
+        try:
+            body = await self._post_with(dispatch)
+        finally:
+            answered.set()
+        await TestCreateInboxMessageResponseTiming._drain_background_tasks()
+        return body
+
+    @pytest.mark.asyncio
+    async def test_failure_before_typing_after_in_progress_is_retried_as_queued(self, live):
+        body = await self._abandon_then_fail(live, "before_typing")
+
+        assert (body["success"], body["delivery"]) == (True, "in_progress")
+        stored = _stored(C)
+        assert stored.status.value == "pending", "handled as queued: back for a retry"
+        assert stored.delivery_attempts == 1
+        assert "lost terminal.read" in stored.last_error
+        assert _failure_notices(W) == [], "no notice while retries remain"
+
+    @pytest.mark.asyncio
+    async def test_uncertain_failure_after_in_progress_notifies_the_sender(self, live):
+        body = await self._abandon_then_fail(live, "uncertain")
+
+        assert (body["success"], body["delivery"]) == (True, "in_progress")
+        assert _stored(C).status.value == "failed"
+        (notice,) = _failure_notices(W)
+        assert "may have arrived" in notice.message
+        assert (W, C) in live.delivered, "the notice delivery was started"
+
+    @pytest.mark.parametrize("kind", ["before_typing", "uncertain"])
+    @pytest.mark.asyncio
+    async def test_outcome_before_the_bound_is_reported_by_the_post_only(self, live, kind):
+        live.paste.dispatch_input.side_effect = self._failure(kind)
+        from cli_agent_orchestrator.api.main import create_inbox_message_endpoint
+
+        body = await create_inbox_message_endpoint(
+            TestCreateInboxMessageResponseTiming._request(), C, W, "status", _scopes=[]
+        )
+        await TestCreateInboxMessageResponseTiming._drain_background_tasks()
+
+        expected = "failed" if kind == "before_typing" else "uncertain"
+        assert (body["success"], body["delivery"]) == (False, expected)
+        assert _stored(C).status.value == "failed", "never retried"
+        assert _failure_notices(W) == []
+
+    @pytest.mark.parametrize("kind", ["before_typing", "uncertain"])
+    @pytest.mark.parametrize("order", ["abandon_first", "classify_first"])
+    @pytest.mark.asyncio
+    async def test_abandon_and_classification_race_has_exactly_one_report_path(
+        self, live, order, kind
+    ):
+        """Drive both orders; whichever wins, exactly one of the two paths reports.
+
+        classify_first: the failure is classified while the event loop is held
+        past the bound, so the POST's timeout and the outcome are both ready
+        when the loop resumes. The POST must still report the failure.
+        """
+        import threading
+        import time
+
+        loop = asyncio.get_running_loop()
+        answered = threading.Event()
+
+        def hold_loop_until_classified():
+            # Runs on the event loop thread: nothing on the loop moves until the
+            # attempt has settled the message and the bound has passed.
+            started = time.monotonic()
+            deadline = started + 5
+            while _stored(C).status.value == "delivered" and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(max(0.0, self.BOUND * 4 - (time.monotonic() - started)))
+
+        def dispatch(*_args, **_kwargs):
+            if order == "abandon_first":
+                assert answered.wait(10), "the POST never answered"
+            else:
+                loop.call_soon_threadsafe(hold_loop_until_classified)
+            raise self._failure(kind)
+
+        live.paste.dispatch_input.side_effect = dispatch
+        try:
+            body = await self._post_with(dispatch)
+        finally:
+            answered.set()
+        await TestCreateInboxMessageResponseTiming._drain_background_tasks()
+
+        stored = _stored(C)
+        notices = _failure_notices(W)
+        reported_by_post = body["delivery"] in ("failed", "uncertain")
+        if kind == "before_typing":
+            handled_as_queued = stored.status.value == "pending" and stored.delivery_attempts == 1
+        else:
+            handled_as_queued = len(notices) == 1
+        assert reported_by_post != handled_as_queued, (body, stored, notices)
+        if order == "abandon_first":
+            assert body["delivery"] == "in_progress" and handled_as_queued
+        else:
+            assert body["success"] is False and reported_by_post
+            assert stored.status.value == "failed" and notices == []
+        assert len(notices) <= 1
