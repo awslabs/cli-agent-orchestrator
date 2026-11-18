@@ -246,6 +246,41 @@ def test_stored_body_heading_does_not_change_topic(
     assert memories[0].content == body
 
 
+@pytest.mark.parametrize("lenient", [True, False])
+def test_compiled_topic_uses_cao_owned_dates(
+    tmp_path: Path,
+    engine: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    lenient: bool,
+) -> None:
+    monkeypatch.setattr(
+        settings_service,
+        "get_memory_settings",
+        lambda: {"parser": {"lenient": lenient}},
+    )
+    path = _topic(
+        tmp_path,
+        "compiled-dates",
+        ("## 2026-01-01T00:00:00Z\nfirst fact\n\n" "## 2026-02-01T00:00:00Z\nsecond fact"),
+    )
+    compiled = wiki_compiler._postprocess_compiled(
+        path.read_text(encoding="utf-8"),
+        newest_entry_at="2026-03-01T00:00:00Z",
+        entry_count=3,
+        compiled_at="2026-03-02T00:00:00Z",
+    )
+    path.write_text(compiled, encoding="utf-8")
+    entry = _entry("compiled-dates", updated_at="2026-03-01T00:00:00Z")
+    entry["created_at"] = "2026-01-01T00:00:00Z"
+
+    memory = MemoryService(tmp_path, engine)._parse_wiki_file(path, compiled, entry)
+
+    assert memory is not None
+    assert memory.created_at == datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert memory.updated_at == datetime(2026, 3, 1, tzinfo=timezone.utc)
+    assert memory.created_at <= memory.updated_at
+
+
 def test_recall_returns_previously_invisible_topic(tmp_path: Path, engine: Any) -> None:
     path = _topic(tmp_path, "visible-now", "The rarevisibilitytoken is searchable.")
     index = tmp_path / "global" / "wiki" / "index.md"

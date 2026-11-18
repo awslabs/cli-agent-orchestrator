@@ -4198,12 +4198,38 @@ class MemoryService:
                 body_lines.pop(0)
         compiled = any(_COMPILED_MARKER_RE.fullmatch(line) for line in body_lines)
 
+        def _entry_time(name: str) -> Optional[datetime]:
+            value = entry.get(name)
+            if isinstance(value, datetime):
+                return (
+                    value.replace(tzinfo=timezone.utc)
+                    if value.tzinfo is None
+                    else value.astimezone(timezone.utc)
+                )
+            if isinstance(value, str):
+                try:
+                    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+                        tzinfo=timezone.utc
+                    )
+                except ValueError:
+                    return None
+            return None
+
         lenient = is_memory_parser_lenient()
         heading_matches: list[re.Match[str]] = []
         timestamps: list[datetime] = []
-        timestamp_texts = _LEGACY_ENTRY_TIMESTAMP_RE.findall(file_content)
+        timestamp_texts = (
+            _CANONICAL_ENTRY_HEADING_RE.findall(file_content)
+            if compiled
+            else _LEGACY_ENTRY_TIMESTAMP_RE.findall(file_content)
+        )
         use_legacy_split = False
-        if not lenient:
+        if compiled:
+            timestamps = [
+                datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                for value in timestamp_texts
+            ]
+        elif not lenient:
             if not timestamp_texts:
                 return None
             timestamps = [
@@ -4231,7 +4257,7 @@ class MemoryService:
                 timestamps.append(parsed)
 
         if timestamps:
-            created_at = timestamps[0]
+            created_at = (_entry_time("created_at") or timestamps[0]) if compiled else timestamps[0]
             updated_at = timestamps[-1]
         else:
             # Leniency applies only to an otherwise-canonical topic. A random
@@ -4257,23 +4283,6 @@ class MemoryService:
             scope = header_match.group("scope").strip()
             memory_type = header_match.group("type").strip()
             tags = normalize_memory_tags(header_match.group("tags"))
-
-            def _entry_time(name: str) -> Optional[datetime]:
-                value = entry.get(name)
-                if isinstance(value, datetime):
-                    return (
-                        value.replace(tzinfo=timezone.utc)
-                        if value.tzinfo is None
-                        else value.astimezone(timezone.utc)
-                    )
-                if isinstance(value, str):
-                    try:
-                        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
-                            tzinfo=timezone.utc
-                        )
-                    except ValueError:
-                        return None
-                return None
 
             file_time = datetime.fromtimestamp(wiki_file.stat().st_mtime, tz=timezone.utc)
             created_at = _entry_time("created_at") or file_time
