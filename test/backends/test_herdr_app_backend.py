@@ -270,6 +270,28 @@ class TestInputNotSent:
         assert raised.value is cause
         assert not isinstance(raised.value, self._not_sent())
 
+    @pytest.mark.parametrize("cannot_start", ["popen_oserror", "no_hc_binary"])
+    def test_input_connection_that_cannot_start_is_not_sent(
+        self, backend, two_windows, monkeypatch, cannot_start
+    ):
+        """Spec scenario "Send request never written", through a real HcRpcClient."""
+        from cli_agent_orchestrator.clients import hc_rpc
+
+        if cannot_start == "popen_oserror":
+
+            def no_process(*_args, **_kwargs):
+                raise OSError(24, "Too many open files")
+
+            monkeypatch.setattr(hc_rpc.subprocess, "Popen", no_process)
+        else:
+            monkeypatch.setattr(hc_rpc.shutil, "which", lambda _name: None)
+        monkeypatch.setattr(backend, "_input", lambda _address: hc_rpc.HcRpcClient("cao"))
+
+        with pytest.raises(self._not_sent()) as raised:
+            backend.send_keys("cao-a", "w1", "hello")
+
+        assert isinstance(raised.value.__cause__, hc_rpc.HcNotSentError)
+
     def test_terminal_lookup_failure_is_not_sent(self, backend, hc, two_windows):
         hc.fail_methods.add("terminal.list")
         with pytest.raises(self._not_sent()):

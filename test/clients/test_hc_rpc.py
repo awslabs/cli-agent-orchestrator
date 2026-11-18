@@ -271,3 +271,31 @@ def test_error_answer_from_the_core_is_not_not_sent(fake_hc):
         client.call("fail")
     assert not isinstance(raised.value, HcNotSentError)
     client.close()
+
+
+def test_connection_that_cannot_start_is_not_sent(fake_hc, monkeypatch):
+    """Spec scenario "Send request never written": `hc connect` could not be started."""
+    from cli_agent_orchestrator.clients.hc_rpc import HcNotSentError
+
+    def no_process(*_args, **_kwargs):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(hc_rpc.subprocess, "Popen", no_process)
+    client = HcRpcClient("cao")
+    with pytest.raises(HcNotSentError, match="terminal.send|hc connect") as raised:
+        client.call("terminal.send", {})
+    assert isinstance(raised.value, TerminalBackendError)
+    assert not fake_hc.exists(), "no `hc connect` ran"
+    client.close()
+
+
+def test_missing_hc_binary_is_not_sent(fake_hc, monkeypatch):
+    """Spec scenario "Send request never written": neither `hc` nor `herdr-core` on PATH."""
+    from cli_agent_orchestrator.clients.hc_rpc import HcNotSentError
+
+    monkeypatch.setattr(hc_rpc.shutil, "which", lambda _name: None)
+    client = HcRpcClient("cao")
+    with pytest.raises(HcNotSentError, match="not installed|terminal.send"):
+        client.call("terminal.send", {})
+    assert not fake_hc.exists(), "no `hc connect` ran"
+    client.close()
