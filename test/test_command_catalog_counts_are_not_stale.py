@@ -164,6 +164,7 @@ def test_the_distribution_test_name_matches_its_assertions():
         "sixtyseven": 67,
         "seventyone": 71,
         "seventyfive": 75,
+        "seventysix": 76,
         "seventy": 70,
         "five": 5,
         "sixteen": 16,

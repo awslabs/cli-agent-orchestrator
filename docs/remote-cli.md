@@ -26,3 +26,13 @@ identity; EC2 and SSM status; local SSH key/config presence; and, after those
 prerequisites pass, SSH connectivity and the box's version/health endpoint.
 Its AWS and SSH calls are read-only. It does not run `aws sso login`,
 `ssh-keygen`, `aws ssm start-session`, or any remote setup command.
+
+## Connect (experimental)
+
+`cao remote connect <box>` first prints the same checks as `check`, then asks
+before it runs AWS SSO login, creates a missing SSH key, writes CAO-owned SSH
+config blocks, or pins a host key obtained through SSM. `--yes` accepts those
+prompts; `--no-attach` stops after setup and prints the attach and dashboard
+commands. A changed pinned host key stops safely; verify it and use `--rekey`
+to replace it. `connect` never changes text outside its marked SSH blocks and
+does not alter the user's normal `known_hosts`.
