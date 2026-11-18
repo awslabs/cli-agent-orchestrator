@@ -11,7 +11,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from itertools import groupby
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 from cli_agent_orchestrator.backends.base import InputNotSentError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -80,6 +80,52 @@ def _short_reason(exc: Exception) -> str:
 
 
 OutcomeCallback = Callable[[int, DeliveryOutcome, Optional[str]], None]
+
+
+class DeliveryHandOff:
+    """Decides who reports the failure of the inbox POST's own message (design D5).
+
+    The POST waits for its message's outcome only up to a bound. While it
+    waits, a failure of that message is the POST's to report: the message is
+    failed at once, with no retry and no notice. Once the POST has given up
+    (answered ``in_progress``), the sender is no longer listening, so a later
+    failure is handled as a queued one. ``offer`` and ``abandon`` take the same
+    lock, so exactly one of the two paths runs for a failure.
+
+    Thread Safety:
+        Safe from any thread: the POST calls ``abandon`` from the event loop
+        while ``deliver_pending`` calls ``offer`` from a worker thread.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._outcome: Optional[Tuple[DeliveryOutcome, Optional[str]]] = None
+        self._abandoned = False
+
+    def offer(self, outcome: DeliveryOutcome, error: Optional[str]) -> bool:
+        """Hand ``outcome`` to the POST. True while the POST is still waiting.
+
+        The first outcome offered is the one the POST reports; a later offer
+        changes nothing. False once the POST has given up, so the caller
+        handles the message as queued.
+        """
+        with self._lock:
+            if self._abandoned:
+                return False
+            if self._outcome is None:
+                self._outcome = (outcome, error)
+            return True
+
+    def abandon(self) -> Optional[Tuple[DeliveryOutcome, Optional[str]]]:
+        """End the POST's wait: the outcome offered so far, or None.
+
+        None means no outcome was offered, and every later ``offer`` returns
+        False.
+        """
+        with self._lock:
+            if self._outcome is None:
+                self._abandoned = True
+            return self._outcome
 
 
 def _record_failure(message_id: int, reason: str) -> int:
@@ -198,6 +244,7 @@ class InboxService:
         source: Optional[str] = None,
         on_outcome: Optional[OutcomeCallback] = None,
         report_to_sender: Optional[int] = None,
+        hand_off: Optional[DeliveryHandOff] = None,
     ) -> int:
         """Deliver pending message(s) to a ready terminal. Use num_messages=0 for all.
 
@@ -229,6 +276,8 @@ class InboxService:
         never changes the delivery. ``report_to_sender`` names the message
         whose outcome the caller returns to its sender (the inbox POST): that
         message is never retried by the server (reply-delivery-failure D5).
+        With a ``hand_off``, that holds only while the POST still waits: a
+        failure the hand-off refuses is handled as a queued one.
 
         Safe to call from any thread: the whole read→mark→send sequence is
         serialized per terminal (see __init__ for why that is load-bearing).
@@ -252,6 +301,7 @@ class InboxService:
                     source=source,
                     on_outcome=on_outcome,
                     report_to_sender=report_to_sender,
+                    hand_off=hand_off,
                 )
         finally:
             notify()
@@ -265,6 +315,7 @@ class InboxService:
         source: Optional[str] = None,
         on_outcome: Optional[OutcomeCallback] = None,
         report_to_sender: Optional[int] = None,
+        hand_off: Optional[DeliveryHandOff] = None,
     ) -> int:
         """Return the number of messages actually handed to the pane.
 
@@ -503,6 +554,7 @@ class InboxService:
                         not_sent=True,
                         retryable=False,
                         report_to_sender=report_to_sender,
+                        hand_off=hand_off,
                         report=report,
                         registry=registry,
                         reason="the terminal refused input"
@@ -516,6 +568,7 @@ class InboxService:
                     not_sent=isinstance(e, InputNotSentError) and not dispatched,
                     retryable=True,
                     report_to_sender=report_to_sender,
+                    hand_off=hand_off,
                     report=report,
                     registry=registry,
                 )
@@ -577,6 +630,7 @@ class InboxService:
         not_sent: bool,
         retryable: bool,
         report_to_sender: Optional[int],
+        hand_off: Optional[DeliveryHandOff],
         report: OutcomeCallback,
         registry: PluginRegistry | None,
         reason: Optional[str] = None,
@@ -596,14 +650,22 @@ class InboxService:
             not_sent: True when nothing of the batch can have been typed.
             retryable: False for a refusal no later attempt can get past.
             report_to_sender: Id of the message the inbox POST reports on.
+            hand_off: The POST's hand-off for that message; when it refuses
+                the failure, the message is handled as queued.
             report: Outcome reporter of this ``deliver_pending`` call.
             registry: Plugin registry for the failure notices.
             reason: Text for the notices; derived from ``error`` when None.
         """
         reason = reason or _short_reason(error)
+        final_outcome = DeliveryOutcome.FAILED if not_sent else DeliveryOutcome.UNCERTAIN
         final: List[InboxMessage] = []
+        reported_ids: Set[int] = set()
         for message in batch:
-            reported = message.id == report_to_sender
+            reported = message.id == report_to_sender and (
+                hand_off is None or hand_off.offer(final_outcome, reason)
+            )
+            if reported:
+                reported_ids.add(message.id)
             attempts = _record_failure(message.id, reason)
             if not_sent and retryable and not reported and attempts < INBOX_MAX_DELIVERY_ATTEMPTS:
                 update_message_status(message.id, MessageStatus.PENDING)
@@ -615,11 +677,7 @@ class InboxService:
                 continue
             logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {error}")
             update_message_status(message.id, MessageStatus.FAILED)
-            report(
-                message.id,
-                DeliveryOutcome.FAILED if not_sent else DeliveryOutcome.UNCERTAIN,
-                reason,
-            )
+            report(message.id, final_outcome, reason)
             final.append(message)
         if final:
             self._report_failed_messages(
@@ -627,7 +685,7 @@ class InboxService:
                 final,
                 reason,
                 uncertain=not not_sent,
-                reported_ids={report_to_sender} if report_to_sender is not None else set(),
+                reported_ids=reported_ids,
                 registry=registry,
             )
 
