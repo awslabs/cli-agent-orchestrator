@@ -9,13 +9,14 @@ space or tab"). Names are set with a version-checked write to the core's
 
 import copy
 import hashlib
+import itertools
 import logging
 import os
 import secrets
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from cli_agent_orchestrator.backends.base import (
     TerminalBackend,
@@ -107,15 +108,23 @@ class HerdrAppBackend(TerminalBackend):
         self,
         herdr_app_session: str = "cao",
         client: Optional[HcRpcClient] = None,
-        input_client: Optional[HcRpcClient] = None,
+        input_client_factory: Optional[Callable[[], HcRpcClient]] = None,
     ) -> None:
         self._session = herdr_app_session
         self._client = client
-        # terminal.send / terminal.keys can wait up to ~60 s for a person's
-        # draft. HcRpcClient serializes exchanges, so they get their own
-        # connection and never stall status lookups or terminal.list. An
-        # injected ``client`` (tests) doubles as the input client.
-        self._input_client = input_client if input_client is not None else client
+        # Input gets one connection per terminal address, opened on first use.
+        # herdr-core answers a plain connection one request at a time and can
+        # hold terminal.send for up to 60 s while a person has a draft in that
+        # terminal (input.rs ``type_in``); the core itself queues input per
+        # terminal, so a connection per terminal is the most concurrency it
+        # offers. On one shared connection, a draft in terminal A would hold
+        # input to every other terminal. An injected ``client`` with no factory
+        # (tests) doubles as every terminal's input client and is never closed.
+        if input_client_factory is None and client is None:
+            input_client_factory = lambda: HcRpcClient(self._session)  # noqa: E731
+        self._input_factory = input_client_factory
+        self._inputs: Dict[str, Tuple[HcRpcClient, int]] = {}
+        self._input_epoch = itertools.count()
         self._input_lock = threading.Lock()
         self._home = cao_home_label()
         self._managed = {**MANAGED, "cao.home": self._home}
@@ -145,15 +154,59 @@ class HerdrAppBackend(TerminalBackend):
         assert self._client is not None
         return self._client.call(method, params, timeout=_timeout)
 
-    def _input(self) -> HcRpcClient:
-        """The input connection, opened on first use (same session as ``_client``)."""
+    def _input(self, address: str) -> HcRpcClient:
+        """Terminal ``address``'s input connection, opened on first use."""
+        if self._input_factory is None:
+            assert self._client is not None
+            return self._client
         with self._input_lock:
-            if self._input_client is None:
-                self._input_client = HcRpcClient(self._session)
-            return self._input_client
+            entry = self._inputs.get(address)
+            if entry is None:
+                entry = (self._input_factory(), next(self._input_epoch))
+                self._inputs[address] = entry
+            return entry[0]
 
-    def _input_call(self, method: str, **params: Any) -> Any:
-        return self._input().call(method, params, timeout=INPUT_TIMEOUT_S)
+    def _input_call(self, address: str, method: str, **params: Any) -> Any:
+        return self._input(address).call(
+            method, {"terminal": address, **params}, timeout=INPUT_TIMEOUT_S
+        )
+
+    def release_input(self, address: str) -> None:
+        """Close terminal ``address``'s input connection, if one is open.
+
+        Safe while a call is in flight on it: that call fails as lost, and
+        herdr-core cancels a send still waiting on a draft (server.rs).
+        """
+        with self._input_lock:
+            entry = self._inputs.pop(address, None)
+        if entry is not None:
+            entry[0].close()
+
+    def _prune_inputs(self, live: Set[str], epoch: int) -> None:
+        """Close input connections of terminals that are no longer live.
+
+        ``live`` is a listing that started after ``epoch`` was taken. Only
+        connections opened before that are judged: an address CAO types into
+        was listed live before its connection opened, so one missing from a
+        later listing has ended. A newer connection may belong to a terminal
+        created after the listing began, and is left for the next pass.
+        """
+        with self._input_lock:
+            gone = [a for a, (_, at) in self._inputs.items() if at < epoch and a not in live]
+        for address in gone:
+            self.release_input(address)
+
+    def close_inputs(self) -> None:
+        """Close every input connection (server shutdown). Later input opens new ones."""
+        with self._input_lock:
+            addresses = list(self._inputs)
+        for address in addresses:
+            self.release_input(address)
+
+    def input_connection_count(self) -> int:
+        """Open per-terminal input connections (each one an ``hc connect`` child)."""
+        with self._input_lock:
+            return len(self._inputs)
 
     # --- Environment and creation ---
 
@@ -309,7 +362,11 @@ class HerdrAppBackend(TerminalBackend):
         """Name every CAO space and tab after its CAO session and window, and put
         CAO's tabs in creation order (new ones at the end). Never raises."""
         try:
+            epoch = next(self._input_epoch)
             live = self._list()
+            # This listing is fresh: drop input connections of terminals
+            # that ended without CAO killing them (no other path sees those).
+            self._prune_inputs({str(t["address"]) for t in live}, epoch)
             spaces = {
                 space_id_for(t["labels"]["cao.session"]): t["labels"]["cao.session"] for t in live
             }
@@ -368,6 +425,7 @@ class HerdrAppBackend(TerminalBackend):
 
     def kill_address(self, address: str) -> None:
         """Kill and remove one herdr-core terminal; a missing one is fine."""
+        self.release_input(address)  # first: a held send ends instead of typing
         for method in ("terminal.kill", "terminal.rm"):
             try:
                 self._call(method, terminal=address)
@@ -503,18 +561,18 @@ class HerdrAppBackend(TerminalBackend):
                 # hc rejects shifted punctuation as key names (invalid_params,
                 # nothing typed), which surfaces as a TerminalBackendError.
                 names = [_CHAR_KEY_NAMES.get(ch, ch) for ch in keys]
-                self._input_call("terminal.keys", terminal=address, keys=names)
+                self._input_call(address, "terminal.keys", keys=names)
             return
         # force: CAO's own delivery gates decide when to type, as on tmux.
-        self._input_call("terminal.send", terminal=address, text=keys, force=True)
+        self._input_call(address, "terminal.send", text=keys, force=True)
         for _ in range(enter_count - 1):
-            self._input_call("terminal.keys", terminal=address, keys=["enter"])
+            self._input_call(address, "terminal.keys", keys=["enter"])
 
     def send_special_key(self, session_name: str, window_name: str, key: str) -> None:
         lowered = (key or "enter").lower()
         name = self._KEY_NAMES.get(lowered, lowered)
         address = self._address(session_name, window_name)
-        self._input_call("terminal.keys", terminal=address, keys=[name])
+        self._input_call(address, "terminal.keys", keys=[name])
 
     # --- Output ---
 

@@ -19,6 +19,7 @@ class FakeHc:
         # Addresses whose terminal outlives terminal.kill and terminal.rm (a
         # kill the core accepted but that did not take, as seen by a re-list).
         self.unkillable: set = set()
+        self.closed = False
         self._addr = itertools.count(1)
 
     # helpers for tests
@@ -55,7 +56,7 @@ class FakeHc:
         self.calls.append(("server.start", {}))
 
     def close(self) -> None:
-        pass
+        self.closed = True
 
     def hello(self) -> Dict[str, Any]:
         from cli_agent_orchestrator.clients.hc_rpc import HcProtocolError

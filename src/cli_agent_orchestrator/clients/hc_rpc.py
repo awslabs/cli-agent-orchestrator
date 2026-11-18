@@ -145,13 +145,19 @@ def _result(message: Dict[str, Any]) -> Any:
 
 
 class HcRpcClient:
-    """Request/response connection. Thread-safe; one exchange at a time."""
+    """Request/response connection. Thread-safe; one exchange at a time.
+
+    herdr-core answers a plain-mode connection one request at a time
+    (server.rs ``connection``), so a call that the core holds (``terminal.send``
+    waiting for a person's draft) holds every later call on this client.
+    """
 
     def __init__(self, session: str) -> None:
         self.session = session
         self._lock = threading.Lock()
         self._conn: Optional[_Connection] = None
         self._ids = itertools.count(1)
+        self._closed = False
 
     def start_server(self, drop_env: Optional[Callable[[str], bool]] = None) -> None:
         """Start the session's core if it is not running (idempotent).
@@ -184,11 +190,16 @@ class HcRpcClient:
             for attempt in (0, 1):
                 if self._conn is None or not self._conn.alive():
                     self._drop()
+                    if self._closed:
+                        raise TerminalBackendError(f"herdr-core client closed before {method}")
                     self._conn = _Connection(self.session)
+                    if self._closed:  # close() ran while the child started
+                        self._drop()
+                        raise TerminalBackendError(f"herdr-core client closed before {method}")
                 try:
                     self._conn.write(request)
                     break
-                except (BrokenPipeError, OSError):
+                except (BrokenPipeError, OSError, ValueError):
                     self._drop()  # not sent yet, so a resend is safe
                     if attempt:
                         raise TerminalBackendError(f"herdr-core unreachable for {method}") from None
@@ -227,8 +238,21 @@ class HcRpcClient:
         self._conn = None
 
     def close(self) -> None:
-        with self._lock:
-            self._drop()
+        """End the connection now, without waiting for a call in flight.
+
+        A call the core is holding (``terminal.send`` during a person's draft)
+        gets EOF and fails as lost; plain mode cancels a send still in its
+        draft hold when its caller goes away (server.rs ``connection``), so
+        nothing is typed later. Calls after this one fail: a closed client
+        never starts another ``hc connect``.
+        """
+        self._closed = True
+        conn = self._conn
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 - already broken
+                pass
 
 
 class HcSubscription:

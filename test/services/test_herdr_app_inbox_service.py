@@ -275,9 +275,11 @@ def test_labels_event_with_record_maps(env):
 
 
 def test_removed_drops_mapping(env):
-    svc = env[0]
+    svc, backend = env[0], env[1]
     run(svc, ev(1, "removed", "t1"))
     assert svc.mapped() == {}
+    # Removed outside CAO: its input connection (an `hc connect` child) is closed.
+    backend.release_input.assert_called_once_with("t1")
 
 
 def test_register_and_unregister(env):

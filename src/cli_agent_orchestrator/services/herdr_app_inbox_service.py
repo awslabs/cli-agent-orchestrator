@@ -276,6 +276,8 @@ class HerdrAppInboxService:
             await self._kill(str(address))
         elif etype == "removed":
             self.unregister_terminal(tid)
+            # Removed outside CAO (`hc rm`): no kill_address closes its input.
+            await asyncio.to_thread(self._backend.release_input, str(address))
 
     async def _kill(self, address: str) -> None:
         try:

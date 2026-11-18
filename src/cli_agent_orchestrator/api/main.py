@@ -1980,6 +1980,9 @@ async def lifespan(app: FastAPI):
             pass
         set_herdr_inbox_service(None)
         logger.info("Herdr inbox service stopped")
+    if isinstance(backend, HerdrAppBackend):
+        # One `hc connect` child per terminal CAO typed into: end them with the server.
+        backend.close_inputs()
 
     if deferred_init_recovery_task is not None:
         deferred_init_recovery_task.cancel()

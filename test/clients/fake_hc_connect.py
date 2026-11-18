@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+import time
 
 mode = os.environ.get("FAKE_HC_MODE", "echo")
 log = os.environ.get("FAKE_HC_LOG")
@@ -31,6 +32,9 @@ for line in sys.stdin:
             "methods": os.environ.get("FAKE_HC_METHODS", "").split(","),
         }
         out = {"jsonrpc": "2.0", "id": rid, "result": result}
+    elif method == "hold":  # a call the core keeps (terminal.send during a draft)
+        time.sleep(60)
+        continue
     elif method == "fail":
         out = {
             "jsonrpc": "2.0",

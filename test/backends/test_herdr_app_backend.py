@@ -1,4 +1,5 @@
 import hashlib
+import threading
 from test.backends.fake_hc import FakeHc, layout_with
 
 import pytest
@@ -428,41 +429,82 @@ def test_server_env_drops_blocked_keys(monkeypatch):
 
 
 class TestInputConnection:
-    """terminal.send / terminal.keys run on their own connection."""
+    """terminal.send / terminal.keys run on one connection per terminal."""
 
-    def test_slow_send_does_not_block_status_lookup(self, hc, monkeypatch):
-        import threading
+    class PlainModeFakeHc(FakeHc):
+        """One request at a time, like a plain `hc connect` (server.rs ``connection``).
 
+        ``hold`` is an address whose terminal.send waits for ``release``, as
+        herdr-core holds a send while a person has a draft in that terminal.
+        """
+
+        def __init__(self, core, hold=None, release=None, holding=None):
+            super().__init__()
+            self.terminals = core.terminals  # one core, many connections
+            self._lock = threading.Lock()
+            self.hold, self.release, self.holding = hold, release, holding
+
+        def call(self, method, params=None, timeout=10.0):
+            with self._lock:
+                if method == "terminal.send" and (params or {}).get("terminal") == self.hold:
+                    self.holding.set()
+                    assert self.release.wait(10), "test never released the send"
+                return super().call(method, params, timeout)
+
+    @pytest.fixture
+    def plain(self, hc, monkeypatch):
+        """A backend whose input connections are PlainModeFakeHc; t2's send is held."""
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.mcp_resolution.cao_server_env", lambda: {}
         )
-        release = threading.Event()
-        sending = threading.Event()
+        release, holding = threading.Event(), threading.Event()
+        made = []
 
-        class LockingFakeHc(FakeHc):
-            """Serializes calls like HcRpcClient; terminal.send waits for a draft."""
+        def factory():
+            made.append(self.PlainModeFakeHc(hc, hold="t2", release=release, holding=holding))
+            return made[-1]
 
-            def __init__(self):
-                super().__init__()
-                self._lock = threading.Lock()
+        backend = HerdrAppBackend("cao", client=hc, input_client_factory=factory)
+        yield backend, made, release, holding
+        release.set()
 
-            def call(self, method, params=None, timeout=10.0):
-                with self._lock:
-                    if method == "terminal.send":
-                        sending.set()
-                        assert release.wait(5), "test never released the send"
-                    return super().call(method, params, timeout)
+    def test_held_send_does_not_delay_another_terminals_input(self, hc, two_windows, plain):
+        """A draft held on terminal A (w1, t2) must not hold keys or a send to B (sup, t1)."""
+        backend, made, release, holding = plain
+        held = threading.Thread(target=backend.send_keys, args=("cao-a", "w1", "to A"))
+        held.start()
+        try:
+            assert holding.wait(5), "the send to A never reached the core"
+            done = threading.Event()
 
-        main, inp = LockingFakeHc(), LockingFakeHc()
-        inp.terminals = main.terminals  # one core, two connections
-        rec = main.add_terminal(_labels("cao-a", "w1", "aaaa0002"))
-        rec["status"] = {"app": "kiro-cli", "state": "working"}
-        backend = HerdrAppBackend("cao", client=main, input_client=inp)
+            def to_b():
+                backend.send_special_key("cao-a", "sup", "Enter")
+                backend.send_keys("cao-a", "sup", "to B")
+                backend.send_keys("cao-a", "sup", "y", enter_count=0)
+                done.set()
 
+            threading.Thread(target=to_b, daemon=True).start()
+            assert done.wait(2), "input to B waited behind A's held terminal.send"
+            assert held.is_alive(), "A's send must still be held while B's input went in"
+            b_conn = [c for c in made if c.calls_to("terminal.keys")]
+            assert len(b_conn) == 1
+            assert b_conn[0].calls_to("terminal.send") == [
+                {"terminal": "t1", "text": "to B", "force": True}
+            ]
+        finally:
+            release.set()
+            held.join(5)
+        assert not held.is_alive()
+        assert len(made) == 2  # one connection per terminal address
+        assert hc.calls_to("terminal.send") == [] and hc.calls_to("terminal.keys") == []
+
+    def test_slow_send_does_not_block_status_lookup(self, hc, two_windows, plain):
+        backend, _, release, holding = plain
+        two_windows[1]["status"] = {"app": "kiro-cli", "state": "working"}
         sender = threading.Thread(target=backend.send_keys, args=("cao-a", "w1", "hi"))
         sender.start()
         try:
-            assert sending.wait(5)
+            assert holding.wait(5)
             result = {}
             looker = threading.Thread(
                 target=lambda: result.update(s=backend.get_native_status("cao-a", "w1"))
@@ -474,23 +516,21 @@ class TestInputConnection:
         finally:
             release.set()
             sender.join(5)
-        assert inp.calls_to("terminal.send") and not main.calls_to("terminal.send")
 
-    def test_keys_use_input_connection(self, backend, hc, two_windows):
-        other = FakeHc()
-        other.terminals = hc.terminals
-        backend._input_client = other
-        backend.send_keys("cao-a", "w1", "3", enter_count=0)
-        backend.send_special_key("cao-a", "w1", "Enter")
-        backend.send_keys("cao-a", "w1", "x", enter_count=2)
-        assert hc.calls_to("terminal.keys") == [] and hc.calls_to("terminal.send") == []
-        assert len(other.calls_to("terminal.keys")) == 3
-        assert len(other.calls_to("terminal.send")) == 1
+    def test_same_terminal_reuses_its_connection(self, backend, hc, two_windows):
+        made = []
+        backend._input_factory = lambda: made.append(FakeHc()) or made[-1]
+        backend._input("t2")
+        backend._input("t2")
+        backend._input("t1")
+        assert len(made) == 2 and backend.input_connection_count() == 2
 
     def test_injected_client_doubles_as_input_client(self, backend, hc):
-        assert backend._input() is hc
+        assert backend._input("t1") is hc and backend._input("t2") is hc
+        backend.release_input("t1")
+        assert not hc.closed, "an injected shared client is the test's, never closed"
 
-    def test_default_input_client_is_a_second_lazy_connection(self, monkeypatch):
+    def test_default_input_client_is_a_lazy_connection_per_terminal(self, monkeypatch):
         from cli_agent_orchestrator.backends import herdr_app_backend as mod
 
         made = []
@@ -509,9 +549,64 @@ class TestInputConnection:
         monkeypatch.setattr(mod, "HcRpcClient", _Client)
         backend = HerdrAppBackend("cao-x")
         assert len(made) == 1
-        first = backend._input()
+        first = backend._input("t1")
         assert len(made) == 2 and first is not made[0] and first.session == "cao-x"
-        assert backend._input() is first and len(made) == 2
+        assert backend._input("t1") is first and len(made) == 2
+        assert backend._input("t2") is not first and len(made) == 3
+
+
+class TestInputConnectionLifetime:
+    """Each input connection is an `hc connect` child: none outlive their terminal."""
+
+    @pytest.fixture
+    def conns(self, backend, hc):
+        made = {}
+
+        def factory():
+            c = FakeHc()
+            c.terminals = hc.terminals
+            made[len(made)] = c
+            return c
+
+        backend._input_factory = factory
+        return made
+
+    def _open(self, backend, hc, address):
+        return backend._input(address)
+
+    def test_kill_window_closes_its_input_connection(self, backend, hc, two_windows, conns):
+        a, b = self._open(backend, hc, "t1"), self._open(backend, hc, "t2")
+        assert backend.kill_window("cao-a", "w1")
+        assert b.closed and not a.closed
+        assert backend.input_connection_count() == 1
+
+    def test_exact_cleanup_and_kill_session_close_input(self, backend, hc, two_windows, conns):
+        a, b = self._open(backend, hc, "t1"), self._open(backend, hc, "t2")
+        assert backend.cleanup_terminal_exact("aaaa0002").outcome.name == "DELETED"
+        assert b.closed and not a.closed
+        assert backend.kill_session("cao-a")
+        assert a.closed and backend.input_connection_count() == 0
+
+    def test_terminal_that_ended_on_its_own_is_pruned(self, backend, hc, two_windows, conns):
+        a, b = self._open(backend, hc, "t1"), self._open(backend, hc, "t2")
+        two_windows[1]["state"] = "finished"  # ended without CAO killing it
+        backend.sync_layout_names()
+        assert b.closed and not a.closed
+        assert backend.input_connection_count() == 1
+
+    def test_prune_spares_a_connection_newer_than_its_listing(self, backend, hc, conns):
+        """A terminal created while a listing ran is missing from it, but alive."""
+        epoch = next(backend._input_epoch)
+        new = backend._input("t5")
+        backend._prune_inputs(set(), epoch)
+        assert not new.closed and backend.input_connection_count() == 1
+
+    def test_close_inputs_closes_all_and_later_input_reopens(self, backend, hc, two_windows, conns):
+        a, b = self._open(backend, hc, "t1"), self._open(backend, hc, "t2")
+        backend.close_inputs()
+        assert a.closed and b.closed and backend.input_connection_count() == 0
+        backend.send_special_key("cao-a", "sup", "Enter")
+        assert backend.input_connection_count() == 1
 
 
 class TestServerIdentity:

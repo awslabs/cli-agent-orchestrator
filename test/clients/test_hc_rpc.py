@@ -157,6 +157,36 @@ def test_closed_connection_respawned_before_write(fake_hc):
     client.close()
 
 
+def test_close_does_not_wait_for_a_held_call_and_is_final(fake_hc):
+    """close() ends a call the core is holding instead of waiting up to its timeout."""
+    import time
+
+    client = HcRpcClient("cao")
+    client.call("ping")  # the child is up
+    failed = []
+
+    def held():
+        try:
+            client.call("hold", timeout=30)
+        except TerminalBackendError as exc:
+            failed.append(exc)
+
+    caller = threading.Thread(target=held)
+    caller.start()
+    deadline = time.monotonic() + 5
+    while not client._lock.locked() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.2)  # the request is on the wire
+    started = time.monotonic()
+    client.close()
+    caller.join(5)
+    assert not caller.is_alive() and time.monotonic() - started < 5
+    assert failed and "lost hold" in str(failed[0])
+    with pytest.raises(TerminalBackendError, match="closed before ping"):
+        client.call("ping")
+    assert len(fake_hc.read_text().splitlines()) == 1  # no new `hc connect` after close
+
+
 def test_hello_checks_generation_and_methods(fake_hc, monkeypatch):
     monkeypatch.setenv("FAKE_HC_METHODS", ",".join(sorted(hc_rpc.REQUIRED_METHODS)))
     HcRpcClient("cao").hello()
