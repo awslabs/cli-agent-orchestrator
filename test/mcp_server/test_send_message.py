@@ -373,3 +373,28 @@ class TestSendToInboxDeliveryOutcome:
         ):
             result = _send_message_impl("c0ffee01", "Done!")
         assert result == body
+
+
+@patch("cli_agent_orchestrator.utils.orchestration._target_binding_denial", return_value=None)
+@patch("cli_agent_orchestrator.utils.orchestration.requests.post")
+def test_uncertain_warning_reaches_the_tool_result_word_for_word(mock_post, _unbound):
+    """Owner request: the agent sees the POST's "May have been delivered:" text as is."""
+    from cli_agent_orchestrator.utils.orchestration import _send_message_impl
+
+    error = (
+        "May have been delivered: RuntimeError: herdr-core lost terminal.send. "
+        "Check the receiver's terminal before you send it again."
+    )
+    body = {"success": False, "message_id": 7, "delivery": "uncertain", "error": error}
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = dict(body)
+    mock_post.return_value = resp
+    with (
+        patch.dict(os.environ, {"CAO_TERMINAL_ID": "badc0de1"}),
+        patch("cli_agent_orchestrator.utils.orchestration._mcp_timeout", return_value=30.0),
+    ):
+        result = _send_message_impl("c0ffee01", "Done!")
+    assert result["success"] is False
+    assert result["error"] == error

@@ -1,6 +1,7 @@
 """Tests for the new inbox messages GET endpoint."""
 
 import asyncio
+import re
 from datetime import datetime
 from unittest.mock import Mock, patch
 
@@ -334,6 +335,21 @@ class TestDatabaseFunctionCompatibility:
         assert isinstance(result, list)
 
 
+_UNCERTAIN_PREFIX = "May have been delivered:"
+_CHECK_BEFORE_RESENDING = re.compile(
+    r"check the receiver'?s terminal before (?:you )?send(?:ing)? it again\.?$", re.IGNORECASE
+)
+
+
+def _assert_uncertain_error(error, cause):
+    """Owner request: an uncertain error leads with the warning, then the cause, then the advice."""
+    assert error.startswith(_UNCERTAIN_PREFIX), error
+    assert cause in error, error
+    advice = _CHECK_BEFORE_RESENDING.search(error)
+    assert advice is not None, error
+    assert len(_UNCERTAIN_PREFIX) <= error.index(cause) < advice.start(), "warning, cause, advice"
+
+
 class TestCreateInboxMessageResponseTiming:
     """PR #1004 review, P2-2: the POST must not wait out a submit confirmation.
 
@@ -482,11 +498,8 @@ class TestCreateInboxMessageResponseTiming:
             kwargs["on_outcome"](7, uncertain, "lost terminal.send")
 
         body = await self._post(deliver)
-        assert (body["success"], body["delivery"], body["error"]) == (
-            False,
-            "uncertain",
-            "lost terminal.send",
-        )
+        assert (body["success"], body["delivery"]) == (False, "uncertain")
+        _assert_uncertain_error(body["error"], "lost terminal.send")
 
     @pytest.mark.asyncio
     async def test_receiver_not_ready_is_queued(self):
@@ -724,7 +737,7 @@ class TestInboxPostOverRealDelivery:
         inbox_service.reconcile_orphaned_messages()
 
         assert (body["success"], body["delivery"]) == (False, "failed")
-        assert "lost terminal.read" in body["error"]
+        assert body["error"] == "InputNotSentError: lost terminal.read", "the raw cause"
         assert live.paste.dispatch_input.call_count == 1
         assert [m.status.value for m in _inbox(C)] == ["failed"]
         assert _inbox(W) == [], "the POST carried the error; no notice"
@@ -737,7 +750,7 @@ class TestInboxPostOverRealDelivery:
         body = await self._post(W, C, "status")
         inbox_service.deliver_pending(C)
         assert (body["success"], body["delivery"]) == (False, "uncertain")
-        assert "lost terminal.send" in body["error"]
+        _assert_uncertain_error(body["error"], "RuntimeError: lost terminal.send")
         assert live.paste.dispatch_input.call_count == 1
         assert _inbox(W) == []
 
