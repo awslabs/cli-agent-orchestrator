@@ -196,7 +196,11 @@ class HcRpcClient:
                     self._drop()
                     if self._closed:
                         raise HcNotSentError(f"herdr-core client closed before {method}")
-                    self._conn = _Connection(self.session)
+                    try:
+                        self._conn = _Connection(self.session)
+                    except TerminalBackendError as exc:
+                        # No `hc connect` child, so the request was never written.
+                        raise HcNotSentError(f"herdr-core unreachable for {method}: {exc}") from exc
                     if self._closed:  # close() ran while the child started
                         self._drop()
                         raise HcNotSentError(f"herdr-core client closed before {method}")
