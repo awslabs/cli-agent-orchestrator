@@ -483,7 +483,7 @@ def handle_messages_failed(
     if unreported:
         handle_delivery_failed(receiver_id, unreported, reason, registry, uncertain=uncertain)
     for edge in list_open_message_edges([i for i in ids if i in reported]):
-        close_delegation_edge(edge.id, EdgeState.WORKER_ENDED)
+        close_delegation_edge(edge.id, EdgeState.WORKER_ENDED, exclude_reply_in_flight=True)
 
     by_id = {m.id: m for m in messages}
     for edge in clear_reply_in_flight(ids):

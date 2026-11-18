@@ -4568,24 +4568,29 @@ def list_unarmed_assign_edges(worker_id: str) -> List[DelegationEdge]:
         return [_edge_from_row(r) for r in rows]
 
 
-def close_delegation_edge(edge_id: int, state: EdgeState) -> bool:
+def close_delegation_edge(
+    edge_id: int, state: EdgeState, *, exclude_reply_in_flight: bool = False
+) -> bool:
     """Close an edge only if it is still OPEN. True when this call closed it.
 
     The conditional UPDATE is the claim: the status-event consumer and the
     sweep can evaluate the same terminal concurrently, and only the caller that
     wins the claim may forward, so a result is never forwarded twice.
+
+    ``exclude_reply_in_flight`` also requires that the edge carries no reply in
+    flight, so a reply marked after the caller listed the edge is left to its
+    delivery outcome (design D8).
     """
     with SessionLocal() as db:
-        count = (
-            db.query(DelegationEdgeModel)
-            .filter(
-                DelegationEdgeModel.id == edge_id,
-                DelegationEdgeModel.state == EdgeState.OPEN.value,
-            )
-            .update(
-                {DelegationEdgeModel.state: state.value, DelegationEdgeModel.closed_at: _utcnow()},
-                synchronize_session=False,
-            )
+        query = db.query(DelegationEdgeModel).filter(
+            DelegationEdgeModel.id == edge_id,
+            DelegationEdgeModel.state == EdgeState.OPEN.value,
+        )
+        if exclude_reply_in_flight:
+            query = query.filter(DelegationEdgeModel.reply_message_id.is_(None))
+        count = query.update(
+            {DelegationEdgeModel.state: state.value, DelegationEdgeModel.closed_at: _utcnow()},
+            synchronize_session=False,
         )
         db.commit()
         return count > 0
@@ -4722,7 +4727,9 @@ def close_open_edges_for_terminal(terminal_id: str, state: EdgeState) -> List[De
     OPEN: the reply's delivery outcome settles it (design D8).
     """
     inbound = list_open_edges_into(terminal_id, exclude_reply_in_flight=True)
-    closed = [e for e in inbound if close_delegation_edge(e.id, state)]
+    closed = [
+        e for e in inbound if close_delegation_edge(e.id, state, exclude_reply_in_flight=True)
+    ]
     for edge in list_open_edges_out_of(terminal_id):
         close_delegation_edge(edge.id, state)
     return closed
