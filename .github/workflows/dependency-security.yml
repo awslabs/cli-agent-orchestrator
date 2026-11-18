@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# The composite action runs `uv sync` and the gate script runs `uv export`; both must use
+# the committed lock (--locked, never --frozen, which would install a stale lock silently).
+env:
+  UV_LOCKED: "1"
+
 jobs:
   dependency-security:
     name: Dependency Security
@@ -21,3 +26,61 @@ jobs:
           persist-credentials: false
 
       - uses: ./.github/actions/dependency-security
+
+  # One tracking issue for toolchain-only HIGH/CRITICAL findings (#1398). They no longer
+  # block pull requests, so this is where they stay visible. It is a separate job so that
+  # `issues: write` is held only by a job that runs no npm lifecycle script or build tool:
+  # the scan job above keeps `contents: read`.
+  toolchain-tracking:
+    name: Toolchain findings tracking issue
+    needs: dependency-security
+    if: ${{ !cancelled() && github.event_name == 'schedule' && github.repository == 'awslabs/cli-agent-orchestrator' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Download the dependency report
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dependency-security-${{ github.run_attempt }}
+          path: report
+
+      - name: Open or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          label="dependency-toolchain"
+          title="Dependency Security: toolchain-only HIGH/CRITICAL findings"
+          existing="$(gh issue list --state open --label "$label" --json number --jq '.[0].number // empty')"
+          # A gate error (or no report at all) says nothing about toolchain findings: keep the
+          # issue open and say why, never take the "none remain" branch.
+          status="$(jq -r '.status // "missing"' report/report.json 2>/dev/null || echo missing)"
+          if [ "$status" = "error" ] || [ "$status" = "missing" ]; then
+            error="$(jq -r '.error // "no report.json was produced"' report/report.json 2>/dev/null || echo "no report.json was produced")"
+            fence="\`\`\`"
+            printf 'The weekly Dependency Security run at %s ended in an error, so this issue was not updated:\n\n%s\n%s\n%s\n' \
+              "$REVISION" "$fence" "$error" "$fence" > report/error.md
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body-file report/error.md
+            else
+              echo "::warning::Dependency Security ended in an error; no tracking issue is open to comment on."
+            fi
+            exit 0
+          fi
+          if [ -f report/toolchain-issue.md ]; then
+            gh label create "$label" --color BFD4F2 \
+              --description "Toolchain-only dependency findings tracked by the weekly Dependency Security run" 2>/dev/null || true
+            if [ -n "$existing" ]; then
+              gh issue edit "$existing" --body-file report/toolchain-issue.md
+            else
+              gh issue create --title "$title" --label "$label" --body-file report/toolchain-issue.md
+            fi
+          elif [ -n "$existing" ]; then
+            printf 'No toolchain-only HIGH/CRITICAL findings remain at %s. This issue can be closed.\n' "$REVISION" > report/none.md
+            gh issue edit "$existing" --body-file report/none.md
+          fi

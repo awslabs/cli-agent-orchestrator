@@ -91,9 +91,11 @@ Security scans run:
 
 ### Full dependency gate
 
-**`Dependency Security` blocks every HIGH/CRITICAL dependency finding in the
-checked-out tree, including unchanged dependencies, development dependencies,
-and advisories with no published fix.** This is separate from the existing
+**`Dependency Security` blocks every HIGH/CRITICAL finding in the dependencies CAO
+ships, including unchanged dependencies and advisories with no published fix.
+Findings in the build, test and lint toolchain are scanned in full and reported,
+but do not block** (#1398; see [Shipped set and toolchain findings](#shipped-set-and-toolchain-findings)).
+This is separate from the existing
 Trivy `Security Scan` and PR-delta `Dependency Review` checks; neither replaces
 this whole-graph gate. The older scan fails on a committed secret of any severity and on a fixable CRITICAL, HIGH or UNKNOWN (not yet scored) vulnerability; fixable MEDIUM and LOW vulnerabilities are reported to the Security tab without failing CI.
 
@@ -131,6 +133,84 @@ assuming their presence cannot change filtering. The Python 3.12 CI unit job
 requires the same pinned Trivy binary and runs a real-scanner regression that
 asserts production and dev-only npm/uv packages appear in the published
 inventory, with only lockfile hashes in the snapshot.
+
+#### Shipped set and toolchain findings
+
+Trivy still scans every locked graph in full. `scripts/dependency_security.py` then
+classifies each finding against a **shipped set measured from the real build**, not
+from the `dependencies` / `devDependencies` labels in `package.json`:
+
+| Lockfile | Shipped set, from |
+| --- | --- |
+| `uv.lock` | `uv export --locked --no-dev --all-extras` (the wheel's runtime closure plus the optional `agui` and `otel` extras users install) |
+| `web/package-lock.json`, `cao_mcp_apps/package-lock.json` | a Vite plugin ([`scripts/shipped-packages.mjs`](scripts/shipped-packages.mjs)) that records, per build config, the npm packages of every bundled module, the packages named in `build.rollupOptions.external`, and the owners of bundler-injected virtual helpers, to `<project>/.shipped/bundled-packages.<config>.json`; an injected module it cannot attribute fails the build |
+| `docusaurus/package-lock.json` | the same record from both webpack passes (the **client** bundle and the **server** pass that renders every page's HTML), plus every locked package matching the build-time HTML writers in the policy file (remark, rehype, MDX, Prism and friends) |
+| `tui/Cargo.lock` | `cargo tree --locked -e normal --target all` (the release build, `cargo build --release --locked`, uses default features and the package has none) |
+| `examples/**` | nothing: examples ship nothing (one list, `NO_SHIP_PREFIXES`) |
+
+Membership is by package **name**, at any version: a lockfile can hold several versions of
+one package, and a version match would let a bundled vulnerable copy look unbundled.
+
+**What blocks (exit 1):** a shipped HIGH/CRITICAL not covered by a valid ignore entry; a
+malware advisory (OSV `MAL-*`, or a "Malware in ..." advisory) in **any** lockfile, which no
+ignore entry can cover; and a toolchain HIGH/CRITICAL that **has a fixed version** and whose
+package and version are new in this pull request compared with its base. A toolchain finding
+with no fix (picomatch, CVE-2026-112366, today) is listed in the step summary with its
+dependency path and in `toolchain.sarif` (a workflow artifact; it is not uploaded to code
+scanning, so the gate needs no `security-events: write`), and does not block. The weekly run opens or updates one tracking issue (label `dependency-toolchain`)
+while toolchain HIGH/CRITICAL findings remain. UNKNOWN-severity advisories do not block, as in
+#884.
+
+**Completeness checks (exit 2).** [`.github/dependency-security/policy.json`](.github/dependency-security/policy.json)
+lists every build that must have recorded a manifest (web, the four MCP App views, Docusaurus
+client and server); a missing or empty record fails. Every `.js`, `.mjs`, `.css` and `.html`
+file under `src/cli_agent_orchestrator/web_ui/` and `src/cli_agent_orchestrator/ext_apps/apps_static/`
+must be listed in some record's `outputs`, so a new bundle with no producer fails. Trivy's
+inventory for every lockfile must be non-empty and contain the policy's sentinel packages
+(`react` in web, `react` and `sigma` in `cao_mcp_apps`, `react` and `@docusaurus/core` in
+`docusaurus`, `fastapi` in `uv.lock`, `serde` and `ratatui` in `tui/Cargo.lock`), so a
+lockfile Trivy failed to parse cannot pass as clean. On a pull request the base commit is
+required, and a missing base is an error. The summary also lists packages that left the
+shipped set compared with [`shipped-baseline.json`](.github/dependency-security/shipped-baseline.json)
+at the base while still locked.
+
+The Vite plugin's handling of worker bundles, `build.rollupOptions.external` and injected
+helpers is tested by `scripts/test-shipped-packages.mjs` (`node --test`), which the gate runs before
+it builds.
+
+Not measured: scripts a site loads from a CDN (Docusaurus `scripts`/`headTags`; there are
+none today), CSS or assets from a package that contributes no JavaScript module, and the
+version ranges in the wheel's `Requires-Dist` that users resolve at install time (the gate
+reads `uv.lock` as a stand-in). Toolchain code still runs in CI and the release build.
+
+The gate **fails closed**: a producer failure, an empty set, a tracked lockfile outside
+`examples/` with no producer, a failed completeness or sentinel check, a missing base on a
+pull request, or any unexpected error is exit 2, never "nothing shipped, so pass". Adding a
+project that ships code means adding a producer and a policy entry. Build locally first
+(`npm run build` in `web/`, `npm run build:all` in `cao_mcp_apps/`, `npm run build` in
+`docusaurus/`), or pass `--shipped-set <file>`.
+
+A shipped finding with no fix can be accepted for at most 14 days in
+[`.github/dependency-security/trivyignore.yaml`](.github/dependency-security/trivyignore.yaml).
+Each entry needs `id`, an https `url`, a reachability `statement`, `added`, `expired_at` and
+a scope: `paths` (lockfiles) or `purl` (`pkg:npm/<name>[@<version>]`); an entry scoped to
+nothing is rejected. The window is checked against the YAML `added` (not in the future) and
+against the date the entry first appeared in the base branch's history of the file; a
+shallow clone that cannot establish that date is an error. An entry that matches no current
+shipped finding is rejected, and an expired entry covers nothing, so the finding blocks
+again. Only the gate script reads this file: it lives outside the repository root because
+Trivy auto-loads a root `.trivyignore.yaml` into the `security` job, and the gate still runs
+Trivy with its own ignore file disabled. `Dependency Review` keeps its default scopes; a
+fixable toolchain HIGH/CRITICAL that a pull request adds or changes is blocked by the tier
+above instead, so an unfixed advisory that a lockfile refresh merely moves does not.
+
+The Vite and webpack recorders write each package under its `node_modules` folder name and,
+for an npm alias (for example `react-helmet-async` installed as
+`@slorber/react-helmet-async`), also under the real name from its own `package.json`, which
+is the name Trivy reports.
+
+A weekly run that ends in an error never marks the tracking issue clear: it comments the
+error on the open issue and leaves it open.
 
 Each executed audit publishes an Actions summary and a `dependency-security-<attempt>`
 artifact, keeping rerun evidence separate, with scan time and CI revision.
@@ -489,7 +569,7 @@ scripts/security-scan.sh dependencies
 
 This reads the current contents of tracked lockfiles; stage new files
 before scanning them. It writes `dependency-security-results/report.json` and
-`summary.md` (gitignored) and exits nonzero for HIGH/CRITICAL findings or scan
+`summary.md` (gitignored) and exits nonzero for shipped HIGH/CRITICAL findings or scan
 errors. It does not install packages or execute their lifecycle scripts.
 Run each affected project's `npm ci && npm run test:dependencies` separately
 to verify installed mitigations. Neither action substitutes for the other.
