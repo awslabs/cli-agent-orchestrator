@@ -2967,3 +2967,147 @@ class TestDeliveryOutcome:
         assert self._deliver(report_to_sender=7) == []
         assert self._statuses(7)[-1] == MessageStatus.PENDING
         self.record.assert_not_called()
+
+
+class TestQueuedRetry:
+    """Spec "Queued delivery failures are retried and reported" (plan Task 3 ``_fail_batch``).
+
+    A real in-memory database holds the message, so the tests read back its
+    status, ``delivery_attempts`` and ``last_error``. Only the dispatch, the
+    receiver status and the failure notice (Task 4) are replaced.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _seams(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients.database import (
+            Base,
+            create_inbox_message,
+            create_terminal,
+        )
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=engine)
+        with (
+            patch("cli_agent_orchestrator.clients.database.SessionLocal", sessionmaker(engine)),
+            patch("cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", False),
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service") as term,
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
+            patch(
+                "cli_agent_orchestrator.services.delegation_callback_service.handle_messages_failed",
+                create=True,  # defined in plan Task 4
+            ),
+            patch(
+                "cli_agent_orchestrator.services.delegation_callback_service.handle_delivery_failed"
+            ),
+        ):
+            monitor.get_status.return_value = TerminalStatus.IDLE
+            term.dispatch_input.return_value = 0
+            create_terminal("term-1", "cao-s", "sup", "claude_code")
+            self.message_id = create_inbox_message("sender-1", "term-1", "queued reply").id
+            self.term = term
+            yield
+        engine.dispose()
+
+    @staticmethod
+    def _outcome():
+        from cli_agent_orchestrator.models.inbox import DeliveryOutcome
+
+        return DeliveryOutcome
+
+    @staticmethod
+    def _max_attempts():
+        from cli_agent_orchestrator import constants
+
+        return constants.INBOX_MAX_DELIVERY_ATTEMPTS
+
+    @staticmethod
+    def _not_sent(text):
+        from cli_agent_orchestrator.backends import base
+
+        return base.InputNotSentError(text)
+
+    def _attempt(self):
+        """One queued delivery (no report_to_sender); returns this call's outcomes."""
+        outcomes = []
+        InboxService().deliver_pending("term-1", on_outcome=lambda *a: outcomes.append(a))
+        return outcomes
+
+    def _stored(self):
+        from cli_agent_orchestrator.clients.database import get_inbox_messages
+
+        [message] = get_inbox_messages("term-1", limit=10)
+        return message
+
+    def _fail_before_typing(self, attempts):
+        self.term.dispatch_input.side_effect = [
+            self._not_sent(f"lost terminal.read on attempt {n}") for n in range(1, attempts + 1)
+        ]
+        return [self._attempt() for _ in range(attempts)]
+
+    def test_failure_before_typing_resets_to_pending_and_records_the_attempt(self):
+        # Act
+        [outcomes] = self._fail_before_typing(1)
+
+        # Assert
+        assert [(o[0], o[1]) for o in outcomes] == [(self.message_id, self._outcome().RETRYING)]
+        stored = self._stored()
+        assert stored.status == MessageStatus.PENDING
+        assert stored.delivery_attempts == 1
+        assert "lost terminal.read on attempt 1" in stored.last_error
+
+    def test_attempt_before_the_last_is_still_retried(self):
+        # Act
+        runs = self._fail_before_typing(self._max_attempts() - 1)
+
+        # Assert
+        retrying = self._outcome().RETRYING
+        assert [[o[1] for o in run] for run in runs] == [[retrying]] * (self._max_attempts() - 1)
+        stored = self._stored()
+        assert stored.status == MessageStatus.PENDING
+        assert stored.delivery_attempts == self._max_attempts() - 1
+        assert f"attempt {self._max_attempts() - 1}" in stored.last_error
+
+    def test_last_attempt_fails_for_good(self):
+        # Act
+        runs = self._fail_before_typing(self._max_attempts())
+
+        # Assert
+        assert [(o[0], o[1]) for o in runs[-1]] == [(self.message_id, self._outcome().FAILED)]
+        stored = self._stored()
+        assert stored.status == MessageStatus.FAILED
+        assert stored.delivery_attempts == self._max_attempts()
+        assert f"attempt {self._max_attempts()}" in stored.last_error, "keeps the last error"
+
+    def test_failed_message_is_not_attempted_again(self):
+        self._fail_before_typing(self._max_attempts())
+        self.term.dispatch_input.side_effect = None
+        assert self._attempt() == []
+        assert self.term.dispatch_input.call_count == self._max_attempts()
+
+    def test_uncertain_failure_fails_at_once_without_retry(self):
+        # Arrange
+        self.term.dispatch_input.side_effect = RuntimeError("herdr-core lost terminal.send")
+
+        # Act
+        outcomes = self._attempt()
+        later = self._attempt()
+
+        # Assert
+        assert [(o[0], o[1]) for o in outcomes] == [(self.message_id, self._outcome().UNCERTAIN)]
+        assert self._stored().status == MessageStatus.FAILED
+        assert later == [], "an uncertain message is never typed a second time"
+        assert self.term.dispatch_input.call_count == 1
+
+    def test_transient_failure_then_success_delivers_once(self):
+        self.term.dispatch_input.side_effect = [self._not_sent("lost terminal.read"), 0]
+        first, second = self._attempt(), self._attempt()
+        assert [o[1] for o in first + second] == [
+            self._outcome().RETRYING,
+            self._outcome().DELIVERED,
+        ]
+        assert self._stored().status == MessageStatus.DELIVERED
+        assert self._attempt() == [], "delivered once"
+        assert self.term.dispatch_input.call_count == 2
