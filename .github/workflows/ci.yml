@@ -84,7 +84,7 @@ jobs:
         # line % that run (today: 89.28 branch vs 93.10 line, so blended is a
         # harder bar at 80 -- not an invariant, just the current numbers). The
         # authoritative, separately-floored line metric is the ratchet's
-        # (.coverage-baseline.json, python.floor_pct = 87.0) in the cao-mcp-apps
+        # (.coverage-baseline.json, python.floor_pct = 87.0) in the coverage-ratchet
         # job below. If the blend lands under 80 on a first run, lower THIS
         # number -- do not drop the branch data, and do not touch the line floor.
 
@@ -243,11 +243,12 @@ jobs:
   cao-mcp-apps:
     name: CAO MCP Apps
     runs-on: ubuntu-latest
-    # Bounds a hung test (#1273 review). "Backend coverage" below runs the same
-    # pytest suite as Unit Tests; over 60 runs this job took a mean of 33.3 min
-    # and a max of 37.9, so 60 matches Unit Tests and is 1.6x the slowest.
+    # Bounds a hung step (#1273 review). Since the coverage ratchet moved to its
+    # own job (#1387), this job no longer runs the Python suite: it took 55 s in
+    # this PR's run. It still runs `uv sync` for the HTTP-only guard, and one
+    # `uv sync` took 15.5 min on 2026-11-17, so 30 leaves room for that.
     # Unbounded, a hang held the runner for GitHub's default of 360 min.
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     # Per-tier test timing budgets (Requirement 20.3), surfaced as env so the
     # vitest tiers (Phase II+) and CI can enforce them:
