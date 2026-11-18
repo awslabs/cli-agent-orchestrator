@@ -3,6 +3,7 @@
 import os
 from unittest.mock import MagicMock, patch
 
+import pytest
 import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
@@ -292,3 +293,83 @@ class TestSendMessageCallerDefault:
         assert result["success"] is False
         assert "own CAO_TERMINAL_ID" in result["error"]
         mock_inbox.assert_not_called()
+
+
+class TestSendToInboxDeliveryOutcome:
+    """reply-delivery-failure D5: the POST can wait INBOX_DELIVERY_OUTCOME_WAIT."""
+
+    @staticmethod
+    def _response(body, status_code=200):
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = body
+        return resp
+
+    @staticmethod
+    def _outcome_wait():
+        from cli_agent_orchestrator import constants
+
+        return constants.INBOX_DELIVERY_OUTCOME_WAIT
+
+    @pytest.mark.parametrize("mcp_timeout", [30.0, 1000.0], ids=["mcp-shorter", "mcp-longer"])
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.post")
+    def test_timeout_is_the_larger_of_the_mcp_timeout_and_the_outcome_wait(
+        self, mock_post, mcp_timeout
+    ):
+        from cli_agent_orchestrator.utils.orchestration import _send_to_inbox
+
+        mock_post.return_value = self._response({"success": True, "delivery": "delivered"})
+        with (
+            patch.dict(os.environ, {"CAO_TERMINAL_ID": "badc0de1"}),
+            patch(
+                "cli_agent_orchestrator.utils.orchestration._mcp_timeout",
+                return_value=mcp_timeout,
+            ),
+        ):
+            _send_to_inbox("c0ffee01", "Done!")
+        expected = max(mcp_timeout, self._outcome_wait() + 10)
+        assert mock_post.call_args.kwargs["timeout"] == expected
+
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.post")
+    def test_callback_retry_uses_the_same_timeout(self, mock_post):
+        from cli_agent_orchestrator.utils.orchestration import _send_to_inbox
+
+        mock_post.side_effect = [
+            self._response({}, status_code=404),
+            self._response({"success": True, "delivery": "queued"}),
+        ]
+        with (
+            patch.dict(os.environ, {"CAO_TERMINAL_ID": "badc0de1"}),
+            patch("cli_agent_orchestrator.utils.orchestration._mcp_timeout", return_value=30.0),
+            patch(
+                "cli_agent_orchestrator.utils.orchestration._callback_route",
+                return_value=("http://supervisor-node:9889", "5ca1ab1e"),
+            ),
+        ):
+            _send_to_inbox("c0ffee01", "Done!")
+        timeouts = [c.kwargs["timeout"] for c in mock_post.call_args_list]
+        assert timeouts == [self._outcome_wait() + 10] * 2
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"success": False, "message_id": 7, "delivery": "failed", "error": "lost read"},
+            {"success": False, "message_id": 7, "delivery": "uncertain", "error": "lost send"},
+            {"success": True, "message_id": 7, "delivery": "in_progress", "error": None},
+        ],
+        ids=["failed", "uncertain", "in_progress"],
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration._target_binding_denial", return_value=None)
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.post")
+    def test_outcome_reaches_the_tool_result_unchanged(self, mock_post, _unbound, body):
+        """Guard: success false from the POST must not be turned into success or an error."""
+        from cli_agent_orchestrator.utils.orchestration import _send_message_impl
+
+        mock_post.return_value = self._response(dict(body))
+        with (
+            patch.dict(os.environ, {"CAO_TERMINAL_ID": "badc0de1"}),
+            patch("cli_agent_orchestrator.utils.orchestration._mcp_timeout", return_value=30.0),
+        ):
+            result = _send_message_impl("c0ffee01", "Done!")
+        assert result == body
