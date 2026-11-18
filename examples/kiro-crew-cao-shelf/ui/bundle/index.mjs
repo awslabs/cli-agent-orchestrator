@@ -1108,7 +1108,7 @@ function HonestLine({ data }) {
     ] }) : null,
     s.completed > 0 ? /* @__PURE__ */ jsxs(Fragment, { children: [
       /* @__PURE__ */ jsx("b", { children: s.completed }),
-      " just completed,",
+      " completed,",
       " "
     ] }) : null,
     s.unknown > 0 ? /* @__PURE__ */ jsxs(Fragment, { children: [
@@ -1121,7 +1121,13 @@ function HonestLine({ data }) {
   ] });
 }
 const POLL_MS = 5e3;
+const MIN_POLL_MS = 3e3;
+const MAX_POLL_MS = 6e4;
 const MAX_BACKOFF_MS = 6e4;
+function pollMs(intervalSeconds) {
+  if (typeof intervalSeconds !== "number" || !Number.isFinite(intervalSeconds)) return POLL_MS;
+  return Math.min(MAX_POLL_MS, Math.max(MIN_POLL_MS, intervalSeconds * 1e3));
+}
 const isUnchanged = (r) => r.unchanged === true;
 function useShelf() {
   const api = useShelfApi();
@@ -1133,6 +1139,7 @@ function useShelf() {
   const [loading, setLoading] = useState(true);
   const revision = useRef(null);
   const failures = useRef(0);
+  const interval = useRef(POLL_MS);
   const timer = useRef(null);
   const ctrl = useRef(null);
   const loop = useRef(null);
@@ -1142,7 +1149,8 @@ function useShelf() {
     const visible = () => document.visibilityState !== "hidden";
     const schedule = () => {
       if (dead || !visible()) return;
-      const wait = failures.current === 0 ? POLL_MS : Math.min(MAX_BACKOFF_MS, POLL_MS * 2 ** failures.current);
+      const every = interval.current;
+      const wait = failures.current === 0 ? every : Math.min(MAX_BACKOFF_MS, every * 2 ** failures.current);
       timer.current = setTimeout(run, wait);
     };
     const run = async () => {
@@ -1158,6 +1166,7 @@ function useShelf() {
         setError(null);
         if (!isUnchanged(r)) {
           revision.current = r.revision;
+          interval.current = pollMs(r.interval_seconds);
           setData(r);
           setReceivedAt(Date.now());
         }
