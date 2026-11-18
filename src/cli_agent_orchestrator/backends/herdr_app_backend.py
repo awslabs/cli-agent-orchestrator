@@ -43,8 +43,13 @@ DOC_WRITE_ATTEMPTS = 5
 DOC_RETRY_DELAY_S = 0.1
 MANAGED = {"cao.managed": "1"}
 RPC_TIMEOUT_S = 10.0
-# terminal.send / terminal.keys wait for a person's unfinished draft (up to
-# ~60 s) and for output to settle before typing.
+# herdr-core types terminal.send and terminal.keys only once 3 s have passed
+# since a person's last key in that terminal (HC_QUIET_MS; no wait if nobody
+# typed), and terminal.send also waits for their unfinished draft (up to 60 s
+# after that key, HC_DRAFT_MS). During a terminal's first 10 s a send also waits
+# up to 5 s for its output to settle (else `unavailable`, nothing typed), and
+# after typing it waits up to 5 s for an agent that reports status to start
+# before it answers (input.rs type_in, settle, send_message). 90 s covers it.
 INPUT_TIMEOUT_S = 90.0
 # hc key names for characters that are not their own name (hc 0.1.21).
 _CHAR_KEY_NAMES = {" ": "space"}
