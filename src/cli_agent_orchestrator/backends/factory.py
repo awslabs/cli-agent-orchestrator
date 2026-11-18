@@ -88,6 +88,13 @@ class BackendFactory:
             from cli_agent_orchestrator.backends.herdr_app_backend import HerdrAppBackend
 
             session = ConfigService.get("terminal.herdr_app_session", default="cao")
+            if session == "default":
+                raise ConfigurationError(
+                    "terminal.herdr_app_session is 'default', the herdr-core session "
+                    "the Herdr app opens for your own terminals. CAO starts that "
+                    "session's core, writes its app layout, and kills terminals in it, "
+                    "so it needs a session of its own. Set another name, such as 'cao'."
+                )
             logger.info(
                 "[EXPERIMENTAL] terminal_backend='herdr-app' is experimental. "
                 "Report issues at https://github.com/awslabs/cli-agent-orchestrator/issues"

@@ -256,6 +256,25 @@ class TestHerdrAppSelection:
         monkeypatch.setattr(HerdrAppBackend, "_connect", lambda self: None)
         assert isinstance(BackendFactory.create("herdr-app"), HerdrAppBackend)
 
+    def test_the_users_default_session_is_refused(self, _isolated_settings, monkeypatch):
+        """docs/herdr-app.md promises CAO never uses the app's own `default` session."""
+        monkeypatch.setenv("CAO_TERMINAL_BACKEND", "herdr-app")
+        monkeypatch.setenv("CAO_HERDR_APP_SESSION", "default")
+        connected = []
+        monkeypatch.setattr(HerdrAppBackend, "_connect", lambda self: connected.append(self))
+        with pytest.raises(ConfigurationError) as exc:
+            BackendFactory.create()
+        assert "'default'" in str(exc.value) and "your own terminals" in str(exc.value)
+        assert connected == [], "refused before any core is started or contacted"
+
+    def test_default_session_in_settings_is_refused(self, _isolated_settings, monkeypatch):
+        _isolated_settings.write_text(
+            json.dumps({"terminal": {"backend": "herdr-app", "herdr_app_session": "default"}})
+        )
+        monkeypatch.setattr(HerdrAppBackend, "_connect", lambda self: None)
+        with pytest.raises(ConfigurationError, match="session of its own"):
+            BackendFactory.create()
+
     def test_unknown_backend_lists_all_three(self, _isolated_settings, monkeypatch):
         monkeypatch.setenv("CAO_TERMINAL_BACKEND", "screen")
         with pytest.raises(ConfigurationError) as exc:
