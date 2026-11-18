@@ -7,7 +7,7 @@ import codecs
 import errno
 import logging
 import os
-import select
+import selectors
 import stat
 import threading
 import time
@@ -371,6 +371,7 @@ class FifoManager:
         topic = f"terminal.{terminal_id}.output"
         read_fd = -1
         keepalive_fd = -1
+        selector: selectors.BaseSelector | None = None
         pending = bytearray()
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         # Time at which the currently-accumulating batch started.
@@ -381,6 +382,8 @@ class FifoManager:
             read_fd = _open_fifo(fifo_path, os.O_RDONLY | os.O_NONBLOCK)
             # With our read end open, a non-blocking write open cannot ENXIO.
             keepalive_fd = _open_fifo(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+            selector = selectors.DefaultSelector()
+            selector.register(read_fd, selectors.EVENT_READ)
 
             while not stop_flag.is_set():
                 # Wait at most _COALESCE_WINDOW so we always flush pending data
@@ -389,7 +392,7 @@ class FifoManager:
                 # _POLL_INTERVAL upper bound is still honored when nothing has
                 # been received yet (pending is empty).
                 timeout = _COALESCE_WINDOW if pending else _POLL_INTERVAL
-                readable, _, _ = select.select([read_fd], [], [], timeout)
+                readable = selector.select(timeout)
                 if readable:
                     try:
                         raw = os.read(read_fd, CHUNK_SIZE)
@@ -446,6 +449,11 @@ class FifoManager:
                     bus.publish(topic, {"data": text})
             except Exception:
                 pass
+            if selector is not None:
+                try:
+                    selector.close()
+                except Exception:  # noqa: BLE001
+                    pass
             for fd in (read_fd, keepalive_fd):
                 if fd >= 0:
                     try:
