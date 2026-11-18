@@ -10453,8 +10453,15 @@ async def create_inbox_message_endpoint(
     error: Optional[str] = None
     if outcome is not None:
         delivery_value = _INBOX_DELIVERY_VALUES[outcome[0]]
-        if outcome[0] in (DeliveryOutcome.FAILED, DeliveryOutcome.UNCERTAIN):
+        if outcome[0] == DeliveryOutcome.FAILED:
             error = outcome[1] or outcome[0].value
+        elif outcome[0] == DeliveryOutcome.UNCERTAIN:
+            # Some or all of the text may be in the terminal: lead with that, so
+            # the sender checks before it sends the message again.
+            error = (
+                f"May have been delivered: {outcome[1] or outcome[0].value}. "
+                "Check the receiver's terminal before you send it again."
+            )
     elif delivery.done():
         # The attempt left this message alone, or raised (logged above).
         delivery_value = "queued"
