@@ -285,6 +285,44 @@ def test_data_mount_never_allows_home(sandbox) -> None:
     assert not (root / "etc" / "cao-box").exists()
 
 
+@pytest.mark.parametrize(
+    ("key", "message"),
+    [
+        ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey comment", ""),
+        ("-----BEGIN OPENSSH PRIVATE KEY-----", "never a private key"),
+        ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey\nssh-rsa AAAA", "one public key line"),
+        ("command=\"x\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey", "unsupported OpenSSH key type"),
+        ("ssh-dss AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey", "unsupported OpenSSH key type"),
+    ],
+)
+def test_box_ssh_public_key_validation(sandbox, key, message) -> None:
+    root = make_root(sandbox.root)
+    arm_stubs(sandbox)
+    result = sandbox.run(
+        "bootstrap.sh", "--dry-run", "--root", str(root), **{**SETTINGS, "BOX_SSH_PUBLIC_KEY": key}
+    )
+    if message:
+        assert result.returncode == 1
+        assert message in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert "install .ssh (0700) and authorized_keys (0600)" in result.stdout
+
+
+def test_box_ssh_public_key_is_installed_once_with_safe_modes(sandbox) -> None:
+    root = make_root(sandbox.root)
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+    key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey laptop"
+    settings = {**SETTINGS, "BOX_SSH_PUBLIC_KEY": key}
+    for _ in range(2):
+        result = sandbox.run("bootstrap.sh", "--root", str(root), **settings)
+        assert result.returncode == 0, result.stderr
+    authorized_keys = root / "home" / "cao-herdr" / ".ssh" / "authorized_keys"
+    assert authorized_keys.read_text(encoding="utf-8") == key + "\n"
+    assert mode(authorized_keys) == 0o600
+    assert mode(authorized_keys.parent) == 0o700
+
+
 def test_a_test_hook_with_dry_run_is_allowed(sandbox) -> None:
     root = make_root(sandbox.root)
     arm_stubs(sandbox)

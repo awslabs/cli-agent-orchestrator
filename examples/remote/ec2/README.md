@@ -195,6 +195,7 @@ BOX_USER=cao-herdr
 BOX_UID=1001                  # 1000-59999 (a macOS uid such as 501 is refused); pick one and never change it
 BOX_HOME=/home/cao-herdr
 DATA_MOUNT=/home/cao-herdr
+BOX_SSH_PUBLIC_KEY=ssh-ed25519 <base64-from-your-public-key> <optional-comment>
 DATA_VOLUME_ID=<vol-id>
 HERDR_VERSION=<laptop-herdr-version>
 HERDR_SHA256=<sha256 of herdr-linux-aarch64>
@@ -223,6 +224,9 @@ writable by group or others, and outside `BOX_HOME`. `bootstrap.sh` also
 refuses to run for real if any `BOX_TEST_*` variable is set (those are hooks
 for its dry-run tests).
 
+At the end, it prints `HOST KEY: ssh-ed25519 AAAA…`, with the host-key comment
+stripped. Pin that public line in the laptop's `known_hosts` before connecting.
+
 The data-volume step formats **only** a disk that matches `DATA_VOLUME_ID`'s
 NVMe serial, is a whole disk, isn't the root disk, has no partitions, holders
 or mounts, has no signatures (`wipefs -n` is empty and `blkid -p` exits 2),
@@ -230,8 +234,12 @@ or mounts, has no signatures (`wipefs -n` is empty and `blkid -p` exits 2),
 A disk that already has ext4 or xfs is mounted as it is. Leave the flag off
 on later runs.
 
-Then add your laptop's **public** key to `/home/cao-herdr/.ssh/authorized_keys`
-(mode 0600, owned by `cao-herdr`).
+Set `BOX_SSH_PUBLIC_KEY` to the one line from your laptop's public key. On the
+box, `bootstrap.sh` installs it as `cao-herdr`, creates `~/.ssh` with mode
+0700 and `authorized_keys` with mode 0600, and does not duplicate it on a
+re-run. It accepts only one normal OpenSSH public-key line, never options or
+a private key. As a fallback, add the public key by hand as `cao-herdr`;
+never let root write in the box user's home.
 
 ### 7. Connect the laptop
 

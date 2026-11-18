@@ -30,6 +30,7 @@
 #   DATA_DEVICE     only a cross-check: must resolve to the same disk.
 #   DATA_MOUNT      where the volume is mounted. Default: BOX_HOME itself;
 #                   never /home, which would hide ubuntu's home.
+#   BOX_SSH_PUBLIC_KEY  one OpenSSH public key line for the box user (optional).
 #   INSTALL_DOCKER  yes to install Docker and add BOX_USER to the docker
 #                   group. Default no. The docker group is root-equivalent.
 #   BACKUP_S3_URI, BACKUP_KMS_KEY_ARN   nightly backup target and its key.
@@ -173,7 +174,7 @@ fi
 log "OS: ubuntu 24.04 aarch64"
 
 # >>> settings-file
-SETTING_NAMES=" BOX_USER BOX_UID BOX_HOME HERDR_VERSION HERDR_SHA256 CAO_REF DATA_VOLUME_ID DATA_DEVICE \
+SETTING_NAMES=" BOX_USER BOX_UID BOX_HOME HERDR_VERSION HERDR_SHA256 CAO_REF DATA_VOLUME_ID DATA_DEVICE BOX_SSH_PUBLIC_KEY \
 DATA_MOUNT INSTALL_DOCKER BACKUP_S3_URI BACKUP_KMS_KEY_ARN CAO_REPO GH_VERSION AWS_CLI_VERSION \
 AWS_CLI_SHA256 SAM_VERSION SAM_SHA256 YAZI_VERSION YAZI_SHA256 HELIX_VERSION HELIX_SHA256 UV_VERSION UV_SHA256 "
 # read_settings FILE: set the known settings from FILE. FILE is parsed line by
@@ -189,6 +190,11 @@ read_settings() {
   fi
   while IFS= read -r line || [ -n "$line" ]; do
     n=$((n + 1))
+    if [[ "$line" =~ ^BOX_SSH_PUBLIC_KEY=(.*)$ ]]; then
+      key="BOX_SSH_PUBLIC_KEY"
+      value="${BASH_REMATCH[1]}"
+      [[ -n "$value" ]] || die "${file} line ${n}: BOX_SSH_PUBLIC_KEY must be one OpenSSH public key line"
+    else
     line="${line%%#*}"
     line="${line%"${line##*[![:space:]]}"}"
     [ -n "$line" ] || continue
@@ -196,6 +202,7 @@ read_settings() {
       || die "${file} line ${n}: expected KEY=VALUE, with only letters, digits and . _ : / @ + , = - in the value"
     key="${BASH_REMATCH[1]}"
     value="${BASH_REMATCH[2]}"
+    fi
     case "$SETTING_NAMES" in
       *" ${key} "*) ;;
       *) die "${file} line ${n}: ${key} is not a bootstrap setting; refusing" ;;
@@ -233,6 +240,7 @@ case "$BOX_HOME" in */|*/../*|*/..) die "BOX_HOME must not be /, end in /, or co
 DATA_VOLUME_ID="${DATA_VOLUME_ID:-}"
 DATA_DEVICE="${DATA_DEVICE:-}"
 DATA_MOUNT="${DATA_MOUNT:-$BOX_HOME}"
+BOX_SSH_PUBLIC_KEY="${BOX_SSH_PUBLIC_KEY:-}"
 if [ -n "$DATA_VOLUME_ID" ]; then
   [[ "$DATA_VOLUME_ID" =~ ^vol-[0-9a-f]{17}$ ]] || die "DATA_VOLUME_ID looks like vol- and 17 hex characters"
 elif [ -n "$DATA_DEVICE" ]; then
@@ -240,6 +248,20 @@ elif [ -n "$DATA_DEVICE" ]; then
 fi
 if ! [[ "$DATA_MOUNT" =~ $PATH_RE ]] || [ "$DATA_MOUNT" = "/" ] || [ "$DATA_MOUNT" = "/home" ]; then
   die "DATA_MOUNT must be an absolute path other than / or /home"
+fi
+if [ -n "$BOX_SSH_PUBLIC_KEY" ]; then
+  [[ "$BOX_SSH_PUBLIC_KEY" != *$'\n'* && "$BOX_SSH_PUBLIC_KEY" != *"PRIVATE KEY"* ]] \
+    || die "BOX_SSH_PUBLIC_KEY must be one public key line, never a private key"
+  read -r ssh_key_type ssh_key_data ssh_key_comment <<< "$BOX_SSH_PUBLIC_KEY"
+  case "$ssh_key_type" in
+    ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-rsa|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) ;;
+    *) die "BOX_SSH_PUBLIC_KEY has an unsupported OpenSSH key type" ;;
+  esac
+  [[ "$ssh_key_data" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] \
+    || die "BOX_SSH_PUBLIC_KEY must contain base64 key data"
+  [ -n "$ssh_key_comment" ] || :
+  [[ "$BOX_SSH_PUBLIC_KEY" != *" "* || "$BOX_SSH_PUBLIC_KEY" == "$ssh_key_type $ssh_key_data"* ]] \
+    || die "BOX_SSH_PUBLIC_KEY must not have an options prefix"
 fi
 INSTALL_DOCKER="${INSTALL_DOCKER:-no}"
 case "$INSTALL_DOCKER" in yes|no) ;; *) die "INSTALL_DOCKER is yes or no" ;; esac
@@ -381,6 +403,7 @@ put_home_file() {
 # step changes the box. Steps 2 and 7 check again just before they act.
 home_paths=("$HOME_DIR/.config/herdr/config.toml" "$HOME_DIR/.aws/cli-agent-orchestrator/settings.json" \
             "$HOME_DIR/.claude/settings.json")
+if [ -n "$BOX_SSH_PUBLIC_KEY" ]; then home_paths+=("$HOME_DIR/.ssh" "$HOME_DIR/.ssh/authorized_keys"); fi
 if system_step; then home_paths+=("$BOX_HOME/.local/bin"); fi
 no_links "${home_paths[@]}"
 
@@ -810,6 +833,24 @@ claude_settings="$HOME_DIR/.claude/settings.json"
 put_home_file claude "$claude_settings" 0600 "" config/claude-settings.box.json.example \
   < "$HERE/config/claude-settings.box.json.example"
 
+if [ -n "$BOX_SSH_PUBLIC_KEY" ]; then
+  step "7a. install the box SSH public key"
+  ssh_dir="$HOME_DIR/.ssh"
+  authorized_keys="$ssh_dir/authorized_keys"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '[dry-run] would, as %s: install .ssh (0700) and authorized_keys (0600) without duplicating BOX_SSH_PUBLIC_KEY\n' "$BOX_USER"
+  elif system_step; then
+    runuser -u "$BOX_USER" -- env HOME="$BOX_HOME" PATH="$USER_PATH" bash -c \
+      'install -d -m 0700 "$2"; touch "$3"; chmod 0600 "$3"; grep -qxF -- "$1" "$3" || printf "%s\n" "$1" >> "$3"' \
+      box-key "$BOX_SSH_PUBLIC_KEY" "$ssh_dir" "$authorized_keys"
+  else
+    install -d -m 0700 "$ssh_dir"
+    touch "$authorized_keys"
+    chmod 0600 "$authorized_keys"
+    grep -qxF -- "$BOX_SSH_PUBLIC_KEY" "$authorized_keys" || printf '%s\n' "$BOX_SSH_PUBLIC_KEY" >> "$authorized_keys"
+  fi
+fi
+
 # ------------------------------------------------------- 8. scripts + units
 step "8. helper scripts and systemd units (enabled, NOT started)"
 for f in backup.sh restore.sh bin/lib-cao-box.sh bin/box-session-name.sh bin/herdr-start.sh bin/herdr-clean-layout.sh \
@@ -855,3 +896,8 @@ Next steps (you run these; see README.md):
   4. On the laptop: herdr machine add <ssh-host> --remote-session <session> --label cao-box
      (answer No if it offers to stop the remote server)
 EOF
+host_key_file="${ROOT}/etc/ssh/ssh_host_ed25519_key.pub"
+if [ -r "$host_key_file" ]; then
+  host_key="$(awk '$1 == "ssh-ed25519" && $2 ~ /^[A-Za-z0-9+/]+={0,2}$/ { print $1 " " $2; exit }' "$host_key_file")"
+  [ -n "$host_key" ] && printf 'HOST KEY: %s\n' "$host_key"
+fi
