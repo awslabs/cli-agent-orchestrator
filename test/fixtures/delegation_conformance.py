@@ -28,6 +28,7 @@ class DelegationAdapter(EngineAdapter):
         self.client = None
         self.reprobe = False
         self.exclude = False
+        self.real_terminal_metadata_keys = None
 
     def configure(self, **kwargs):
         super().configure(**kwargs)
@@ -115,6 +116,7 @@ class DelegationAdapter(EngineAdapter):
                     ["*"],
                     delegate_tools=["*"],
                 )
+                self.real_terminal_metadata_keys = frozenset(get_terminal_metadata("a1b2c3d4"))
                 backend.session_exists.return_value = not options.get("new_session", False)
                 backend.session_exists_strict.return_value = not options.get("new_session", False)
                 probe = Mock(
@@ -170,13 +172,46 @@ class DelegationAdapter(EngineAdapter):
         patch.setattr(session_service, "create_terminal", create)
         from cli_agent_orchestrator.clients.database import get_terminal_metadata
 
+        def worker_metadata(terminal_id):
+            terminal = self.terminal
+            metadata = {
+                "id": terminal_id,
+                "tmux_session": terminal.session_name,
+                "tmux_window": terminal.name,
+                "provider": self.provider,
+                "agent_profile": terminal.agent_profile,
+                "description": None,
+                "model": terminal.model,
+                "model_honored": terminal.model_honored,
+                "ephemeral": False,
+                "working_directory": "/workspace",
+                "allowed_tools": None,
+                "delegate_tools": None,
+                "shell_command": None,
+                "caller_id": "a1b2c3d4",
+                "engine": "v2" if self.provider == "kiro_cli" else None,
+                "provider_variant": None,
+                "group": None,
+                "metadata": None,
+                "deferred_init_failure": None,
+                "initial_delivery": {"state": "pending"},
+                "deferred_init_external_owner": False,
+                "deferred_init_runtime_reclaimed": False,
+                "session_incarnation_id": None,
+                # The fake Kiro initialization accepts the identity before it
+                # dispatches the initial message.
+                "identity_verified": True if self.provider == "kiro_cli" else None,
+                "last_active": terminal.last_active,
+            }
+            return metadata
+
         patch.setattr(
             terminal_service,
             "get_terminal_metadata",
             lambda tid: (
                 get_terminal_metadata(tid)
                 if tid == "a1b2c3d4" and self.reprobe
-                else {"provider": self.provider, "engine": None}
+                else worker_metadata(tid)
             ),
         )
         patch.setattr(
