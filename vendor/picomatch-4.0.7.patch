@@ -1,6 +1,6 @@
 --- a/lib/parse.js
 +++ b/lib/parse.js
-@@ -139,26 +139,20 @@
+@@ -139,26 +139,46 @@
    return value.replace(/\\(.)/g, '$1');
  };
 
@@ -16,19 +16,41 @@
 -      if (!char || a !== char.repeat(a.length) || b !== char.repeat(b.length)) {
 -        continue;
 -      }
--
++const normalizeQuotedLiteral = (branch, options) => {
++  let quoted = false;
++  let value = '';
++  for (const ch of branch) {
++    if (ch === '"') {
++      quoted = !quoted;
++      if (options.keepQuotes === true) value += ch;
++    } else {
++      // Escapes can denote regex syntax, not just literal characters.
++      if (ch === '\\' || (!quoted && !isPlainBranch(ch))) return;
++      value += ch;
++    }
++  }
++  if (!quoted) return value;
++};
+
 -      if (a === b || a.startsWith(b) || b.startsWith(a)) {
 -        return true;
 -      }
--    }
--  }
--
--  return false;
 +const hasLiteralOverlap = (branches, options) => {
 +  const ignoreCase = options.flags ? options.flags.includes('i') : options.nocase;
-+  const values = branches.map(normalizeSimpleBranch).filter(Boolean)
-+    .map(value => ignoreCase ? value.toUpperCase() : value);
-+
++  const hasQuotes = branches.some(branch => branch.includes('"'));
++  const values = [];
++  for (const branch of branches) {
++    const literal = hasQuotes
++      ? normalizeQuotedLiteral(branch, options)
++      : normalizeSimpleBranch(branch);
++    if (!literal) {
++      if (hasQuotes) return true;
++      continue;
+     }
++    values.push(ignoreCase ? literal.toUpperCase() : literal);
+   }
+
+-  return false;
 +  // A literal and all its extensions are adjacent in lexicographic order.
 +  const hasPrefix = words => words.sort().some((word, i, sorted) =>
 +    i > 0 && word.startsWith(sorted[i - 1]));
@@ -41,7 +63,7 @@
  };
 
  const parseRepeatedExtglob = (pattern, requireEnd = true) => {
-@@ -270,6 +264,74 @@
+@@ -270,6 +290,74 @@
    return chars;
  };
 
@@ -116,7 +138,7 @@
  const repeatedExtglobRecursion = pattern => {
    let depth = 0;
    let value = pattern.trim();
-@@ -300,7 +362,7 @@
+@@ -300,7 +388,7 @@
      if (
        branches.some(branch => branch === '') ||
        branches.some(branch => /^[*?]+$/.test(branch)) ||
@@ -125,7 +147,7 @@
      ) {
        return { risky: true };
      }
-@@ -343,6 +405,13 @@
+@@ -343,6 +431,13 @@
        : { risky: true };
    }
 
@@ -139,7 +161,69 @@
    return { risky: false };
  };
 
-@@ -565,6 +634,12 @@
+@@ -539,7 +634,51 @@
+   const extglobClose = token => {
+     const literal = input.slice(token.startIndex, state.index + 1);
+     const body = input.slice(token.startIndex + 2, state.index);
+-    const analysis = analyzeRepeatedExtglob(body, opts);
++    let analysis = analyzeRepeatedExtglob(body, opts);
++    if ((analysis.collapse || analysis.risky) && body.includes('[') &&
++        (token.type === 'plus' || token.type === 'star')) {
++      const parts = tokens.slice(token.tokensIndex + 2);
++      for (const part of parts) {
++        if (part.type !== 'bracket') continue;
++        const source = part.value;
++        const charClass = part.charClass || source;
++        // Unicode-set classes may match strings, not just single characters.
++        if ((opts.flags || '').includes('v')) {
++          analysis = { risky: true };
++          break;
++        }
++        const simple = !opts.bash && parts.length === 2 &&
++          parts.some(t => t.type === 'star' && t.value === '*' && t.output === star) &&
++          charClass.startsWith('[') && charClass.endsWith(']');
++        if (!simple && !analysis.collapse) break;
++        try {
++          // Use the parser's actual class, including ranges and platform options.
++          const member = new RegExp(`^(?:${charClass})$`, (opts.flags || '').replace(/[gy]/g, ''));
++          const separators = opts.windows ? ['/', '\\'] : ['/'];
++          if (part.charClass && separators.some(s => charClass.includes(s) && !member.test(s))) {
++            analysis = { risky: true };
++            break;
++          }
++          if (!member.test('/') && !(opts.windows && member.test('\\'))) {
++            if (simple) analysis = { collapse: true };
++            continue;
++          }
++        } catch {
++          analysis = { risky: true };
++          break;
++        }
++
++        analysis = { risky: true };
++        if (simple) {
++          // For a one-character class C and segment alphabet A, (A* C)+ = (A ∪ C)* C.
++          // The two alphabet choices are disjoint. The mirror identity covers (C A*)+.
++          const union = `(?:${QMARK}|(?=${SLASH_LITERAL})${charClass})*?`;
++          const flat = parts[0] === part ? source + union : union + source;
++          analysis.safeOutput = token.type === 'plus' ? flat : `(?:${flat})?`;
++        }
++        break;
++      }
++    }
+
+     if ((token.type === 'plus' || token.type === 'star') && analysis.risky) {
+       const safeOutput = analysis.safeOutput
+@@ -549,7 +688,7 @@
+
+       open.type = 'text';
+       open.value = literal;
+-      open.output = safeOutput || utils.escapeRegex(literal);
++      open.output = safeOutput || utils.escapeRegex(literal.replace(/\\/g, '\\\\'));
+
+       for (let i = token.tokensIndex + 1; i < tokens.length; i++) {
+         tokens[i].value = '';
+@@ -565,6 +704,12 @@
        return;
      }
 
@@ -152,6 +236,14 @@
      let output = token.close + (opts.capture ? ')' : '');
      let rest;
 
+@@ -869,6 +1014,7 @@
+       }
+
+       // when the user specifies nothing, try to match both
++      prev.charClass = prev.value;
+       prev.value = `(${capture}${escaped}|${prev.value})`;
+       state.output += prev.value;
+       continue;
 --- a/package.json
 +++ b/package.json
 @@ -1,7 +1,7 @@
@@ -161,7 +253,7 @@
 -  "version": "4.0.7",
 +  "name": "cao-picomatch-guard",
 +  "description": "CAO backport of picomatch 4.0.7 with repeated-extglob guards",
-+  "version": "4.0.7-cao.1",
++  "version": "4.0.7-cao.2",
    "homepage": "https://github.com/micromatch/picomatch",
    "author": "Jon Schlinkert (https://github.com/jonschlinkert)",
    "funding": "https://github.com/sponsors/jonschlinkert",

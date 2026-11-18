@@ -31,7 +31,7 @@ const EXACT = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/;
 
 // The shared matcher check verifies this archive's path, version, license and SHA-512.
 const matcherName = 'cao-picomatch-guard';
-const matcherArchive = 'file:../../../vendor/cao-picomatch-guard-4.0.7-cao.1.tgz';
+const matcherArchive = 'file:../../../vendor/cao-picomatch-guard-4.0.7-cao.2.tgz';
 const directSpecs = Object.values({...manifest.dependencies, ...manifest.devDependencies});
 const localDirs = directSpecs.filter(spec => spec.startsWith('file:') && spec !== matcherArchive);
 const localPackages = new Map(localDirs.map(spec => {
