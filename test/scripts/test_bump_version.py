@@ -299,7 +299,8 @@ class TestTheBumpPassesThePublishCheck:
 
     def test_a_drifting_lock_leaves_the_whole_tree_as_it_was(self, tree, monkeypatch, capsys):
         originals = {
-            rel: (tree / rel).read_text("utf-8") for rel in ("pyproject.toml", "uv.lock", FEATURE)
+            rel: (tree / rel).read_text("utf-8")
+            for rel in ("pyproject.toml", "uv.lock", FEATURE, "CHANGELOG.md")
         }
 
         def re_resolves(text: str) -> str:
@@ -341,7 +342,8 @@ class TestMainRestoresOnAnyException:
     )
     def test_every_snapshotted_file_is_restored_on_any_exception(self, tree, monkeypatch, exc):
         originals = {
-            rel: (tree / rel).read_text("utf-8") for rel in ("pyproject.toml", "uv.lock", FEATURE)
+            rel: (tree / rel).read_text("utf-8")
+            for rel in ("pyproject.toml", "uv.lock", FEATURE, "CHANGELOG.md")
         }
         runner = _RaisingRunner(exc)
         real = bv.update_uv_lock
