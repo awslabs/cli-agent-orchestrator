@@ -128,6 +128,22 @@ def test_failure_in_any_pre_send_step_is_not_sent(seams, step):
     _assert_nothing_typed(seams)
 
 
+@pytest.mark.parametrize("step", sorted(_PRE_SEND_STEPS))
+def test_value_error_in_a_pre_send_step_is_not_sent(seams, step):
+    """Only "metadata lookup found no row" stays a ValueError; any other one typed nothing."""
+    # Arrange
+    cause = ValueError(f"{step} rejected its input")
+    _PRE_SEND_STEPS[step](seams).side_effect = cause
+
+    # Act
+    with pytest.raises(_not_sent()) as raised:
+        terminal_service.dispatch_input("t1", "hello")
+
+    # Assert
+    assert raised.value.__cause__ is cause
+    _assert_nothing_typed(seams)
+
+
 def test_redelivery_bookkeeping_failure_is_not_sent(seams):
     cause = RuntimeError("redelivery mark broke")
     seams.provider.mark_redelivery_received.side_effect = cause
