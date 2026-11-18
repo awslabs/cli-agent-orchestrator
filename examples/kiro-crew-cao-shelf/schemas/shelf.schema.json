@@ -37,6 +37,12 @@
       "type": "boolean",
       "description": "true when CAO is unreachable and this is the last good snapshot."
     },
+    "interval_seconds": {
+      "type": "number",
+      "minimum": 3,
+      "maximum": 60,
+      "description": "The poll_seconds setting: the page asks for the shelf at this interval (5 s when absent)."
+    },
     "snapshot_age_seconds": {
       "type": "integer",
       "minimum": 0,

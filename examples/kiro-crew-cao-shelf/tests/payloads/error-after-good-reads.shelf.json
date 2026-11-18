@@ -34,6 +34,7 @@
   },
   "generated_at": "2026-11-15T12:03:15Z",
   "history_total": 20,
+  "interval_seconds": 5.0,
   "last_good_at": "2026-11-15T12:00:10Z",
   "revision": 4,
   "sessions": [

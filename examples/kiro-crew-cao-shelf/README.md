@@ -559,7 +559,7 @@ folder (file mode 0600). A change may name any subset of the settings; a change 
 | Setting | Default | Range | Meaning |
 |---|---|---|---|
 | `cao_url` | `http://127.0.0.1:9889` | `http://` and host `127.0.0.1`, `localhost` or `::1` | Where CAO is. Anything else is refused with `forbidden_host`. |
-| `poll_seconds` | 5 | 3 to 60 | How often the backend and the page refresh. |
+| `poll_seconds` | 5 | 3 to 60 | How often the backend reads CAO and the page asks the backend (the shelf carries it as `interval_seconds`). |
 | `warm_hours` | 1 | 0.25 to 24 | Idle under this is "warm". |
 | `stale_hours` | 48 | 2 to 720 | Idle at or above this is Stale. |
 | `persist_history` | true | on or off | Keep the optional closed-helper ledger (see Privacy). |

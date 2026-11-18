@@ -50,6 +50,7 @@ def stack(tmp_path: Path) -> Iterator[Stack]:
 def strip(shelf: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(shelf)
     out.pop("revision", None)
+    out.pop("interval_seconds", None)  # the served poll setting, not part of the fixture days
     if "cao" in out:  # the fake CAO is not on 9889
         out["cao"] = dict(out["cao"], base_url="http://127.0.0.1:9889")
     return out

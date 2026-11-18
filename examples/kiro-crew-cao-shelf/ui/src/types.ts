@@ -112,6 +112,8 @@ export interface ShelfResponse {
   last_good_at: string | null
   /** true when CAO is unreachable and this is the last good snapshot. */
   stale_snapshot: boolean
+  /** The poll_seconds setting: the page asks for the shelf at this interval (5 s when absent). */
+  interval_seconds?: number
   /** Age of the snapshot at the moment of this answer. It is NOT refreshed by an `unchanged` answer, so the page must not print it: it shows the age from last_good_at against its own clock. */
   snapshot_age_seconds: number
   cao: Cao

@@ -31,7 +31,7 @@ describe('useShelf', () => {
     setHidden(false)
   })
 
-  it('polls every 5 s and sends ?since= with the last revision', async () => {
+  it('polls every 5 s when the backend sends no interval, and sends ?since= with the last revision', async () => {
     const b = mockBackend({ 'GET /shelf': () => ({ body: busy() }) })
     render(<Probe onState={(s) => (last = s)} />)
     await tick(10)
@@ -41,6 +41,20 @@ describe('useShelf', () => {
     expect(b.calls.at(-1)!.path).toBe('/shelf?since=1')
     await tick(5000)
     expect(b.calls).toHaveLength(3)
+  })
+
+  it('polls at the interval_seconds the backend sends, bounded to 3..60 s', async () => {
+    for (const [sent, expected] of [[12, 12000], [1, 3000], [600, 60000]] as const) {
+      const b = mockBackend({ 'GET /shelf': () => ({ body: { ...busy(), interval_seconds: sent } }) })
+      const view = render(<Probe onState={(s) => (last = s)} />)
+      await tick(10)
+      expect(b.calls).toHaveLength(1)
+      await tick(expected - 20)
+      expect(b.calls).toHaveLength(1)
+      await tick(20)
+      expect(b.calls).toHaveLength(2)
+      view.unmount()
+    }
   })
 
   it('keeps the data when the backend answers unchanged', async () => {

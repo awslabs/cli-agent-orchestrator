@@ -61,6 +61,7 @@ def rig(tmp_path: Path) -> Rig:
 def strip(shelf: Dict[str, Any]) -> Dict[str, Any]:
     out = copy.deepcopy(shelf)
     out.pop("revision", None)
+    out.pop("interval_seconds", None)  # the served poll setting, not part of the fixture days
     return out
 
 
@@ -256,6 +257,17 @@ def test_revision_moves_when_the_clock_crosses_a_tier_threshold(tmp_path: Path) 
     r.now += 50 * 3600  # parked sessions become stale
     r.tick()
     assert r.poller.shelf(since=first)["revision"] > first
+
+
+def test_the_shelf_tells_the_page_how_often_to_poll(rig: Rig) -> None:
+    rig.settings["poll_seconds"] = 12
+    rig.ticks(2)
+    first = rig.poller.shelf()
+    assert first["interval_seconds"] == 12
+    rig.settings["poll_seconds"] = 30
+    rig.tick()
+    changed = rig.poller.shelf(since=first["revision"])  # a new interval is not "unchanged"
+    assert changed.get("unchanged") is None and changed["interval_seconds"] == 30
 
 
 # ---------------------------------------------------------------------------------- failures

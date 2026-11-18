@@ -4,7 +4,15 @@ import { type ShelfError, toShelfError, useShelfApi } from '../api'
 import type { ShelfResponse, Unchanged } from '../types'
 
 export const POLL_MS = 5000
+const MIN_POLL_MS = 3000
+const MAX_POLL_MS = 60000
 const MAX_BACKOFF_MS = 60000
+
+/** The poll interval the backend sent (the poll_seconds setting), bounded to 3..60 s; 5 s when absent. */
+export function pollMs(intervalSeconds: number | undefined): number {
+  if (typeof intervalSeconds !== 'number' || !Number.isFinite(intervalSeconds)) return POLL_MS
+  return Math.min(MAX_POLL_MS, Math.max(MIN_POLL_MS, intervalSeconds * 1000))
+}
 
 export interface ShelfState {
   data: ShelfResponse | null
@@ -29,6 +37,7 @@ export function useShelf(): ShelfState {
   const [loading, setLoading] = useState(true)
   const revision = useRef<number | null>(null)
   const failures = useRef(0)
+  const interval = useRef(POLL_MS)
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const ctrl = useRef<AbortController | null>(null)
   const loop = useRef<(() => void) | null>(null)
@@ -40,7 +49,8 @@ export function useShelf(): ShelfState {
 
     const schedule = () => {
       if (dead || !visible()) return
-      const wait = failures.current === 0 ? POLL_MS : Math.min(MAX_BACKOFF_MS, POLL_MS * 2 ** failures.current)
+      const every = interval.current
+      const wait = failures.current === 0 ? every : Math.min(MAX_BACKOFF_MS, every * 2 ** failures.current)
       timer.current = setTimeout(run, wait)
     }
     const run = async () => {
@@ -56,6 +66,7 @@ export function useShelf(): ShelfState {
         setError(null)
         if (!isUnchanged(r)) {
           revision.current = r.revision
+          interval.current = pollMs(r.interval_seconds)
           setData(r)
           setReceivedAt(Date.now())
         }

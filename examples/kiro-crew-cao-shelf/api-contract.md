@@ -88,6 +88,9 @@ test suites in one change.
   It is used for ordering. The page does not display it: it computes ages from `last_active`
   against its own clock (the backend's `generated_at` moved on by elapsed page time), so ages keep
   moving while the backend answers "unchanged".
+* **`interval_seconds`** is the `poll_seconds` setting; the page asks for the shelf at that interval
+  (bounded to 3..60 s, 5 s when absent). It is in the change signature, so a new setting reaches the
+  page as a full answer.
 * **`revision`** changes only when the shelf changes in a way a viewer would notice. The clock
   alone never changes it (`generated_at`, `last_good_at`, `snapshot_age_seconds` and every
   `idle_seconds` are left out of the change signature); a threshold the clock crosses (stale, warm) shows up as a tier or

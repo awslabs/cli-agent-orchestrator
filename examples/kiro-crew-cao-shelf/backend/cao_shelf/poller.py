@@ -620,6 +620,9 @@ class Poller:
             self._store(shelf)
 
     def _store(self, shelf: Dict[str, Any]) -> None:
+        # the page polls at this interval; it is in the signature, so a new setting reaches the
+        # page as a full answer and not as "unchanged"
+        shelf["interval_seconds"] = float(self._settings()["poll_seconds"])
         signature = tiering.change_signature(shelf)
         if signature != self._signature:
             self._signature = signature
