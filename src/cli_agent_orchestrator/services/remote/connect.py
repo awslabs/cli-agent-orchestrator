@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import re
+import shlex
 import tempfile
 import time
 from pathlib import Path
@@ -20,6 +21,7 @@ Tell = Callable[[str], None]
 MARKER = "# >>> cao remote: {host} (managed by CAO; edits are replaced) >>>"
 END_MARKER = "# <<< cao remote: {host} (managed by CAO; edits are replaced) <<<"
 HOST_KEY_RE = re.compile(r"^ssh-ed25519 ([A-Za-z0-9+/]+={0,2})$")
+PUBLIC_KEY_RE = re.compile(r"^ssh-ed25519 ([A-Za-z0-9+/]+={0,2})(?: [^\r\n]+)?$")
 
 
 class ConnectError(ValueError):
@@ -128,6 +130,21 @@ def parse_host_key(value: str) -> str:
     return lines[0]
 
 
+def parse_public_key(value: str) -> str:
+    """Accept exactly one syntactically valid ed25519 public-key line."""
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise ConnectError("SSH public key must be exactly one ed25519 public-key line")
+    match = PUBLIC_KEY_RE.fullmatch(lines[0])
+    if not match:
+        raise ConnectError("SSH public key must be an ed25519 public-key line")
+    try:
+        base64.b64decode(match.group(1), validate=True)
+    except ValueError as exc:
+        raise ConnectError("SSH public key must be an ed25519 public-key line") from exc
+    return lines[0]
+
+
 def _command_id(result: RunResult) -> str:
     try:
         return str(json.loads(result.stdout)["Command"]["CommandId"])
@@ -208,6 +225,71 @@ def ensure_host_key(box: RemoteBox, runner: Runner, home: Path, rekey: bool = Fa
     return True
 
 
+def install_public_key(box: RemoteBox, runner: Runner, home: Path) -> None:
+    """Install this laptop's public key using a bounded, idempotent Run Command."""
+    path = home / ".ssh" / f"cao-{box.name}_ed25519.pub"
+    if not path.exists():
+        raise ConnectError(f"SSH public key {path.name} is missing")
+    public_key = parse_public_key(path.read_text(encoding="utf-8"))
+    encoded = base64.b64encode(public_key.encode("utf-8")).decode("ascii")
+    script = (
+        "umask 077; mkdir -p ~/.ssh; chmod 700 ~/.ssh; "
+        "touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; "
+        f"key=$(printf %s {encoded} | base64 -d); "
+        'grep -qxF "$key" ~/.ssh/authorized_keys || '
+        "printf '%s\\n' \"$key\" >> ~/.ssh/authorized_keys"
+    )
+    command = f"runuser -u {shlex.quote(box.user)} -- sh -c {shlex.quote(script)}"
+    _run_command(runner, box, command)
+
+
+def remove_ssh_artifacts(box: RemoteBox, home: Path) -> bool:
+    """Remove only a box's marked config blocks and pinned host-key line."""
+    host = f"cao-{box.name}"
+    changed = False
+    config = home / ".ssh" / "config"
+    if config.exists():
+        with config.open(encoding="utf-8", newline="") as handle:
+            original = handle.read()
+        updated = original
+        for managed_host in (host, f"{host}-dash"):
+            pattern = re.compile(
+                rf"(?P<prefix>^|\r?\n){re.escape(MARKER.format(host=managed_host))}\r?\n.*?"
+                rf"{re.escape(END_MARKER.format(host=managed_host))}\r?\n?",
+                re.DOTALL,
+            )
+            updated = pattern.sub(lambda match: match.group("prefix"), updated)
+        if updated != original:
+            _atomic_write(config, updated)
+            changed = True
+    known_hosts = home / ".ssh" / "cao_known_hosts"
+    if known_hosts.exists():
+        with known_hosts.open(encoding="utf-8", newline="") as handle:
+            original = handle.read()
+        updated = re.sub(rf"(?m)^{re.escape(host)} [^\r\n]*(?:\r?\n|$)", "", original)
+        if updated != original:
+            _atomic_write(known_hosts, updated)
+            changed = True
+    return changed
+
+
+def has_ssh_artifacts(box: RemoteBox, home: Path) -> bool:
+    """Return whether this box has managed local SSH artifacts to clean up."""
+    host = f"cao-{box.name}"
+    config = home / ".ssh" / "config"
+    if config.exists():
+        config_text = config.read_text(encoding="utf-8")
+        if any(
+            MARKER.format(host=managed_host) in config_text
+            for managed_host in (host, f"{host}-dash")
+        ):
+            return True
+    known_hosts = home / ".ssh" / "cao_known_hosts"
+    return known_hosts.exists() and any(
+        line.startswith(f"{host} ") for line in known_hosts.read_text(encoding="utf-8").splitlines()
+    )
+
+
 def attach_argv(box: RemoteBox) -> list[str]:
     host = f"cao-{box.name}"
     if box.mode == "herdr":
@@ -266,6 +348,29 @@ def connect(
     if not ask(action):
         return
     ensure_host_key(box, runner, home, rekey)
+    ssh = runner.run(["ssh", "-o", "BatchMode=yes", f"cao-{box.name}", "true"])
+    if ssh.returncode and "publickey" in f"{ssh.stdout}\n{ssh.stderr}".lower():
+        public_path = home / ".ssh" / f"cao-{box.name}_ed25519.pub"
+        if not public_path.exists():
+            tell(f"FIX  ssh key: public key {public_path.name} is missing")
+            return
+        public_key = parse_public_key(public_path.read_text(encoding="utf-8"))
+        tell(f"BOX_SSH_PUBLIC_KEY='{public_key}'")
+        action = f"Install SSH public key for {box.user} through SSM Run Command"
+        tell(action)
+        if not ask(action):
+            return
+        try:
+            install_public_key(box, runner, home)
+        except ConnectError as exc:
+            tell(f"FIX  ssh key: {exc}")
+            return
+        checks = check_box(box, runner, home)
+        for check in checks:
+            if check.name == "ssh":
+                tell(check.rendered())
+                if check.status == "FIX":
+                    return
     if no_attach:
         for line in ready_lines(box):
             tell(line)

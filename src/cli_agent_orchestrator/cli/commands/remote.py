@@ -8,7 +8,12 @@ from pathlib import Path
 import click
 
 from cli_agent_orchestrator.services.remote.checks import check_box, check_json
-from cli_agent_orchestrator.services.remote.connect import ConnectError, connect
+from cli_agent_orchestrator.services.remote.connect import (
+    ConnectError,
+    connect,
+    has_ssh_artifacts,
+    remove_ssh_artifacts,
+)
 from cli_agent_orchestrator.services.remote.registry import (
     RemoteBox,
     RemoteConfigError,
@@ -57,13 +62,21 @@ def list_cmd() -> None:
 
 @remote.command("remove")
 @click.argument("box")
-def remove_cmd(box: str) -> None:
+@click.option("--yes", is_flag=True, help="Approve SSH artifact cleanup without prompting.")
+def remove_cmd(box: str, yes: bool) -> None:
     """Remove a local Remote CAO box registration."""
     try:
-        remove(box)
+        remote_box = load(box)
+        remove(remote_box.name)
     except RemoteConfigError as exc:
         raise click.UsageError(str(exc)) from exc
     click.echo(f"Removed remote box '{box}'.")
+    home = Path.home()
+    if has_ssh_artifacts(remote_box, home):
+        action = f"Remove managed SSH entries for cao-{remote_box.name}"
+        click.echo(action)
+        if yes or click.confirm(f"{action}?", default=False):
+            remove_ssh_artifacts(remote_box, home)
 
 
 @remote.command("check")

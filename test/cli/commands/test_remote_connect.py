@@ -7,13 +7,18 @@ import stat
 from typing import Sequence
 
 import pytest
+from click.testing import CliRunner
 
+from cli_agent_orchestrator.cli.main import cli
 from cli_agent_orchestrator.services.remote.connect import (
     ConnectError,
     attach_argv,
     connect,
     ensure_host_key,
+    install_public_key,
     parse_host_key,
+    parse_public_key,
+    remove_ssh_artifacts,
     update_ssh_config,
 )
 from cli_agent_orchestrator.services.remote.registry import RemoteBox
@@ -174,3 +179,149 @@ def test_canary_is_not_rendered(box, tmp_path, monkeypatch):
     messages: list[str] = []
     connect(box, FakeRunner(), tmp_path, lambda _: False, messages.append, no_attach=True)
     assert canary not in "\n".join(messages)
+
+
+@pytest.mark.parametrize("value", ["not-a-key", "ssh-rsa c2FmZQ==", "ssh-ed25519 !!!", "a\nb"])
+def test_public_key_validation_rejects_non_public_input(value):
+    with pytest.raises(ConnectError, match="public key"):
+        parse_public_key(value)
+
+
+def test_public_key_run_command_uses_base64_and_is_idempotent(box, tmp_path):
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    public = "ssh-ed25519 cHVibGljLWtleQ== workstation"
+    (ssh / "cao-box-1_ed25519.pub").write_text(public, encoding="utf-8")
+    runner = FakeRunner()
+    install_public_key(box, runner, tmp_path)
+    install_public_key(box, runner, tmp_path)
+    commands = [" ".join(argv) for argv in runner.argv if "send-command" in argv]
+    assert len(commands) == 2
+    assert public not in "\n".join(commands)
+    assert "c3NoLWVkMjU1MTkgY0hWaWJHbGpMV3RsZVE9PSB3b3Jrc3RhdGlvbg==" in commands[0]
+    assert "runuser -u" in commands[0]
+    assert "authorized_keys" in commands[0]
+
+
+def test_public_key_denial_prints_key_and_no_consent_does_not_send_command(
+    box, tmp_path, monkeypatch
+):
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    public = "ssh-ed25519 cHVibGljLWtleQ== workstation"
+    (ssh / "cao-box-1_ed25519").write_text("private", encoding="utf-8")
+    (ssh / "cao-box-1_ed25519.pub").write_text(public, encoding="utf-8")
+    runner = FakeRunner()
+
+    def denied(argv, timeout=15.0):
+        result = FakeRunner.run(runner, argv, timeout)
+        if argv[0] == "ssh":
+            return RunResult(255, stderr="Permission denied (publickey).")
+        return result
+
+    monkeypatch.setattr(runner, "run", denied)
+    monkeypatch.setattr("cli_agent_orchestrator.services.remote.connect.check_box", lambda *_: [])
+    messages: list[str] = []
+    connect(
+        box,
+        runner,
+        tmp_path,
+        lambda action: not action.startswith("Install SSH public key"),
+        messages.append,
+        no_attach=True,
+    )
+    assert f"BOX_SSH_PUBLIC_KEY='{public}'" in messages
+    assert not any("authorized_keys" in " ".join(argv) for argv in runner.argv)
+
+
+@pytest.mark.parametrize("status, expected", [("Failed", "failed"), ("TimedOut", "failed")])
+def test_public_key_command_failure_is_clear_fix(box, tmp_path, monkeypatch, status, expected):
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    public = "ssh-ed25519 cHVibGljLWtleQ== workstation"
+    (ssh / "cao-box-1_ed25519").write_text("private", encoding="utf-8")
+    (ssh / "cao-box-1_ed25519.pub").write_text(public, encoding="utf-8")
+    runner = FakeRunner()
+
+    invocation_count = 0
+
+    def result(argv, timeout=15.0):
+        nonlocal invocation_count
+        command = tuple(argv)
+        runner.argv.append(command)
+        if command[0] == "ssh":
+            return RunResult(255, stderr="Permission denied (publickey).")
+        if "send-command" in command:
+            return RunResult(0, json.dumps({"Command": {"CommandId": "cmd-1"}}))
+        if "get-command-invocation" in command:
+            invocation_count += 1
+            if invocation_count == 1:
+                return RunResult(
+                    0,
+                    json.dumps(
+                        {
+                            "Status": "Success",
+                            "StandardOutputContent": "ssh-ed25519 c2FmZS1rZXk=\n",
+                        }
+                    ),
+                )
+            return RunResult(0, json.dumps({"Status": status}))
+        return RunResult(0, "herdr 1.0")
+
+    monkeypatch.setattr(runner, "run", result)
+    monkeypatch.setattr("cli_agent_orchestrator.services.remote.connect.check_box", lambda *_: [])
+    messages: list[str] = []
+    connect(box, runner, tmp_path, lambda _: True, messages.append, no_attach=True)
+    assert any(line == f"FIX  ssh key: SSM Run Command {expected}" for line in messages)
+
+
+def test_remove_ssh_artifacts_preserves_other_blocks_and_is_idempotent(box, tmp_path):
+    update_ssh_config(box, tmp_path)
+    ssh = tmp_path / ".ssh"
+    config = ssh / "config"
+    other = "\nHost personal\n  HostName example.test\n"
+    with config.open("a", encoding="utf-8", newline="") as handle:
+        handle.write(other)
+    known = ssh / "cao_known_hosts"
+    known.write_text(
+        "cao-box-1 ssh-ed25519 c2FmZQ==\nother ssh-ed25519 b3RoZXI=\n", encoding="utf-8"
+    )
+    assert remove_ssh_artifacts(box, tmp_path)
+    assert config.read_text(encoding="utf-8") == other
+    assert known.read_text(encoding="utf-8") == "other ssh-ed25519 b3RoZXI=\n"
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600
+    assert stat.S_IMODE(known.stat().st_mode) == 0o600
+    assert not remove_ssh_artifacts(box, tmp_path)
+
+
+def test_remove_ssh_artifacts_handles_missing_files(box, tmp_path):
+    assert not remove_ssh_artifacts(box, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "input_text", "expected_cleanup"),
+    [
+        (["--yes"], None, True),
+        ([], "n\n", False),
+    ],
+)
+def test_remote_remove_cleanup_requires_consent(
+    box, tmp_path, monkeypatch, arguments, input_text, expected_cleanup
+):
+    calls: list[object] = []
+    monkeypatch.setattr("cli_agent_orchestrator.cli.commands.remote.load", lambda _: box)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.cli.commands.remote.remove", lambda _: calls.append("remove")
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.cli.commands.remote.has_ssh_artifacts", lambda *_: True
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.cli.commands.remote.remove_ssh_artifacts",
+        lambda actual_box, home: calls.append((actual_box, home)),
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.cli.commands.remote.Path.home", lambda: tmp_path)
+    result = CliRunner().invoke(cli, ["remote", "remove", box.name, *arguments], input=input_text)
+    assert result.exit_code == 0
+    assert calls[0] == "remove"
+    assert (len(calls) == 2) is expected_cleanup
