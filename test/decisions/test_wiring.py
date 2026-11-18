@@ -3,6 +3,7 @@
 import asyncio
 from dataclasses import replace
 from datetime import datetime
+from test.fixtures.app_state import app_state_items
 from test.decisions.test_engine import (  # noqa: F401  # pytest fixture, injected by name into the tests below
     setup_engine,
 )
@@ -21,8 +22,8 @@ def handler_path(setup_engine, monkeypatch):
     from cli_agent_orchestrator.plugins import PluginRegistry
 
     engine, req, decider, store, events, settings = setup_engine
-    monkeypatch.setitem(api.app.state._state, "decision_engine", engine)
-    monkeypatch.setitem(api.app.state._state, "plugin_registry", PluginRegistry())
+    monkeypatch.setitem(app_state_items(api.app), "decision_engine", engine)
+    monkeypatch.setitem(app_state_items(api.app), "plugin_registry", PluginRegistry())
     monkeypatch.setattr(api, "_record_job_state", AsyncMock())
     from cli_agent_orchestrator.utils import agent_profiles
 

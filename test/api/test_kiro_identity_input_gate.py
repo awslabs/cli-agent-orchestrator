@@ -44,6 +44,8 @@ from cli_agent_orchestrator.services.agui.handoff_approval import (
     TerminalServiceAnswerDelivery,
 )
 
+from test.fixtures.app_state import app_state_items
+
 _TID = "1e293d67"
 _FAILURE = {"phase": "deferred_init", "kind": "provider_init_error", "untrusted_runtime": True}
 
@@ -420,7 +422,7 @@ def agui_routes(monkeypatch, approvals):
     monkeypatch.delenv("AUTH0_DOMAIN", raising=False)
     monkeypatch.delenv("CAO_AUTH_JWKS_URI", raising=False)
     monkeypatch.setitem(
-        main_module.app.state._state, "approval_bridge", ApprovalBridge(construct=approvals)
+        app_state_items(main_module.app), "approval_bridge", ApprovalBridge(construct=approvals)
     )
 
 

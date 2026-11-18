@@ -5,6 +5,7 @@ import sys
 import threading
 from contextlib import contextmanager
 from pathlib import Path
+from test.fixtures.app_state import app_state_items
 from test.services.test_ephemeral_bind import (  # noqa: F401
     CHILD,
     assert_released,
@@ -79,7 +80,7 @@ def launch_http(release_runtime, monkeypatch):
     from cli_agent_orchestrator.plugins.registry import PluginRegistry
 
     monkeypatch.setenv("CAO_TERMINAL_ID", CALLER)
-    monkeypatch.setitem(main.app.state._state, "plugin_registry", PluginRegistry())
+    monkeypatch.setitem(app_state_items(main.app), "plugin_registry", PluginRegistry())
     monkeypatch.setattr(agent_step, "wait_until_status", AsyncMock(return_value=True))
     monkeypatch.setattr(agent_step, "_wait_for_completion", AsyncMock())
     monkeypatch.setattr(agent_step.frozen_run_memory, "frozen_memory_for", lambda *a: None)
@@ -435,7 +436,7 @@ def askable_decisions(launch_http, tmp_path, monkeypatch):
         ]["state"]
         == "on"
     )
-    monkeypatch.setitem(app.state._state, "decision_engine", engine)
+    monkeypatch.setitem(app_state_items(app), "decision_engine", engine)
     yield req, store
     db.dispose()
 

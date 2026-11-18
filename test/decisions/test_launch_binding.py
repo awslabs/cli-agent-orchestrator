@@ -1,6 +1,7 @@
 """Terminal-layer plan precedence, capability fallback and deferred binding."""
 
 import asyncio
+from test.fixtures.app_state import app_state_items
 from test.decisions.test_engine import (  # noqa: F401  # pytest fixture, injected by name into the tests below
     setup_engine,
 )
@@ -15,7 +16,7 @@ def terminal_path(setup_engine, monkeypatch, tmp_path):
     from cli_agent_orchestrator.services import terminal_service as service
 
     engine, req, decider, store, events, settings = setup_engine
-    monkeypatch.setitem(app.state._state, "decision_engine", engine)
+    monkeypatch.setitem(app_state_items(app), "decision_engine", engine)
     from test.fixtures.terminal_launch import install_launch_stubs
 
     provider, backend, providers = install_launch_stubs(monkeypatch, tmp_path)

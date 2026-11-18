@@ -23,6 +23,8 @@ from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.utils import server_lock
 from cli_agent_orchestrator.utils.server_lock import ServerLockHeldError, acquire_server_lock
 
+from test.fixtures.app_state import app_state_items
+
 
 async def _fake_flow_daemon() -> None:
     """flow_daemon stand-in: create_task needs a real coroutine."""
@@ -98,7 +100,7 @@ async def test_lifespan_holds_the_lock_while_running_and_releases_on_shutdown(
 ) -> None:
     lock_path = tmp_path / "home" / "server.lock"
     monkeypatch.setattr(server_lock, "SERVER_LOCK_FILE", lock_path)
-    monkeypatch.setitem(app.state._state, "server_port", 4321)
+    monkeypatch.setitem(app_state_items(app), "server_port", 4321)
 
     with ExitStack() as stack:
         init_db = _patch_startup_side_effects(stack)
@@ -123,7 +125,7 @@ async def test_lifespan_falls_back_to_configured_port_without_main(
 
     lock_path = tmp_path / "home" / "server.lock"
     monkeypatch.setattr(server_lock, "SERVER_LOCK_FILE", lock_path)
-    monkeypatch.delitem(app.state._state, "server_port", raising=False)
+    monkeypatch.delitem(app_state_items(app), "server_port", raising=False)
     monkeypatch.setattr(api_main, "SERVER_PORT", 6543)
 
     with ExitStack() as stack:

@@ -8,6 +8,7 @@ reads are doubles.
 
 import json
 from datetime import timedelta
+from test.fixtures.app_state import app_state_items
 from test.services.test_ephemeral_bind import (  # noqa: F401
     CHILD,
     assert_released,
@@ -534,7 +535,7 @@ async def test_the_route_deletes_a_kept_child_that_is_working_again(keep, monkey
     from cli_agent_orchestrator.api import main
     from cli_agent_orchestrator.plugins.registry import PluginRegistry
 
-    monkeypatch.setitem(main.app.state._state, "plugin_registry", PluginRegistry())
+    monkeypatch.setitem(app_state_items(main.app), "plugin_registry", PluginRegistry())
     await launch_runtime(release_runtime_of(keep))
     keep.setting()
     keep_service.keep_finished(CHILD, reason="handoff")

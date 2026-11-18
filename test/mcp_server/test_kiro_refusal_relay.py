@@ -2,6 +2,7 @@
 
 import json
 from concurrent.futures import ThreadPoolExecutor
+from test.fixtures.app_state import app_state_items
 from test.providers.kiro_helper_support import operator_home  # noqa: F401
 from test.services.test_ephemeral_service import CALLER, create_store  # noqa: F401
 from test.services.test_kiro_helper_launch import (  # noqa: F401
@@ -33,7 +34,7 @@ pytestmark = pytest.mark.parametrize("create_store", ["file"], indirect=True)
 def helper_http(kiro, monkeypatch):
     monkeypatch.setenv("CAO_TERMINAL_ID", CALLER)
     monkeypatch.setattr(kiro.service.secrets, "token_hex", lambda n: "c" * (2 * n))
-    monkeypatch.setitem(main.app.state._state, "plugin_registry", PluginRegistry())
+    monkeypatch.setitem(app_state_items(main.app), "plugin_registry", PluginRegistry())
     with TestClient(main.app, base_url="http://localhost") as client:
 
         def call(method, url, **kwargs):

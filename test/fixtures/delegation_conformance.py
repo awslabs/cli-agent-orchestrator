@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import datetime
+from test.fixtures.app_state import app_state_items
 from test.fixtures.decision_conformance import EngineAdapter, Observation
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -43,8 +44,8 @@ class DelegationAdapter(EngineAdapter):
         from cli_agent_orchestrator.utils import orchestration as o
 
         patch = self.monkeypatch
-        patch.setitem(api.app.state._state, "decision_engine", self.engine)
-        patch.setitem(api.app.state._state, "plugin_registry", PluginRegistry())
+        patch.setitem(app_state_items(api.app), "decision_engine", self.engine)
+        patch.setitem(app_state_items(api.app), "plugin_registry", PluginRegistry())
         patch.setattr(api, "_record_job_state", AsyncMock())
         patch.setattr(api, "resolve_provider", lambda *a, **k: self.provider)
         patch.setattr(o, "resolve_provider", lambda *a, **k: self.provider)

@@ -18,6 +18,8 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.utils import agent_profiles
 
+from test.fixtures.app_state import app_state_items
+
 CALLER = "abcd1234"
 SPEC = {"spec_version": 1, "purpose": "log_triage", "brief": "Inspect logs.", "tools": ["fs_read"]}
 
@@ -638,7 +640,7 @@ def test_future_profile_source_contract(create_store, monkeypatch, case):
         monkeypatch.setattr(terminal_service, "get_max_terminals", lambda: None)
         monkeypatch.setattr(terminal_service, "get_backend", lambda: Mock())
         monkeypatch.setattr(terminal_service, "generate_terminal_id", fail_create)
-        monkeypatch.setitem(main.app.state._state, "plugin_registry", PluginRegistry())
+        monkeypatch.setitem(app_state_items(main.app), "plugin_registry", PluginRegistry())
         monkeypatch.setattr(agent_profiles, "resolve_env_vars", lambda text: text)
         for value in ("missing", "malformed"):
             with pytest.raises(ValueError) as create_error:

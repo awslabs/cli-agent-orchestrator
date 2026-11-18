@@ -6,6 +6,8 @@ from typing import NoReturn
 
 import pytest
 
+from test.fixtures.app_state import app_state_items
+
 
 @dataclass
 class RecordAccessGuard:
@@ -39,7 +41,6 @@ def default_decision_runtime(tmp_path, monkeypatch):
     from cli_agent_orchestrator.api.main import app
 
     runtime, guard = isolated_runtime(tmp_path)
-    # Starlette stores these attributes in _state, not the instance __dict__ that pytest restores.
-    monkeypatch.setitem(app.state._state, "decision_engine", runtime)
+    monkeypatch.setitem(app_state_items(app), "decision_engine", runtime)
     yield runtime
     guard.check()
