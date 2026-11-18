@@ -18,31 +18,34 @@
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "braces": "file:braces-compat",
+    "cao-picomatch-guard": "file:../vendor/cao-picomatch-guard-4.0.7-cao.3.tgz",
     "graphology": "^0.26.0",
     "graphology-layout": "^0.6.1",
-    "lucide-react": "^1.66.0",
+    "lucide-react": "^1.71.0",
     "patch-package": "8.0.1",
+    "picomatch": "file:picomatch-compat",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
-    "sigma": "^4.0.4",
-    "zustand": "^5.0.16"
+    "sigma": "^4.0.5",
+    "zustand": "^5.1.0"
   },
   "devDependencies": {
-    "@tailwindcss/postcss": "^4.3.4",
+    "@tailwindcss/postcss": "^4.3.5",
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.3",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
-    "@vitejs/plugin-react": "^6.2.1",
+    "@vitejs/plugin-react": "^6.3.0",
     "jsdom": "^31.0.0",
     "postcss": "^8.5.32",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
-    "vite": "^8.3.5",
+    "vite": "^8.3.7",
     "vitest": "^5.1.0"
   },
   "overrides": {
     "braces": "$braces",
-    "nanoid": "^3.3.17"
+    "nanoid": "^3.3.17",
+    "picomatch": "$picomatch"
   }
 }
