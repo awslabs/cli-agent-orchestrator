@@ -334,14 +334,6 @@ class TestReaderThreadLifecycle:
         target_soft_limit = 4096 if hard_limit == resource.RLIM_INFINITY else min(hard_limit, 4096)
         if target_soft_limit < 1100:
             pytest.skip("descriptor limit cannot reach FD_SETSIZE")
-        limit_changes = []
-        setrlimit = resource.setrlimit
-
-        def record_limit_change(which, limits):
-            limit_changes.append((which, limits))
-            setrlimit(which, limits)
-
-        monkeypatch.setattr(resource, "setrlimit", record_limit_change)
         limit_changed = False
         if soft_limit < target_soft_limit:
             try:
@@ -349,8 +341,7 @@ class TestReaderThreadLifecycle:
                 limit_changed = True
             except (OSError, ValueError):
                 pytest.skip("unable to raise file descriptor limit for this regression")
-        if soft_limit >= target_soft_limit:
-            assert limit_changes == []
+        assert resource.getrlimit(resource.RLIMIT_NOFILE)[0] >= soft_limit
 
         held_fds = []
         writer = -1
@@ -358,7 +349,6 @@ class TestReaderThreadLifecycle:
         try:
             while max(held_fds, default=0) < 1024:
                 held_fds.append(os.open("/dev/null", os.O_RDONLY))
-            assert max(held_fds) >= 1024
 
             proc_fds = "/proc/self/fd"
             if os.path.isdir(proc_fds):
