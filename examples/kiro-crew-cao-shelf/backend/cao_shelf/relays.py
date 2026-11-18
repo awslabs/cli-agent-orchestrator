@@ -726,16 +726,28 @@ class Relays:
         live: Any,
     ) -> None:
         """Poller hook, after a successful read: CAO session gone -> ``orphaned``; conductor
-        changed -> ``needs_reattach``. Uses only what the poller already read."""
+        changed -> ``needs_reattach``. Uses what the poller already read, except that a relayed
+        session missing from the listing is confirmed gone by its own read (``not_found``), as
+        the watch thread does: CAO answers an empty listing with 200 when it fails inside."""
         url = validate_cao_url(self._settings()["cao_url"])
         changed = False
+        with self._lock:
+            missing = [
+                rec
+                for rec in self._records
+                if rec["state"] == "active"
+                and _same_cao(str(rec["cao_url"]), url)
+                and SESSION_PREFIX + str(rec["session"]) not in listed
+            ]
+        gone = {id(rec) for rec in missing if self._session_gone(str(rec["session"]))}
         with self._lock:
             for rec in self._records:
                 if rec["state"] != "active" or not _same_cao(str(rec["cao_url"]), url):
                     continue
                 name = SESSION_PREFIX + str(rec["session"])
                 if name not in listed:
-                    changed = self._finish(rec, "orphaned", "session_gone") or changed
+                    if id(rec) in gone:
+                        changed = self._finish(rec, "orphaned", "session_gone") or changed
                     continue
                 rows = views.get(name)
                 if rows is None:
@@ -746,6 +758,15 @@ class Relays:
         if changed:
             self._changed()
         self._wake.set()
+
+    def _session_gone(self, session: str) -> bool:
+        """True only when CAO answers ``not_found`` for the session now; any other answer or
+        error keeps the relay for a later pass (unknown is not gone)."""
+        try:
+            self._actions.conductor_of_session(session)
+        except ShelfError as err:
+            return err.code == "not_found"
+        return False
 
     @staticmethod
     def _conductor_moved(

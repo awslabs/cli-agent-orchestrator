@@ -472,6 +472,26 @@ def test_session_deleted_elsewhere_is_orphaned_within_one_poll(rig: RelayRig) ->
     assert "reason: session_gone (the CAO session no longer exists)" in msg
 
 
+def test_an_empty_listing_then_a_good_one_leaves_the_relay_active(rig: RelayRig) -> None:
+    # CAO's list_sessions answers [] with 200 when it catches an internal error
+    out = rig.attach()
+    real = rig.cao._route
+
+    def empty_once(method: str, path: str, query: Dict[str, str], body: Any) -> Any:
+        if method == "GET" and path == "/sessions":
+            rig.cao._route = real  # type: ignore[method-assign]
+            return 200, []
+        return real(method, path, query, body)
+
+    rig.cao._route = empty_once  # type: ignore[method-assign]
+    rig.warm(1)
+    rig.warm(1)
+    listed = {r["relay_id"]: r for r in rig.relays.list()["relays"]}
+    assert listed[out["relay_id"]]["state"] == "active"
+    assert listed[out["relay_id"]]["end_reason"] is None
+    assert len(rig.gw.messages(out["slot_key"])) == 1  # the setup message only
+
+
 def test_conductor_change_is_needs_reattach_and_the_card_says_so(rig: RelayRig) -> None:
     out = rig.attach()
     terms = rig.cao.session_terminals(RELAY_SESSION)

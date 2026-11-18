@@ -296,8 +296,10 @@ Each text is the fenced block after its `rc:` marker. Words in angle brackets ar
   whose relay-ended message is still owed, else `null`. Its `ended_notice_pending` is true when any
   chat of the session is still owed that message (also after a Take over, on the new relay). A relay
   change bumps the shelf `revision`.
-* **Reconcile.** On every poll tick, from what the poller read (no extra CAO request): a relayed
-  session missing from `GET /sessions` is `orphaned`; one whose bound conductor is no longer among
+* **Reconcile.** On every poll tick, from what the poller read: a relayed session missing from
+  `GET /sessions` is `orphaned` once its own `GET /sessions/{name}` answers 404 (CAO answers an
+  empty list with 200 when it fails inside, so the listing alone is not proof; that one read is
+  the only extra CAO request, and any other answer keeps the relay); one whose bound conductor is no longer among
   its terminals, or is no longer the conductor once every caller is known, is `needs_reattach`. A
   session listed but not read this tick is not judged. A watch thread, which runs while any relay
   is active even with no page open, reads each relayed session from CAO at most once a minute and
