@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -22,6 +23,15 @@ class MessageStatus(str, Enum):
     FAILED = "failed"
 
 
+class DeliveryOutcome(str, Enum):
+    """What one delivery attempt did with one message (reply-delivery-failure D3)."""
+
+    DELIVERED = "delivered"  # the paste reached the terminal
+    FAILED = "failed"  # nothing was typed
+    UNCERTAIN = "uncertain"  # some or all of it may have been typed
+    RETRYING = "retrying"  # nothing was typed; back to PENDING for another attempt
+
+
 class InboxMessage(BaseModel):
     """Inbox message model."""
 
@@ -31,6 +41,8 @@ class InboxMessage(BaseModel):
     message: str = Field(..., description="Message content")
     status: MessageStatus = Field(..., description="Message status")
     created_at: datetime = Field(..., description="Creation timestamp (UTC)")
+    delivery_attempts: int = Field(default=0, description="Failed delivery attempts so far")
+    last_error: Optional[str] = Field(default=None, description="Error of the last failed attempt")
 
     @field_validator("created_at")
     @classmethod
