@@ -9,7 +9,7 @@ const path = require('node:path');
 const {test} = require('node:test');
 
 const name = 'cao-picomatch-guard';
-const version = '4.0.7-cao.2';
+const version = '4.0.7-cao.3';
 
 // Run in a child with a hard deadline. Check what the compiler emits on short inputs;
 // a literal fallback must not silently turn back into a repeated alternation.
@@ -20,6 +20,8 @@ if (require.main === module) {
       ['+(ab|abab)', 'ab'],
       ['*(loglog|log)', 'log'],
       ['+(Post|POSTpost)', 'Post', {nocase: true}],
+      ['+(k|\u212ak)', 'k', {flags: 'iu'}],
+      ['+(\u00df|\u1e9e\u00df)', '\u00df', {flags: 'iu'}],
       ['+("red"|redred)', 'red'],
       ['*(n"ot"e|noteno"te")', 'note'],
     ]) {
@@ -37,6 +39,9 @@ if (require.main === module) {
       ['*([.-0]*)', {windows: false}, '/a/b', 'ab'],
       ['+(*[Z-^])', {windows: true}, 'a\\b\\', 'a/b/'],
       ['+(*[[:digit:]])', {windows: false}, 'part1part2', 'part1/part2'],
+      ['+(*\\D)', {windows: false}, 'a/b/', 'a/b/9'],
+      ['+(*\n)', {bash: true}, 'a\nb\n', 'a\nb'],
+      ['+(a[bc]*z)', {regex: true}, 'abzacbz', 'abzc'],
     ]) {
       const re = match.makeRe(pattern, options);
       assert.ok(re.test(yes), manifest);
@@ -79,7 +84,7 @@ module.exports = function registerTests(project) {
       assert.equal(manifest.name, name, location);
       assert.equal(manifest.version, version, location);
       for (const [file, digest] of [
-        ['lib/parse.js', '9ac3b9756ecaf80b24d78bdcadb4c2d92ebd4fbe50860bc904fa86aa2b7e94f1'],
+        ['lib/parse.js', '273b8d06b2bf53e2d6e51daa36bbb21c50d7562829c3db0db58547546f5f0e62'],
         ['lib/constants.js', 'c28f952d2758261fe5428a121add485cc25b03e0193633f649de903dc0e5e222'],
       ]) {
         const bytes = readFileSync(from.resolve(`${name}/${file}`));

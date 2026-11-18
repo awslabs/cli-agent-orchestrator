@@ -18,7 +18,7 @@
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "braces": "file:braces-compat",
-    "cao-picomatch-guard": "file:../vendor/cao-picomatch-guard-4.0.7-cao.2.tgz",
+    "cao-picomatch-guard": "file:../vendor/cao-picomatch-guard-4.0.7-cao.3.tgz",
     "graphology": "^0.26.0",
     "graphology-layout": "^0.6.1",
     "lucide-react": "^1.71.0",

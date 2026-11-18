@@ -26,7 +26,7 @@
     "@docusaurus/preset-classic": "3.10.2",
     "@mdx-js/react": "^3.0.0",
     "braces": "file:braces-compat",
-    "cao-picomatch-guard": "file:../vendor/cao-picomatch-guard-4.0.7-cao.2.tgz",
+    "cao-picomatch-guard": "file:../vendor/cao-picomatch-guard-4.0.7-cao.3.tgz",
     "clsx": "^2.0.0",
     "patch-package": "8.0.1",
     "picomatch": "file:picomatch-compat",

@@ -259,7 +259,7 @@ These are explicit maintainer review checkpoints, not automated notifications.
 
 #### Guarded picomatch parser
 
-The docs, web UI, MCP Apps, and AG-UI operator dashboard use `cao-picomatch-guard@4.0.7-cao.2`
+The docs, web UI, MCP Apps, and AG-UI operator dashboard use `cao-picomatch-guard@4.0.7-cao.3`
 instead of upstream picomatch 2.x and 4.x. This is a private, MIT-licensed backport based
 on the **published 4.0.7 release**, not upstream `master` or an official security release.
 The [vendored archive and rebuild instructions](vendor/README.md#guarded-picomatch-backport)
@@ -267,21 +267,23 @@ identify the release, the source of the single-branch fix for
 [CVE-2026-112366](https://github.com/advisories/GHSA-fc5q-39xc-vjpf), and the complete patch.
 
 The parser drops redundant repetition around simple star-containing branches. For a star
-next to a character class, it accounts for which path separators that class can match.
+next to a character class or a single-character escape, it accounts for characters
+outside the wildcard's range (including path separators and Bash line endings).
 It uses the existing literal fallback for repeated alternatives with ambiguous literal
-boundaries, including quoted literals. Prefix-free or suffix-free literal choices retain normal matching.
+boundaries, including quoted literals and Unicode case-insensitive matches.
 The guard is conservative: some patterns that used to match filenames
 now match the glob text itself, and capture groups can differ. This is not a general
 resource bound: a repeated group with multiple alternatives that contain wildcards or
 bracket expressions can still backtrack, as in the upstream release. Do not accept
 untrusted glob syntax on the strength of this patch or disable `maxExtglobRecursion`.
+Opt-in raw regex quantifiers are not glob wildcards and retain upstream regex semantics.
 
 Each npm lock pins the same local archive and SHA-512. Private project adapters forward
 `picomatch` imports to its real package name. `test:dependencies` checks package identity,
 parser and constants bytes, and the compiled guard behavior through every installed consumer.
 
 The three projects with v2 consumers also apply
-[`cao-picomatch-guard+4.0.7-cao.2.patch`](patches/cao-picomatch-guard+4.0.7-cao.2.patch) to preserve Windows paths and
+[`cao-picomatch-guard+4.0.7-cao.3.patch`](patches/cao-picomatch-guard+4.0.7-cao.3.patch) to preserve Windows paths and
 captures in the old API. This changes only the platform option handling, not the parser.
 The dashboard uses only v4 consumers and still installs with scripts disabled.
 

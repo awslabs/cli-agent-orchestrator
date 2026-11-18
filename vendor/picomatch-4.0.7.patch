@@ -1,6 +1,6 @@
 --- a/lib/parse.js
 +++ b/lib/parse.js
-@@ -139,26 +139,46 @@
+@@ -139,26 +139,51 @@
    return value.replace(/\\(.)/g, '$1');
  };
 
@@ -16,6 +16,10 @@
 -      if (!char || a !== char.repeat(a.length) || b !== char.repeat(b.length)) {
 -        continue;
 -      }
+-
+-      if (a === b || a.startsWith(b) || b.startsWith(a)) {
+-        return true;
+-      }
 +const normalizeQuotedLiteral = (branch, options) => {
 +  let quoted = false;
 +  let value = '';
@@ -27,30 +31,32 @@
 +      // Escapes can denote regex syntax, not just literal characters.
 +      if (ch === '\\' || (!quoted && !isPlainBranch(ch))) return;
 +      value += ch;
-+    }
-+  }
+     }
+   }
 +  if (!quoted) return value;
 +};
 
--      if (a === b || a.startsWith(b) || b.startsWith(a)) {
--        return true;
--      }
+-  return false;
 +const hasLiteralOverlap = (branches, options) => {
 +  const ignoreCase = options.flags ? options.flags.includes('i') : options.nocase;
++  const unicodeCase = ignoreCase && /[uv]/.test(options.flags || '');
 +  const hasQuotes = branches.some(branch => branch.includes('"'));
 +  const values = [];
 +  for (const branch of branches) {
++    if (/\\[A-Za-z0-9]/.test(branch)) return true;
 +    const literal = hasQuotes
 +      ? normalizeQuotedLiteral(branch, options)
 +      : normalizeSimpleBranch(branch);
 +    if (!literal) {
 +      if (hasQuotes) return true;
 +      continue;
-     }
-+    values.push(ignoreCase ? literal.toUpperCase() : literal);
-   }
-
--  return false;
++    }
++    // Unicode regexp folding includes compatibility letters. Fold per code point
++    // to avoid context-sensitive whole-word mappings; expansions are conservative.
++    values.push(unicodeCase ? Array.from(literal, ch => ch.toLowerCase().toUpperCase()).join('')
++      : ignoreCase ? literal.toUpperCase() : literal);
++  }
++
 +  // A literal and all its extensions are adjacent in lexicographic order.
 +  const hasPrefix = words => words.sort().some((word, i, sorted) =>
 +    i > 0 && word.startsWith(sorted[i - 1]));
@@ -63,7 +69,7 @@
  };
 
  const parseRepeatedExtglob = (pattern, requireEnd = true) => {
-@@ -270,6 +290,74 @@
+@@ -270,6 +295,74 @@
    return chars;
  };
 
@@ -138,7 +144,7 @@
  const repeatedExtglobRecursion = pattern => {
    let depth = 0;
    let value = pattern.trim();
-@@ -300,7 +388,7 @@
+@@ -300,7 +393,7 @@
      if (
        branches.some(branch => branch === '') ||
        branches.some(branch => /^[*?]+$/.test(branch)) ||
@@ -147,7 +153,7 @@
      ) {
        return { risky: true };
      }
-@@ -343,6 +431,13 @@
+@@ -343,6 +436,13 @@
        : { risky: true };
    }
 
@@ -161,37 +167,51 @@
    return { risky: false };
  };
 
-@@ -539,7 +634,51 @@
+@@ -539,7 +639,65 @@
    const extglobClose = token => {
      const literal = input.slice(token.startIndex, state.index + 1);
      const body = input.slice(token.startIndex + 2, state.index);
 -    const analysis = analyzeRepeatedExtglob(body, opts);
-+    let analysis = analyzeRepeatedExtglob(body, opts);
-+    if ((analysis.collapse || analysis.risky) && body.includes('[') &&
-+        (token.type === 'plus' || token.type === 'star')) {
++    const repeated = token.type === 'plus' || token.type === 'star';
++    let analysis = repeated ? analyzeRepeatedExtglob(body, opts) : { risky: false };
++    if (analysis.collapse || (analysis.risky && body.includes('['))) {
 +      const parts = tokens.slice(token.tokensIndex + 2);
++      const bash = opts.bash === true;
++      const flags = opts.flags || '';
++      const alphabet = bash ? '.' : QMARK;
++      const outside = bash ? '[\\n\\r\\u2028\\u2029]' : SLASH_LITERAL;
++      const excluded = bash ? (flags.includes('s') ? [] : ['\n', '\r', '\u2028', '\u2029'])
++        : opts.windows ? ['/', '\\'] : ['/'];
++      const isGlobStar = t => t.type === 'star' && t.output === (bash ? '.*?' : star);
++      if (analysis.collapse && !parts.some(isGlobStar)) {
++        // regex:true can emit a regex quantifier rather than a glob star.
++        // Leave explicit regex syntax to upstream; the glob collapse does not apply.
++        analysis = { risky: !(opts.regex && parts.some(t => t.type === 'star' && t.output === '*')) };
++      }
 +      for (const part of parts) {
-+        if (part.type !== 'bracket') continue;
-+        const source = part.value;
++        if (!analysis.collapse && !analysis.risky) break;
++        const source = part.output ?? part.value;
 +        const charClass = part.charClass || source;
++        const bracket = part.type === 'bracket' || part.type === 'qmark';
++        const text = part.type === 'text' && (/\\[A-Za-z0-9]/.test(source) || excluded.some(s => source.includes(s)));
++        if (!bracket && !text) continue;
 +        // Unicode-set classes may match strings, not just single characters.
-+        if ((opts.flags || '').includes('v')) {
++        const single = bracket ? charClass.startsWith('[') && charClass.endsWith(']')
++          : source.length === 1 || /^\\(?:[dDsSwWfnrtv]|x[\dA-Fa-f]{2}|u[\dA-Fa-f]{4})$/.test(source);
++        if (!single || flags.includes('v')) {
 +          analysis = { risky: true };
 +          break;
 +        }
-+        const simple = !opts.bash && parts.length === 2 &&
-+          parts.some(t => t.type === 'star' && t.value === '*' && t.output === star) &&
-+          charClass.startsWith('[') && charClass.endsWith(']');
++        const simple = parts.length === 2 && parts.some(t => isGlobStar(t) && t.value === '*');
 +        if (!simple && !analysis.collapse) break;
 +        try {
 +          // Use the parser's actual class, including ranges and platform options.
-+          const member = new RegExp(`^(?:${charClass})$`, (opts.flags || '').replace(/[gy]/g, ''));
-+          const separators = opts.windows ? ['/', '\\'] : ['/'];
-+          if (part.charClass && separators.some(s => charClass.includes(s) && !member.test(s))) {
++          const member = new RegExp(`^(?:${charClass})$`, flags.replace(/[gy]/g, ''));
++          if (part.charClass && excluded.some(s => charClass.includes(s) && !member.test(s))) {
 +            analysis = { risky: true };
 +            break;
 +          }
-+          if (!member.test('/') && !(opts.windows && member.test('\\'))) {
++          if (!excluded.some(s => member.test(s))) {
 +            if (simple) analysis = { collapse: true };
 +            continue;
 +          }
@@ -204,7 +224,7 @@
 +        if (simple) {
 +          // For a one-character class C and segment alphabet A, (A* C)+ = (A ∪ C)* C.
 +          // The two alphabet choices are disjoint. The mirror identity covers (C A*)+.
-+          const union = `(?:${QMARK}|(?=${SLASH_LITERAL})${charClass})*?`;
++          const union = `(?:${alphabet}|(?=${outside})${charClass})*?`;
 +          const flat = parts[0] === part ? source + union : union + source;
 +          analysis.safeOutput = token.type === 'plus' ? flat : `(?:${flat})?`;
 +        }
@@ -214,7 +234,7 @@
 
      if ((token.type === 'plus' || token.type === 'star') && analysis.risky) {
        const safeOutput = analysis.safeOutput
-@@ -549,7 +688,7 @@
+@@ -549,7 +707,7 @@
 
        open.type = 'text';
        open.value = literal;
@@ -223,7 +243,7 @@
 
        for (let i = token.tokensIndex + 1; i < tokens.length; i++) {
          tokens[i].value = '';
-@@ -565,6 +704,12 @@
+@@ -565,6 +723,12 @@
        return;
      }
 
@@ -236,7 +256,7 @@
      let output = token.close + (opts.capture ? ')' : '');
      let rest;
 
-@@ -869,6 +1014,7 @@
+@@ -869,6 +1033,7 @@
        }
 
        // when the user specifies nothing, try to match both
@@ -253,7 +273,7 @@
 -  "version": "4.0.7",
 +  "name": "cao-picomatch-guard",
 +  "description": "CAO backport of picomatch 4.0.7 with repeated-extglob guards",
-+  "version": "4.0.7-cao.2",
++  "version": "4.0.7-cao.3",
    "homepage": "https://github.com/micromatch/picomatch",
    "author": "Jon Schlinkert (https://github.com/jonschlinkert)",
    "funding": "https://github.com/sponsors/jonschlinkert",
