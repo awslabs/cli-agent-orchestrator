@@ -446,16 +446,25 @@ def test_a_checkout_inside_the_box_users_home_is_refused(sandbox) -> None:
 # ---------------------------------------------------- session name and units
 
 
-def test_the_real_branch_enables_but_never_starts(sandbox) -> None:
+def test_the_real_branch_enables_and_starts_by_default(sandbox) -> None:
     result = dry_run(sandbox, FakeSystem(sandbox), **BOOTSTRAP_SETTINGS)
     assert result.returncode == 0, result.stderr
     runs = [line for line in lines(result) if "would run: systemctl" in line]
     assert runs == [
         "[dry-run] would run: systemctl daemon-reload",
         "[dry-run] would run: systemctl enable herdr-cao.service cao-server.service cao-backup.timer",
+        "[dry-run] would run: systemctl start herdr-cao.service cao-server.service cao-backup.timer",
     ]
     assert "--now" not in result.stdout
-    assert "systemctl start" not in "\n".join(l for l in lines(result) if "would run" in l)
+    assert "would wait up to 30 seconds" in result.stdout
+
+
+def test_no_start_only_enables_services(sandbox) -> None:
+    result = dry_run(sandbox, FakeSystem(sandbox), "--no-start", **BOOTSTRAP_SETTINGS)
+    assert result.returncode == 0, result.stderr
+    assert "would run: systemctl enable" in result.stdout
+    assert "would run: systemctl start" not in result.stdout
+    assert "--no-start: enabled services but did not start them" in result.stdout
 
 
 @pytest.mark.skipif(

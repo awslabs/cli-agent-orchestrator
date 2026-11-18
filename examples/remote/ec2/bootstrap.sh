@@ -103,6 +103,7 @@ DRY_RUN=0
 ROOT=""
 FORMAT_NEW=0
 FORMAT_FROM_ENV=0
+NO_START=0
 if [ "${FORMAT_DATA_DEVICE:-}" = "yes" ]; then FORMAT_NEW=1; FORMAT_FROM_ENV=1; fi
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"; }
@@ -111,6 +112,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --format-new-volume) FORMAT_NEW=1 ;;
+    --no-start) NO_START=1 ;;
     --settings)
       { [ $# -ge 2 ] && [ -n "$2" ]; } || { echo "--settings needs a file" >&2; exit 2; }
       SETTINGS_FILE="$2"; shift ;;
@@ -852,7 +854,7 @@ if [ -n "$BOX_SSH_PUBLIC_KEY" ]; then
 fi
 
 # ------------------------------------------------------- 8. scripts + units
-step "8. helper scripts and systemd units (enabled, NOT started)"
+step "8. helper scripts and systemd units"
 for f in backup.sh restore.sh bin/lib-cao-box.sh bin/box-session-name.sh bin/herdr-start.sh bin/herdr-clean-layout.sh \
          bin/wait-herdr-socket.sh bin/resource-probe-linux.sh bin/box-resume.sh; do
   install_file "$HERE/$f" "$LIB_DIR/$(basename "$f")" 0755
@@ -882,6 +884,25 @@ else
   run systemctl daemon-reload
   run systemctl enable herdr-cao.service cao-server.service cao-backup.timer
 fi
+if [ -n "$ROOT" ]; then
+  log "skipped under --root: start the enabled services after the image boots"
+elif [ "$NO_START" -eq 1 ]; then
+  log "--no-start: enabled services but did not start them"
+else
+  step "9. start services and wait for CAO health"
+  run systemctl start herdr-cao.service cao-server.service cao-backup.timer
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '[dry-run] would wait up to 30 seconds for curl -fsS http://127.0.0.1:9889/health\n'
+  else
+    healthy=0
+    for _ in $(seq 1 30); do
+      if curl -fsS --max-time 2 http://127.0.0.1:9889/health >/dev/null; then healthy=1; break; fi
+      sleep 1
+    done
+    [ "$healthy" -eq 1 ] || die "services did not become healthy within 30 seconds; check systemctl status herdr-cao.service cao-server.service"
+    log "services healthy"
+  fi
+fi
 
 # ------------------------------------------------------------------ done
 step "done"
@@ -890,9 +911,8 @@ Next steps (you run these; see README.md):
   1. Log in to the agent CLIs as ${BOX_USER}: Claude Code (Bedrock via the instance
      role, see config/claude-settings.box.json.example), codex login --device-auth,
      gh auth login.
-  2. Start herdr first, then CAO (cao-server waits for herdr's socket):
-     sudo systemctl start herdr-cao.service && sudo systemctl start cao-server.service
-  3. Check: curl -fsS http://127.0.0.1:9889/health
+  2. Check: systemctl is-active herdr-cao.service cao-server.service cao-backup.timer
+     (with --no-start, start herdr-cao then cao-server, and the backup timer).
   4. On the laptop: herdr machine add <ssh-host> --remote-session <session> --label cao-box
      (answer No if it offers to stop the remote server)
 EOF

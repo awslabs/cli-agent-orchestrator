@@ -261,11 +261,7 @@ From your admin shell (the Session Manager shell; `cao-herdr` has no sudo, and
 shouldn't):
 
 ```bash
-sudo systemctl start herdr-cao.service
-sudo systemctl start cao-server.service     # waits for herdr's socket; fails if it never appears
-sudo systemctl start cao-backup.timer       # bootstrap only enables it; a reboot would start it too
-# cao-server takes a few seconds to listen after systemd says it started:
-for i in $(seq 1 30); do curl -fsS http://127.0.0.1:9889/health && break; sleep 1; done
+systemctl is-active herdr-cao.service cao-server.service cao-backup.timer
 sudo -u cao-herdr -i /usr/local/lib/cao-box/box-resume.sh   # herdr state is per user
 ```
 
