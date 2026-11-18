@@ -1045,6 +1045,18 @@ async def complete_assignment(
         }
 
     delivered = _send_message_impl(None, message)
+    if delivered.get("delivery") == "uncertain":
+        # The result may already be with the supervisor: releasing would end the
+        # worker on a result nobody saw, and a blind resend could deliver it twice.
+        return {
+            "success": False,
+            "delivered": delivered,
+            "delivery": "uncertain",
+            "error": (
+                "result delivery is uncertain: it may have arrived at the supervisor. "
+                "Check the supervisor before you resend it; the worker was not released"
+            ),
+        }
     if not delivered.get("success"):
         return {
             "success": False,
