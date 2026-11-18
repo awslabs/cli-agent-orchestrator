@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import re
 
 import pytest
 from remote_ec2_support import (
@@ -477,6 +478,21 @@ def test_tmux_mode_uses_its_user_and_never_installs_herdr(sandbox) -> None:
     assert "herdr-cao.service" not in result.stdout
     assert "herdr-linux-aarch64" not in result.stdout
     assert "cao-tmux.service cao-server.service cao-backup.timer" in result.stdout
+
+
+def test_tmux_unit_uses_a_separate_standard_socket_server() -> None:
+    unit = (SAMPLE_DIR / "systemd" / "cao-tmux.service").read_text(encoding="utf-8")
+    assert "Type=forking" in unit
+    assert "ExecStart=/usr/bin/tmux new-session -d -s box-keepalive" in unit
+    assert "ExecStop=/usr/bin/tmux kill-server" in unit
+    assert "KillMode=none" not in unit
+    assert "\nPrivateTmp=" not in unit
+    for path in (SAMPLE_DIR / "systemd").glob("*.service"):
+        text = path.read_text(encoding="utf-8")
+        names = re.findall(r"\btmux\s+new-session\s+-d\s+-s\s+(\S+)", text)
+        assert all(not name.startswith("cao-") for name in names), (
+            f"{path.name} declares a CAO-reserved tmux session name"
+        )
 
 
 @pytest.mark.skipif(

@@ -255,7 +255,8 @@ BOX_UID=1001
 Setup installs tmux 3.3 or newer, does not install herdr or `herdr-cao`, and
 starts `cao-tmux.service` before `cao-server.service`. `cao-tmux.service`
 owns tmux's normal per-user socket in its own cgroup, so restarting
-`cao-server.service` cannot kill running agent sessions. There is no
+`cao-server.service` cannot kill running agent sessions; explicitly stopping
+`cao-tmux.service` intentionally does. There is no
 `PrivateTmp`, allowing the same user to attach from SSH:
 
 ```bash

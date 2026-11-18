@@ -1,5 +1,5 @@
 # tmux is deliberately a separate unit. CAO uses tmux's standard per-user
-# socket, and a cao-server restart must not kill the agents in that server.
+# socket, and a cao-server restart cannot kill the agents in this cgroup.
 # Do not add PrivateTmp: interactive `ssh -t ... tmux attach` must see it too.
 [Unit]
 Description=tmux server for CAO agents
@@ -7,17 +7,16 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=forking
 User=@BOX_USER@
 Group=@BOX_USER@
 WorkingDirectory=@BOX_HOME@
 Environment=HOME=@BOX_HOME@
 Environment=USER=@BOX_USER@
 Environment=PATH=@BOX_HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/tmux new-session -d -s cao-server
-# tmux daemonizes. Keep its cgroup separate and never kill sessions on stop.
-KillMode=none
+ExecStart=/usr/bin/tmux new-session -d -s box-keepalive
+# An explicit stop intentionally kills the server and its agent sessions.
+ExecStop=/usr/bin/tmux kill-server
 
 [Install]
 WantedBy=multi-user.target
