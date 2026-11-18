@@ -392,6 +392,8 @@ class InboxModel(Base):
     message = Column(String, nullable=False)
     status = Column(String, nullable=False)  # MessageStatus enum value
     created_at = Column(UTCDateTime, default=_utcnow)
+    delivery_attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    last_error = Column(String, nullable=True)
 
 
 class DelegationEdgeModel(Base):
@@ -409,6 +411,7 @@ class DelegationEdgeModel(Base):
     created_at = Column(UTCDateTime, default=_utcnow)
     delivered_at = Column(UTCDateTime, nullable=True)
     closed_at = Column(UTCDateTime, nullable=True)
+    reply_message_id = Column(Integer, nullable=True)  # reply stored, not yet delivered
 
 
 class DecisionRecordModel(Base):
@@ -1399,6 +1402,9 @@ def init_db() -> None:
     _migrate_decision_records_provider_route()
     # Appended LAST (issue #1199). Eight nullable decision_records columns, no backfill.
     _migrate_decision_records_match()
+    # Appended LAST (reply-delivery-failure). Three additive columns on inbox and
+    # delegation_edges, no backfill, so registry order is immaterial here too.
+    _migrate_delivery_failure_columns()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -1484,6 +1490,45 @@ def _migrate_decision_records_target_kind() -> None:
     except Exception as e:
         # Records cannot be written without the column, so this is louder than debug.
         logger.warning(f"Migration check for decision_records target_kind failed: {e}")
+
+
+_DELIVERY_FAILURE_COLUMNS = {
+    "delegation_edges": {
+        "reply_message_id": "ALTER TABLE delegation_edges ADD COLUMN reply_message_id INTEGER",
+    },
+    "inbox": {
+        "delivery_attempts": (
+            "ALTER TABLE inbox ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0"
+        ),
+        "last_error": "ALTER TABLE inbox ADD COLUMN last_error TEXT",
+    },
+}
+
+
+def _migrate_delivery_failure_columns() -> None:
+    """Add the reply-delivery-failure columns to existing tables (idempotent).
+
+    PRAGMA table_info gate per table, ALTER TABLE ADD COLUMN only for a missing
+    column. A table that does not exist yet is skipped: create_all makes it with
+    the columns. Existing rows read as "no reply in flight" and "no failures".
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
+            for table, statements in _DELIVERY_FAILURE_COLUMNS.items():
+                columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                if not columns:
+                    continue
+                for column, ddl in statements.items():
+                    if column not in columns:
+                        conn.execute(ddl)
+                        logger.info(f"Migration: added {column} column to {table}")
+    except Exception as e:
+        # Delivery cannot record failures or replies without the columns.
+        logger.warning(f"Migration check for delivery failure columns failed: {e}")
 
 
 _PROVIDER_ROUTE_COLUMNS = {
@@ -4011,6 +4056,8 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
             message=inbox_msg.message,
             status=MessageStatus(inbox_msg.status),
             created_at=inbox_msg.created_at,
+            delivery_attempts=inbox_msg.delivery_attempts or 0,
+            last_error=inbox_msg.last_error,
         )
 
 
@@ -4083,6 +4130,8 @@ def get_inbox_messages(
                 message=msg.message,
                 status=MessageStatus(msg.status),
                 created_at=msg.created_at,
+                delivery_attempts=msg.delivery_attempts or 0,
+                last_error=msg.last_error,
             )
             for msg in messages
         ]
@@ -4278,6 +4327,7 @@ def _edge_from_row(row: DelegationEdgeModel) -> DelegationEdge:
         created_at=row.created_at,
         delivered_at=row.delivered_at,
         closed_at=row.closed_at,
+        reply_message_id=row.reply_message_id,
     )
 
 
@@ -4360,6 +4410,114 @@ def list_open_message_edges(message_ids: List[int]) -> List[DelegationEdge]:
         return [_edge_from_row(r) for r in rows]
 
 
+def mark_reply_in_flight(edge_id: int, message_id: int) -> bool:
+    """Record ``message_id`` as the OPEN edge's reply in flight (design D1).
+
+    A later reply replaces an earlier one: the latest message decides.
+
+    Args:
+        edge_id: The edge the worker replied on.
+        message_id: Inbox id of the stored, not yet delivered reply.
+
+    Returns:
+        True when the edge is OPEN and now carries the mark; False for a
+        closed or unknown edge, which is left unchanged.
+    """
+    with SessionLocal() as db:
+        count = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.id == edge_id,
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+            )
+            .update({DelegationEdgeModel.reply_message_id: message_id}, synchronize_session=False)
+        )
+        db.commit()
+        return count > 0
+
+
+def close_edges_replied_by(message_ids: List[int]) -> int:
+    """Close as replied the OPEN edges whose reply in flight is one of ``message_ids``.
+
+    Args:
+        message_ids: Inbox ids of messages just delivered.
+
+    Returns:
+        The number of edges this call closed. An edge whose mark was replaced
+        by a newer reply is not closed by the older one.
+    """
+    if not message_ids:
+        return 0
+    with SessionLocal() as db:
+        count = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.reply_message_id.in_(message_ids),
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+            )
+            .update(
+                {
+                    DelegationEdgeModel.state: EdgeState.REPLIED.value,
+                    DelegationEdgeModel.closed_at: _utcnow(),
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return count
+
+
+def clear_reply_in_flight(message_ids: List[int]) -> List[DelegationEdge]:
+    """Clear the reply mark of OPEN edges carrying one of ``message_ids`` (design D7).
+
+    Args:
+        message_ids: Inbox ids of replies that failed for good.
+
+    Returns:
+        The edges as they were before clearing, so ``reply_message_id`` still
+        names the failed reply. Closed edges are neither returned nor changed.
+    """
+    if not message_ids:
+        return []
+    with SessionLocal() as db:
+        rows = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.reply_message_id.in_(message_ids),
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+            )
+            .order_by(DelegationEdgeModel.id)
+            .all()
+        )
+        edges = [_edge_from_row(r) for r in rows]
+        for row in rows:
+            row.reply_message_id = None
+        db.commit()
+        return edges
+
+
+def record_delivery_failure(message_id: int, error: str) -> int:
+    """Count one failed delivery attempt for ``message_id`` and keep ``error``.
+
+    Args:
+        message_id: Inbox id of the message whose attempt failed.
+        error: Text of the failure, stored verbatim as ``last_error``.
+
+    Returns:
+        The message's failed-attempt count after this one, or 0 when the
+        message does not exist.
+    """
+    with SessionLocal() as db:
+        row = db.query(InboxModel).filter(InboxModel.id == message_id).first()
+        if row is None:
+            return 0
+        attempts = (row.delivery_attempts or 0) + 1
+        row.delivery_attempts = attempts
+        row.last_error = error
+        db.commit()
+        return attempts
+
+
 def list_unarmed_assign_edges(worker_id: str) -> List[DelegationEdge]:
     """OPEN assign edges into ``worker_id`` whose task was never delivered."""
     with SessionLocal() as db:
@@ -4437,8 +4595,14 @@ def close_delegation_edge_with_message(
         return count > 0
 
 
-def list_open_edges_into(worker_id: str, armed_only: bool = False) -> List[DelegationEdge]:
-    """Open edges where ``worker_id`` is the worker someone is waiting on."""
+def list_open_edges_into(
+    worker_id: str, armed_only: bool = False, exclude_reply_in_flight: bool = False
+) -> List[DelegationEdge]:
+    """Open edges where ``worker_id`` is the worker someone is waiting on.
+
+    ``exclude_reply_in_flight`` drops edges whose reply is stored but not yet
+    delivered: the worker has answered, the answer is on its way.
+    """
     with SessionLocal() as db:
         query = db.query(DelegationEdgeModel).filter(
             DelegationEdgeModel.worker_id == worker_id,
@@ -4446,6 +4610,8 @@ def list_open_edges_into(worker_id: str, armed_only: bool = False) -> List[Deleg
         )
         if armed_only:
             query = query.filter(DelegationEdgeModel.delivered_at.isnot(None))
+        if exclude_reply_in_flight:
+            query = query.filter(DelegationEdgeModel.reply_message_id.is_(None))
         return [_edge_from_row(r) for r in query.order_by(DelegationEdgeModel.id).all()]
 
 
@@ -4514,9 +4680,10 @@ def close_open_edges_for_terminal(terminal_id: str, state: EdgeState) -> List[De
 
     Inbound edges (someone waits on this terminal) need a notice; outbound
     edges (this terminal waited on others) are closed silently because their
-    replies have no live receiver.
+    replies have no live receiver. An inbound edge with a reply in flight stays
+    OPEN: the reply's delivery outcome settles it (design D8).
     """
-    inbound = list_open_edges_into(terminal_id)
+    inbound = list_open_edges_into(terminal_id, exclude_reply_in_flight=True)
     closed = [e for e in inbound if close_delegation_edge(e.id, state)]
     for edge in list_open_edges_out_of(terminal_id):
         close_delegation_edge(edge.id, state)
