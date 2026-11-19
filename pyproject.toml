@@ -546,8 +546,8 @@ addopts = "--cov=src --cov-branch --cov-report=term-missing -m 'not e2e'"
 # explicit CI invocation in `.github/workflows/ci.yml`; the line-only floor is
 # the ratchet's `python.floor_pct` in `.coverage-baseline.json`, not this flag.
 #
-# NOTE for anyone reading ci.yml: the separate "Coverage ratchet" step there
-# belongs to cao_mcp_apps (the TypeScript subproject), not to this suite.
+# NOTE for anyone reading ci.yml: the separate "Coverage ratchet" job reads
+# this suite's Unit Tests (3.12) report.
 #
 # CAUTION (#1005): with `--cov-branch` on, coverage.py's `totals.percent_covered`
 # becomes a BLENDED line+branch figure -- (covered_lines + covered_branches) /
