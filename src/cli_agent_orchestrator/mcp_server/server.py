@@ -2051,7 +2051,7 @@ async def memory_store(
                 tags=tags or "",
                 terminal_context=terminal_context,
             )
-        return {
+        result = {
             "success": True,
             "key": memory.key,
             "scope": memory.scope,
@@ -2060,6 +2060,10 @@ async def memory_store(
             "action": memory.action
             or ("updated" if memory.created_at != memory.updated_at else "created"),
         }
+        if key is not None and MemoryService._key_was_truncated(key):
+            result["key_truncated"] = True
+            result["requested_key"] = key
+        return result
     except MemoryPartialWriteError as e:
         return {
             "success": False,
@@ -2183,7 +2187,7 @@ async def memory_forget(
         default="project",
         description=(
             'Scope of the memory to remove: "global", "project", "session", '
-            '"agent", or "federated"'
+            + '"agent", or "federated"'
         ),
     ),
 ) -> Dict[str, Any]:
@@ -2528,13 +2532,17 @@ async def store_lesson(
             },
             timeout=_mcp_timeout(),
         )
-        return {
+        result = {
             "success": True,
             "key": payload["key"],
             "scope": payload["scope"],
             "scope_id": payload["scope_id"],
             "target_agent_profile": payload["target_agent_profile"],
         }
+        if payload.get("key_truncated") is True:
+            result["key_truncated"] = True
+            result["requested_key"] = payload["requested_key"]
+        return result
     except requests.RequestException as e:
         partial = _partial_write_payload(e)
         if partial is not None:

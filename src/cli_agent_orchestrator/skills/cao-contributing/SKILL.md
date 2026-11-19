@@ -214,6 +214,24 @@ to rediscover.
    `uv run python scripts/dependency_security.py`. Every HIGH or CRITICAL finding blocks, and
    local mitigations are not exemptions.
 
+## Refreshing the Playwright image digest
+
+Five jobs in `ci.yml` run in `mcr.microsoft.com/playwright:v<version>-noble@sha256:<digest>`. The tag
+is checked against each job's locked `playwright-core`, and the digest keeps a re-pushed tag from
+changing what CI runs; `test/test_playwright_image_matches_lockfiles.py` requires both, on all five
+jobs, with one digest. When a Playwright bump changes the locked version, change the tag and the
+digest together:
+
+1. Ask the registry for the digest of the new tag (read-only). The tag is a multi-arch image
+   index, so pin the index digest, not a per-platform one:
+   `curl -sS -D - -o /tmp/pw.json -H 'Accept: application/vnd.oci.image.index.v1+json' https://mcr.microsoft.com/v2/playwright/manifests/v<version>-noble`
+   and read `docker-content-digest` from the headers.
+2. Check it against the bytes you were served: `shasum -a 256 /tmp/pw.json` must print the same
+   hash.
+3. Replace `v<old>-noble@sha256:<old digest>` with the new value on every `container:` line that
+   names the image (`grep -n 'playwright:v' .github/workflows/ci.yml` lists them), then run
+   `uv run pytest test/test_playwright_image_matches_lockfiles.py`.
+
 ## Pre-PR checklist
 
 1. `uv run black src/ test/ && uv run isort src/ test/` (or `--check` to verify).
