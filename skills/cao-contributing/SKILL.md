@@ -88,7 +88,7 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 | **AI-DLC Portfolio Example** | example project builds | **Yes** |
 | **Security Scan** | Trivy | **Yes** |
 | **CodeQL** | GitHub Actions, JavaScript/TypeScript, Python, and Rust analysis and upload in the same CI run, including forks after required workflow approval | **Yes** — no project build; the hosted scan/status rules remain as documented in `SECURITY.md` |
-| **Dependency Security** | Full locked npm, Bun, uv, and Cargo inventories, including development dependencies and unfixed advisories; independent clean-install mitigation checks | **Yes** — every HIGH/CRITICAL finding or scan error fails; locally, `scripts/security-scan.sh dependencies` with Trivy installed |
+| **Dependency Security** | Full locked npm, Bun, uv, and Cargo inventories, including development dependencies and unfixed advisories, classified against a shipped set measured from the builds; independent clean-install mitigation checks | **Yes** — every HIGH/CRITICAL finding in the shipped set (wheel runtime closure, bundled web/MCP App/docs packages, TUI crates), a malware advisory anywhere, a toolchain HIGH/CRITICAL with a fix that the PR adds or changes, or any scan, completeness or shipped-set error, fails; other toolchain-only findings are listed and do not block; locally, build the bundles first, then `scripts/security-scan.sh dependencies` with Trivy installed |
 | **Dependency Review** | `actions/dependency-review-action` over the PR's dependency delta: `fail-on-severity: high` plus denied licences `GPL-3.0`/`AGPL-3.0` | **Yes** — CI-only; there is nothing to run locally, and it is skipped on forks (`if: github.repository == 'awslabs/cli-agent-orchestrator'`), so a green run on your fork has not exercised it |
 
 CodeQL's four language jobs are part of `ci.yml`, so **Re-run all jobs** includes
@@ -211,8 +211,11 @@ to rediscover.
    It exits 11, but the pipe reports `grep`'s status, so a floor read off a stale wheel looks
    like a pass.
 4. **Run the dependency gate locally** with the Trivy version CI pins (see `SECURITY.md`):
-   `uv run python scripts/dependency_security.py`. Every HIGH or CRITICAL finding blocks, and
-   local mitigations are not exemptions.
+   `uv run python scripts/dependency_security.py` (after `npm run build` in `web/`,
+   `npm run build:all` in `cao_mcp_apps/` and `npm run build` in `docusaurus/`, which record
+   the shipped set). Every HIGH or CRITICAL finding in the shipped set blocks, and local
+   mitigations are not exemptions; a finding only in the build or test toolchain is listed
+   and does not block (see `SECURITY.md`, "Shipped set and toolchain findings").
 
 ## Refreshing the Playwright image digest
 

@@ -17,6 +17,7 @@ from cli_agent_orchestrator.clients.database import (
     get_handoff_result,
     upsert_handoff_result,
 )
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 
 @pytest.fixture(autouse=True)
@@ -131,14 +132,14 @@ class TestMigrateAddHandoffResults:
         import cli_agent_orchestrator.constants as consts
 
         db_path = tmp_path / "legacy.db"
-        with sqlite3.connect(str(db_path)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_path))) as conn:
             conn.execute("CREATE TABLE terminals (id TEXT PRIMARY KEY)")
             conn.commit()
         monkeypatch.setattr(consts, "DATABASE_FILE", db_path, raising=False)
         return db_path
 
     def test_creates_table_with_expected_shape(self, legacy_db):
-        with sqlite3.connect(str(legacy_db)) as conn:
+        with closing_transaction(sqlite3.connect(str(legacy_db))) as conn:
             assert (
                 conn.execute(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='handoff_results'"
@@ -148,7 +149,7 @@ class TestMigrateAddHandoffResults:
 
         db_mod._migrate_add_handoff_results()
 
-        with sqlite3.connect(str(legacy_db)) as conn:
+        with closing_transaction(sqlite3.connect(str(legacy_db))) as conn:
             info = list(conn.execute("PRAGMA table_info(handoff_results)"))
         cols = {r[1]: r for r in info}
         assert set(cols) == {
@@ -169,7 +170,7 @@ class TestMigrateAddHandoffResults:
 
     def test_idempotent_rerun_keeps_one_table_and_its_rows(self, legacy_db):
         db_mod._migrate_add_handoff_results()
-        with sqlite3.connect(str(legacy_db)) as conn:
+        with closing_transaction(sqlite3.connect(str(legacy_db))) as conn:
             conn.execute(
                 "INSERT INTO handoff_results (job_id, state, last_message) VALUES (?, ?, ?)",
                 ("survivor", "completed", "worker output"),
@@ -178,7 +179,7 @@ class TestMigrateAddHandoffResults:
 
         db_mod._migrate_add_handoff_results()  # re-run must not raise or reset
 
-        with sqlite3.connect(str(legacy_db)) as conn:
+        with closing_transaction(sqlite3.connect(str(legacy_db))) as conn:
             assert (
                 conn.execute(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='handoff_results'"

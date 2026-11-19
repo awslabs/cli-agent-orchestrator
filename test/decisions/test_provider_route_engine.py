@@ -9,6 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.decisions.types import DecisionAnswer
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 TIERS = {
     provider: {t: f"{provider}-{t}" for t in ("small", "medium", "large")}
@@ -664,7 +665,7 @@ def _legacy_decision_table(path):
     import sqlite3
 
     rows = [(1, "model.route", "fixture", "error"), (2, "effort.route", None, "unsure")]
-    with sqlite3.connect(path) as db:
+    with closing_transaction(sqlite3.connect(path)) as db:
         db.execute(
             "CREATE TABLE decision_records (id INTEGER PRIMARY KEY, point TEXT, decider TEXT, "
             "reason TEXT)"
@@ -686,7 +687,7 @@ def test_the_migration_is_additive_nullable_idempotent_and_leaves_rows(tmp_path,
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
     database._migrate_decision_records_provider_route()
     database._migrate_decision_records_provider_route()
-    with sqlite3.connect(path) as db:
+    with closing_transaction(sqlite3.connect(path)) as db:
         columns = {row[1]: row for row in db.execute("PRAGMA table_info(decision_records)")}
         migrated = db.execute(
             "SELECT id, point, decider, reason, " + ", ".join(COLUMNS) + " FROM decision_records"
@@ -704,11 +705,11 @@ def test_the_migration_adds_only_the_missing_columns(tmp_path, monkeypatch):
 
     path = tmp_path / "partial.db"
     _legacy_decision_table(path)
-    with sqlite3.connect(path) as db:
+    with closing_transaction(sqlite3.connect(path)) as db:
         db.execute("ALTER TABLE decision_records ADD COLUMN options TEXT")
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
     database._migrate_decision_records_provider_route()
-    with sqlite3.connect(path) as db:
+    with closing_transaction(sqlite3.connect(path)) as db:
         names = [row[1] for row in db.execute("PRAGMA table_info(decision_records)")]
     assert all(names.count(column) == 1 for column in COLUMNS)
 
@@ -722,7 +723,7 @@ def test_the_migration_creates_nothing_without_the_table(tmp_path, monkeypatch):
     sqlite3.connect(path).close()
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
     database._migrate_decision_records_provider_route()
-    with sqlite3.connect(path) as db:
+    with closing_transaction(sqlite3.connect(path)) as db:
         assert db.execute("SELECT name FROM sqlite_master").fetchall() == []
 
 
@@ -737,7 +738,7 @@ def test_init_db_adds_the_columns_to_an_existing_database(tmp_path, monkeypatch)
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
     with patch.object(database, "Base"):
         database.init_db()
-    with sqlite3.connect(path) as db:
+    with closing_transaction(sqlite3.connect(path)) as db:
         names = {row[1] for row in db.execute("PRAGMA table_info(decision_records)")}
     assert set(COLUMNS) <= names
 

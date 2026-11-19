@@ -21,6 +21,7 @@ from cli_agent_orchestrator.models.workflow_runtime import StepOutputRecord
 from cli_agent_orchestrator.services import workflow_journal
 from cli_agent_orchestrator.services import workflow_service as ws
 from cli_agent_orchestrator.services.agent_step import StepExecutionError
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 _SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
 
@@ -384,7 +385,7 @@ def test_workflow_run_row_has_the_caller_column(tmp_path):
 
     from cli_agent_orchestrator import constants
 
-    with sqlite3.connect(str(constants.DATABASE_FILE)) as conn:
+    with closing_transaction(sqlite3.connect(str(constants.DATABASE_FILE))) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(workflow_run)")}
     assert "caller_id" in columns
     workflow_journal.insert_run("legacy", "wf", "{}", "{}", "running", "t")
