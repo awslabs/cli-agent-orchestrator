@@ -4,7 +4,7 @@ import shlex
 import shutil
 import subprocess
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import click
 
@@ -56,6 +56,14 @@ def _cao_requirement(receipt: Path) -> Optional[dict]:
     requirement that isn't a mapping) yields None so the caller degrades to the
     documented fallback rather than raising on a malformed file.
     """
+    for req in _requirements(receipt) or []:
+        if isinstance(req, dict) and req.get("name") == _PACKAGE:
+            return req
+    return None
+
+
+def _requirements(receipt: Path) -> Optional[list]:
+    """Return the receipt's requirement list, or None if it is missing or malformed."""
     try:
         data = tomllib.loads(receipt.read_text())
     except (OSError, ValueError):
@@ -65,12 +73,7 @@ def _cao_requirement(receipt: Path) -> Optional[dict]:
     if not isinstance(tool, dict):
         return None
     requirements = tool.get("requirements")
-    if not isinstance(requirements, list):
-        return None
-    for req in requirements:
-        if isinstance(req, dict) and req.get("name") == _PACKAGE:
-            return req
-    return None
+    return requirements if isinstance(requirements, list) else None
 
 
 def _str_field(req: dict, key: str) -> Optional[str]:
@@ -131,7 +134,56 @@ def _classify_source(receipt: Optional[Path]) -> Tuple[str, Optional[str]]:
     return (_REGISTRY, None)
 
 
-def _build_command(kind: str, detail: Optional[str]) -> List[str]:
+def _with_requirement(req: object) -> Optional[str]:
+    """The ``--with`` value that reinstalls one extra receipt requirement, or None.
+
+    Covers the shapes uv records for a ``<name>[extras]<specifier>`` requirement, a
+    wheel ``path`` and a ``directory``. Any other shape, such as a git or URL source
+    or a marker, returns None.
+    """
+    if not isinstance(req, dict):
+        return None
+    name = _str_field(req, "name")
+    if name is None:
+        return None
+    if "path" in req or "directory" in req:
+        if set(req) not in ({"name", "path"}, {"name", "directory"}):
+            return None
+        return _str_field(req, "path") or _str_field(req, "directory")
+    if set(req) - {"name", "extras", "specifier"}:
+        return None
+    extras = req.get("extras", [])
+    specifier = req.get("specifier", "")
+    if not isinstance(extras, list) or not all(isinstance(e, str) and e for e in extras):
+        return None
+    if not isinstance(specifier, str):
+        return None
+    return name + (f"[{','.join(extras)}]" if extras else "") + specifier
+
+
+def _with_args(receipt: Optional[Path]) -> List[str]:
+    """``--with`` arguments for every requirement in the receipt other than CAO.
+
+    ``uv tool install <pkg>@latest --upgrade`` replaces the recorded requirements, so
+    uv uninstalls any extra package (for example a decider) that is not passed again.
+    """
+    args: List[str] = []
+    for req in (_requirements(receipt) if receipt else None) or []:
+        if isinstance(req, dict) and req.get("name") == _PACKAGE:
+            continue
+        value = _with_requirement(req)
+        if value is None:
+            name = req.get("name") if isinstance(req, dict) else req
+            raise click.ClickException(
+                f"CAO was installed with the extra package {name!r}, which `cao update` "
+                "can't carry over while unpinning CAO. Reinstall both yourself: "
+                f"uv tool install {_PACKAGE}@latest --upgrade --with <{name} source>"
+            )
+        args += ["--with", value]
+    return args
+
+
+def _build_command(kind: str, detail: Optional[str], with_args: Sequence[str] = ()) -> List[str]:
     """The uv invocation that advances CAO for a remote-backed install kind.
 
     - git: ``uv tool upgrade <pkg> --reinstall`` lets uv reuse the receipt,
@@ -140,7 +192,8 @@ def _build_command(kind: str, detail: Optional[str]) -> List[str]:
     - registry (unconstrained): ``uv tool upgrade`` re-resolves to the latest.
     - registry (constrained): ``uv tool upgrade`` honours the constraint and can
       report "Nothing to upgrade"; ``uv tool install <pkg>@latest --upgrade``
-      unpins to the latest published release.
+      unpins to the latest published release. That replaces the receipt's
+      requirements, so ``with_args`` passes the extra packages back.
 
     Local (directory/path/editable) kinds have no remote to advance and are
     handled by the command before reaching here.
@@ -148,7 +201,7 @@ def _build_command(kind: str, detail: Optional[str]) -> List[str]:
     if kind == _GIT and detail:
         return ["uv", "tool", "upgrade", _PACKAGE, "--reinstall"]
     if kind == _REGISTRY_CONSTRAINED:
-        return ["uv", "tool", "install", f"{_PACKAGE}@latest", "--upgrade"]
+        return ["uv", "tool", "install", f"{_PACKAGE}@latest", "--upgrade", *with_args]
     return ["uv", "tool", "upgrade", _PACKAGE]
 
 
@@ -193,7 +246,8 @@ def update():
             "package manager you installed it with."
         )
 
-    kind, detail = _classify_source(_receipt_path())
+    receipt = _receipt_path()
+    kind, detail = _classify_source(receipt)
 
     if kind in _LOCAL_KINDS:
         # A local install has no remote to advance from; `uv tool upgrade` would
@@ -205,7 +259,8 @@ def update():
             f"`cao update` can't advance a local install; {_local_fix_hint(kind, detail)}"
         )
 
-    command = _build_command(kind, detail)
+    with_args = _with_args(receipt) if kind == _REGISTRY_CONSTRAINED else []
+    command = _build_command(kind, detail, with_args)
 
     if kind == _GIT:
         source_desc = f"git ({detail})"
