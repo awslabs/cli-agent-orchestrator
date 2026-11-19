@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, cast
@@ -52,8 +53,9 @@ _HERDR_WEB_INPUT_ESCAPE_HOLD_S = 0.3
 # is written (see HerdrBackend.focus_web_input).
 _HERDR_WEB_FOCUS_SETTLE_S = 0.15
 # Longest wait for the herdr session's focus lock, which a web view holds for
-# one resize (at most about 2.5 s; see herdr_web_view._Sizer). Past it the
-# input frame is dropped rather than sent while the focus may move.
+# one resize (nominally 2.5 s, up to about 4 s when every check finds another
+# tab focused; see herdr_web_view._Sizer). Past it the input frame is dropped
+# rather than sent while the focus may move.
 _HERDR_WEB_FOCUS_LOCK_TIMEOUT_S = 5.0
 _HERDR_WEB_FOCUS_LOCK_POLL_S = 0.02
 
@@ -216,6 +218,7 @@ class HerdrBackend(TerminalBackend):
         self._workspace_cache: Dict[str, tuple[str, float]] = {}
         # The focus lock held for one web input turn (see focus_web_input).
         self._web_focus_lock_fd: Optional[int] = None
+        self._web_focus_lock_missing_logged = False
         self._ensure_session_running()
 
     @property
@@ -974,8 +977,11 @@ class HerdrBackend(TerminalBackend):
         """Hold the herdr session's focus lock, waiting out a web view's resize.
 
         cao-server runs one input turn per herdr session at a time, so this
-        process holds the lock at most once. No lock file (no private state
-        directory) means focus changes go unserialised, as before the lock.
+        process holds the lock at most once. With no private state directory
+        there is no lock, and the views then never move herdr's focus (they
+        do not resize), so input goes on safely; the cause is logged once. A
+        lock file this process cannot open drops the frame instead: a view
+        may still hold the lock.
         """
         # Imported here: the view module needs POSIX terminal modules.
         from cli_agent_orchestrator.backends import herdr_web_view
@@ -983,13 +989,26 @@ class HerdrBackend(TerminalBackend):
         self.release_web_input("")  # a turn that ended without releasing
         path = herdr_web_view.focus_lock_path(self._herdr_session)
         if path is None:
+            if not self._web_focus_lock_missing_logged:
+                self._web_focus_lock_missing_logged = True
+                logger.warning(
+                    "herdr session '%s': no private state directory for the web views' "
+                    "focus lock (%s is missing, not 0700 or not ours); browser terminals "
+                    "will not resize their agents' panes",
+                    self._herdr_session,
+                    os.path.join(
+                        tempfile.gettempdir(), f"cao-herdr-web-view-{os.getuid()}"
+                    ),
+                )
             return
         deadline = time.monotonic() + _HERDR_WEB_FOCUS_LOCK_TIMEOUT_S
         while True:
             try:
                 fd = herdr_web_view.try_lock(path)
-            except OSError:
-                return
+            except OSError as e:
+                raise TerminalBackendError(
+                    f"herdr session '{self._herdr_session}' focus lock unusable: {e}"
+                ) from e
             if fd is not None:
                 self._web_focus_lock_fd = fd
                 return

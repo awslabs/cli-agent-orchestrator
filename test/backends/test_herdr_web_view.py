@@ -242,6 +242,54 @@ class TestSizer:
         set_size.assert_called_once_with(99, 21, 96)
         assert len(calls) == 2
 
+    def test_without_a_lock_it_never_moves_the_focus(self):
+        """No private state directory: resizing unlocked could misroute keys (review P3)."""
+        focus = []
+        sizer = view._Sizer(client_pid=1, client_fd=99, focus_own_tab=lambda: focus.append(1))
+        sizer.resize(20, 70)
+        set_size = self._run(sizer, [(20, 70, True)])
+        assert focus == []
+        set_size.assert_not_called()
+        assert self.write_all.call_args_list == []  # no focus report either
+        assert not sizer.due()
+
+    def test_a_lock_file_that_cannot_be_opened_also_fails_closed(self, tmp_path):
+        focus = []
+        sizer = self._sizer(
+            tmp_path,
+            lock_path=str(tmp_path / "missing-dir" / "focus.lock"),
+            focus_own_tab=lambda: focus.append(1),
+        )
+        sizer.resize(20, 70)
+        set_size = self._run(sizer, [(20, 70, True)])
+        assert focus == [] and sizer.lock_path is None
+        set_size.assert_not_called()
+
+    def test_a_socket_error_in_the_check_lets_the_lock_go(self, tmp_path):
+        sizer = self._sizer(tmp_path)
+        sizer.resize(20, 70)
+        with (
+            patch.object(view, "_set_window_size"),
+            patch.object(view, "_write_all"),
+            patch.object(view.os, "kill"),
+        ):
+            for _ in range(3):  # grace, focus, claim
+                sizer.next_at = 0.0
+                sizer.step(lambda: None)
+
+            def _fail():
+                raise view.HerdrSocketError("session.snapshot: gone")
+
+            sizer.next_at = 0.0
+            with pytest.raises(view.HerdrSocketError):
+                sizer.step(_fail)
+        other = self._sizer(tmp_path)
+        assert other._acquire() is True  # input is not blocked meanwhile
+        other._release()
+        assert sizer.attempts == view.CALIBRATION_ATTEMPTS - 1 and sizer.due() is False
+        set_size = self._run(sizer, [(20, 70, True)])
+        set_size.assert_called_once_with(99, 21, 96)
+
     def test_it_gives_up_after_a_bounded_number_of_tries(self, tmp_path):
         sizer = self._sizer(tmp_path)
         sizer.resize(20, 70)
@@ -480,6 +528,32 @@ class TestRun:
             typist.join(timeout=5)
 
         assert b"typed\r" in env.client_input.read_bytes()
+
+    def test_with_no_usable_state_directory_it_paints_but_leaves_the_focus(
+        self, env, monkeypatch
+    ):
+        self._on_the_pty(env, monkeypatch)
+        # Another user's directory, say: not 0700, so the view has no lock.
+        (env.tmp_path / f"cao-herdr-web-view-{os.getuid()}").mkdir(mode=0o755)
+        os.chmod(env.tmp_path / f"cao-herdr-web-view-{os.getuid()}", 0o755)
+        assert view.focus_lock_path("cao") is None
+        with _FakeHerdr(str(env.tmp_path / "h.sock"), self.ROWS, self.COLS) as herdr:
+
+            def _close_once_painted():
+                self._until(lambda: b"hello from the agent" in env.out)
+                time.sleep(0.5)  # longer than a whole resize would take here
+                herdr.tab_open = False
+
+            closer = threading.Thread(target=_close_once_painted, daemon=True)
+            closer.start()
+            assert view.run("cao", herdr.path, "cao-a", "dev-1") == 0
+            closer.join(timeout=5)
+
+        assert b"hello from the agent" in env.out
+        assert [m for m, _ in herdr.methods if m == "tab.focus"] == []
+        assert not env.client_input.exists() or (
+            view.FOCUS_REPORT not in env.client_input.read_bytes()
+        )
 
     def test_an_unreachable_socket_is_one_line_not_a_traceback(self, env, monkeypatch):
         self._on_the_pty(env, monkeypatch)

@@ -280,6 +280,31 @@ class TestHerdrBackendCommands:
         assert fd is not None
         herdr_web_view.unlock(fd)
 
+    def test_no_state_directory_logs_once_and_lets_input_through(self, backend, caplog):
+        """The views do not move the focus without the lock, so input stays safe."""
+        with patch(
+            "cli_agent_orchestrator.backends.herdr_web_view.focus_lock_path", return_value=None
+        ):
+            self._focus(backend)
+            self._focus(backend)
+        warnings = [r for r in caplog.records if "focus lock" in r.getMessage()]
+        assert len(warnings) == 1
+        assert backend._web_focus_lock_fd is None
+
+    def test_a_lock_file_it_cannot_open_drops_the_frame(self, backend, tmp_path):
+        """A view may still hold the lock, so the focus must not move (review P3)."""
+        path = str(tmp_path / "missing-dir" / "focus.lock")
+        with (
+            patch(
+                "cli_agent_orchestrator.backends.herdr_web_view.focus_lock_path",
+                return_value=path,
+            ),
+            patch.object(backend, "_run_herdr") as run,
+            pytest.raises(TerminalBackendError, match="focus lock unusable"),
+        ):
+            backend.focus_web_input(json.dumps(["cao-test", "developer-abcd"]))
+        run.assert_not_called()
+
     def test_release_without_a_turn_is_harmless(self, backend):
         backend.release_web_input("")
         backend.release_web_input("")

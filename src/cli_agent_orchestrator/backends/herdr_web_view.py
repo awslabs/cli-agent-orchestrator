@@ -23,7 +23,8 @@ exactly one herdr pane and nothing of herdr's own UI:
   across later focus changes, so a tab keeps its view's size while the view
   is parked in the browser's pool, and only a view whose own size changed
   redoes this. (The agent's pane is one column narrower than the browser
-  pane while herdr shows its scrollbar gutter.)
+  pane while herdr shows its scrollbar gutter.) Without the lock the view
+  does not resize, so it never moves the focus unlocked.
 - **Input.** Keystrokes go, byte for byte, to a hidden herdr client this
   process owns, so herdr's own key handling applies (Enter, Escape, arrows,
   Ctrl keys, bracketed paste). cao-server focuses this view's tab before it
@@ -299,7 +300,9 @@ def session_state_dir(herdr_session: str) -> Optional[str]:
 
     It lives under the shared temp dir, so it is created 0700 and refused if
     another user made it first, is a symlink, or is group/world accessible.
-    None means no usable directory: focus changes then go unserialised.
+    None means no usable directory, and so no focus lock: views then never
+    move herdr's focus (see ``_Sizer``), and only cao-server does, one input
+    turn at a time.
     """
     root = os.path.join(tempfile.gettempdir(), f"cao-herdr-web-view-{os.getuid()}")
     path = os.path.join(root, herdr_session)
@@ -349,6 +352,11 @@ class _Sizer:
     estimate until it fits. The layout is only this tab's while the tab is
     focused, so a check that finds another tab focused starts over instead of
     finishing. What a view measured is saved for the next view to start from.
+
+    Without the lock (no private state directory, or a lock file that cannot
+    be opened) the view does not resize at all: moving herdr's focus unlocked
+    could send another view's keys to this tab. Its pane then keeps whatever
+    size herdr gives it, but input still reaches the right agent.
     """
 
     def __init__(
@@ -394,19 +402,33 @@ class _Sizer:
     # --- the lock, held for one apply-and-verify sequence ---
 
     def _acquire(self) -> bool:
+        """True once the lock is held; False if it is busy or cannot be had.
+
+        A lock file that cannot be opened clears ``lock_path``, so the
+        sequence stops instead of retrying (see the class docstring).
+        """
         if self._lock_fd is not None:
             return True
         if not self.lock_path:
-            return True
+            return False
         try:
             fd = try_lock(self.lock_path)
         except OSError:
-            self.lock_path = None  # unlockable: resize unserialised rather than not at all
-            return True
+            self.lock_path = None
+            return False
         if fd is None:
             return False
         self._lock_fd = fd
         return True
+
+    def _retry_later(self) -> None:
+        """After a socket error: let the lock go, and start over if tries are left."""
+        self.attempts -= 1
+        self._phase = "grace"
+        self._release()
+        self.next_at = time.monotonic() + LOCK_RETRY_S
+        if self.attempts <= 0:
+            self._finish()
 
     def _release(self) -> None:
         if self._lock_fd is None:
@@ -435,6 +457,9 @@ class _Sizer:
         is focused, ``(rows, cols, focused)``, or None if it cannot be read.
         """
         if not self._acquire():
+            if not self.lock_path:
+                self._finish()  # no lock: never move herdr's focus unlocked
+                return
             self.next_at = time.monotonic() + LOCK_RETRY_S  # another view or an input turn
             return
         if self._phase == "grace":
@@ -445,13 +470,7 @@ class _Sizer:
             try:
                 self.focus_own_tab()
             except HerdrSocketError:
-                # Let input through meanwhile, and try again from the start.
-                self.attempts -= 1
-                self._phase = "grace"
-                self._release()
-                self.next_at = time.monotonic() + LOCK_RETRY_S
-                if self.attempts <= 0:
-                    self._finish()
+                self._retry_later()  # let input through meanwhile
                 raise
             self._phase = "claim"
             self.next_at = time.monotonic() + FOCUS_SETTLE_S
@@ -460,7 +479,11 @@ class _Sizer:
             self._phase = "verify"
             self._apply()
             return
-        state = read_state()
+        try:
+            state = read_state()
+        except HerdrSocketError:
+            self._retry_later()
+            raise
         self.attempts -= 1
         if state is None:
             self._finish()
