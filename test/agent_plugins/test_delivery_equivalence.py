@@ -3,11 +3,11 @@
 **Property 10: Cross-provider delivery equivalence**
 **Validates: Requirements 13.2, 13.6, 13.7**
 
-For every one of the seven providers, the set of skill names reachable by an
+For every provider listed below, the set of skill names reachable by an
 agent equals ``builtin ∪ projected(valid plugin skills)``, plus ``extra_dirs``
 for the providers Requirement 13.6 names — asserted against each provider's
 *real* delivery artifact, not against ``list_skills()`` standing in for all of
-them. Two of the seven (Kiro, OpenCode) never call ``list_skills()`` at all, so a
+them. Two (Kiro, OpenCode) never call ``list_skills()`` at all, so a
 test that only checked it would prove nothing about them.
 
 The ``extra_dirs`` term is provider-dependent because Kiro's glob and OpenCode's
@@ -46,6 +46,7 @@ ALL_PROVIDERS = [
     ProviderType.COPILOT_CLI.value,
     ProviderType.KIRO_CLI.value,
     ProviderType.OPENCODE_CLI.value,
+    ProviderType.QWEN_CLI.value,
 ]
 
 _CATALOG_LINE = re.compile(r"^- \*\*(?P<name>[^*]+)\*\*:", re.MULTILINE)
@@ -66,6 +67,7 @@ def reachable_skill_names(provider: str, skills_dir: Path, opencode_dir: Path) -
         ProviderType.CODEX.value,
         ProviderType.KIMI_CLI.value,
         ProviderType.ANTIGRAVITY_CLI.value,
+        ProviderType.QWEN_CLI.value,
     }:
         from cli_agent_orchestrator.utils.skills import build_skill_catalog
 
@@ -152,7 +154,7 @@ def delivery_world(tmp_path):
 
 @pytest.mark.parametrize("provider", ALL_PROVIDERS)
 def test_every_provider_reaches_the_full_union(delivery_world, provider):
-    """The named, concrete case for all seven providers."""
+    """The named, concrete case for every listed provider."""
     from cli_agent_orchestrator.utils.opencode_config import ensure_skills_symlink
 
     world = delivery_world
@@ -324,8 +326,8 @@ def delivered_server_names(provider: str, store) -> Set[str]:
 STDIO_SERVER = {"type": "stdio", "command": "demo-server"}
 HTTP_SERVER = {"type": "streamable-http", "url": "https://example.test/mcp"}
 
-#: The providers whose native MCP shape cannot carry a url-based entry, audited
-#: against each serializer rather than assumed (review on #584 caught the
+#: The providers whose CAO agent-plugin delivery is stdio-only, audited against
+#: each adapter rather than assumed (review on #584 caught the
 #: original single-entry set as wrong):
 #:
 #: * ``opencode_cli`` — `utils/opencode_config.translate_mcp_server_config`
@@ -335,12 +337,16 @@ HTTP_SERVER = {"type": "streamable-http", "url": "https://example.test/mcp"}
 #: * ``antigravity_cli`` — `_register_mcp_servers` always writes a local
 #:   `command`/`args`/`env` entry into `mcp_config.json`.
 #:
-#: In every case an HTTP server would arrive with an empty command — worse than
-#: absent, because it would look configured.
+#: In those three cases an HTTP server would arrive with an empty command —
+#: worse than absent, because it would look configured.
+#: * ``qwen_cli`` — the adapter declares only stdio agent-plugin delivery.
+#:   Its native ``--mcp-config`` retains server fields, but remote transport
+#:   delivery through CAO has not been validated and is not advertised.
 STDIO_ONLY_PROVIDERS = {
     ProviderType.OPENCODE_CLI.value,
     ProviderType.CODEX.value,
     ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.QWEN_CLI.value,
 }
 
 

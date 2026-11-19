@@ -2303,6 +2303,9 @@ class TestInboxRecoveryCoverageByProvider:
         "grok_cli",
         "hermes",
         "kimi_cli",
+        # Qwen has no composer reader, so a swallowed submit cannot be retried
+        # safely without risking duplicate input.
+        "qwen_cli",
         "omp",
         "mock_cli",
         # Probe but no composer reader: the probe can confirm a working agent

@@ -1360,6 +1360,8 @@ class TmuxClient:
             "SSH_AUTH_SOCK",
             "DISPLAY",
             "XDG_RUNTIME_DIR",
+            "QWEN_HOME",  # shared native auth/config; do not snapshot rotating tokens
+            "QWEN_RUNTIME_DIR",  # separate session/runtime data without splitting auth
             "DO_NOT_TRACK",
         }
     )
