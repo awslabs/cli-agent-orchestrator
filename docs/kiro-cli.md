@@ -4,6 +4,8 @@
 
 The Kiro CLI provider enables CLI Agent Orchestrator (CAO) to work with **Kiro CLI**, an AI-powered coding assistant that operates through agent-based conversations with customizable profiles.
 
+This page covers Kiro CLI as a CAO provider. To use CAO from the Kiro Crew dashboard, see [Kiro Crew](kiro-crew.md).
+
 ## Quick Start
 
 ### Prerequisites

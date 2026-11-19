@@ -139,9 +139,14 @@ daylight saving):
    - It refuses to run from any branch but `main`, or on a commit whose `ci.yml` run is
      not green.
    - `release.yml` bumps `pyproject.toml`, `uv.lock` and the devcontainer feature, runs
-     `git-cliff` to update `CHANGELOG.md`, checks the result the way
-     `verify-release-version` will, then commits, tags `v<version>`, pushes both in one
-     atomic push, and creates a GitHub Release.
+     the same version check `verify-release-version` will, then commits, tags
+     `v<version>`, pushes both in one atomic push, and creates a GitHub Release.
+   - The changelog is not generated from commit subjects. The bump renames the single
+     hand-written `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD` and inserts a
+     fresh empty `## [Unreleased]` above it, preserving all notes and older sections
+     byte-for-byte. A missing or duplicate heading refuses the release. An empty
+     Unreleased section is allowed because the release policy derives whether to release
+     from commits, and changelog entries are not a preflight requirement.
    - If `uv lock` would change anything in `uv.lock` beyond this project's own version
      line, the bump refuses: the release commit goes to `main` without a PR, so it may
      carry the bump and nothing else. Relock `main` in a reviewed PR first.
@@ -247,7 +252,7 @@ Release on it.
 See the table under "The weekly release". The schedule will not guess; run **Release** by
 hand with the bump you intend.
 
-**Release fails at "Bump version and generate changelog" with "`uv lock` changed N
+**Release fails at "Bump version and promote the changelog" with "`uv lock` changed N
 line(s) of uv.lock beyond the cli-agent-orchestrator version":**
 The uv on the runner would rewrite more of the lock than the version line, usually
 because the lock was written by a different uv. Nothing was committed. Relock `main` in

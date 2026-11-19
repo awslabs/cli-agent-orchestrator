@@ -268,6 +268,18 @@ class InboxService:
         for message in messages:
             update_message_status(message.id, MessageStatus.DELIVERED)
 
+        # Event-inbox backends whose service delivers off the event loop
+        # (herdr-app) run the submit confirmation too. They have no output
+        # generation, so pickup is judged by a transition from the status read
+        # just before each dispatch, as the first-task path does for them
+        # (terminal_service._wait_for_post_dispatch_start).
+        confirm = INBOX_SUBMIT_CONFIRMATION and not eager
+        native_confirm = (
+            confirm
+            and get_backend().supports_event_inbox()
+            and get_backend().event_inbox_confirms_submit() is True
+        )
+
         # Deliver in contiguous runs of the same sender. With the default
         # num_messages=1 this is a single run; when draining all pending messages
         # (num_messages=0) a batch can span multiple senders, so each run is sent
@@ -277,6 +289,9 @@ class InboxService:
             batch = list(group)
             combined = "\n".join(m.message for m in batch)
             try:
+                pre_dispatch_status = (
+                    status_monitor.get_status(terminal_id) if native_confirm else None
+                )
                 # Taken from dispatch_input's return value -- sampled AFTER the
                 # monitor is armed and the rolling buffer cleared, before any key
                 # reaches the pane (terminal_service.py:4008-4022). That is the
@@ -318,10 +333,10 @@ class InboxService:
                 # that the receiver started on its last input keeps an
                 # unpicked delivery from forwarding the previous answer, and
                 # its pickup timeout tells the caller if it never starts.
-                if INBOX_SUBMIT_CONFIRMATION and not eager:
-                    if get_backend().supports_event_inbox():
-                        # Event-inbox backends (herdr) push delivery synchronously
-                        # inline on their single asyncio event loop thread
+                if confirm:
+                    if get_backend().supports_event_inbox() and not native_confirm:
+                        # The herdr TUI backend pushes delivery synchronously
+                        # inline on its single asyncio event loop thread
                         # (herdr_inbox_service.py's _event_loop -> _deliver, with
                         # no asyncio.to_thread offload -- see the TODO at
                         # herdr_inbox_service.py:1276-1277). _confirm_submitted's
@@ -355,6 +370,8 @@ class InboxService:
                             boundary,
                             registry=registry,
                             sender_id=sender_id,
+                            native=native_confirm,
+                            pre_dispatch_status=pre_dispatch_status,
                         )
                 self._arm_message_edges(terminal_id, batch)
             except TerminalNotFoundError as e:
@@ -521,6 +538,9 @@ class InboxService:
         self,
         terminal_id: str,
         boundary: int,
+        *,
+        native: bool = False,
+        pre_dispatch_status: TerminalStatus | None = None,
     ) -> bool:
         """Wait for a started status that is EVIDENCE OF THIS DELIVERY.
 
@@ -531,15 +551,33 @@ class InboxService:
         causal pair from ``status_observation`` is required -- the generation the
         status was EARNED at must exceed the delivery boundary.
 
-        Callers never pass event-inbox (herdr) terminals here: that backend
-        pushes delivery inline on its own asyncio event loop thread, so
-        ``_deliver_pending_locked`` skips confirmation for it entirely rather
-        than block that loop (see the caller).
+        The herdr TUI backend never gets here: it pushes delivery inline on
+        its own asyncio event loop thread, so ``_deliver_pending_locked`` skips
+        confirmation for it rather than block that loop (see the caller).
+
+        ``native`` (herdr-app, which delivers off the loop): status is derived
+        on demand and has no output generation, so ``boundary`` cannot be
+        used. The rule is the first-task path's for event-inbox backends
+        (``terminal_service._wait_for_post_dispatch_start``): a started status
+        counts if it is PROCESSING or differs from ``pre_dispatch_status``, the
+        reading taken just before the dispatch. Native activity after the send
+        (herdr-core reported ``working``, ``status_monitor.started_on_last_input``)
+        also counts: herdr-core's terminal.send itself waits up to 5 s for the
+        agent to start, so a short turn can be over before the wait begins.
         """
         deadline = time.monotonic() + INBOX_SUBMIT_CONFIRM_TIMEOUT
         while True:
             observation = status_monitor.status_observation(terminal_id)
-            if (
+            if native:
+                if (
+                    observation.status in _SUBMIT_STARTED_STATUSES
+                    and (
+                        observation.status == TerminalStatus.PROCESSING
+                        or observation.status != pre_dispatch_status
+                    )
+                ) or status_monitor.started_on_last_input(terminal_id) is True:
+                    return True
+            elif (
                 observation.status in _SUBMIT_STARTED_STATUSES
                 and observation.output_generation is not None
                 and observation.output_generation > boundary
@@ -557,6 +595,8 @@ class InboxService:
         *,
         registry: PluginRegistry | None,
         sender_id: str | None,
+        native: bool = False,
+        pre_dispatch_status: TerminalStatus | None = None,
     ) -> bool:
         """Confirm the receiver began processing this delivery; re-submit if not.
 
@@ -590,7 +630,15 @@ class InboxService:
         DELIVERED either way: it HAS been typed into the pane, so reverting it to
         PENDING would let the reconcile sweep paste it a second time.
         """
-        if self._wait_for_pickup(terminal_id, boundary):
+
+        def picked_up(since: int) -> bool:
+            # ``native``: judged against the pre-dispatch reading every time, as
+            # the first-task path keeps one reading across its resubmits.
+            return self._wait_for_pickup(
+                terminal_id, since, native=native, pre_dispatch_status=pre_dispatch_status
+            )
+
+        if picked_up(boundary):
             return True
 
         for attempt in range(1, INBOX_SUBMIT_MAX_RESUBMITS + 1):
@@ -637,7 +685,7 @@ class InboxService:
             # The recency bar advances per attempt: evidence has to be earned
             # after THIS re-submission, not after the original send.
             boundary = new_boundary
-            if self._wait_for_pickup(terminal_id, boundary):
+            if picked_up(boundary):
                 return True
 
         logger.error(

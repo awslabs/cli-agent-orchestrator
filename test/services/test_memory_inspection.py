@@ -45,13 +45,16 @@ def test_recall_record_access_false_leaves_counts(inspection, db_engine):
     assert row.last_accessed_at is None
 
 
-@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("enabled", [None, True, False])
 @pytest.mark.parametrize("surface", ["list", "show"])
 def test_cli_inspection_access_counts(inspection, monkeypatch, db_engine, enabled, surface):
     from cli_agent_orchestrator.cli.commands import memory
 
     service, _, ctx = inspection
-    monkeypatch.setenv("CAO_MEMORY_NON_ACCESSING_INSPECTION", str(enabled).lower())
+    if enabled is None:
+        monkeypatch.delenv("CAO_MEMORY_NON_ACCESSING_INSPECTION", raising=False)
+    else:
+        monkeypatch.setenv("CAO_MEMORY_NON_ACCESSING_INSPECTION", str(enabled).lower())
     monkeypatch.setattr(memory, "_get_memory_service", lambda: service)
     command, args = (
         (memory.list_memories, ["--scope", "global"])
@@ -61,11 +64,12 @@ def test_cli_inspection_access_counts(inspection, monkeypatch, db_engine, enable
     result = CliRunner().invoke(command, args)
     assert result.exit_code == 0, result.output
     row = _row(db_engine, "inspect-note")
-    assert row.access_count == int(not enabled)
-    assert (row.last_accessed_at is None) == enabled
+    expected = int(enabled is False)
+    assert row.access_count == expected
+    assert (row.last_accessed_at is None) == (expected == 0)
 
 
-@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("enabled", [None, True, False])
 @pytest.mark.parametrize("surface", ["list", "show"])
 def test_get_memory_routes_non_accessing_when_on(
     inspection, monkeypatch, db_engine, enabled, surface
@@ -75,15 +79,19 @@ def test_get_memory_routes_non_accessing_when_on(
     from cli_agent_orchestrator.api import main
 
     service, _, _ = inspection
-    monkeypatch.setenv("CAO_MEMORY_NON_ACCESSING_INSPECTION", str(enabled).lower())
+    if enabled is None:
+        monkeypatch.delenv("CAO_MEMORY_NON_ACCESSING_INSPECTION", raising=False)
+    else:
+        monkeypatch.setenv("CAO_MEMORY_NON_ACCESSING_INSPECTION", str(enabled).lower())
     monkeypatch.setattr(main, "_get_memory_service", lambda: service)
     response = TestClient(main.app, base_url="http://localhost").get(
         "/memory" if surface == "list" else "/memory/inspect-note", params={"scope": "global"}
     )
     assert response.status_code == 200, response.text
     row = _row(db_engine, "inspect-note")
-    assert row.access_count == int(not enabled)
-    assert (row.last_accessed_at is None) == enabled
+    expected = int(enabled is False)
+    assert row.access_count == expected
+    assert (row.last_accessed_at is None) == (expected == 0)
 
 
 def test_mcp_recall_still_counts_when_on(inspection, monkeypatch, db_engine):
@@ -109,7 +117,10 @@ def test_mcp_recall_still_counts_when_on(inspection, monkeypatch, db_engine):
     assert _row(db_engine, "inspect-note").access_count == 1
 
 
-def test_internal_recall_still_counts_when_on(inspection, monkeypatch, db_engine):
+@pytest.mark.parametrize("record_access, expected", [(None, 1), (False, 0)])
+def test_internal_recall_record_access_control(
+    inspection, monkeypatch, db_engine, record_access, expected
+):
     from fastapi.testclient import TestClient
 
     from cli_agent_orchestrator.api import main
@@ -117,11 +128,14 @@ def test_internal_recall_still_counts_when_on(inspection, monkeypatch, db_engine
     service, _, _ = inspection
     monkeypatch.setenv("CAO_MEMORY_NON_ACCESSING_INSPECTION", "true")
     monkeypatch.setattr(main, "_get_memory_service", lambda: service)
+    body = {"query": "inspect-note", "scope": "global"}
+    if record_access is not None:
+        body["record_access"] = record_access
     response = TestClient(main.app, base_url="http://localhost").post(
-        "/internal/memory/recall", json={"query": "inspect-note", "scope": "global"}
+        "/internal/memory/recall", json=body
     )
     assert response.status_code == 200, response.text
-    assert _row(db_engine, "inspect-note").access_count == 1
+    assert _row(db_engine, "inspect-note").access_count == expected
 
 
 def test_promotion_plan_unchanged_by_inspection_when_on(
@@ -166,8 +180,8 @@ def test_non_accessing_inspection_setting_precedence(monkeypatch):
     from cli_agent_orchestrator.services.config_service import ConfigService, MemoryConfig
 
     monkeypatch.delenv("CAO_MEMORY_NON_ACCESSING_INSPECTION", raising=False)
-    assert settings_service.is_non_accessing_inspection_enabled() is False
-    assert MemoryConfig().non_accessing_inspection is False
+    assert settings_service.is_non_accessing_inspection_enabled() is True
+    assert MemoryConfig().non_accessing_inspection is True
     ConfigService.set("memory.non_accessing_inspection", True)
     assert ConfigService.get("memory.non_accessing_inspection") is True
     monkeypatch.setenv("CAO_MEMORY_NON_ACCESSING_INSPECTION", "false")
@@ -177,9 +191,9 @@ def test_non_accessing_inspection_setting_precedence(monkeypatch):
     assert ConfigService.get("memory.non_accessing_inspection") is True
 
 
-def test_non_accessing_read_error_is_off(monkeypatch):
+def test_non_accessing_read_error_keeps_safe_default(monkeypatch):
     def broken():
         raise OSError("unavailable")
 
     monkeypatch.setattr(settings_service, "get_memory_settings", broken)
-    assert settings_service.is_non_accessing_inspection_enabled() is False
+    assert settings_service.is_non_accessing_inspection_enabled() is True
