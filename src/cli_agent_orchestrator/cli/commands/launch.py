@@ -52,6 +52,7 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "grok_cli",
     "hermes",
     "kimi_cli",
+    "qwen_cli",
     "kiro_cli",
     "mcode",
     "opencode_cli",

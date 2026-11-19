@@ -142,6 +142,7 @@ async def test_conformance_adapter_carries_purpose(tmp_path, monkeypatch):
     assert decider.requests[0].purpose == "purpose-sentinel"
     assert "purpose-sentinel" not in str(adapter.store.list())
     await adapter.engine.runner.close()
+    adapter.db.dispose()
 
 
 @pytest.mark.asyncio

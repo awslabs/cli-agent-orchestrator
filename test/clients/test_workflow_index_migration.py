@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from cli_agent_orchestrator.clients.database import _migrate_workflow_index
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 
 @pytest.fixture
@@ -20,7 +21,7 @@ def patched_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _columns(db_path: Path) -> dict:
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_path))) as conn:
         rows = conn.execute("PRAGMA table_info(workflow_index)").fetchall()
     # PRAGMA returns (cid, name, type, notnull, dflt_value, pk).
     return {r[1]: r for r in rows}
@@ -51,7 +52,7 @@ def test_creates_table_with_expected_columns(patched_db):
 def test_is_idempotent(patched_db):
     _migrate_workflow_index()
     # Insert a row, then re-run the migration — it must NOT drop/recreate.
-    with sqlite3.connect(str(patched_db)) as conn:
+    with closing_transaction(sqlite3.connect(str(patched_db))) as conn:
         conn.execute(
             "INSERT INTO workflow_index "
             "(name, source_path, mode, step_count, description, indexed_at) "
@@ -59,7 +60,7 @@ def test_is_idempotent(patched_db):
         )
         conn.commit()
     _migrate_workflow_index()  # second run
-    with sqlite3.connect(str(patched_db)) as conn:
+    with closing_transaction(sqlite3.connect(str(patched_db))) as conn:
         count = conn.execute("SELECT COUNT(*) FROM workflow_index").fetchone()[0]
     assert count == 1
 
@@ -72,7 +73,7 @@ def test_zero_arg_callable(patched_db):
 def test_widens_legacy_not_null_step_count(patched_db):
     # Simulate a pre-U5 installed DB: workflow_index exists with step_count
     # NOT NULL (the original schema, before script-tier NULL rows existed).
-    with sqlite3.connect(str(patched_db)) as conn:
+    with closing_transaction(sqlite3.connect(str(patched_db))) as conn:
         conn.execute(
             "CREATE TABLE workflow_index ("
             "name TEXT PRIMARY KEY, "
@@ -98,12 +99,12 @@ def test_widens_legacy_not_null_step_count(patched_db):
     # survive (the caller's next `list` rebuilds the index from files).
     cols = _columns(patched_db)
     assert cols["step_count"][3] == 0
-    with sqlite3.connect(str(patched_db)) as conn:
+    with closing_transaction(sqlite3.connect(str(patched_db))) as conn:
         count = conn.execute("SELECT COUNT(*) FROM workflow_index").fetchone()[0]
     assert count == 0
 
     # A NULL step_count row (script-tier) must now insert cleanly.
-    with sqlite3.connect(str(patched_db)) as conn:
+    with closing_transaction(sqlite3.connect(str(patched_db))) as conn:
         conn.execute(
             "INSERT INTO workflow_index "
             "(name, source_path, mode, step_count, description, indexed_at) "
@@ -115,7 +116,7 @@ def test_widens_legacy_not_null_step_count(patched_db):
 
 
 def test_widen_migration_logs_when_it_fires(patched_db, caplog):
-    with sqlite3.connect(str(patched_db)) as conn:
+    with closing_transaction(sqlite3.connect(str(patched_db))) as conn:
         conn.execute(
             "CREATE TABLE workflow_index ("
             "name TEXT PRIMARY KEY, "

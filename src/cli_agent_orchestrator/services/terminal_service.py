@@ -841,6 +841,7 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CLAUDE_CODE.value,
     ProviderType.CODEX.value,
     ProviderType.KIMI_CLI.value,
+    ProviderType.QWEN_CLI.value,
     ProviderType.ANTIGRAVITY_CLI.value,
     ProviderType.OMP.value,
     ProviderType.GROK_CLI.value,

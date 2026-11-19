@@ -422,3 +422,25 @@ def cleanup_terminal(terminal_id: str, session_name: str) -> None:
         requests.delete(f"{API_BASE_URL}/sessions/{session_name}")
     except Exception:
         pass
+
+
+@pytest.fixture()
+def require_qwen_cli(require_cao_server: CaoServer):
+    """Use one native auth store; never snapshot rotating subscription credentials."""
+    if not _cli_available("qwen"):
+        pytest.skip("Qwen Code (qwen) not installed")
+    native_home = os.environ.get("QWEN_HOME")
+    runtime_home = os.environ.get("QWEN_RUNTIME_DIR")
+    if not native_home or not runtime_home:
+        pytest.skip(
+            "Set QWEN_HOME to the native auth store and QWEN_RUNTIME_DIR to a test directory"
+        )
+    if not (Path(native_home).expanduser() / "settings.json").is_file():
+        pytest.skip("Authenticate Qwen before running its live tests")
+    store = require_cao_server.home_dir / ".aws" / "cli-agent-orchestrator" / "agent-store"
+    store.mkdir(mode=0o700, parents=True, exist_ok=True)
+    repo = Path(__file__).resolve().parents[2]
+    for name in ("analysis_supervisor", "data_analyst", "report_generator"):
+        dest = store / f"{name}.md"
+        if not dest.exists():
+            shutil.copy2(repo / "examples" / "assign" / f"{name}.md", dest)

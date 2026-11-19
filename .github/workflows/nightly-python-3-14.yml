@@ -1,0 +1,67 @@
+name: Nightly Python 3.14
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_LOCKED: "1"
+
+concurrency:
+  group: nightly-python-3-14
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python 3.14 tests
+    if: github.repository == 'awslabs/cli-agent-orchestrator'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.14
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Install Trivy for inventory regressions
+        uses: ./.github/actions/install-trivy
+
+      - name: Run unit tests
+        env:
+          CAO_MUST_RUN: unit
+        run: |
+          # CI intentionally includes integration-marked tests except for the Kiro
+          # provider test, which requires an authenticated external CLI.
+          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ \
+            --ignore=test/providers/test_kiro_cli_integration.py \
+            --ignore=test/e2e \
+            -m "not e2e" \
+            --cov=src/cli_agent_orchestrator \
+            --cov-branch \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v
+
+      - name: Validate Markdown links
+        run: uv run python scripts/validate_markdown_links.py
+
+      - name: Check Agent Plugins schema pin
+        run: make check-agent-plugins-schemas
+
+      - name: Check CAO agent plugin packages
+        run: make check-agent-plugin
