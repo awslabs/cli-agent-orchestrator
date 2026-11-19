@@ -138,6 +138,10 @@ _VOCABULARY_BACKLOG_DOCS = [
     # The doc does not cite CAO agent plugins, so it stays out of
     # _THIRD_PARTY_DOCS_CITING_AGENT_PLUGINS.
     "tool-restrictions.md",
+    # Its two bare "plugin" mentions are Claude Code plugins and plugins installed in
+    # Kiro Crew, both reaching the CAO Shelf relay chat's model: third-party extension
+    # systems, not CAO agent or event plugins. It does not cite CAO agent plugins.
+    "kiro-crew.md",
 ]
 
 #: Third-party-plugin docs that **also** legitimately reference CAO's agent

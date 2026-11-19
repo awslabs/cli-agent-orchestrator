@@ -1,0 +1,39 @@
+{
+  "name": "cao-shelf-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Front-end page of the CAO Shelf Kiro Crew App (workstream B).",
+  "scripts": {
+    "gen:types": "node scripts/gen-types.mjs",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext .ts,.tsx",
+    "test": "vitest",
+    "build": "vite build && python3 scripts/inputs_hash.py --write",
+    "check:bundle": "node scripts/check-bundle.mjs",
+    "check": "npm run typecheck && npm run lint && npm test -- --run && npm run build && npm run check:bundle"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.4.0",
+    "@testing-library/react": "^16.0.0",
+    "@testing-library/user-event": "^14.5.0",
+    "@types/jest-axe": "^3.5.9",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@typescript-eslint/eslint-plugin": "^8.72.2",
+    "@typescript-eslint/parser": "^8.72.2",
+    "@vitejs/plugin-react": "^5.2.0",
+    "eslint": "^8.57.0",
+    "eslint-plugin-react": "^7.34.0",
+    "jest-axe": "^9.0.0",
+    "jsdom": "^24.0.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "typescript": "^5.4.0",
+    "vite": "^7.3.8",
+    "vitest": "^4.1.12"
+  },
+  "overrides": {
+    "minimatch": "^11.0.8"
+  }
+}

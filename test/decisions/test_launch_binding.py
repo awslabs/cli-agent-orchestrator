@@ -4,6 +4,7 @@ import asyncio
 from test.decisions.test_engine import (  # noqa: F401  # pytest fixture, injected by name into the tests below
     setup_engine,
 )
+from test.fixtures.app_state import app_state_items
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -15,7 +16,7 @@ def terminal_path(setup_engine, monkeypatch, tmp_path):
     from cli_agent_orchestrator.services import terminal_service as service
 
     engine, req, decider, store, events, settings = setup_engine
-    monkeypatch.setattr(app.state, "decision_engine", engine, raising=False)
+    monkeypatch.setitem(app_state_items(app), "decision_engine", engine)
     from test.fixtures.terminal_launch import install_launch_stubs
 
     provider, backend, providers = install_launch_stubs(monkeypatch, tmp_path)

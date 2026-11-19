@@ -232,3 +232,4 @@ gaps there are, and the timeline marks each one.
 - [web/README.md](../web/README.md) — frontend architecture and component details
 - [docs/configuration.md](configuration.md) — agent directory configuration
 - [docs/control-planes.md](control-planes.md) — where the Web UI fits alongside `cao session` and `cao-ops-mcp`
+- [docs/kiro-crew.md](kiro-crew.md) — the CAO Shelf, a session page inside the Kiro Crew dashboard
