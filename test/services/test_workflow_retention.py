@@ -38,6 +38,7 @@ from cli_agent_orchestrator.models.workflow_runtime import StepOutputRecord
 from cli_agent_orchestrator.services import audit_log, workflow_journal, workflow_retention
 from cli_agent_orchestrator.services import workflow_service as ws
 from cli_agent_orchestrator.services.step_result import build_envelope, parse_envelope
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +254,7 @@ async def test_br_sec_2_capture_off_stores_no_prompt_or_output_text(settings, mo
     monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
     await ws.start_run(spec, {}, "runNoText")
 
-    with sqlite3.connect(str(workflow_journal_db())) as conn:
+    with closing_transaction(sqlite3.connect(str(workflow_journal_db()))) as conn:
         # Every cell of every event row: neither sentinel.
         rows = conn.execute(
             "SELECT * FROM workflow_run_event WHERE run_id = ?", ("runNoText",)
@@ -387,7 +388,7 @@ async def test_br_sec_2_step_output_received_output_ref_null_when_capture_off(
     # ``output_json`` is FUNCTIONAL execution state (resume + ``{{steps.<id>.output}}``
     # templating) that is intentionally retained regardless of the capture gate — it is
     # not the diagnostic free-text the gate governs.
-    with sqlite3.connect(str(workflow_journal_db())) as conn:
+    with closing_transaction(sqlite3.connect(str(workflow_journal_db()))) as conn:
         rows = conn.execute(
             "SELECT * FROM workflow_run_event WHERE run_id = ?", ("runCapOff",)
         ).fetchall()
@@ -438,7 +439,7 @@ async def test_br_sec_2_step_output_received_never_carries_the_payload(settings,
     expected = workflow_retention.output_reference(json.dumps({"secret": big}))
     assert received.output_ref == expected
     # Defense in depth: the sentinel is in NO cell of the event log.
-    with sqlite3.connect(str(workflow_journal_db())) as conn:
+    with closing_transaction(sqlite3.connect(str(workflow_journal_db()))) as conn:
         rows = conn.execute(
             "SELECT * FROM workflow_run_event WHERE run_id = ?", ("runCapOn",)
         ).fetchall()

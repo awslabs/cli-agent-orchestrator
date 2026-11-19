@@ -33,6 +33,7 @@ from cli_agent_orchestrator.clients.database import (
     _migrate_workflow_run_seq,
     _migrate_workflow_run_step,
 )
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 
 @pytest.fixture
@@ -43,14 +44,14 @@ def patched_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _columns(db_path: Path, table: str) -> dict:
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_path))) as conn:
         rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return {r[1]: r for r in rows}  # (cid, name, type, notnull, dflt_value, pk)
 
 
 def _index_names(db_path: Path) -> set:
     """User-defined index names on the DB (excludes SQLite's implicit autoindexes)."""
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_path))) as conn:
         rows = conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
     return {r[0] for r in rows if not r[0].startswith("sqlite_")}
 
@@ -225,7 +226,7 @@ def test_migrations_are_idempotent(patched_db):
     _migrate_workflow_run_step()
     _migrate_workflow_run_event()
     _migrate_workflow_run_seq()
-    with sqlite3.connect(str(patched_db)) as conn:
+    with closing_transaction(sqlite3.connect(str(patched_db))) as conn:
         conn.execute(
             "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, started_at) "
@@ -243,7 +244,7 @@ def test_migrations_are_idempotent(patched_db):
     _migrate_workflow_run_step()
     _migrate_workflow_run_event()
     _migrate_workflow_run_seq()
-    with sqlite3.connect(str(patched_db)) as conn:
+    with closing_transaction(sqlite3.connect(str(patched_db))) as conn:
         assert conn.execute("SELECT COUNT(*) FROM workflow_run").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM workflow_run_event").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM workflow_run_seq").fetchone()[0] == 1
