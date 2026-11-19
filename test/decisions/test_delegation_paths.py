@@ -246,6 +246,12 @@ async def test_real_capability_reprobe_is_reflected_in_tool_result(
     )
     assert adapter.probe.call_count == 2
     assert message.endswith("; ran on model-y (auto: fallback, not_honored)")
+    from cli_agent_orchestrator.services import terminal_service
+
+    assert (
+        set(terminal_service.get_terminal_metadata(adapter.terminal.id))
+        == adapter.real_terminal_metadata_keys
+    )
     row = adapter.store.list()[0]
     assert row["launched_model"] == "model-y" and row["candidate_model"] == "model-x"
     assert row["outcome"] == "fallback" and row["reason"] == "not_honored"

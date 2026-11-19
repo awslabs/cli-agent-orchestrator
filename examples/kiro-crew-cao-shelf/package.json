@@ -1,0 +1,13 @@
+{
+  "name": "cao-shelf",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Root package of the CAO Shelf Kiro Crew App. Only the build script matters: registry installs run `npm install && npm run build` in this folder.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build": "npm --prefix ui ci && npm --prefix ui run build"
+  }
+}
