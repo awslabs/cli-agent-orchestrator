@@ -21,12 +21,12 @@
     "cao-picomatch-guard": "file:../vendor/cao-picomatch-guard-4.0.7-cao.3.tgz",
     "graphology": "^0.26.0",
     "graphology-layout": "^0.6.1",
-    "lucide-react": "^1.71.0",
+    "lucide-react": "^1.72.0",
     "patch-package": "8.0.1",
     "picomatch": "file:picomatch-compat",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
-    "sigma": "^4.0.5",
+    "sigma": "^4.0.6",
     "zustand": "^5.1.0"
   },
   "devDependencies": {
@@ -40,7 +40,7 @@
     "postcss": "^8.5.32",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
-    "vite": "^8.3.7",
+    "vite": "^8.3.8",
     "vitest": "^5.1.0"
   },
   "overrides": {
