@@ -1,0 +1,34 @@
+{
+  "session": "payments-fix",
+  "source": "inbox_rows",
+  "complete": true,
+  "window_rows": 100,
+  "rows_seen": 9,
+  "closed": [
+    {
+      "terminal_id": "b9963ace",
+      "label": null,
+      "rows": 3,
+      "first_at": "2026-11-15T09:54:00+00:00",
+      "last_at": "2026-11-15T10:24:00+00:00",
+      "last_status": "delivered"
+    },
+    {
+      "terminal_id": "f6fcb96a",
+      "label": null,
+      "rows": 3,
+      "first_at": "2026-11-14T13:30:00+00:00",
+      "last_at": "2026-11-14T14:00:00+00:00",
+      "last_status": "delivered"
+    },
+    {
+      "terminal_id": "0db60a14",
+      "label": null,
+      "rows": 3,
+      "first_at": "2026-11-14T09:30:00+00:00",
+      "last_at": "2026-11-14T10:00:00+00:00",
+      "last_status": "delivered"
+    }
+  ],
+  "external_senders": []
+}

@@ -1,0 +1,26 @@
+{
+  "session": "docs-refresh",
+  "source": "inbox_rows",
+  "complete": true,
+  "window_rows": 100,
+  "rows_seen": 6,
+  "closed": [
+    {
+      "terminal_id": "7e5affe9",
+      "label": null,
+      "rows": 3,
+      "first_at": "2026-11-15T05:30:00+00:00",
+      "last_at": "2026-11-15T06:00:00+00:00",
+      "last_status": "delivered"
+    },
+    {
+      "terminal_id": "4ad52c0e",
+      "label": null,
+      "rows": 3,
+      "first_at": "2026-11-14T05:30:00+00:00",
+      "last_at": "2026-11-14T06:00:00+00:00",
+      "last_status": "delivered"
+    }
+  ],
+  "external_senders": []
+}

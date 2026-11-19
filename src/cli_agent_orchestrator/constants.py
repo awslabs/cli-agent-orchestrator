@@ -8,6 +8,7 @@ Codex, Kimi CLI, Q CLI) through tmux sessions, providing a unified interface
 for agent management.
 """
 
+import math
 import os
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -32,7 +33,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _env_positive_float(name: str, default: float) -> float:
-    """Read a float env var, falling back when the value is invalid OR non-positive.
+    """Read a float env var, falling back when the value is invalid, non-finite OR non-positive.
 
     For env vars that feed a ``threading.Event.wait(timeout)``-style poll
     interval, a non-positive value isn't just atypical, it's actually
@@ -43,7 +44,7 @@ def _env_positive_float(name: str, default: float) -> float:
     the default — rather than introducing a separate arbitrary floor value.
     """
     value = _env_float(name, default)
-    return value if value > 0 else default
+    return value if math.isfinite(value) and value > 0 else default
 
 
 # =============================================================================
@@ -111,6 +112,13 @@ TMUX_HISTORY_LIMIT = _env_int("CAO_TMUX_HISTORY_LIMIT", 50000)
 # serve; a rung above it returns the same 1000 lines as the rung below (#728).
 # Not operator-tunable: it is herdr's number, not CAO's.
 HERDR_PANE_READ_MAX_LINES = 1000
+
+# Most history lines HerdrAppBackend asks herdr-core's terminal.read for.
+# Set from the live measurement in test/e2e/test_herdr_app_backend_e2e.py:
+# hc 0.1.21 returned 2994 rows (history plus the 120-row screen) for
+# lines=20000, so N rounded down to a multiple of 1000. The cap counts screen
+# rows, so lines wider than the terminal wrap and return fewer lines.
+HC_READ_MAX_LINES = 2000
 
 # Foreground commands to treat as bracketed-paste INCOMPATIBLE.
 # (\x1b[200~...\x1b[201~). send_keys(force_bracketed_paste=True) checks the
