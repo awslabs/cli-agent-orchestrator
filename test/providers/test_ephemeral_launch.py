@@ -1,6 +1,7 @@
 """Launch paths must not turn an unavailable ephemeral into a native agent."""
 
 import json
+from test.fixtures.app_state import app_state_items
 from test.services.test_ephemeral_service import create_store  # noqa: F401
 from test.utils.test_agent_profiles_ephemeral import DOCUMENT, NAME, stores  # noqa: F401
 from unittest.mock import AsyncMock, Mock
@@ -158,7 +159,7 @@ def test_launch_routes_map_ephemeral_policy_refusals(stores, monkeypatch, route,
 
     from cli_agent_orchestrator.plugins.registry import PluginRegistry
 
-    monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    monkeypatch.setitem(app_state_items(main.app), "plugin_registry", PluginRegistry())
     monkeypatch.setattr(main.session_service, "create_session", launch)
     monkeypatch.setattr(main, "run_agent_step", launch)
     from cli_agent_orchestrator.clients import database

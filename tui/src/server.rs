@@ -461,9 +461,10 @@ fn route(id: CommandId) -> Option<Route> {
                 wire: "scope",
             }],
         ),
-        // HIDE: maintenance sweeps with no route (`memory compact`/`heal` call the LLM compiler
-        // and lint repair in-process).
+        // HIDE: local maintenance commands with no route (`memory compact`/`heal` call the LLM
+        // compiler and lint repair in-process; `memory doctor` inspects local files).
         CommandId::MemoryCompact => None,
+        CommandId::MemoryDoctor => None,
         CommandId::MemoryHeal => None,
         // HANDOFF, all five — OQ-6. No route exists, and ADR-02 forbids the subprocess that
         // would be the only alternative, so they cannot run captured in-pane at all. The

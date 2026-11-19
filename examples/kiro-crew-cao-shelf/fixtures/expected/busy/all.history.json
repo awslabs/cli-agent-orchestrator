@@ -1,0 +1,125 @@
+{
+  "closed": [
+    {
+      "session": "payments-fix",
+      "terminal_id": "b9963ace",
+      "rows": 3,
+      "last_at": "2026-11-15T10:24:00+00:00"
+    },
+    {
+      "session": "docs-refresh",
+      "terminal_id": "7e5affe9",
+      "rows": 3,
+      "last_at": "2026-11-15T06:00:00+00:00"
+    },
+    {
+      "session": "migrate-db",
+      "terminal_id": "0f691b16",
+      "rows": 3,
+      "last_at": "2026-11-14T20:00:00+00:00"
+    },
+    {
+      "session": "migrate-db",
+      "terminal_id": "d67e8c34",
+      "rows": 3,
+      "last_at": "2026-11-14T16:00:00+00:00"
+    },
+    {
+      "session": "payments-fix",
+      "terminal_id": "f6fcb96a",
+      "rows": 3,
+      "last_at": "2026-11-14T14:00:00+00:00"
+    },
+    {
+      "session": "payments-fix",
+      "terminal_id": "0db60a14",
+      "rows": 3,
+      "last_at": "2026-11-14T10:00:00+00:00"
+    },
+    {
+      "session": "migrate-db",
+      "terminal_id": "8258e533",
+      "rows": 3,
+      "last_at": "2026-11-14T08:00:00+00:00"
+    },
+    {
+      "session": "docs-refresh",
+      "terminal_id": "4ad52c0e",
+      "rows": 3,
+      "last_at": "2026-11-14T06:00:00+00:00"
+    },
+    {
+      "session": "migrate-db",
+      "terminal_id": "9aeff40c",
+      "rows": 3,
+      "last_at": "2026-11-13T20:00:00+00:00"
+    },
+    {
+      "session": "search-tuning",
+      "terminal_id": "afc02950",
+      "rows": 3,
+      "last_at": "2026-11-13T00:00:00+00:00"
+    },
+    {
+      "session": "release-notes",
+      "terminal_id": "44d39125",
+      "rows": 3,
+      "last_at": "2026-11-12T04:00:00+00:00"
+    },
+    {
+      "session": "release-notes",
+      "terminal_id": "27f33cef",
+      "rows": 3,
+      "last_at": "2026-11-11T18:00:00+00:00"
+    },
+    {
+      "session": "release-notes",
+      "terminal_id": "1cc86efb",
+      "rows": 3,
+      "last_at": "2026-11-11T08:00:00+00:00"
+    },
+    {
+      "session": "api-cleanup",
+      "terminal_id": "fc807a20",
+      "rows": 3,
+      "last_at": "2026-11-10T22:00:00+00:00"
+    },
+    {
+      "session": "api-cleanup",
+      "terminal_id": "aed76204",
+      "rows": 3,
+      "last_at": "2026-11-10T12:00:00+00:00"
+    },
+    {
+      "session": "perf-probe",
+      "terminal_id": "38115fa8",
+      "rows": 3,
+      "last_at": "2026-11-10T02:00:00+00:00"
+    },
+    {
+      "session": "ui-polish",
+      "terminal_id": "76db3313",
+      "rows": 3,
+      "last_at": "2026-11-08T20:00:00+00:00"
+    },
+    {
+      "session": "data-backfill",
+      "terminal_id": "b9986ac5",
+      "rows": 3,
+      "last_at": "2026-11-06T18:00:00+00:00"
+    },
+    {
+      "session": "data-backfill",
+      "terminal_id": "dd03c5e6",
+      "rows": 3,
+      "last_at": "2026-11-06T13:00:00+00:00"
+    },
+    {
+      "session": "ci-flakes",
+      "terminal_id": "e7b057e8",
+      "rows": 3,
+      "last_at": "2026-11-03T00:00:00+00:00"
+    }
+  ],
+  "complete": true
+}
