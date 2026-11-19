@@ -362,6 +362,46 @@ class TestLiteralStepIdRule:
         assert _findings_by_rule(result, "invalid-step-id") == []
         assert result.status == "pass"
 
+    @pytest.mark.parametrize(
+        "step_id",
+        [
+            'f"summarize:{filename}"',
+            'f"review:{a}-{b}"',
+            'f"{name}.txt"',
+            'f"{name} copy"',
+            'f"a:b"',
+            'f"step-{n}-' + "x" * 64 + '"',
+        ],
+    )
+    def test_fstring_whose_text_breaks_the_rule_is_a_blocking_error(self, step_id):
+        """Regression for #1396: no interpolated value can remove the bad text."""
+        source = SHIM_IMPORT + f"step('p', 'a', 'x', step_id={step_id}, recovery='idempotent')\n"
+        result = lint_script(source, "s.py")
+
+        findings = _findings_by_rule(result, "invalid-step-id")
+        assert result.status == "fail"
+        assert len(findings) == 1
+        assert findings[0].severity == "error"
+        assert findings[0].line == 3
+        assert "[A-Za-z0-9_-]" in findings[0].message
+
+    @pytest.mark.parametrize(
+        "step_id",
+        [
+            'f"summarize-{filename}"',
+            'f"{name}"',
+            'f"{a}_{b}"',
+            'f"item-{i:03d}"',
+            'f"item-{label!r}"',
+        ],
+    )
+    def test_fstring_with_valid_text_is_left_to_runtime_validation(self, step_id):
+        source = SHIM_IMPORT + f"step('p', 'a', 'x', step_id={step_id}, recovery='idempotent')\n"
+        result = lint_script(source, "s.py")
+
+        assert _findings_by_rule(result, "invalid-step-id") == []
+        assert result.status == "pass"
+
     def test_unrelated_run_step_method_is_not_blocked(self):
         source = "runner.run_step('p', 'a', 'x', step_id='not:a:cao:id')\n"
         result = lint_script(source, "s.py")
