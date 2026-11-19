@@ -477,6 +477,15 @@ class TerminalBackend(ABC):
         """Focus ``target`` (from ``prepare_web_attach_input``) so input reaches it."""
         return None
 
+    def release_web_input(self, target: str) -> None:
+        """End the input turn ``focus_web_input`` began, once the frame was read.
+
+        Called after every successful ``focus_web_input``, when the client has
+        read the input frame. A backend that holds something across the turn
+        (herdr: a lock shared with its web views) releases it here.
+        """
+        return None
+
     # --- Pipe-pane (logging) ---
 
     @abstractmethod

@@ -10861,6 +10861,14 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             return False
         return True
 
+    async def _release_own_pane() -> None:
+        """End the turn a successful ``_select_own_pane`` began."""
+        assert input_focus is not None
+        try:
+            await asyncio.to_thread(get_backend().release_web_input, input_focus[1])
+        except Exception as e:  # noqa: BLE001 — the next focus retries the release
+            logger.warning(f"Could not end the input turn for terminal {terminal_id}: {e}")
+
     # Create PTY pair for backend attach
     master_fd, slave_fd = pty.openpty()
 
@@ -10890,7 +10898,8 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # terminal's pane so its cursor starts on the right agent.
     if input_window is not None:
         async with input_window.turn(input_owner):
-            await _select_own_pane()
+            if await _select_own_pane():
+                await _release_own_pane()
 
     # Make master_fd non-blocking for event-driven reads
     flag = fcntl.fcntl(master_fd, fcntl.F_GETFL)
@@ -10998,8 +11007,11 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
                         if not await _select_own_pane():
                             # Dropped: never deliver keys to another agent's pane.
                             continue
-                        await _write_input(raw)
-                        drained = await _wait_for_pty_drain(slave_path)
+                        try:
+                            await _write_input(raw)
+                            drained = await _wait_for_pty_drain(slave_path)
+                        finally:
+                            await _release_own_pane()
                         input_window.after_write(input_owner, raw, escape_hold_s)
                         if not drained:
                             if not drain_timeout_logged:
