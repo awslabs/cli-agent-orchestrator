@@ -324,6 +324,7 @@ As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-
 | **OpenCode CLI** | Hard | `permission:` YAML frontmatter enforced natively at install time; launch-time `--allowed-tools` and role overrides select the installed agent and do not change its permissions |
 | **Grok Build CLI** | Native (mapped families) | Restricted profiles use deny-by-default `--permission-mode dontAsk` with explicit native/MCP allows and defense-in-depth denies; native subagents are disabled |
 | **Kimi CLI** | Soft | Security system prompt only |
+| **Qwen Code** | Soft | Security system prompt only; tool calls auto-approved |
 | **MiniMax Code** | Soft | Security bootstrap prompt only |
 | **OMP** | Soft | Security system prompt only |
 | **Codex** | Soft | Security system prompt only |

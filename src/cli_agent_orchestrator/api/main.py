@@ -4122,6 +4122,7 @@ async def list_providers_endpoint(
         "codex": "codex",
         "hermes": "hermes",
         "kimi_cli": "kimi",
+        "qwen_cli": "qwen",
         "copilot_cli": "copilot",
         "opencode_cli": "opencode",
         "cursor_cli": "agent",

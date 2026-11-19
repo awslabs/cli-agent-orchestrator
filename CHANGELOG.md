@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add the Qwen Code (`qwen_cli`) provider with profile, skill, MCP and model support.
+
 - **`cao memory show` finds an existing key when recall ranks by BM25** (#1329).
 - **Memory inspection and fixture hygiene are safer by default** (#1329).
   This resolves #861 Q3: CLI list/show and REST list/show no longer increment
