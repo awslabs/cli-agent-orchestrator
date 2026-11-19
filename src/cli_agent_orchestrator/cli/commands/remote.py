@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import click
 
 from cli_agent_orchestrator.services.remote.checks import check_box, check_json
+from cli_agent_orchestrator.services.remote.connect import (
+    ConnectError,
+    connect,
+    has_ssh_artifacts,
+    remove_ssh_artifacts,
+)
 from cli_agent_orchestrator.services.remote.registry import (
     RemoteBox,
     RemoteConfigError,
@@ -15,6 +22,7 @@ from cli_agent_orchestrator.services.remote.registry import (
     remove,
     save,
 )
+from cli_agent_orchestrator.services.remote.runner import Runner
 
 
 @click.group()
@@ -54,13 +62,21 @@ def list_cmd() -> None:
 
 @remote.command("remove")
 @click.argument("box")
-def remove_cmd(box: str) -> None:
+@click.option("--yes", is_flag=True, help="Approve SSH artifact cleanup without prompting.")
+def remove_cmd(box: str, yes: bool) -> None:
     """Remove a local Remote CAO box registration."""
     try:
-        remove(box)
+        remote_box = load(box)
+        remove(remote_box.name)
     except RemoteConfigError as exc:
         raise click.UsageError(str(exc)) from exc
     click.echo(f"Removed remote box '{box}'.")
+    home = Path.home()
+    if has_ssh_artifacts(remote_box, home):
+        action = f"Remove managed SSH entries for cao-{remote_box.name}"
+        click.echo(action)
+        if yes or click.confirm(f"{action}?", default=False):
+            remove_ssh_artifacts(remote_box, home)
 
 
 @remote.command("check")
@@ -79,3 +95,25 @@ def check_cmd(box: str, as_json: bool) -> None:
             click.echo(result.rendered())
     if any(result.status == "FIX" for result in checks):
         raise click.exceptions.Exit(1)
+
+
+@remote.command("connect")
+@click.argument("box")
+@click.option("--no-attach", is_flag=True, help="Print connection instructions without attaching.")
+@click.option("--yes", is_flag=True, help="Approve each setup action without prompting.")
+@click.option("--rekey", is_flag=True, help="Replace a changed pinned host key after confirmation.")
+def connect_cmd(box: str, no_attach: bool, yes: bool, rekey: bool) -> None:
+    """Set up an experimental Remote CAO connection after confirmation."""
+    try:
+        remote_box = load(box)
+        connect(
+            remote_box,
+            runner=Runner(),
+            home=Path.home(),
+            ask=lambda action: yes or click.confirm(f"{action}?", default=False),
+            tell=click.echo,
+            no_attach=no_attach,
+            rekey=rekey,
+        )
+    except (RemoteConfigError, ConnectError) as exc:
+        raise click.UsageError(str(exc)) from exc

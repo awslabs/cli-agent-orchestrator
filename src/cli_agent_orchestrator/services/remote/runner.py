@@ -34,3 +34,11 @@ class Runner:
         except (OSError, subprocess.TimeoutExpired) as exc:
             return RunResult(1, stderr=type(exc).__name__)
         return RunResult(completed.returncode, completed.stdout, completed.stderr)
+
+    def run_interactive(self, argv: Sequence[str]) -> RunResult:
+        """Run an explicitly approved command on the caller's terminal."""
+        try:
+            completed = subprocess.run(list(argv), check=False)
+        except OSError as exc:
+            return RunResult(1, stderr=type(exc).__name__)
+        return RunResult(completed.returncode)
