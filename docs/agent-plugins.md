@@ -602,6 +602,42 @@ failing CI on any drift.
 > The name `cao-contributor` and the packaged name of the event-plugin authoring
 > skill are provisional, pending maintainer decision **M4**.
 
+## Install from the marketplace
+
+The repository root carries a marketplace catalog for each client that can add a
+repository as a marketplace, so the four packages above install without
+cloning anything or enabling `CAO_AGENT_PLUGINS_ENABLED`:
+
+```sh
+# Claude Code
+/plugin marketplace add awslabs/cli-agent-orchestrator
+/plugin install cao@cli-agent-orchestrator
+
+# Codex
+codex plugin marketplace add awslabs/cli-agent-orchestrator
+codex plugin add cao@cli-agent-orchestrator
+```
+
+The same commands work from a shell as `claude plugin marketplace add ...` and
+`claude plugin install ...`. Verified against Claude Code 2.1.328 and Codex CLI
+0.170.0, from a local checkout.
+
+The catalogs are `.claude-plugin/marketplace.json` (Claude Code) and
+`.agents/plugins/marketplace.json` (Codex). The Agent Plugins specification
+defines one manifest per plugin and no marketplace format, so each client's own
+file is needed. `scripts/build_agent_plugin.py` writes both from the same package
+list that writes the per-package manifests, and `make check-agent-plugin` fails
+when either is stale.
+
+**The catalog follows `main`**, not a release tag. A marketplace added from
+`awslabs/cli-agent-orchestrator` receives `main`'s skills, including
+`cao-ag-ui-builder`, which can describe behavior that has not been released.
+Package versions say what was last pinned, not what `main` contains.
+
+`cao plugin add` remains the route that works across every CAO provider: it
+installs a package into CAO's own skill store and provider configs, which a
+client-specific marketplace does not do.
+
 ## Trying it in a client
 
 Two routes reach a client, and they are worth keeping apart. **Through CAO** —
