@@ -529,9 +529,7 @@ class TestRun:
 
         assert b"typed\r" in env.client_input.read_bytes()
 
-    def test_with_no_usable_state_directory_it_paints_but_leaves_the_focus(
-        self, env, monkeypatch
-    ):
+    def test_with_no_usable_state_directory_it_paints_but_leaves_the_focus(self, env, monkeypatch):
         self._on_the_pty(env, monkeypatch)
         # Another user's directory, say: not 0700, so the view has no lock.
         (env.tmp_path / f"cao-herdr-web-view-{os.getuid()}").mkdir(mode=0o755)

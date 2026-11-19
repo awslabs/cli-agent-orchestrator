@@ -996,9 +996,7 @@ class HerdrBackend(TerminalBackend):
                     "focus lock (%s is missing, not 0700 or not ours); browser terminals "
                     "will not resize their agents' panes",
                     self._herdr_session,
-                    os.path.join(
-                        tempfile.gettempdir(), f"cao-herdr-web-view-{os.getuid()}"
-                    ),
+                    os.path.join(tempfile.gettempdir(), f"cao-herdr-web-view-{os.getuid()}"),
                 )
             return
         deadline = time.monotonic() + _HERDR_WEB_FOCUS_LOCK_TIMEOUT_S
