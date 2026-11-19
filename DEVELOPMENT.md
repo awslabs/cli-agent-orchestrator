@@ -228,6 +228,15 @@ uv run pytest test/ \
 uv run python scripts/validate_markdown_links.py
 ```
 
+### Tests that need extra tools
+
+`test/examples/test_remote_runners_manifests.py` checks the remote-runner Kubernetes
+example. Its rendered-overlay tests need `kubectl` (for `kubectl kustomize`), and its
+tests of the EKS `deploy.sh` (run against stub `aws`, `kubectl` and `docker`, without
+reaching AWS or a cluster) need `kubectl` and `openssl`. Without them those tests are
+skipped, not failed, which is about half of that module; run with `-rs` to see the
+skips. Install `kubectl` and `openssl` to run them.
+
 ### Test Markers
 
 Tests are organized with pytest markers:

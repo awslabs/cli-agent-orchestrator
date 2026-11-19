@@ -24,23 +24,25 @@ base/              cluster-neutral: any conformant cluster
   networkpolicy.yaml default-deny, then only the paths below
   workspace.yaml     the RWX workspace claim (no storage class)
 overlays/kind/     a local test cluster: hostPath workspace, cleartext ws://
+overlays/eks/      EKS Auto Mode: EFS workspace, gp3 state, wss://, Pod Identity
+  iac/               CloudFormation for the AWS side (VPC, cluster, EFS, IAM, ECR)
 ```
 
 The base names no storage class, registry or model provider, and does not
 choose a transport: its runners point at the hub with a cleartext `ws://` URL,
 which they refuse until an overlay either opts into cleartext explicitly or
-serves `wss://`. An overlay supplies all of these. `overlays/kind` is for local testing only; an EKS overlay
-(EFS workspace, images from ECR, `wss://`, provider credentials through EKS Pod
-Identity) is the next phase of #745.
+serves `wss://`. An overlay supplies all of these. `overlays/kind` is for local testing
+only; `overlays/eks` runs it on EKS Auto Mode (see [Run it on EKS Auto Mode](#run-it-on-eks-auto-mode)).
 
 What an overlay must decide:
 
-| Concern | Base | `overlays/kind` | Production cluster |
+| Concern | Base | `overlays/kind` | `overlays/eks` |
 |---|---|---|---|
-| Workspace (RWX) | claim, no class | hostPath PV on a shared host dir | an RWX class (EFS, NFS, ...) |
-| Runner to hub transport | `ws://`, refused off loopback | `CAO_RUNNER_ALLOW_INSECURE=1` | `wss://` (see [Transport](#transport)) |
-| Image | `cao-server:dev` | built and `kind load`ed by `deploy.sh` | your registry |
-| Provider settings and credentials | optional `cao-provider-env` ConfigMap, `cao-provider-credentials` Secret | none (bring your own) | workload identity where available |
+| Workspace (RWX) | claim, no class | hostPath PV on a shared host dir | EFS access point (static PV) |
+| Server state (RWO) | claim, no class | the cluster default | gp3 (`cao-gp3`, Auto Mode's EBS driver) |
+| Runner to hub transport | `ws://`, refused off loopback | `CAO_RUNNER_ALLOW_INSECURE=1` | `wss://`, the hub serves TLS (see [Transport](#transport)) |
+| Image | `cao-server:dev` | built and `kind load`ed by `deploy.sh` | built and pushed to the stack's ECR repository |
+| Provider settings and credentials | optional `cao-provider-env` ConfigMap, `cao-provider-credentials` Secret | none (bring your own) | Bedrock through EKS Pod Identity, runners only |
 
 ## Network paths
 
@@ -62,7 +64,8 @@ Ingress, LoadBalancer or NodePort. Reach the API with `kubectl port-forward`.
 
 Two cluster requirements. The network plugin must enforce NetworkPolicy, or
 these objects are accepted and silently ignored: kind's default CNI (kindnet)
-enforces them, and on EKS the VPC CNI's network policy agent must be enabled.
+enforces them, and on EKS the VPC CNI's network policy agent must be enabled
+(in Auto Mode, a ConfigMap that `overlays/eks/deploy.sh` applies first).
 And the DNS rule selects pods labelled `k8s-app: kube-dns` in `kube-system`
 (CoreDNS's usual label); patch `allow-dns` in your overlay if your cluster's DNS
 differs, since under default-deny no pod could resolve `cao-server` otherwise.
@@ -142,6 +145,183 @@ kubectl --context kind-cao-remote -n cao-remote create secret generic cao-provid
   --from-env-file=<file with AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN>
 kubectl --context kind-cao-remote -n cao-remote rollout restart deployment/cao-runner
 ```
+
+## Run it on EKS Auto Mode
+
+`overlays/eks/iac/cfn-auto-mode.yaml` creates the AWS side in one stack: a
+two-AZ VPC with one NAT gateway, an EKS Auto Mode cluster with Secrets
+encrypted by KMS, the EFS workspace (NFS only from the cluster's nodes), the
+Bedrock role the runners assume through EKS Pod Identity, and a private ECR
+repository. `overlays/eks/deploy.sh` then builds and pushes the image and
+applies the overlay.
+
+```bash
+export AWS_REGION=ap-southeast-2
+aws cloudformation deploy \
+  --template-file examples/cao-clusters/kubernetes/remote-runners/overlays/eks/iac/cfn-auto-mode.yaml \
+  --stack-name cao-remote --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides ClusterName=cao-remote PublicAccessCidrs=<your-ip>/32
+examples/cao-clusters/kubernetes/remote-runners/overlays/eks/deploy.sh cao-remote
+```
+
+- **Kubernetes API endpoint:** public, limited to `PublicAccessCidrs` and
+  authenticated by IAM; the stack grants cluster admin to whoever deploys it.
+  If your outbound address changes between connections (a corporate egress
+  pool), list each range it uses. The CAO API and the hub stay ClusterIP:
+  reach the API with `kubectl port-forward`.
+- **Transport:** `deploy.sh` makes a CA for this purpose, signs the hub's
+  certificate with it and discards the CA key. The server gets the certificate
+  and key (`cao-hub-tls` Secret), the runners only the CA certificate
+  (`cao-hub-ca` ConfigMap). The CA has keyUsage and the certificate names
+  `cao-server.cao-remote.svc`, as the strict X.509 checks of Python 3.13 and
+  later require. Each run checks what is in the cluster and issues both anew
+  if either is missing, the certificate does not pass those checks against the
+  CA (material from an earlier `deploy.sh` whose CA had no keyUsage does not),
+  or it expires within 30 days. A hash of both is in the server and runner
+  pod templates, so new material rolls them, also on the run after a failed
+  one. To rotate, delete `cao-hub-tls` and run `deploy.sh` again.
+- **Image updates:** the default tag is the commit plus a digest of the files
+  the image is built from, and the repository's tags are immutable, so a
+  re-run with the same files reuses the pushed image. The OS packages the build
+  upgrades are not in that digest: to take package fixes published since the
+  last build, run with `CAO_IMAGE_REBUILD=1`, which builds a new image from
+  a fresh base pull with no cached layers, pushes it and rolls the pods onto it.
+  Later runs without it (a TLS rotation, a model change) keep that rebuilt
+  image while the files are the same, instead of going back to the image from
+  before the rebuild; a change to the files builds a new image as usual. To
+  run a different pushed image, set `CAO_IMAGE_TAG` to its tag.
+- **Model:** `claude_code` on Bedrock, model `CAO_BEDROCK_MODEL` (default
+  `global.anthropic.claude-sonnet-4-6`, the global cross-Region inference
+  profile: the region you deploy in serves it, and Bedrock may process
+  requests in any commercial region; for data residency set a geographic
+  profile such as `us.`, `eu.` or `au.anthropic.claude-sonnet-4-6`). Of the CAO
+  pods, only the runners get AWS credentials, and those allow only invoking the
+  models `BedrockModelPattern` names (default Anthropic Claude) and reading the
+  model catalogue. Activate model access for the account once, as an
+  administrator, before the first run; the runners cannot subscribe to a model.
+  The EFS CSI driver has its own roles, for EFS only. Changing the model in
+  `deploy.sh` rolls the runners; agents already running keep their model.
+- **Workspace:** the EFS access point pins every client to uid/gid 1000 under
+  `/cao-workspace`. The volume mounts with the `iam` option, as the EFS CSI
+  driver's node role (Pod Identity on `efs-csi-node-sa`), whose policy lets it
+  mount and write only through the workspace access point. The file system
+  policy allows nothing to clients without IAM, and denies every mount
+  without an access point or without TLS, whatever an identity policy
+  allows. It also denies root access, which squashes root rather than
+  refusing the mount: UID 0 on the client is mapped to a user with limited
+  permissions (through the workspace access point, every request runs as
+  uid/gid 1000 regardless). It cannot limit mounts to the node role: EFS
+  enforces only a few condition keys for NFS clients, and none of them names
+  the principal. So any principal of this account whose own IAM policy grants
+  EFS client actions (`elasticfilesystem:ClientMount`, `ClientWrite`) can
+  still mount through an access point of this file system, including the
+  workspace one (there as uid/gid 1000 under `/cao-workspace`; through
+  another access point as whatever that access point sets). Whoever can run
+  pods as `efs-csi-node-sa` in `kube-system` (a cluster admin) can use the
+  node role. TLS is the EFS CSI driver's default, and the file system policy
+  refuses a mount without it.
+
+  **Upgrading a stack from before the file system policy:** as soon as the
+  stack update applies the policy, mounts made without `iam` (every mount
+  until then) are anonymous and lose access, so the workspace is unavailable
+  to running agents until the driver's node pods are restarted (Pod Identity
+  gives a pod its credentials when it starts) and the runner pods are
+  recreated, which remounts the workspace with `iam`. Update when no agent
+  runs, and right after the stack update (step 5 of the log group upgrade
+  below, if that applies) run:
+
+  ```bash
+  kubectl -n kube-system rollout restart daemonset efs-csi-node
+  kubectl -n kube-system rollout status daemonset efs-csi-node --timeout=300s
+  kubectl -n cao-remote rollout restart deployment/cao-runner
+  kubectl -n cao-remote rollout status deployment/cao-runner --timeout=600s
+  examples/cao-clusters/kubernetes/remote-runners/overlays/eks/deploy.sh <stack>
+  ```
+
+  The explicit runner restart is what guarantees the remount: `deploy.sh`
+  applies the manifests and rolls the runners only when their pod template
+  changes (a new image, TLS material or provider settings). Running
+  `deploy.sh` first is fine too, but restart the runners after it either
+  way.
+- **Auto Mode and NetworkPolicy:** cluster DNS runs on each node at the `.10`
+  address of the service range, not in CoreDNS pods, and Pod Identity's agent
+  answers on `169.254.170.23:80`. The overlay allows exactly those two, on top
+  of the base policy. The service range is pinned in the stack so the DNS
+  address is known. As everywhere in Kubernetes, NetworkPolicy does not stop a
+  pod from reaching its own node, so a runner can reach its node's kubelet
+  port; the kubelet requires authentication, and runners mount no service
+  account token.
+- **Cost:** the control plane, the nodes, the NAT gateway and EFS bill while the
+  stack exists. `aws cloudformation delete-stack --stack-name cao-remote`
+  removes everything, including the image repository's images and the
+  control-plane log group (`/aws/eks/<ClusterName>/cluster`, kept 30 days
+  while the stack exists); delete the `cao-remote` namespace first so Auto
+  Mode releases its volumes and nodes. The stack declares that log group, so
+  creating it fails while a group of that name exists, for example one left
+  by an earlier cluster of the same name.
+- **Upgrading a stack created before the template declared the log group:**
+  its cluster already created the group, so the update cannot create it.
+  Import it into the stack first, which keeps its logs. With `STACK` and
+  `CLUSTER` set to the stack and its `ClusterName`:
+
+  1. Save the deployed template. For a stack created from this (YAML)
+     template, `--output text` prints the YAML as it was deployed; for a
+     JSON template, use `--output json > deployed.json` instead.
+
+     ```bash
+     aws cloudformation get-template --stack-name "$STACK" \
+       --template-stage Original --query TemplateBody --output text > deployed.yaml
+     ```
+
+  2. Edit `deployed.yaml`: add the `ClusterLogGroup` resource under
+     `Resources`, exactly as `iac/cfn-auto-mode.yaml` defines it (with its
+     `DeletionPolicy` and `UpdateReplacePolicy`), and change nothing else.
+  3. Create the import change set, and check that its only change is
+     `Import` of `ClusterLogGroup`:
+
+     ```bash
+     aws cloudformation create-change-set --stack-name "$STACK" \
+       --change-set-name import-cluster-log-group --change-set-type IMPORT \
+       --resources-to-import "[{\"ResourceType\":\"AWS::Logs::LogGroup\",\"LogicalResourceId\":\"ClusterLogGroup\",\"ResourceIdentifier\":{\"LogGroupName\":\"/aws/eks/$CLUSTER/cluster\"}}]" \
+       --template-body file://deployed.yaml \
+       --parameters ParameterKey=ClusterName,UsePreviousValue=true \
+         ParameterKey=KubernetesVersion,UsePreviousValue=true \
+         ParameterKey=VpcCidr,UsePreviousValue=true \
+         ParameterKey=ServiceIpv4Cidr,UsePreviousValue=true \
+         ParameterKey=PublicAccessCidrs,UsePreviousValue=true \
+         ParameterKey=BedrockModelPattern,UsePreviousValue=true \
+       --capabilities CAPABILITY_NAMED_IAM
+     aws cloudformation wait change-set-create-complete --stack-name "$STACK" \
+       --change-set-name import-cluster-log-group
+     aws cloudformation describe-change-set --stack-name "$STACK" \
+       --change-set-name import-cluster-log-group \
+       --query 'Changes[].ResourceChange.[Action,LogicalResourceId,ResourceType]' --output text
+     ```
+
+  4. Execute it, wait, and set the retention: an import keeps the group's
+     current retention.
+
+     ```bash
+     aws cloudformation execute-change-set --stack-name "$STACK" \
+       --change-set-name import-cluster-log-group
+     aws cloudformation wait stack-import-complete --stack-name "$STACK"
+     aws logs put-retention-policy --log-group-name "/aws/eks/$CLUSTER/cluster" \
+       --retention-in-days 30
+     ```
+
+  5. Update the stack with the new template. `aws cloudformation deploy`
+     keeps the current value of every parameter not overridden; then follow
+     the workspace upgrade above.
+
+     ```bash
+     aws cloudformation deploy --stack-name "$STACK" \
+       --template-file examples/cao-clusters/kubernetes/remote-runners/overlays/eks/iac/cfn-auto-mode.yaml \
+       --capabilities CAPABILITY_NAMED_IAM
+     ```
+
+  Alternatively, delete the group before the update
+  (`aws logs delete-log-group --log-group-name /aws/eks/<ClusterName>/cluster`),
+  which loses its logs, or delete and recreate the stack.
 
 ## Placement
 
