@@ -331,6 +331,25 @@ class TestStatusWithCompletionFooter:
         ]
         assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
 
+    def test_attributed_long_prose_reply_completes_with_0_169_blank_rows(self):
+        """Codex 0.169 leaves two blank rows between the completion footer and
+        the composer. A dispatched reply longer than the pane shows neither the
+        echo nor a bullet, only prose rows, then the footer and the blank rows
+        (#1390). The turn must still read as completed."""
+        provider = TestEmptyDispatchedTurn()._dispatched_provider("a very long task " * 8)
+        provider._codex_version = (0, 169, 0)
+        frame = [
+            *(f"  Row {n} of a long review, plain prose." for n in range(40)),
+            "",
+            "  Worked for 55s • 4:15 PM",
+            "",
+            "",
+            COMPOSER,
+            STATUS_BAR,
+            SHORTCUTS_BAR,
+        ]
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+
     def test_previous_turn_footer_does_not_complete_the_next_turn(self):
         frame = screen(
             *TASK,

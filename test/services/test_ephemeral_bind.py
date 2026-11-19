@@ -4,6 +4,7 @@ import asyncio
 import json
 from datetime import timedelta
 from itertools import combinations
+from test.fixtures.app_state import app_state_items
 from test.services.test_ephemeral_claim import (  # noqa: F401
     NOW,
     audit,
@@ -348,7 +349,7 @@ def test_fresh_session_still_has_no_owner_and_ignores_claim_query(runtime_store,
     monkey = pytest.MonkeyPatch()
     from cli_agent_orchestrator.plugins.registry import PluginRegistry
 
-    monkey.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    monkey.setitem(app_state_items(main.app), "plugin_registry", PluginRegistry())
     try:
         before = database.get_ephemeral_agent(name)
         response = TestClient(main.app, base_url="http://localhost").post(
@@ -377,7 +378,7 @@ def test_api_claim_is_forwarded_and_refusals_structured(runtime_store, monkeypat
         forwarded.append(kwargs)
         raise env[0].EphemeralPolicyError("claim_expired", status_code=409)
 
-    monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    monkeypatch.setitem(app_state_items(main.app), "plugin_registry", PluginRegistry())
     monkeypatch.setattr(main.terminal_service, "create_terminal", fail)
     monkeypatch.setattr(main, "run_agent_step", fail)
     client = TestClient(main.app, base_url="http://localhost")
@@ -503,7 +504,7 @@ async def test_raw_api_launch_and_delete_releases(release_runtime, monkeypatch):
     from cli_agent_orchestrator.plugins.registry import PluginRegistry
 
     env, name, _, _ = release_runtime
-    monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    monkeypatch.setitem(app_state_items(main.app), "plugin_registry", PluginRegistry())
     client = TestClient(main.app, base_url="http://localhost")
     response = client.post(
         "/sessions/cao-session/terminals",
@@ -881,7 +882,7 @@ def test_collected_name_relaunch_is_structured(release_runtime, monkeypatch):
     from cli_agent_orchestrator.plugins.registry import PluginRegistry
 
     env, name, _, _ = release_runtime
-    monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    monkeypatch.setitem(app_state_items(main.app), "plugin_registry", PluginRegistry())
     client = TestClient(main.app, base_url="http://localhost")
     params = dict(provider="claude_code", agent_profile=name, caller_id=CALLER)
     response = client.post("/sessions/cao-session/terminals", params=params)
@@ -897,7 +898,7 @@ def test_never_created_name_launch_is_structured(runtime_store, monkeypatch, rou
     from cli_agent_orchestrator.api import main
     from cli_agent_orchestrator.plugins.registry import PluginRegistry
 
-    monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    monkeypatch.setitem(app_state_items(main.app), "plugin_registry", PluginRegistry())
     params = dict(provider="claude_code", agent_profile="Ramones-unknown_name-abcd")
     if route == "terminal":
         params["caller_id"] = CALLER
@@ -975,7 +976,7 @@ def test_fresh_session_initial_message_refuses_before_delivery(runtime_store, mo
     before = database.list_all_terminals()
     pending_before = set(terminal_service._pending_initial_delivery)
     schedule = Mock(side_effect=AssertionError("refusal must precede scheduling"))
-    monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    monkeypatch.setitem(app_state_items(main.app), "plugin_registry", PluginRegistry())
     monkeypatch.setattr(terminal_service, "_schedule_deferred_init", schedule)
     response = TestClient(main.app, base_url="http://localhost").post(
         "/sessions",

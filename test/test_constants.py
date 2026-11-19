@@ -577,6 +577,11 @@ class TestPipeLivenessCheckIntervalClamp:
         mod = self._reload_constants({"CAO_PIPE_LIVENESS_CHECK_INTERVAL_S": "not-a-number"})
         assert mod.PIPE_LIVENESS_CHECK_INTERVAL_S == 4.0
 
+    @pytest.mark.parametrize("value", ["inf", "Infinity", "1e999", "-inf", "nan"])
+    def test_non_finite_falls_back_to_default(self, value):
+        mod = self._reload_constants({"CAO_PIPE_LIVENESS_CHECK_INTERVAL_S": value})
+        assert mod.PIPE_LIVENESS_CHECK_INTERVAL_S == 4.0
+
     def test_positive_value_is_honored(self):
         mod = self._reload_constants({"CAO_PIPE_LIVENESS_CHECK_INTERVAL_S": "0.5"})
         assert mod.PIPE_LIVENESS_CHECK_INTERVAL_S == 0.5
