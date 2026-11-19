@@ -31,13 +31,14 @@ def test_start_prompt_provider_and_kill_switch_docs_match_runtime():
         "omp": "OMP",
         "grok_cli": "Grok CLI",
         "mcode": "MiniMax Code",
+        "qwen_cli": "Qwen Code",
     }
     assert set(expected_provider_names) == RUNTIME_SKILL_PROMPT_PROVIDERS
 
     memory_text = MEMORY_DOC.read_text(encoding="utf-8")
     changelog_text = (
         CHANGELOG.read_text(encoding="utf-8")
-        .split("### Changed", maxsplit=1)[1]
+        .split("- **Provider memory file writes now default off**", maxsplit=1)[1]
         .split("- **Memory injection no longer", maxsplit=1)[0]
     )
     for display_name in expected_provider_names.values():

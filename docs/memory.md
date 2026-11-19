@@ -575,7 +575,7 @@ parse/validate/secret pipeline and reports without writing.
 
 CAO normally injects memory without touching the project tree. Interactive
 `cao launch` sessions using a runtime start-prompt provider — Claude Code,
-Codex, Kimi CLI, Antigravity CLI, OMP, Grok CLI, or MiniMax Code — receive the
+Codex, Kimi CLI, Antigravity CLI, OMP, Grok CLI, MiniMax Code, or Qwen Code — receive the
 block through that prompt when the launch has no CAO-delivered first message.
 Orchestrated launches receive it on their first CAO-delivered message, which
 preserves task-aware context-manager selection; workflow steps stay on the
