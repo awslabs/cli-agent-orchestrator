@@ -3,7 +3,8 @@ name: cao-agent-routing
 description: Find and select the best installed CAO agent profile for a task before
   delegating with assign or handoff. Use when a supervisor needs to route coding,
   documentation, infrastructure, review, research, or other specialist work and the
-  user has not already chosen an agent profile.
+  user has not already chosen an agent profile. Also use when the user asks "which agent
+  should do this" or "pick a profile for this task".
 ---
 
 # CAO Agent Routing

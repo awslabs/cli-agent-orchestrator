@@ -1,0 +1,44 @@
+{
+  "cao": {
+    "base_url": "http://127.0.0.1:9889",
+    "error": {
+      "code": "cao_incompatible",
+      "message": "CAO /sessions is not a list",
+      "retryable": false
+    },
+    "reachable": false,
+    "terminal_backend": null,
+    "version": null
+  },
+  "counts": {
+    "by_status": {
+      "completed": 0,
+      "error": 0,
+      "idle": 0,
+      "processing": 0,
+      "unknown": 0,
+      "waiting_user_answer": 0
+    },
+    "by_tier": {
+      "live": 0,
+      "needs_you": 0,
+      "parked": 0,
+      "stale": 0
+    },
+    "hidden_sessions": 0,
+    "sessions": 0,
+    "terminals": 0
+  },
+  "generated_at": "2026-11-15T12:03:00Z",
+  "history_total": null,
+  "interval_seconds": 5.0,
+  "last_good_at": null,
+  "revision": 1,
+  "sessions": [],
+  "snapshot_age_seconds": 0,
+  "stale_snapshot": false,
+  "thresholds": {
+    "stale_hours": 48.0,
+    "warm_hours": 1.0
+  }
+}

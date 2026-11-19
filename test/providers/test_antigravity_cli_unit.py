@@ -11,6 +11,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.antigravity_cli import (
     IDLE_FOOTER_PATTERN,
     PROCESSING_FOOTER_PATTERN,
+    PROCESSING_SPINNER_PATTERN,
     AntigravityCliProvider,
     ProviderError,
 )
@@ -297,6 +298,159 @@ def test_recorded_startup_after_trust_picker_reaches_idle(chunk):
 
     status = _replay_startup("agy_init_stale_trust_picker.txt", chunk, arm_on_trust_picker=False)
     assert status == TerminalStatus.IDLE
+
+
+# --------------------------------------------------------------------------- #
+# A recorded agy 1.5.8 turn end replayed through the real screen path
+# --------------------------------------------------------------------------- #
+#
+# agy_turn_end_stale_esc_to_cancel.txt is a slice of one live session's pipe-pane
+# bytes: the second turn of a worker that had already answered once, up to the
+# point where agy had printed its "ready for input" notification. Every word that
+# is not agy UI chrome is x'd at the same length, so the cursor geometry of the
+# redraw is unchanged.
+#
+# agy moves the cursor to a column with HPA (``CSI n ```) after a line feed. pyte
+# 0.8.2 binds HPA to the wrong final byte, so a compositor built on the stock
+# stream ignored those moves: the column kept growing, the text wrapped, and the
+# composite drifted four rows below the real pane. agy's relative cursor-down
+# then started from the wrong row, its ready footer landed on a different row
+# from the one it redrew, and an ``esc to cancel`` row from the working turn
+# survived below the live ``? for shortcuts`` row, in the composite only. The
+# status read processing for as long as nothing redrew the screen. StatusMonitor
+# now maps HPA (see test_status_monitor.py), so after the turn no ``esc to
+# cancel`` row remains.
+
+
+def _replay_screen(data: str, chunk: int, *, turns: int = 1):
+    """Feed raw pane bytes through StatusMonitor's pyte path.
+
+    Returns ``(monitor, provider)``; the settled verdict is
+    ``monitor._detect_screen("t1", provider)``, which is what the quiescence
+    timer applies once the output stops.
+    """
+    from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+    provider = AntigravityCliProvider("t1", "s", "w")
+    provider._turns = turns
+    sm = StatusMonitor()
+    with (
+        patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as pm,
+        patch(
+            "cli_agent_orchestrator.services.status_monitor.get_server_settings",
+            return_value={"state_buffer_max": 32768},
+        ),
+        patch("cli_agent_orchestrator.services.status_monitor._queue_status_transition"),
+    ):
+        pm.get_provider.return_value = provider
+        sm.notify_input_sent("t1")
+        for i in range(0, len(data), chunk):
+            sm._process_chunk("t1", data[i : i + chunk])
+    return sm, provider
+
+
+def _bottom_rows(sm) -> list:
+    lines, _ = sm._screen_lines("t1")
+    return [ln.rstrip() for ln in (lines or []) if ln.strip()][-12:]
+
+
+@pytest.mark.parametrize("chunk", [64, 512, 4096])
+def test_recorded_turn_end_leaves_no_working_footer_row_and_reads_completed(chunk):
+    data = _read_raw_fixture("agy_turn_end_stale_esc_to_cancel.txt")
+    sm, provider = _replay_screen(data, chunk)
+
+    # The premise: the live ready footer is the last row, and no "esc to cancel"
+    # row (and no spinner row) is left anywhere in the bottom rows.
+    bottom = _bottom_rows(sm)
+    assert bottom[-1].startswith("? for shortcuts")
+    assert not any(re.search(PROCESSING_FOOTER_PATTERN, row) for row in bottom)
+    assert not any(re.search(PROCESSING_SPINNER_PATTERN, row) for row in bottom)
+
+    assert sm._detect_screen("t1", provider) == TerminalStatus.COMPLETED
+
+
+def test_recorded_turn_end_is_idle_before_the_first_turn():
+    data = _read_raw_fixture("agy_turn_end_stale_esc_to_cancel.txt")
+    sm, provider = _replay_screen(data, 4096, turns=0)
+    assert sm._detect_screen("t1", provider) == TerminalStatus.IDLE
+
+
+def test_recorded_turn_mid_flight_still_reads_processing():
+    """The same recording, cut at agy's "ready for input" notification.
+
+    That OSC is written after the last working frame and before the ready footer
+    is painted, so the screen at that byte is the turn still working: a spinner
+    row and the working footer, with no ready footer anywhere.
+    """
+    data = _read_raw_fixture("agy_turn_end_stale_esc_to_cancel.txt")
+    cut = data.index("\x1b]9;Antigravity CLI is ready for input")
+    sm, provider = _replay_screen(data[:cut], 4096)
+
+    bottom = _bottom_rows(sm)
+    assert any(re.search(PROCESSING_SPINNER_PATTERN, row) for row in bottom)
+    assert any(row.startswith("esc to cancel") for row in bottom)
+    assert not any(row.startswith("? for shortcuts") for row in bottom)
+    assert sm._detect_screen("t1", provider) == TerminalStatus.PROCESSING
+
+
+@pytest.mark.parametrize("chunk", [64, 4096])
+def test_recorded_queued_message_frame_is_never_ready(chunk):
+    """A message pasted into a working agy: "Sending to agent..." and the queue hint.
+
+    The footer is replaced by "Press up to edit queued messages", so neither
+    footer string is on screen. The spinner row is what keeps it PROCESSING, and
+    nothing in this frame may read as ready.
+    """
+    data = _read_raw_fixture("agy_queued_message_working.txt")
+    sm, provider = _replay_screen(data, chunk)
+
+    bottom = _bottom_rows(sm)
+    assert any("Sending to agent..." in row for row in bottom)
+    assert any("Press up to edit queued messages" in row for row in bottom)
+    assert not any(row.startswith("? for shortcuts") for row in bottom)
+    assert sm._detect_screen("t1", provider) == TerminalStatus.PROCESSING
+
+
+def test_screen_spinner_row_outvotes_ready_footer():
+    screen = [
+        "> analyze this",
+        "⣽  Working...",
+        "? for shortcuts   Gemini 3.1 Pro (High)",
+        "esc to cancel   Gemini 3.1 Pro (High)",
+    ]
+    p = make_provider()
+    assert p.get_status_from_screen(screen) == TerminalStatus.PROCESSING
+    assert p.probe_processing_from_screen(screen) is True
+
+
+def test_screen_working_footer_alone_is_processing():
+    screen = ["  here is the analysis", "esc to cancel   Gemini 3.1 Pro (High)"]
+    assert make_provider().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+
+
+def test_screen_quoted_ready_footer_in_response_text_stays_processing():
+    """A working agent printing the footer text (a file it reads) is not idle.
+
+    A wrapped response line can start at column 0, so a row that begins with
+    the ready hint is not proof of a ready footer while ``esc to cancel`` is
+    drawn.
+    """
+    screen = [
+        "? for shortcuts, see the agy docs.",
+        "  and esc to cancel while working",
+        "esc to cancel   Gemini 3.1 Pro (High)",
+    ]
+    assert make_provider().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+    assert make_provider().probe_processing_from_screen(screen) is True
+
+
+def test_screen_waiting_user_answer_outvotes_both_footers():
+    screen = [
+        "Do you want to allow this action? [y/n]",
+        "? for shortcuts   Gemini 3.1 Pro (High)",
+        "esc to cancel   Gemini 3.1 Pro (High)",
+    ]
+    assert make_provider().get_status_from_screen(screen) == TerminalStatus.WAITING_USER_ANSWER
 
 
 # --------------------------------------------------------------------------- #

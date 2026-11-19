@@ -1,0 +1,51 @@
+{
+  "session": {
+    "id": "cao-onboarding-flow",
+    "name": "cao-onboarding-flow",
+    "status": "detached"
+  },
+  "terminals": [
+    {
+      "id": "d28d8fa5",
+      "tmux_session": "cao-onboarding-flow",
+      "tmux_window": "conductor",
+      "provider": "mock_cli",
+      "agent_profile": "supervisor",
+      "description": null,
+      "model": null,
+      "model_honored": null,
+      "ephemeral": false,
+      "working_directory": "/work/example",
+      "engine": null,
+      "deferred_init_failure": null,
+      "deferred_init_external_owner": false,
+      "deferred_init_runtime_reclaimed": false,
+      "session_incarnation_id": "05e329ae",
+      "kept_until": null,
+      "last_active": "2026-11-13T11:42:00.000000Z",
+      "pending_inbox_count": 0,
+      "status": "idle"
+    },
+    {
+      "id": "96726f64",
+      "tmux_session": "cao-onboarding-flow",
+      "tmux_window": "yoda",
+      "provider": "mock_cli",
+      "agent_profile": "advisor",
+      "description": null,
+      "model": null,
+      "model_honored": null,
+      "ephemeral": false,
+      "working_directory": "/work/example",
+      "engine": null,
+      "deferred_init_failure": null,
+      "deferred_init_external_owner": false,
+      "deferred_init_runtime_reclaimed": false,
+      "session_incarnation_id": "05e329ae",
+      "kept_until": null,
+      "last_active": "2026-11-13T11:42:00.000000Z",
+      "pending_inbox_count": 0,
+      "status": "idle"
+    }
+  ]
+}

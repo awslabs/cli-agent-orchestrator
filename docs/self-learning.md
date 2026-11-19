@@ -3,8 +3,9 @@
 CAO's self-learning loop lets a multi-agent workflow improve as it runs
 repeatedly: agents report **outcomes** of their work, a **retrospector** agent
 distills those outcomes into durable memory **lessons**, and — behind a second,
-stricter gate — reinforced lessons are **promoted** into agent profile files so
-every future session starts with them.
+stricter gate — reinforced lessons can be **promoted**, by an operator running
+`cao memory promote`, into agent profile files so every future session starts
+with them.
 
 Everything in this document is **opt-in and off by default**. A CAO deployment
 that never touches the flags behaves identically to one without the feature.
@@ -21,7 +22,7 @@ supervisor ──handoff──▶ retrospector ──reads──▶ list_outcome
                                the WORKER's agent-scope memory lessons
                                                    │
 lessons recalled in later sessions                 │ (each recall bumps
-(injected via <cao-memory> / CLAUDE.md)            │  access_count)
+(memory_recall; not injected)                      │  access_count)
                                                    ▼
 operator ──cao memory promote <agent> --apply──▶ "## Learned Patterns" block
                                                  in the agent's profile .md
@@ -144,8 +145,8 @@ Two SOP additions make a workflow learn (see
    >     <session_name>, workflow <name>, package <item>. Agents involved:
    >     transformer, improver." Record its one-line summary in the run log.
 
-Workers additionally get a `## Memory` section telling them to apply
-injected lessons and store new ones (the [cao-learning skill](#the-cao-learning-skill)
+Workers additionally get a `## Memory` section telling them to look up
+lessons and store new ones (the [cao-learning skill](#the-cao-learning-skill)
 packages this guidance).
 
 ## The retrospector agent
@@ -159,8 +160,13 @@ lessons per retrospection** via `store_lesson`.
 **calling** terminal's profile — a retrospector using it would file every
 lesson under `retrospector`. `store_lesson` takes a required
 `target_agent_profile` and stores into **that worker's** agent scope
-(type fixed to `feedback`), so the worker's future sessions and
-`cao memory promote <worker>` actually find the lessons. Provenance fields
+(type fixed to `feedback`), so the worker's own `memory_recall` and
+`cao memory promote <worker>` find the lessons. Agent scope is not part of the
+`<cao-memory>` block injected at session start, so a lesson reaches a worker
+only through `memory_recall` or, after a promote, its profile's
+`## Learned Patterns` block. Lessons are filed under the profile name; an
+ephemeral agent gets a generated name for each launch, so lessons stored for one
+are not found by a later one. Provenance fields
 still record the retrospector as the writer.
 
 Cross-agent writes are **authorized server-side**: the caller's profile —
@@ -182,15 +188,17 @@ Lesson contract (enforced by the profile's rules):
 - **Type `feedback`** for hard-won corrections (permanent), `project` for
   project facts.
 - **1–2 sentences ending with `Applies when: <trigger>`** — the trigger
-  clause is what lets curators match the lesson against future tasks.
+  clause lets the agent tell, when it recalls the lesson, whether it applies
+  to the task.
 - Learn from failures **and** successes; cite the task label; store nothing
   when no general pattern emerged ("no lessons" is a valid outcome).
 - Never store transcripts, logs, stack traces, or secrets.
 
 Because lessons are ordinary memories, everything in [Memory](memory.md)
-applies to them: injection into new sessions, recall (which bumps
-`access_count` — the reinforcement signal), `cao memory lint` contradiction
-checks, retention, and the audit log.
+applies to them, except that agent scope is not injected into new sessions:
+recall (which bumps `access_count` — the reinforcement signal, at most once a
+minute per lesson), `cao memory lint` contradiction checks, retention, and the
+audit log.
 
 ## Phase 2 — instruction promotion
 
@@ -216,14 +224,14 @@ A lesson is **eligible** when all of:
   promotable);
 - `access_count >= 3` (configurable via `--min-recalls`) — i.e. it was
   *recalled* at least 3 times after storage. Recall frequency is the
-  reinforcement signal: every recall means an agent or curator found the
+  reinforcement signal: every recall means the agent found the
   lesson relevant again;
 - ≤ 400 characters (compact it first if longer).
 
 ### Promotion, recall, and retention
 
 Promotion **copies, never moves**. The backing memory stays in the wiki and
-continues to participate in recall and injection unchanged; the promoted
+continues to participate in recall unchanged; the promoted
 text additionally becomes part of the profile itself — present in **every**
 session deterministically, without competing for the injection budget or
 needing a `memory_recall`. Re-running `promote` never proposes an
@@ -292,7 +300,7 @@ cao memory promote transformer --min-recalls 5 --profile-path ~/agents/transform
 
 The `cao-learning` skill (`skills/cao-learning/SKILL.md`) packages the agent
 habits: supervisors learn when to `report_outcome` and how to dispatch the
-retrospector; workers learn to apply injected lessons and store new ones with
+retrospector; workers learn to recall lessons and store new ones with
 `Applies when:` triggers. Add it to profiles the way `cao-memory` is added.
 
 ## Recommended operating pattern (A/B-validated)
@@ -317,18 +325,22 @@ Measured result (LLM-judged proxy task, median-of-3 scoring): on work items
 where the baseline struggled, the learning arm won 6/6 with a mean +11-point
 gain (sign test p = 0.016); on items the baseline already handled well the
 effect was neutral (−0.1). Cost: roughly 2× worker latency from the injected
-lesson context — worth it where the alternative is repeated fix iterations.
+lesson context (the experiment branch injected lessons; current CAO does not) — worth it where the alternative is repeated fix iterations.
 
 ## Limitations
 
+- **Lessons are not injected, and nothing promotes on its own.** A new session
+  does not receive agent-scope lessons in its `<cao-memory>` block, and
+  promotion happens only when an operator runs `cao memory promote --apply`.
 - **No automatic session-end trigger.** Retrospection runs when a supervisor
   hands off to the retrospector; nothing fires it automatically on
   `post_kill_session` today.
 - **The recall-count gate is a signal-free heuristic.** Where a workflow has
   a real fitness metric (validator scores, benchmarks), gate promotions on
   it externally — CAO only checks reinforcement, not "did quality improve".
-- **Lessons cost tokens.** Injected context grows with the lesson store;
-  prefer curated injection (`memory_manager`) for latency-sensitive setups.
+- **Lessons cost tokens.** Each `memory_recall` and the promoted
+  `## Learned Patterns` block add to the agent's context, and both grow with the
+  lesson store; keep promoted lessons few for latency-sensitive setups.
 
 ## See also
 

@@ -41,6 +41,7 @@ def test_every_provider_explicitly_declares_model_support() -> None:
         (ProviderType.KIRO_CLI, "worker", _profile(), "model-x", True),
         (ProviderType.CODEX, "worker", _profile(), "model-x", True),
         (ProviderType.KIMI_CLI, "worker", _profile(), "model-x", True),
+        (ProviderType.QWEN_CLI, "worker", _profile(), "model-x", True),
         (ProviderType.OPENCODE_CLI, "worker", _profile(), "model-x", True),
         (ProviderType.OMP, "worker", _profile(), "model-x", True),
         (ProviderType.HERMES, "worker", _profile(), "model-x", True),

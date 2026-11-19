@@ -26,7 +26,7 @@ under the *nested* schema described in issue #357.
 import json
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -66,11 +66,16 @@ class LifecycleConfig(BaseModel):
     enabled: bool = False
 
 
+class RankingConfig(BaseModel):
+    default_sort: Literal["recency", "bm25"] = "recency"
+
+
 class MemoryConfig(BaseModel):
     enabled: bool = True
     explain_enabled: bool = True
-    non_accessing_inspection: bool = False
+    non_accessing_inspection: bool = True
     lifecycle: LifecycleConfig = Field(default_factory=LifecycleConfig)
+    ranking: RankingConfig = Field(default_factory=RankingConfig)
     compile_mode: str = "llm"
     flush_threshold: float = 0.85
     compile_timeout_s: float = 120.0
@@ -90,6 +95,7 @@ class KeepFinishedConfig(BaseModel):
 class TerminalConfig(BaseModel):
     backend: str = "tmux"
     herdr_session: str = "cao"
+    herdr_app_session: str = "cao"
     spawn_mode: str = "window"
     pane_window: str = "cao-agents"
     pane_layout: str = "tiled"
@@ -175,6 +181,7 @@ _LEGACY_KEY_MAP: Dict[str, Tuple[str, ...]] = {
 _OWNED_DEFAULTS: Dict[str, Any] = {
     "terminal.backend": "tmux",
     "terminal.herdr_session": "cao",
+    "terminal.herdr_app_session": "cao",
     "terminal.spawn_mode": "window",
     "terminal.pane_window": "cao-agents",
     "terminal.pane_layout": "tiled",
@@ -202,6 +209,7 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
 ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_TERMINAL_BACKEND": ("terminal.backend", "str", "tmux"),
     "CAO_HERDR_SESSION": ("terminal.herdr_session", "str", "cao"),
+    "CAO_HERDR_APP_SESSION": ("terminal.herdr_app_session", "str", "cao"),
     "CAO_TERMINAL_SPAWN_MODE": ("terminal.spawn_mode", "str", "window"),
     "CAO_TERMINAL_PANE_WINDOW": ("terminal.pane_window", "str", "cao-agents"),
     "CAO_TERMINAL_PANE_LAYOUT": ("terminal.pane_layout", "str", "tiled"),
@@ -217,7 +225,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_WS_ALLOWED_ORIGINS": ("network.ws_allowed_origins", "list", []),
     "CAO_MEMORY_ENABLED": ("memory.enabled", "bool", True),
     "CAO_MEMORY_EXPLAIN_ENABLED": ("memory.explain_enabled", "bool", True),
-    "CAO_MEMORY_NON_ACCESSING_INSPECTION": ("memory.non_accessing_inspection", "bool", False),
+    "CAO_MEMORY_NON_ACCESSING_INSPECTION": ("memory.non_accessing_inspection", "bool", True),
     "CAO_MEMORY_LIFECYCLE_ENABLED": ("memory.lifecycle.enabled", "bool", False),
     "CAO_MEMORY_LINT_ENABLED": ("memory.lint_enabled", "bool", True),
     "CAO_MEMORY_COMPILE_MODE": ("memory.compile_mode", "str", "llm"),
@@ -460,6 +468,9 @@ def _get_owned_section(path: str, default: Any) -> Any:
     if section == "memory":
         if key == "lifecycle.enabled":
             return settings_service.is_memory_lifecycle_enabled()
+        if key == "ranking.default_sort":
+            ranking = settings_service.get_memory_settings().get("ranking", {})
+            return ranking.get("default_sort", default) if isinstance(ranking, dict) else default
         if key == "enabled":
             return settings_service.is_memory_enabled()
         if key == "lint_enabled":
@@ -636,6 +647,7 @@ _ALL_PATHS = sorted(
         "memory.compile_mode",
         "memory.flush_threshold",
         "memory.compile_timeout_s",
+        "memory.ranking.default_sort",
         "memory.vault",
         "terminal.keep_finished.enabled",
         "terminal.keep_finished.idle_window_minutes",
@@ -724,6 +736,9 @@ class ConfigService:
                 explain_enabled=settings_service.is_memory_explain_enabled(),
                 non_accessing_inspection=settings_service.is_non_accessing_inspection_enabled(),
                 lifecycle=LifecycleConfig(enabled=settings_service.is_memory_lifecycle_enabled()),
+                ranking=RankingConfig(
+                    default_sort=_get_value("memory.ranking.default_sort", default="recency")
+                ),
                 lint_enabled=_get_value("memory.lint_enabled", default=True),
                 compile_mode=_get_value("memory.compile_mode", default="llm"),
                 flush_threshold=_get_value("memory.flush_threshold", default=0.85),
@@ -733,6 +748,7 @@ class ConfigService:
             terminal=TerminalConfig(
                 backend=_get_value("terminal.backend", default="tmux"),
                 herdr_session=_get_value("terminal.herdr_session", default="cao"),
+                herdr_app_session=_get_value("terminal.herdr_app_session", default="cao"),
                 spawn_mode=_get_value("terminal.spawn_mode", default="window"),
                 pane_window=_get_value("terminal.pane_window", default="cao-agents"),
                 pane_layout=_get_value("terminal.pane_layout", default="tiled"),

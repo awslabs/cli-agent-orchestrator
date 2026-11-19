@@ -2051,7 +2051,7 @@ async def memory_store(
                 tags=tags or "",
                 terminal_context=terminal_context,
             )
-        return {
+        result = {
             "success": True,
             "key": memory.key,
             "scope": memory.scope,
@@ -2060,6 +2060,10 @@ async def memory_store(
             "action": memory.action
             or ("updated" if memory.created_at != memory.updated_at else "created"),
         }
+        if key is not None and MemoryService._key_was_truncated(key):
+            result["key_truncated"] = True
+            result["requested_key"] = key
+        return result
     except MemoryPartialWriteError as e:
         return {
             "success": False,
@@ -2103,10 +2107,10 @@ async def memory_recall(
         ge=1,
         le=100,
     ),
-    search_mode: str = "hybrid",
-    sort_by: str = Field(
-        default="recency",
-        description='Ranking: "recency" (default), "score" (BM25+recency+usage), "usage", or "relevance" (lexical relevance over a widened pool; needs query, else behaves as recency).',
+    search_mode: Optional[str] = None,
+    sort_by: Optional[str] = Field(
+        default=None,
+        description='Ranking: "recency" (default), "score" (BM25+recency+usage), "usage", or "relevance" (lexical relevance over a widened pool; needs query, else behaves as recency). When both ranking arguments are omitted, memory.ranking.default_sort may select BM25 for query recall.',
     ),
     include_related: bool = Field(
         default=False,
@@ -2121,7 +2125,7 @@ async def memory_recall(
 
     Returns content from matching wiki files, ranked by ``sort_by`` (default
     recency). When no scope is specified, results follow scope precedence:
-    session > project > global.
+    session > project > global > agent > federated.
 
     Use this to check if relevant knowledge already exists before asking the user.
     """
@@ -2183,7 +2187,7 @@ async def memory_forget(
         default="project",
         description=(
             'Scope of the memory to remove: "global", "project", "session", '
-            '"agent", or "federated"'
+            + '"agent", or "federated"'
         ),
     ),
 ) -> Dict[str, Any]:
@@ -2458,8 +2462,8 @@ async def store_lesson(
     target_agent_profile: str = Field(
         description=(
             "Agent profile the lesson is for (e.g. 'transformer'). The lesson is "
-            "stored in THAT profile's agent scope so it reaches that agent's "
-            "future sessions."
+            "stored in THAT profile's agent scope; that agent finds it by calling "
+            "memory_recall (it is not injected into its sessions)."
         )
     ),
     content: str = Field(
@@ -2528,13 +2532,17 @@ async def store_lesson(
             },
             timeout=_mcp_timeout(),
         )
-        return {
+        result = {
             "success": True,
             "key": payload["key"],
             "scope": payload["scope"],
             "scope_id": payload["scope_id"],
             "target_agent_profile": payload["target_agent_profile"],
         }
+        if payload.get("key_truncated") is True:
+            result["key_truncated"] = True
+            result["requested_key"] = payload["requested_key"]
+        return result
     except requests.RequestException as e:
         partial = _partial_write_payload(e)
         if partial is not None:

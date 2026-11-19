@@ -462,6 +462,67 @@ def set_disabled_agent_dirs(dirs: List[str]) -> List[str]:
     return cleaned
 
 
+# Longest label accepted for a session alias. Long enough for a sentence-style
+# run name, short enough to stay on one line in any listing.
+SESSION_LABEL_MAX_LENGTH = 60
+
+
+def get_session_labels() -> Dict[str, str]:
+    """Operator-assigned friendly names for sessions (session_name -> label)."""
+    settings = _load()
+    labels = settings.get("session_labels", {})
+    return labels if isinstance(labels, dict) else {}
+
+
+def set_session_label(session_name: str, label: str) -> Dict[str, str]:
+    """Set, or clear with an empty/blank label, a session's friendly name.
+
+    Stored separately from the tmux session name so nothing that references
+    the real name (terminals, DB rows, the backend) is disturbed: a pure
+    display alias. Whitespace is trimmed, the label is capped at
+    ``SESSION_LABEL_MAX_LENGTH`` and must be printable (``str.isprintable``):
+    a control character or line break is a ``ValueError``. Returns the full
+    label map after the update.
+
+    Setting OR clearing a label over a settings.json that exists but cannot be
+    read raises :class:`SettingsUnreadableError` and leaves the file untouched;
+    the two callers decide what that means. The HTTP endpoint reports it (a
+    200 for a clear that changed nothing would hide a broken file and let the
+    old label reappear once it is repaired). Session teardown logs it and
+    completes: nothing was written, nothing was lost, and the teardown itself
+    succeeded (haofeif / plauzy, #724 review).
+    """
+    clean = label.strip()[:SESSION_LABEL_MAX_LENGTH]
+    if not clean.isprintable():
+        # "ok\x1b[2J\nrm -rf /" was stored and echoed verbatim: the comment
+        # above promises one line in any listing, and a CLI that prints
+        # labels must not become an ANSI-escape injection sink (plauzy, #724).
+        # Validated before the lock, like every other writer's input.
+        raise ValueError("label must be printable: no control characters or line breaks")
+
+    def update(settings: Dict[str, Any]) -> bool:
+        labels = settings.get("session_labels", {})
+        if not isinstance(labels, dict):
+            labels = {}
+        if clean:
+            if labels.get(session_name) == clean:
+                return False
+            labels[session_name] = clean
+        elif session_name in labels:
+            del labels[session_name]
+        else:
+            # Nothing to clear: do not rewrite settings.json for a no-op.
+            # Session teardown clears unconditionally, so this is the common
+            # case.
+            return False
+        settings["session_labels"] = labels
+        return True
+
+    settings = _mutate(update)
+    labels = settings.get("session_labels", {})
+    return labels if isinstance(labels, dict) else {}
+
+
 # Default server tuning values
 _SERVER_DEFAULTS = {
     "mcp_request_timeout": 30,
@@ -751,8 +812,9 @@ def get_memory_settings() -> Dict[str, Any]:
         "learning_enabled": False,
         "instruction_promotion_enabled": False,
         "explain_enabled": True,
-        "non_accessing_inspection": False,
+        "non_accessing_inspection": True,
         "lifecycle": {"enabled": False},
+        "ranking": {"default_sort": "recency"},
     }
     saved = settings.get("memory", {})
     if not isinstance(saved, dict):
@@ -899,12 +961,12 @@ def is_memory_lint_enabled(settings: Optional[Dict[str, Any]] = None) -> bool:
 
 
 def is_non_accessing_inspection_enabled() -> bool:
-    """Opt-in operator inspection: env > file > False; read errors stay off."""
+    """Non-accessing operator inspection: env > file > True; read errors stay on."""
     try:
-        return bool(get_memory_settings().get("non_accessing_inspection", False))
+        return bool(get_memory_settings().get("non_accessing_inspection", True))
     except Exception:
-        logger.warning("Failed to read memory.non_accessing_inspection; defaulting to False")
-        return False
+        logger.warning("Failed to read memory.non_accessing_inspection; defaulting to True")
+        return True
 
 
 def is_memory_lifecycle_enabled() -> bool:
@@ -1217,7 +1279,8 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``enabled`` (bool) — master switch for the memory subsystem.
         ``explain_enabled`` (bool) — on-demand CLI relevance diagnostic.
         ``lifecycle.enabled`` (bool) — opt-in supersedes lifecycle.
-        ``non_accessing_inspection`` (bool) — opt-in operator reads without access bumps.
+        ``ranking.default_sort`` (str) — ``recency`` or ``bm25`` query recall default.
+        ``non_accessing_inspection`` (bool) — operator reads without access bumps.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
         ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
         ``learning_enabled`` (bool) — workflow self-learning (outcome capture).
@@ -1257,6 +1320,14 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         if not isinstance(value, bool):
             raise ValueError("lifecycle.enabled must be a bool")
         coerced = value
+    elif key == "ranking.default_sort":
+        from cli_agent_orchestrator.services.memory_scoring import DEFAULT_SORT_VALUES
+
+        if not isinstance(value, str) or value not in DEFAULT_SORT_VALUES:
+            raise ValueError(
+                f"ranking.default_sort must be one of {sorted(DEFAULT_SORT_VALUES)}, got {value!r}"
+            )
+        coerced = value
     elif key in {"explain_enabled", "non_accessing_inspection"}:
         if not isinstance(value, bool):
             raise ValueError(f"{key} must be a bool, got {type(value).__name__}")
@@ -1290,6 +1361,11 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
             if not isinstance(lifecycle, dict):
                 lifecycle = {}
             memory["lifecycle"] = {**lifecycle, "enabled": coerced}
+        elif key == "ranking.default_sort":
+            ranking = memory.get("ranking", {})
+            if not isinstance(ranking, dict):
+                ranking = {}
+            memory["ranking"] = {**ranking, "default_sort": coerced}
         else:
             memory[key] = coerced
         settings["memory"] = memory

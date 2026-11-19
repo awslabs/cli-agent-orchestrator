@@ -108,11 +108,14 @@ def load(catalog):
 
 
 class Harness:
+    active: set["Harness"] = set()
+
     def __init__(self, tmp_path, name="h", decider=None, emit=None):
         from cli_agent_orchestrator.clients.database import DecisionRecordModel
         from cli_agent_orchestrator.decisions.store import DecisionStore
 
         db = create_engine("sqlite:///" + str(tmp_path / f"{name}.db"))
+        self.db = db
         DecisionRecordModel.__table__.create(db)
         self.events = []
         self.store = DecisionStore(
@@ -124,6 +127,7 @@ class Harness:
         self.extra = {}
         self.max_pending = 64
         self.configure()
+        self.active.add(self)
 
     def configure(
         self,
@@ -247,7 +251,17 @@ class Harness:
 
 @pytest.fixture
 def h(tmp_path):
-    return Harness(tmp_path)
+    harness = Harness(tmp_path)
+    yield harness
+    harness.db.dispose()
+
+
+@pytest.fixture(autouse=True)
+def dispose_harness_engines():
+    yield
+    for harness in Harness.active:
+        harness.db.dispose()
+    Harness.active.clear()
 
 
 def plan_values(plan):

@@ -520,6 +520,141 @@ class TestInboxSubmitConfirmation:
         redeliver.assert_not_called()
 
 
+class TestHerdrAppInboxSubmitConfirmation:
+    """herdr-app: herdr-core submits 200 ms after the paste, whatever the provider asks.
+
+    herdr-core's terminal.send waits a fixed PASTE_GAP (200 ms; a template's
+    paste_gap_ms is the only override, input.rs) before Enter, and CAO cannot
+    ask for more per send. Claude Code asks for 2.0 s because a too-early
+    Enter is swallowed. Inbox deliveries on herdr-app run off the event loop
+    (HerdrAppInboxService uses asyncio.to_thread), so they run the submit
+    confirmation and resend the Enter. The herdr TUI backend still skips it.
+    """
+
+    @pytest.fixture
+    def herdr_app(self, monkeypatch):
+        from test.backends.fake_hc import FakeHc
+
+        from cli_agent_orchestrator.backends.herdr_app_backend import HerdrAppBackend
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.mcp_resolution.cao_server_env", lambda: {}
+        )
+        return HerdrAppBackend("cao", client=FakeHc())
+
+    def _deliver(self, backend, sm, provider, order=None):
+        from cli_agent_orchestrator.services import terminal_service
+
+        enters = []
+        boundary = MagicMock(return_value=0)
+        if order is not None:
+            sm.get_status.side_effect = lambda tid: order.append("status") or sm._status
+            boundary.side_effect = lambda *a, **k: order.append("dispatch") or 0
+        with (
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRM_TIMEOUT", 0.0
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_MAX_RESUBMITS", 1),
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", sm),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_backend", return_value=backend
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[_make_message()],
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.terminal_service.dispatch_input",
+                boundary,
+            ),
+            # The real recovery helper; only the composer read and the key sink are stubbed.
+            patch.object(terminal_service, "_message_in_composer", return_value=True),
+            patch.object(
+                terminal_service,
+                "send_special_key",
+                side_effect=lambda tid, key: enters.append((tid, key)),
+            ),
+            patch.object(terminal_service.provider_manager, "get_provider", return_value=provider),
+            patch.object(terminal_service, "status_monitor", sm),
+        ):
+            InboxService().deliver_pending("term-1")
+        return enters
+
+    @staticmethod
+    def _monitor(status, started=False):
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        sm = MagicMock()
+        sm._status = status
+        sm.get_status.return_value = status
+        sm.output_generation.return_value = 0
+        # Event-inbox backends report no output generation.
+        sm.status_observation.return_value = StatusObservation(status, None)
+        sm.started_on_last_input.return_value = started
+        return sm
+
+    @staticmethod
+    def _claude_code():
+        from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+        provider = ClaudeCodeProvider("term-1", "cao-a", "w1")
+        assert provider.paste_submit_delay == 2.0  # herdr-core gives it 0.2 s
+        return provider
+
+    def test_swallowed_enter_is_resent_for_claude_code(self, herdr_app):
+        """COMPLETED before the send, COMPLETED after, no native activity: Enter again."""
+        from cli_agent_orchestrator.services import terminal_service
+
+        assert herdr_app.supports_event_inbox() and herdr_app.event_inbox_confirms_submit()
+        sm = self._monitor(TerminalStatus.COMPLETED)
+        with patch.object(terminal_service, "_worker_is_started_direct", return_value=False):
+            enters = self._deliver(herdr_app, sm, self._claude_code())
+        assert enters == [("term-1", "Enter")]
+
+    def test_pre_dispatch_status_is_read_before_the_paste(self, herdr_app):
+        order = []
+        sm = self._monitor(TerminalStatus.IDLE)
+        provider = MagicMock(supports_direct_status_probe=False)
+        self._deliver(herdr_app, sm, provider, order=order)
+        # The gate's read, then the transition baseline, then the paste.
+        assert order[:3] == ["status", "status", "dispatch"]
+
+    @pytest.mark.parametrize(
+        "status, started",
+        [
+            (TerminalStatus.PROCESSING, False),  # working now
+            (TerminalStatus.COMPLETED, True),  # a short turn already over: core said working
+        ],
+    )
+    def test_pickup_sends_no_recovery(self, herdr_app, status, started):
+        sm = self._monitor(status, started=started)
+        sm.get_status.side_effect = [TerminalStatus.COMPLETED, TerminalStatus.COMPLETED]
+        enters = self._deliver(herdr_app, sm, MagicMock(supports_direct_status_probe=False))
+        assert enters == []
+
+    def test_transition_from_pre_dispatch_status_is_pickup(self, herdr_app):
+        """IDLE before the send and COMPLETED after: the turn started and ended."""
+        sm = self._monitor(TerminalStatus.COMPLETED)
+        sm.get_status.side_effect = [TerminalStatus.IDLE, TerminalStatus.IDLE]
+        enters = self._deliver(herdr_app, sm, MagicMock(supports_direct_status_probe=False))
+        assert enters == []
+
+    def test_herdr_tui_keeps_skipping_confirmation(self):
+        from cli_agent_orchestrator.backends.base import TerminalBackend
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+        from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
+
+        # Its inbox service delivers on the event loop, where the wait would block.
+        assert (
+            HerdrBackend.event_inbox_confirms_submit is TerminalBackend.event_inbox_confirms_submit
+        )
+        assert (
+            TmuxBackend.event_inbox_confirms_submit is TerminalBackend.event_inbox_confirms_submit
+        )
+        assert TerminalBackend.event_inbox_confirms_submit(MagicMock()) is False
+
+
 class TestCodexEmptyTurnInboxIntegration:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("word_wrapped", [False, True])
@@ -693,6 +828,46 @@ class TestDeliverPending:
         svc = InboxService()
         svc.deliver_pending("term-1")
 
+        mock_term_svc.dispatch_input.assert_called_once_with(
+            "term-1", "hello", orchestration_type=OrchestrationType.SEND_MESSAGE
+        )
+        mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_codex_background_completion_releases_pending_message(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        provider = CodexProvider("term-1", "session", "window")
+        provider._codex_version = (0, 169, 0)
+        provider._ends_turns_with_footer = True
+        chrome = [
+            "",
+            "1 background terminal running · /ps to view · /stop to close",
+            "",
+            "",
+            "› Ask Codex to do anything",
+            "",
+            "gpt-6 max · /tmp/project",
+            "← for agents · ? for shortcuts · ⚠ 1 warning · f2 to view",
+        ]
+        mock_get.return_value = [_make_message()]
+        svc = InboxService()
+        mock_monitor.get_status.return_value = provider.get_status_from_screen(
+            ["› 1+1", "• 2", *chrome]
+        )
+        svc.deliver_pending("term-1")
+        mock_term_svc.dispatch_input.assert_not_called()
+        mock_update.assert_not_called()
+
+        mock_monitor.get_status.return_value = provider.get_status_from_screen(
+            ["› 1+1", "• 2", "Worked for 1s • 3:43 AM", *chrome]
+        )
+        svc.deliver_pending("term-1")
         mock_term_svc.dispatch_input.assert_called_once_with(
             "term-1", "hello", orchestration_type=OrchestrationType.SEND_MESSAGE
         )
@@ -1966,6 +2141,147 @@ class TestSwallowedEnterRecoveryOnRealComposers:
         assert pane.composer == ""
 
 
+class TestCodexNoStatusSubmitRecovery:
+    def test_contiguous_status_path_does_not_submit_unrelated_draft(self):
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        message = "/tmp/project"
+        provider = CodexProvider("term-1", "s", "w")
+        pane = MagicMock()
+        pane.get_history.return_value = (
+            "› pending unrelated task\n"
+            "  gpt-6 max · /tmp/project                       ⚠ 1 warning · f2 to view\n"
+            "  ? for shortcuts\n"
+        )
+        with (
+            patch.object(ts, "get_backend", return_value=pane),
+            patch.object(
+                ts, "get_terminal_metadata", return_value={"tmux_session": "s", "tmux_window": "w"}
+            ),
+            patch.object(ts.provider_manager, "get_provider", return_value=provider),
+            patch.object(ts, "send_special_key") as send_key,
+            patch.object(ts, "dispatch_input") as dispatch,
+        ):
+            assert ts._message_in_composer("term-1", message) is None
+            assert ts.redeliver_dropped_message_with_boundary(
+                "term-1",
+                message,
+                1,
+                provider=provider,
+                full_resend_requires_composer_evidence=True,
+            ) == (False, None)
+        send_key.assert_not_called()
+        dispatch.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("message", "expected"),
+        [
+            ("pending unrelated task", True),
+            ("unrelated task gpt-6 max", None),
+            ("missing content", False),
+        ],
+    )
+    def test_match_only_in_certain_composer_text(self, message, expected):
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        pane = MagicMock()
+        pane.get_history.return_value = (
+            "› pending unrelated task\n" "  gpt-6 max · /tmp/project\n" "  ? for shortcuts\n"
+        )
+        with (
+            patch.object(ts, "get_backend", return_value=pane),
+            patch.object(
+                ts, "get_terminal_metadata", return_value={"tmux_session": "s", "tmux_window": "w"}
+            ),
+            patch.object(
+                ts.provider_manager, "get_provider", return_value=CodexProvider("term-1", "s", "w")
+            ),
+        ):
+            assert ts._message_in_composer("term-1", message) is expected
+
+    @pytest.mark.parametrize("path", ["/tmp/x", "~/x"])
+    @pytest.mark.parametrize("execution_observed", [False, True])
+    @pytest.mark.parametrize("multiline", [False, True])
+    @pytest.mark.parametrize("prefix", ["and report", "and  report", "gpt-custom", "codex"])
+    def test_swallowed_enter_recovers_without_repeating_paste(
+        self, path, execution_observed, multiline, prefix
+    ):
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+        from cli_agent_orchestrator.services import terminal_service as ts
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        message = f"check foo\n  {prefix} {path}" if multiline else f"check foo · {path} and report"
+        screen = (
+            "› Earlier request\n"
+            "Previous response\n"
+            "  Worked for 2s • 7:46 AM\n"
+            f"› {message}\n\n"
+            "  ? for shortcuts\n"
+        )
+        provider = CodexProvider("term-1", "s", "w")
+        pane = MagicMock()
+        pane.get_history.return_value = screen
+        sm = MagicMock()
+        sm.get_status.return_value = TerminalStatus.IDLE
+        sm.output_generation.return_value = 7
+        entered = []
+        sm.status_observation.side_effect = lambda tid: (
+            StatusObservation(TerminalStatus.PROCESSING, 8)
+            if entered and execution_observed
+            else StatusObservation(TerminalStatus.IDLE, 7)
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRM_TIMEOUT", 0.0
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_MAX_RESUBMITS", 1),
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", sm),
+            patch.object(ts, "status_monitor", sm),
+            patch.object(ts, "get_backend", return_value=pane),
+            patch.object(
+                ts, "get_terminal_metadata", return_value={"tmux_session": "s", "tmux_window": "w"}
+            ),
+            patch.object(ts.provider_manager, "get_provider", return_value=provider),
+            patch.object(ts, "dispatch_input", return_value=7) as dispatch,
+            patch.object(
+                ts, "send_special_key", side_effect=lambda tid, key: entered.append((tid, key))
+            ),
+        ):
+            # The initial dispatch succeeds, but its Enter is absorbed by the TUI.
+            boundary = dispatch("term-1", message)
+            assert ts._message_in_composer("term-1", message) is True
+            confirmed = InboxService()._confirm_submitted(
+                "term-1", message, boundary, registry=None, sender_id="sender-1"
+            )
+
+        dispatch.assert_called_once_with("term-1", message)
+        assert entered == [("term-1", "Enter")]
+        assert confirmed is execution_observed
+
+    def test_previous_message_in_history_is_not_in_empty_composer(self):
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        message = "check foo · /tmp/x and report"
+        pane = MagicMock()
+        pane.get_history.return_value = (
+            f"› {message}\nPrevious response\n  Worked for 2s • 7:46 AM\n"
+            "› Ask Codex to do anything\n\n  ? for shortcuts\n"
+        )
+        with (
+            patch.object(ts, "get_backend", return_value=pane),
+            patch.object(
+                ts, "get_terminal_metadata", return_value={"tmux_session": "s", "tmux_window": "w"}
+            ),
+            patch.object(
+                ts.provider_manager, "get_provider", return_value=CodexProvider("term-1", "s", "w")
+            ),
+        ):
+            assert ts._message_in_composer("term-1", message) is False
+
+
 class TestInboxRecoveryCoverageByProvider:
     """Which providers can recover a swallowed inbox submit, enumerated.
 
@@ -1987,6 +2303,9 @@ class TestInboxRecoveryCoverageByProvider:
         "grok_cli",
         "hermes",
         "kimi_cli",
+        # Qwen has no composer reader, so a swallowed submit cannot be retried
+        # safely without risking duplicate input.
+        "qwen_cli",
         "omp",
         "mock_cli",
         # Probe but no composer reader: the probe can confirm a working agent

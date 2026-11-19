@@ -334,11 +334,11 @@ def _unit_tests_pytest_command() -> str:
     """The Unit Tests job's pytest invocation, and only that one.
 
     Anchored to ``jobs.test`` rather than regexed out of the whole file because
-    ``ci.yml`` runs a SECOND pytest, with its own ``--cov`` and ``-m``, in the
-    ``cao-mcp-apps`` job (the coverage-ratchet floor). A whole-file regex can
-    therefore validate the wrong job: verified by deleting ``--cov`` and ``-m``
-    from the Unit Tests step, which left the previous unanchored assertions green
-    while the documented job produced no coverage and deselected nothing.
+    ``ci.yml`` runs other pytest commands, including the HTTP-only boundary guard
+    in the ``cao-mcp-apps`` job. A whole-file regex can therefore validate the
+    wrong job: verified by deleting ``--cov`` and ``-m`` from the Unit Tests step,
+    which left the previous unanchored assertions green while the documented job
+    produced no coverage and deselected nothing.
     """
     steps = _ci_spec()["jobs"]["test"]["steps"]
     commands = [str(s.get("run", "")) for s in steps if "pytest" in str(s.get("run", ""))]
