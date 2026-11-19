@@ -76,6 +76,13 @@ from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
+# Local startup-phase budgets, matching the sibling Antigravity provider's
+# shell wait and readiness floor. The readiness phase allows three minutes for
+# Qwen and its first MCP connection (which may fetch cao-mcp-server via uvx).
+# Neither budget includes the separately configured startup-dialog phase.
+SHELL_WAIT_TIMEOUT_S = 10.0
+READY_TIMEOUT_S = 180.0
+
 
 class ProviderError(Exception):
     """Exception raised for Qwen Code provider-specific errors."""
@@ -399,8 +406,10 @@ class QwenCliProvider(BaseProvider):
         Raises:
             TimeoutError: If the shell or qwen initialization times out.
         """
-        if not await wait_for_shell(self.terminal_id, timeout=10.0):
-            raise TimeoutError("Shell initialization timed out after 10 seconds")
+        if not await wait_for_shell(self.terminal_id, timeout=SHELL_WAIT_TIMEOUT_S):
+            raise TimeoutError(
+                f"Shell initialization timed out after {SHELL_WAIT_TIMEOUT_S:g} seconds"
+            )
 
         try:
             return await self._initialize_cli()
@@ -432,9 +441,11 @@ class QwenCliProvider(BaseProvider):
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=180.0,
+            timeout=READY_TIMEOUT_S,
         ):
-            raise TimeoutError("Qwen Code initialization timed out after 180 seconds")
+            raise TimeoutError(
+                f"Qwen Code initialization timed out after {READY_TIMEOUT_S:g} seconds"
+            )
 
         self._initialized = True
         return True

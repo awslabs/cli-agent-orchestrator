@@ -48,6 +48,7 @@ CAO_PROVIDERS = frozenset(
         "mcode",
         "omp",
         "opencode_cli",
+        "qwen_cli",
     }
 )
 # The providers whose runtime refuses the tools that a profile does not allow

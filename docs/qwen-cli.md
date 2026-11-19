@@ -68,7 +68,7 @@ Each terminal gets a private, mode-0600 `--mcp-config` file. Server fields are
 preserved, optional `args` and `env` are normalized, and `CAO_TERMINAL_ID` is
 injected. CAO Agent Plugin **stdio** MCP servers are merged into that file.
 Remote MCP configured natively in Qwen remains Qwen's responsibility; remote
-transport delivery through CAO's plugin mapper is not declared by this adapter.
+transport delivery through CAO's agent plugin mapper is not declared by this adapter.
 Configuration files are removed on cleanup and on failed initialization.
 
 Qwen has a native team `send_message` tool. Its name collides with CAO's MCP
@@ -116,6 +116,10 @@ must be treated as having unrestricted tool access. See
 
 Native `qwen --resume` exists, but Qwen session resume is not exposed through
 CAO's HTTP resume contract.
+
+Automatic recovery of a swallowed inbox submit is not supported: this adapter
+does not read back Qwen's composer. If a message remains unsent in the input box,
+inspect the terminal before submitting or retrying it to avoid duplicate input.
 
 ## Development checks
 
