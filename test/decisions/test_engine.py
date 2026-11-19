@@ -44,7 +44,7 @@ def setup_engine(tmp_path, monkeypatch):
         profile_loader=lambda _: AgentProfile(name="worker", description="worker", model="model-y"),
         honors_model=lambda *args: True,
     )
-    return (
+    yield (
         engine,
         DelegationRequest("assign", "codex", "worker", None, "sentinel-body"),
         decider,
@@ -52,6 +52,7 @@ def setup_engine(tmp_path, monkeypatch):
         events,
         settings,
     )
+    db.dispose()
 
 
 @pytest.mark.asyncio
