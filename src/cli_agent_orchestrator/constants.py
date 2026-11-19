@@ -113,6 +113,13 @@ TMUX_HISTORY_LIMIT = _env_int("CAO_TMUX_HISTORY_LIMIT", 50000)
 # Not operator-tunable: it is herdr's number, not CAO's.
 HERDR_PANE_READ_MAX_LINES = 1000
 
+# Most history lines HerdrAppBackend asks herdr-core's terminal.read for.
+# Set from the live measurement in test/e2e/test_herdr_app_backend_e2e.py:
+# hc 0.1.21 returned 2994 rows (history plus the 120-row screen) for
+# lines=20000, so N rounded down to a multiple of 1000. The cap counts screen
+# rows, so lines wider than the terminal wrap and return fewer lines.
+HC_READ_MAX_LINES = 2000
+
 # Foreground commands to treat as bracketed-paste INCOMPATIBLE.
 # (\x1b[200~...\x1b[201~). send_keys(force_bracketed_paste=True) checks the
 # pane's live #{pane_current_command} against this set before wrapping, so a

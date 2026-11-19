@@ -526,6 +526,18 @@ class TerminalBackend(ABC):
         """
         return False
 
+    def event_inbox_confirms_submit(self) -> bool:
+        """Whether inbox deliveries on this event-inbox backend run the submit confirmation.
+
+        The confirmation (``InboxService._confirm_submitted``) blocks for up to
+        its timeout per attempt. True means this backend's inbox service calls
+        ``deliver_pending`` off the event loop, so blocking there is safe.
+
+        Default is False: the herdr TUI inbox service delivers on its event
+        loop. Backends without an event inbox always confirm and ignore this.
+        """
+        return False
+
     def get_pane_id(self, terminal_id: str, session_name: str = "", window_name: str = "") -> str:
         """Resolve terminal_id to backend-specific pane identifier.
 
