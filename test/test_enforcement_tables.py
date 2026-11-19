@@ -22,6 +22,7 @@ DISPLAY_TO_PROVIDER = {
     "OpenCode CLI": "opencode_cli",
     "Grok Build CLI": "grok_cli",
     "Kimi CLI": "kimi_cli",
+    "Qwen Code": "qwen_cli",
     "Codex": "codex",
     "Antigravity CLI": "antigravity_cli",
     "OMP": "omp",
