@@ -106,6 +106,25 @@ class TestHealthCheck:
         data = response.json()
         assert data["terminal_backend"] == "herdr"
 
+    def test_health_reports_terminal_backend_herdr_app(self, client):
+        """GET /health reports 'herdr-app' and a herdr-core component for HerdrAppBackend."""
+        from cli_agent_orchestrator.backends.herdr_app_backend import HerdrAppBackend
+
+        mock_app = MagicMock(spec=HerdrAppBackend)
+        with (
+            patch("cli_agent_orchestrator.api.main.get_backend", return_value=mock_app),
+            patch("shutil.which", side_effect=lambda b: "/bin/hc" if b == "hc" else None),
+        ):
+            response = client.get("/health")
+        data = response.json()
+        assert data["terminal_backend"] == "herdr-app"
+        assert data["components"]["herdr-core"] == "ok"
+
+    def test_health_herdr_core_unavailable(self, client):
+        with patch("shutil.which", return_value=None):
+            data = client.get("/health").json()
+        assert data["components"]["herdr-core"] == "unavailable"
+
 
 # ── Agent profiles endpoint ──────────────────────────────────────────
 
@@ -171,13 +190,14 @@ class TestAgentProviders:
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data) == 12
+        assert len(data) == 13
         names = [p["name"] for p in data]
         assert "kiro_cli" in names
         assert "claude_code" in names
         assert "codex" in names
         assert "hermes" in names
         assert "kimi_cli" in names
+        assert "qwen_cli" in names
         assert "copilot_cli" in names
         assert "opencode_cli" in names
         assert "cursor_cli" in names
@@ -236,6 +256,7 @@ class TestAgentProviders:
         assert providers_dict["omp"]["binary"] == "omp"
         assert providers_dict["grok_cli"]["binary"] == "grok"
         assert providers_dict["mcode"]["binary"] == "mcode"
+        assert providers_dict["qwen_cli"]["binary"] == "qwen"
 
     def test_list_providers_preserves_common_wire_contract(self, client):
         """Provider discovery has the same shape consumed by the web and Rust clients."""
@@ -2419,6 +2440,20 @@ class TestMainEntryPoint:
 
             mock_create.assert_called_once_with(backend_override="herdr")
             mock_set.assert_called_once_with(mock_create.return_value)
+
+    def test_main_accepts_terminal_herdr_app(self):
+        """cao-server --terminal herdr-app parses and reaches the factory."""
+        with (
+            patch("sys.argv", ["cao-server", "--terminal", "herdr-app"]),
+            patch("uvicorn.run"),
+            patch("cli_agent_orchestrator.backends.factory.BackendFactory.create") as mock_create,
+            patch("cli_agent_orchestrator.backends.registry.set_backend"),
+        ):
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            mock_create.assert_called_once_with(backend_override="herdr-app")
 
     def test_main_no_terminal_flag_leaves_backend_lazy(self):
         """Without --terminal, main() does not eagerly set the backend."""

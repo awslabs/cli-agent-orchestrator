@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/cao-shelf/relays.schema.json",
+  "title": "Remote-control relay bodies (GET and POST /api/relays...)",
+  "$defs": {
+    "RelaySummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relay_id",
+        "slot_key",
+        "title",
+        "session",
+        "conductor_id",
+        "label",
+        "origin",
+        "state",
+        "end_reason",
+        "created_at",
+        "updated_at",
+        "not_relayed",
+        "permission_pending",
+        "ended_notice_pending"
+      ],
+      "properties": {
+        "relay_id": {
+          "type": "string",
+          "pattern": "^rc-[a-f0-9]{10}$"
+        },
+        "slot_key": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "session": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,58}$",
+          "description": "Bare session name (CAO's is cao-<session>)."
+        },
+        "conductor_id": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{8}$",
+          "description": "The conductor bound when the relay was attached."
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "origin": {
+          "enum": [
+            "attached",
+            "started_by_relay"
+          ]
+        },
+        "state": {
+          "enum": [
+            "active",
+            "ended",
+            "orphaned",
+            "needs_reattach"
+          ]
+        },
+        "end_reason": {
+          "enum": [
+            "ended_by_owner",
+            "taken_over",
+            "session_gone",
+            "conductor_changed",
+            "chat_gone",
+            null
+          ]
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "not_relayed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "permission_pending": {
+          "type": "boolean"
+        },
+        "ended_notice_pending": {
+          "type": "boolean",
+          "description": "The relay-ended message is still owed to this relay's chat; CAO Shelf posts it on every watch pass until it is."
+        },
+        "replaced_chat": {
+          "enum": [
+            "notified",
+            "gone",
+            "unreachable"
+          ],
+          "description": "Take over only: whether the replaced relay's chat got its relay-ended message. unreachable means Kiro Crew did not answer: that chat keeps relaying until it is told, and CAO Shelf posts the message again on every watch pass until it is."
+        }
+      }
+    },
+    "RelayList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relays"
+      ],
+      "properties": {
+        "relays": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RelaySummary"
+          }
+        }
+      }
+    },
+    "RelayCreateRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Exactly one of session (attach to a running session) or start (start one with the handshake as its first message, then attach), with acknowledge_risk.",
+      "required": [
+        "acknowledge_risk"
+      ],
+      "properties": {
+        "acknowledge_risk": {
+          "const": true,
+          "description": "The owner accepted the stated risk of a relay chat (api-contract.md, Remote control, risk). Without it the request is refused with risk_not_acknowledged."
+        },
+        "session": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,58}$"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Shown in the chat title, Remote control: <label>. Defaults to the session name."
+        },
+        "start": {
+          "$ref": "actions.schema.json#/$defs/RelayStart"
+        }
+      }
+    },
+    "RelayEndRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "delete_chat": {
+          "type": "boolean",
+          "description": "Delete the chat instead of posting the relay-ended message in it."
+        }
+      }
+    },
+    "RelayTakeoverRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "acknowledge_risk"
+      ],
+      "properties": {
+        "acknowledge_risk": {
+          "const": true,
+          "description": "The owner accepted the stated risk of a relay chat (api-contract.md, Remote control, risk). Without it the request is refused with risk_not_acknowledged."
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Shown in the chat title, Remote control: <label>. Defaults to the session name."
+        }
+      }
+    },
+    "RelayEndResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relay",
+        "chat"
+      ],
+      "properties": {
+        "relay": {
+          "$ref": "#/$defs/RelaySummary"
+        },
+        "chat": {
+          "enum": [
+            "notified",
+            "deleted",
+            "gone",
+            "unreachable"
+          ],
+          "description": "What happened to the chat: the relay-ended message was posted, the chat was deleted, it was already gone, or Kiro Crew could not be reached. On unreachable the relay is ended here, the chat keeps relaying until it is told, and CAO Shelf posts the message again on every watch pass until it is."
+        }
+      }
+    }
+  }
+}

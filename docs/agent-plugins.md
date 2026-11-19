@@ -348,7 +348,7 @@ OpenCode's `opencode.json` with no per-provider work.
 | When | Providers |
 |---|---|
 | **Install time** — written into a config file the CLI reads later | `kiro_cli`, `opencode_cli` |
-| **Launch time** — recomputed each time a terminal is created | `claude_code`, `codex`, `kimi_cli`, `cursor_cli`, `copilot_cli`, `antigravity_cli`, `omp`, `grok_cli`, `mcode` |
+| **Launch time** — recomputed each time a terminal is created | `claude_code`, `codex`, `kimi_cli`, `cursor_cli`, `copilot_cli`, `antigravity_cli`, `omp`, `grok_cli`, `mcode`, `qwen_cli` |
 | **Never** — the provider builds no MCP configuration at all | `hermes`, `mock_cli` |
 
 The last row is *reported*, not silent: installing an agent for one of those
@@ -458,7 +458,7 @@ Some entries are rejected, always with a report and never silently:
 
   | Delivery | Providers | How |
   |---|---|---|
-  | Native field | `codex`, `antigravity_cli`, `opencode_cli`, `kimi_cli` | The format documents a working-directory key, so CAO writes it directly. Codex `mcp_servers.<id>.cwd` and Antigravity `cwd` are documented; OpenCode's `McpLocalConfig.cwd` and FastMCP's `StdioMCPServer.cwd` (Kimi) are in their schemas. |
+  | Native field | `codex`, `antigravity_cli`, `opencode_cli`, `kimi_cli`, `qwen_cli` | The format documents a working-directory key, so CAO writes it directly. Codex `mcp_servers.<id>.cwd` and Antigravity `cwd` are documented; OpenCode's `McpLocalConfig.cwd`, FastMCP's `StdioMCPServer.cwd` (Kimi), and Qwen's `MCPServerConfig.cwd` are in their schemas. |
   | `/bin/sh` wrapper | `grok_cli`, `mcode`, `kiro_cli`, `claude_code`, `cursor_cli`, `copilot_cli`, `omp` | The format has **no** working-directory key, so the command becomes `/bin/sh -c 'cd -- "$1" && shift && exec "$@"' cao-cwd-shim <cwd> <command> <args…>`. `exec` replaces the shell, the environment passes through, and argument boundaries survive because each argument stays a separate argv element. |
   | Nothing to carry | `hermes`, `mock_cli` | These build no MCP configuration at all and already report `mcp.provider_unsupported` per server. |
 
@@ -844,7 +844,7 @@ corpus case is a directory under `fixtures/corpus/`, and
 
 | # | Requirement | Spec | Status | CAO code | Proven by |
 |---|---|---|---|---|---|
-| 11 | Support at least one of stdio and Streamable HTTP | §7.2.1 (Transport support) | Implemented, per provider. Eight providers carry stdio, Streamable HTTP and SSE; `opencode_cli`, `codex` and `antigravity_cli` carry stdio only; `hermes` and `mock_cli` have no MCP path, which is reported as `mcp.provider_unsupported` | `PROVIDER_TRANSPORTS` (`mcp_mapping.py:103`) | `test_mcp_launch_delivery.py::TestEveryDeliveringProviderIsCovered::test_every_provider_type_has_a_transport_row`; `test_mcp_mapping.py::TestTransportMatrix::test_http_transports_map_for_providers_that_carry_them`, `::test_a_provider_with_no_mcp_path_reports_provider_unsupported` |
+| 11 | Support at least one of stdio and Streamable HTTP | §7.2.1 (Transport support) | Implemented, per provider. Eight providers carry stdio, Streamable HTTP and SSE; `opencode_cli`, `codex`, `antigravity_cli` and `qwen_cli` carry stdio only; `hermes` and `mock_cli` have no MCP path, which is reported as `mcp.provider_unsupported` | `PROVIDER_TRANSPORTS` (`mcp_mapping.py:103`) | `test_mcp_launch_delivery.py::TestEveryDeliveringProviderIsCovered::test_every_provider_type_has_a_transport_row`; `test_mcp_mapping.py::TestTransportMatrix::test_http_transports_map_for_providers_that_carry_them`, `::test_a_provider_with_no_mcp_path_reports_provider_unsupported` |
 | 12 | Use each entry's declared transport for the initial connection attempt | §7.2.1 (Transport support) | Delegated. CAO never substitutes a transport: an unsupported one is skipped with `mcp.transport_unsupported` (`mcp_mapping.py:771`, §7.2.2 rule 4). The connection attempt is the provider CLI's | `_map_entry` (`mcp_mapping.py:719`) | CAO's half: `test_mcp_mapping.py::TestTransportMatrix::test_an_unsupported_transport_is_skipped_not_substituted`; `test_mcp_launch_delivery.py::TestKimiCarriesTheDeclaredTransport::test_an_sse_plugin_server_reaches_kimi_as_transport_sse` |
 | 13 | Validate the closed top-level `mcp.json` and each server entry independently | §7.2.1, §7.2.2 | Implemented | `_document_errors` (`mcp_mapping.py:626`); `_server_errors` (`:646`) | corpus `mcp-invalid`; `test_mcp_mapping.py::TestTheDocumentEntryBoundary::test_one_invalid_server_does_not_drop_its_valid_siblings`; `::TestDocumentLevelFailures::test_an_unknown_top_level_key_still_disables_mcp` |
 | 14a | Keep a stdio `command` as one token, never split or placeholder-expanded, and resolve a `./` command against the plugin root | §7.2.1 (stdio) | Implemented | `_map_stdio` (`mcp_mapping.py:816`); `mcp.command_invalid` (`:835`); `mcp.command_escapes_root` (`:849`) | `test_mcp_mapping.py::TestCommandIsOneToken::test_a_command_with_spaces_is_not_split`, `::test_a_command_is_never_placeholder_expanded`, `::test_a_dot_rooted_command_is_resolved_inside_the_plugin`, `::test_a_dot_rooted_command_escaping_the_root_is_skipped` |

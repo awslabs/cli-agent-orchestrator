@@ -144,3 +144,30 @@ class TestModuleImport:
         reloaded = importlib.reload(herdr_inbox_registry)
         assert callable(reloaded.get_herdr_inbox_service)
         assert callable(reloaded.set_herdr_inbox_service)
+
+
+def test_registry_accepts_any_event_inbox_service():
+    from cli_agent_orchestrator.services.herdr_inbox_registry import EventInboxService
+
+    class Svc:
+        def register_terminal(self, terminal_id, pane_id, is_kiro=False): ...
+
+        def unregister_terminal(self, terminal_id): ...
+
+    svc = Svc()
+    assert isinstance(svc, EventInboxService)
+    assert not isinstance(object(), EventInboxService)
+    set_herdr_inbox_service(svc)
+    assert get_herdr_inbox_service() is svc
+
+
+def test_both_inbox_services_satisfy_the_protocol():
+    from cli_agent_orchestrator.services.herdr_app_inbox_service import HerdrAppInboxService
+    from cli_agent_orchestrator.services.herdr_inbox_registry import EventInboxService
+    from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
+
+    for cls in (HerdrInboxService, HerdrAppInboxService):
+        assert callable(getattr(cls, "register_terminal"))
+        assert callable(getattr(cls, "unregister_terminal"))
+    backend = type("B", (), {"home_label": "a" * 16, "herdr_app_session": "cao"})()
+    assert isinstance(HerdrAppInboxService(backend, lambda tid: None), EventInboxService)

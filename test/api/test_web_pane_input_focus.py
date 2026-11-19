@@ -99,6 +99,7 @@ def _pty_attach(plan):
         state.stamps.append(("focus", pane, time.monotonic()))
 
     backend.focus_web_input.side_effect = _focus
+    backend.release_web_input.side_effect = lambda pane: state.events.append(("release", pane))
     backend.web_input_escape_hold.return_value = 0.0
     state.backend = backend
     proc = MagicMock()
@@ -161,12 +162,15 @@ class TestPaneTerminalsSelectTheirOwnPane:
 
         assert _kinds(state.events) == [
             "focus",  # on connect
+            "release",
             "focus",
             "write",
             "drain",
+            "release",  # held until the reader has read the frame
             "focus",
             "write",
             "drain",
+            "release",
         ]
         assert [e[2] for e in state.events if e[0] == "write"] == [b"A-1", b"A-2"]
         assert {e[1] for e in state.events if e[0] == "focus"} == {_PANE}
@@ -180,6 +184,16 @@ class TestPaneTerminalsSelectTheirOwnPane:
         assert [e for e in state.events if e[0] == "write"] == []
         drops = [r for r in caplog.records if "could not focus its pane" in r.getMessage()]
         assert len(drops) == 1
+        # A focus that failed has nothing to release (the backend undid it).
+        assert [e for e in state.events if e[0] == "release"] == []
+
+    @pytest.mark.asyncio
+    async def test_the_turn_is_released_even_when_the_write_fails(self):
+        with _pty_attach((_ARGV, (_SCOPE, _PANE))) as state:
+            with patch.object(main_module, "_wait_for_pty_drain", side_effect=OSError("gone")):
+                await _attach([_input("A-1")])
+
+        assert _kinds(state.events)[-2:] == ["write", "release"]
 
     @pytest.mark.asyncio
     async def test_the_window_lock_is_released_when_the_terminal_disconnects(self):

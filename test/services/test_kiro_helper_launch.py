@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from test.fixtures.app_state import app_state_items
 from test.providers.kiro_helper_support import operator_home  # noqa: F401
 from test.services.test_ephemeral_claim import audit, claim  # noqa: F401
 from test.services.test_ephemeral_service import CALLER, SPEC, create, create_store  # noqa: F401
@@ -728,7 +729,7 @@ def decided(kiro, tmp_path, monkeypatch):
             on_timeout_ms=timeout["ms"],
         ),
     )
-    monkeypatch.setattr(main.app.state, "decision_engine", engine, raising=False)
+    monkeypatch.setitem(app_state_items(main.app), "decision_engine", engine)
 
     async def run(**kwargs):
         claimed = claim(kiro.env, kiro.name)["claim_id"]

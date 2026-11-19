@@ -1,0 +1,50 @@
+[
+  {
+    "id": 3,
+    "sender_id": "7e5affe9",
+    "receiver_id": "ace587ab",
+    "message": "DONE: outliner finished",
+    "status": "delivered",
+    "created_at": "2026-11-15T06:00:00+00:00"
+  },
+  {
+    "id": 2,
+    "sender_id": "7e5affe9",
+    "receiver_id": "ace587ab",
+    "message": "progress: halfway, no blockers",
+    "status": "delivered",
+    "created_at": "2026-11-15T05:48:00+00:00"
+  },
+  {
+    "id": 1,
+    "sender_id": "7e5affe9",
+    "receiver_id": "ace587ab",
+    "message": "READY: started, working on the assignment",
+    "status": "delivered",
+    "created_at": "2026-11-15T05:30:00+00:00"
+  },
+  {
+    "id": 6,
+    "sender_id": "4ad52c0e",
+    "receiver_id": "ace587ab",
+    "message": "DONE: link-check finished",
+    "status": "delivered",
+    "created_at": "2026-11-14T06:00:00+00:00"
+  },
+  {
+    "id": 5,
+    "sender_id": "4ad52c0e",
+    "receiver_id": "ace587ab",
+    "message": "progress: halfway, no blockers",
+    "status": "delivered",
+    "created_at": "2026-11-14T05:48:00+00:00"
+  },
+  {
+    "id": 4,
+    "sender_id": "4ad52c0e",
+    "receiver_id": "ace587ab",
+    "message": "READY: started, working on the assignment",
+    "status": "delivered",
+    "created_at": "2026-11-14T05:30:00+00:00"
+  }
+]

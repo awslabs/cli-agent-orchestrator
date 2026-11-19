@@ -1,0 +1,27 @@
+# Accepted shipped-dependency findings, read ONLY by scripts/dependency_security.py (#1398).
+# It is not named `.trivyignore.yaml` and does not sit at the repository root: Trivy would
+# auto-load that into the `security` job. The gate runs Trivy with its ignore file disabled.
+#
+# Only a finding in the SHIPPED set (wheel runtime, bundled web UI / MCP App / docs
+# packages, TUI crates) needs an entry. An entry is for a shipped HIGH/CRITICAL with no
+# fix, for at most 14 days, and must be scoped by `paths` (lockfiles) or `purl` (one
+# package, optionally one version); an entry with neither is rejected:
+#
+#   vulnerabilities:
+#     - id: CVE-2099-00001  # advisory ID
+#       url: https://example.invalid/advisory/1  # https URL of the advisory
+#       statement: The vulnerable function is not called by the bundled code.
+#       added: 2026-11-18  # ISO date; not in the future
+#       expired_at: 2026-11-25  # added < expired_at <= added + 14 days
+#       paths: [web/package-lock.json]  # scope: these lockfiles
+#     - id: CVE-2099-00002
+#       url: https://example.invalid/advisory/2
+#       statement: Only the server-side helper is affected; the client bundle never loads it.
+#       added: 2026-11-18
+#       expired_at: 2026-12-02
+#       purl: pkg:npm/example-lib@1.2.3  # scope: this package (and version)
+#
+# The script rejects any other shape. An entry that matches no current shipped finding is
+# rejected, the 14 days are also checked against the date git first shows the entry on the
+# base branch, and an expired entry covers nothing, so the finding blocks again.
+vulnerabilities: []

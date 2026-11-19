@@ -2641,6 +2641,10 @@ class CodexProvider(BaseProvider):
         if _find_assistant_marker(output) is not None:
             return True
         rows = _body_rows(output)
+        # Codex 0.169 leaves two blank rows between the completion footer and the
+        # composer, so the body can end with blank rows (#1390).
+        while rows and not rows[-1].strip():
+            rows.pop()
         if not rows or not _is_completion_footer(rows[-1], self._codex_version):
             return False
         baseline_rows = set(baseline or ())

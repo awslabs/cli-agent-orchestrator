@@ -62,6 +62,7 @@ from pydantic import (
 )
 
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
+from cli_agent_orchestrator.backends.herdr_app_backend import HerdrAppBackend
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.cli.commands.agent_plugin import UNTRUSTED_CONTENT_WARNING
@@ -191,6 +192,7 @@ from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.event_log_service import RING_CAPACITY
 from cli_agent_orchestrator.services.event_primitives import KINDS as EVENT_KINDS
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.services.herdr_app_inbox_service import HerdrAppInboxService
 from cli_agent_orchestrator.services.herdr_inbox_registry import set_herdr_inbox_service
 from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
 from cli_agent_orchestrator.services.inbox_service import inbox_service
@@ -1950,6 +1952,16 @@ async def lifespan(app: FastAPI):
         set_herdr_inbox_service(svc)
         herdr_inbox_task = asyncio.create_task(svc.start())
         logger.info("Herdr inbox service started")
+    elif isinstance(backend, HerdrAppBackend):
+        # herdr-app: the same delivery path, driven by herdr-core events.
+
+        def deliver_app_inbox(terminal_id: str) -> None:
+            inbox_service.deliver_pending(terminal_id, registry=registry)
+
+        app_svc = HerdrAppInboxService(backend, deliver_app_inbox)
+        set_herdr_inbox_service(app_svc)
+        herdr_inbox_task = asyncio.create_task(app_svc.start())
+        logger.info("Herdr app inbox service started")
 
     yield
 
@@ -1959,7 +1971,7 @@ async def lifespan(app: FastAPI):
 
     _ambient_run.request_stop(sticky=False)
 
-    # Stop herdr inbox service on shutdown
+    # Stop the event inbox service (herdr or herdr-app) on shutdown
     if herdr_inbox_task is not None:
         herdr_inbox_task.cancel()
         try:
@@ -1968,6 +1980,9 @@ async def lifespan(app: FastAPI):
             pass
         set_herdr_inbox_service(None)
         logger.info("Herdr inbox service stopped")
+    if isinstance(backend, HerdrAppBackend):
+        # One `hc connect` child per terminal CAO typed into: end them with the server.
+        backend.close_inputs()
 
     if deferred_init_recovery_task is not None:
         deferred_init_recovery_task.cancel()
@@ -2271,6 +2286,7 @@ async def oauth_protected_resource_metadata():
 async def health_check():
     import shutil
 
+    from cli_agent_orchestrator.backends.herdr_app_backend import HerdrAppBackend
     from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 
     def _probe(binary: str) -> str:
@@ -2279,7 +2295,12 @@ async def health_check():
     from cli_agent_orchestrator.services.settings_service import get_server_settings
 
     backend = get_backend()
-    backend_name = "herdr" if isinstance(backend, HerdrBackend) else "tmux"
+    if isinstance(backend, HerdrAppBackend):
+        backend_name = "herdr-app"
+    elif isinstance(backend, HerdrBackend):
+        backend_name = "herdr"
+    else:
+        backend_name = "tmux"
 
     # The installed package version, so a client (the web UI's server card) can
     # show what it is talking to without a shell. Same source as `cao --version`.
@@ -2308,6 +2329,9 @@ async def health_check():
         "components": {
             "cao": "ok",
             "herdr": _probe("herdr"),
+            "herdr-core": (
+                "ok" if (shutil.which("hc") or shutil.which("herdr-core")) else "unavailable"
+            ),
             "claude": _probe("claude"),
         },
     }
@@ -4098,6 +4122,7 @@ async def list_providers_endpoint(
         "codex": "codex",
         "hermes": "hermes",
         "kimi_cli": "kimi",
+        "qwen_cli": "qwen",
         "copilot_cli": "copilot",
         "opencode_cli": "opencode",
         "cursor_cli": "agent",
@@ -10861,6 +10886,14 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             return False
         return True
 
+    async def _release_own_pane() -> None:
+        """End the turn a successful ``_select_own_pane`` began."""
+        assert input_focus is not None
+        try:
+            await asyncio.to_thread(get_backend().release_web_input, input_focus[1])
+        except Exception as e:  # noqa: BLE001 — the next focus retries the release
+            logger.warning(f"Could not end the input turn for terminal {terminal_id}: {e}")
+
     # Create PTY pair for backend attach
     master_fd, slave_fd = pty.openpty()
 
@@ -10890,7 +10923,8 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # terminal's pane so its cursor starts on the right agent.
     if input_window is not None:
         async with input_window.turn(input_owner):
-            await _select_own_pane()
+            if await _select_own_pane():
+                await _release_own_pane()
 
     # Make master_fd non-blocking for event-driven reads
     flag = fcntl.fcntl(master_fd, fcntl.F_GETFL)
@@ -10998,8 +11032,11 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
                         if not await _select_own_pane():
                             # Dropped: never deliver keys to another agent's pane.
                             continue
-                        await _write_input(raw)
-                        drained = await _wait_for_pty_drain(slave_path)
+                        try:
+                            await _write_input(raw)
+                            drained = await _wait_for_pty_drain(slave_path)
+                        finally:
+                            await _release_own_pane()
                         input_window.after_write(input_owner, raw, escape_hold_s)
                         if not drained:
                             if not drain_timeout_logged:
@@ -12431,7 +12468,7 @@ def main():
     parser.add_argument(
         "--terminal",
         type=str,
-        choices=["tmux", "herdr"],
+        choices=["tmux", "herdr", "herdr-app"],
         default=None,
         help="Terminal backend to use, overriding terminal_backend in config.json",
     )

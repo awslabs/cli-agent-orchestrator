@@ -36,3 +36,39 @@ revision as its lockfiles. Do not substitute another registry tag or create a
 different tarball under this version. See
 [SECURITY.md](../SECURITY.md#guarded-fork-maintenance) for the upstream-advisory
 limitation, concrete maintenance checkpoints, and eventual replacement policy.
+
+## Guarded picomatch backport
+
+`cao-picomatch-guard-4.0.7-cao.3.tgz` is built from the **official npm
+`picomatch@4.0.7` archive**, corresponding to [tag `4.0.7` at `6bb40679`](https://github.com/micromatch/picomatch/tree/6bb40679c218cefba5d4e9662408c5fdf699a8bb).
+It retains the original MIT license and copyright notice. No runtime source file
+except `lib/parse.js` differs from the release. The package metadata marks this
+as a private CAO backport, not an upstream fix.
+
+[The complete patch](picomatch-4.0.7.patch) backports the three single-branch
+guard changes from [the MIT-licensed fix at `3ab5a762`](https://github.com/ryotsu-kankichi/secured-picomatch/commit/3ab5a7627d480259e3d9ca67fbc14c125d374f0e)
+and extends the release's checks to quoted, multi-character and Unicode
+case-insensitive literal alternatives. The star guard uses the emitted wildcard's
+character range, including for separator classes and single-character escapes.
+It does not include that fork's unreleased bracket-negation, globstar, or POSIX
+punctuation changes. No install or build step downloads the fork.
+
+To reproduce the archive, run from the root of this checkout on Linux:
+
+```bash
+set -eu
+vendor="$PWD/vendor"
+work=$(mktemp -d)
+cd "$work"
+curl -fsSLo upstream.tgz https://registry.npmjs.org/picomatch/-/picomatch-4.0.7.tgz
+echo 'a9c26ef3c436216a89b030f9dbd24a31dc069bf76f2275b81ef427470887f49b62849bf318eb1c0ed1c4df1d6904a794393cac43c91598b9c9da426eef285c18  upstream.tgz' | sha512sum -c -
+tar -xzf upstream.tgz
+cd package
+git apply -p1 "$vendor/picomatch-4.0.7.patch"
+corepack npm@10.9.4 pack --ignore-scripts --pack-destination "$work"
+cmp "$work/cao-picomatch-guard-4.0.7-cao.3.tgz" "$vendor/cao-picomatch-guard-4.0.7-cao.3.tgz"
+```
+
+The four lockfiles record the archive SHA-512. The separate postinstall patch for
+legacy Windows callers is not part of this archive. See
+[SECURITY.md](../SECURITY.md#guarded-picomatch-parser) for guard behavior and upstream monitoring.
