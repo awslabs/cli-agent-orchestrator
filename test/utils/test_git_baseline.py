@@ -618,13 +618,15 @@ def test_unavailable_reason_covers_failure_seams(tmp_path, monkeypatch, seam, re
             monkeypatch.setattr(subprocess, "run", listed_entry)
         else:
             entry.write_bytes(b"data")
+        # Inject faults only into the snapshot code; pytest also uses os.fstat for output capture.
+        snapshot_os = SimpleNamespace(**vars(os))
+        monkeypatch.setattr(git_baseline, "os", snapshot_os)
         if seam == "flags":
-            monkeypatch.setattr(os, "O_NOFOLLOW", None)
+            snapshot_os.O_NOFOLLOW = None
         if seam == "inode":
-            original = os.fstat
 
             def raced(fd):
-                result = original(fd)
+                result = os.fstat(fd)
                 return SimpleNamespace(
                     st_mode=result.st_mode,
                     st_dev=result.st_dev,
@@ -632,13 +634,13 @@ def test_unavailable_reason_covers_failure_seams(tmp_path, monkeypatch, seam, re
                     st_size=result.st_size,
                 )
 
-            monkeypatch.setattr(os, "fstat", raced)
+            snapshot_os.fstat = raced
         if seam == "hash-error":
 
             def unreadable(fd):
                 raise OSError(str(tmp_path))
 
-            monkeypatch.setattr(os, "fstat", unreadable)
+            snapshot_os.fstat = unreadable
     result = git_baseline.derive_baseline(str(tmp_path))
     assert result["available"] is False
     assert result["reason"] == reason

@@ -1,0 +1,86 @@
+[
+  {
+    "id": "cao-payments-fix",
+    "name": "cao-payments-fix",
+    "status": "detached",
+    "working_directory": "/work/example",
+    "agent_profile": "supervisor"
+  },
+  {
+    "id": "cao-docs-refresh",
+    "name": "cao-docs-refresh",
+    "status": "detached",
+    "working_directory": "/work/example",
+    "agent_profile": "supervisor"
+  },
+  {
+    "id": "cao-migrate-db",
+    "name": "cao-migrate-db",
+    "status": "detached",
+    "working_directory": "/work/example",
+    "agent_profile": "supervisor"
+  },
+  {
+    "id": "cao-search-tuning",
+    "name": "cao-search-tuning",
+    "status": "detached",
+    "working_directory": "/work/example",
+    "agent_profile": "supervisor"
+  },
+  {
+    "id": "cao-onboarding-flow",
+    "name": "cao-onboarding-flow",
+    "status": "detached",
+    "working_directory": "/work/example",
+    "agent_profile": "supervisor"
+  },
+  {
+    "id": "cao-infra-audit",
+    "name": "cao-infra-audit",
+    "status": "detached",
+    "working_directory": "/work/example",
+    "agent_profile": "supervisor"
+  },
+  {
+    "id": "cao-release-notes",
+    "name": "cao-release-notes",
+    "status": "detached",
+    "working_directory": "/work/example",
+    "agent_profile": "supervisor"
+  },
+  {
+    "id": "cao-api-cleanup",
+    "name": "cao-api-cleanup",
+    "status": "detached",
+    "working_directory": "/work/example",
+    "agent_profile": "supervisor"
+  },
+  {
+    "id": "cao-perf-probe",
+    "name": "cao-perf-probe",
+    "status": "detached",
+    "working_directory": "/work/example",
+    "agent_profile": "supervisor"
+  },
+  {
+    "id": "cao-ui-polish",
+    "name": "cao-ui-polish",
+    "status": "detached",
+    "working_directory": "/work/example",
+    "agent_profile": "supervisor"
+  },
+  {
+    "id": "cao-data-backfill",
+    "name": "cao-data-backfill",
+    "status": "detached",
+    "working_directory": "/work/example",
+    "agent_profile": "supervisor"
+  },
+  {
+    "id": "cao-ci-flakes",
+    "name": "cao-ci-flakes",
+    "status": "detached",
+    "working_directory": "/work/example",
+    "agent_profile": "supervisor"
+  }
+]

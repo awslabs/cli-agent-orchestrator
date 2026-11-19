@@ -1,0 +1,26 @@
+[
+  {
+    "id": 3,
+    "sender_id": "afc02950",
+    "receiver_id": "19384629",
+    "message": "DONE: baseline finished",
+    "status": "delivered",
+    "created_at": "2026-11-13T00:00:00+00:00"
+  },
+  {
+    "id": 2,
+    "sender_id": "afc02950",
+    "receiver_id": "19384629",
+    "message": "progress: halfway, no blockers",
+    "status": "delivered",
+    "created_at": "2026-11-12T23:48:00+00:00"
+  },
+  {
+    "id": 1,
+    "sender_id": "afc02950",
+    "receiver_id": "19384629",
+    "message": "READY: started, working on the assignment",
+    "status": "delivered",
+    "created_at": "2026-11-12T23:30:00+00:00"
+  }
+]

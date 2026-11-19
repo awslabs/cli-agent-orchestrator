@@ -1,0 +1,189 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/cao-shelf/history.schema.json",
+  "title": "GET /api/sessions/{name}/history response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "session",
+    "source",
+    "complete",
+    "window_rows",
+    "rows_seen",
+    "closed",
+    "external_senders"
+  ],
+  "properties": {
+    "session": {
+      "type": "string"
+    },
+    "source": {
+      "const": "inbox_rows"
+    },
+    "complete": {
+      "type": "boolean",
+      "description": "false when the 100-row window was full, so older closed helpers may be missing."
+    },
+    "window_rows": {
+      "const": 100
+    },
+    "rows_seen": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "closed": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "terminal_id",
+          "label",
+          "rows",
+          "first_at",
+          "last_at",
+          "last_status"
+        ],
+        "properties": {
+          "terminal_id": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{8}$"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Always null today: CAO keeps no name for a deleted terminal."
+          },
+          "rows": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "first_at": {
+            "type": "string"
+          },
+          "last_at": {
+            "type": "string"
+          },
+          "last_status": {
+            "enum": [
+              "pending",
+              "delivered",
+              "failed"
+            ]
+          }
+        }
+      }
+    },
+    "external_senders": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "sender_id",
+          "rows"
+        ],
+        "properties": {
+          "sender_id": {
+            "type": "string"
+          },
+          "rows": {
+            "type": "integer"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "HistoryRows": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rows"
+      ],
+      "description": "GET /api/sessions/{name}/history/{terminal_id}/rows: up to 3 newest rows of one closed helper, read live and never stored.",
+      "properties": {
+        "rows": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "created_at",
+              "status",
+              "text"
+            ],
+            "properties": {
+              "id": {
+                "type": "integer"
+              },
+              "created_at": {
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "delivered",
+                  "failed"
+                ]
+              },
+              "text": {
+                "type": "string",
+                "maxLength": 2000,
+                "description": "Untrusted message text. Render as text."
+              }
+            }
+          }
+        }
+      }
+    },
+    "AllHistory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "closed",
+        "complete"
+      ],
+      "description": "GET /api/history: every closed helper, newest last message first.",
+      "properties": {
+        "closed": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "session",
+              "terminal_id",
+              "rows",
+              "last_at"
+            ],
+            "properties": {
+              "session": {
+                "type": "string"
+              },
+              "terminal_id": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{8}$"
+              },
+              "rows": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "last_at": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "complete": {
+          "type": "boolean",
+          "description": "false when some session was not read this call (at most 4 inbox reads per call, the rest on the next call) or its 100-row window was full."
+        }
+      }
+    }
+  }
+}

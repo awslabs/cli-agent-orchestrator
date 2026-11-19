@@ -1,0 +1,26 @@
+{
+  "session": "api-cleanup",
+  "source": "inbox_rows",
+  "complete": true,
+  "window_rows": 100,
+  "rows_seen": 6,
+  "closed": [
+    {
+      "terminal_id": "fc807a20",
+      "label": null,
+      "rows": 3,
+      "first_at": "2026-11-10T21:30:00+00:00",
+      "last_at": "2026-11-10T22:00:00+00:00",
+      "last_status": "delivered"
+    },
+    {
+      "terminal_id": "aed76204",
+      "label": null,
+      "rows": 3,
+      "first_at": "2026-11-10T11:30:00+00:00",
+      "last_at": "2026-11-10T12:00:00+00:00",
+      "last_status": "delivered"
+    }
+  ],
+  "external_senders": []
+}
