@@ -587,6 +587,7 @@ CAO translates `allowedTools` into each provider's native restriction mechanism:
 | OpenCode CLI | Hard | `permission:` block written at install time from the profile; launch-time `--allowed-tools` and role overrides do not change it |
 | Grok Build CLI | Hard | `--permission-mode dontAsk` with `--allow`/`--deny` |
 | Kimi CLI | Soft | Security system prompt (no native mechanism) |
+| Qwen Code | Soft | Security system prompt (no native mechanism) |
 | Codex | Soft | Security system prompt (no native mechanism) |
 | Antigravity CLI | Soft | Security system prompt (no native mechanism) |
 | OMP | Soft | Security system prompt (no native mechanism) |

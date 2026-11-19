@@ -42,7 +42,7 @@ def _create_terminal_in_session(session_name: str, provider: str, agent_profile:
     Returns (terminal_id, window_name).
     """
     resp = requests.post(
-        f"{API_BASE_URL}/sessions/{session_name}/terminals",
+        f"{API_BASE_URL}/sessions/{session_name}/terminals:operator",
         params={
             "provider": provider,
             "agent_profile": agent_profile,
@@ -327,3 +327,17 @@ class TestMiniMaxCodeSendMessage:
 
     def test_send_message_to_inbox(self, require_minimax_code):
         _run_send_message_test(provider="mcode", agent_profile="developer")
+
+
+# ---------------------------------------------------------------------------
+# Qwen Code provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestQwenCliSendMessage:
+    """E2E send_message tests for the Qwen Code provider."""
+
+    def test_send_message_to_inbox(self, require_qwen_cli):
+        """Send a message to another Qwen Code terminal's inbox and verify delivery."""
+        _run_send_message_test(provider="qwen_cli", agent_profile="developer")

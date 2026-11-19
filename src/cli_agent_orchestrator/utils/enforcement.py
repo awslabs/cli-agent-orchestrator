@@ -42,6 +42,7 @@ PROVIDER_ENFORCEMENT: Dict[str, str] = {
     "opencode_cli": NATIVE,
     "grok_cli": NATIVE,  # --permission-mode dontAsk with --allow/--deny
     "kimi_cli": PROMPT,
+    "qwen_cli": PROMPT,  # advisory system prompt under --approval-mode yolo
     "codex": PROMPT,
     "antigravity_cli": PROMPT,
     "omp": PROMPT,
