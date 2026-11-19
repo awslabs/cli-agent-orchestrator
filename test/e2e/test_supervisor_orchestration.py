@@ -604,12 +604,6 @@ def _run_supervisor_assign_three_analysts_test(provider: str, *, result_check=No
             "then use handoff to report_generator for the template, then combine "
             "all three analyst results into the final report."
         )
-        if provider == "qwen_cli":
-            task_message += (
-                " Do not calculate statistics yourself or run analysis code. "
-                "Use only the CAO MCP tools for delegation, not native subagents. "
-                "The final report must cover datasets A, B, and C."
-            )
         resp = requests.post(
             f"{API_BASE_URL}/terminals/{supervisor_id}/input",
             params={"message": task_message},
