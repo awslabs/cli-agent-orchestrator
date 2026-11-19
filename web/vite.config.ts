@@ -4,6 +4,8 @@
 // longer widens vite's own UserConfig to accept `test`.
 import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
+// Records the npm packages the build bundles, for the shipped-only dependency gate (#1398).
+import { bundledPackagesPlugin } from '../scripts/shipped-packages.mjs'
 
 // Minimal structural shapes for the two proxy hooks we use. Declared locally
 // rather than imported from node:http / http-proxy: this package ships no
@@ -17,7 +19,9 @@ type ConfigurableProxy = {
 }
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), bundledPackagesPlugin({ project: 'web', config: 'web' })],
+  // Worker bundles are built in a separate pass; record them too (no worker today, so no record).
+  worker: { plugins: () => [bundledPackagesPlugin({ project: 'web', config: 'web-worker' })] },
   build: {
     outDir: '../src/cli_agent_orchestrator/web_ui',
     emptyOutDir: true,
