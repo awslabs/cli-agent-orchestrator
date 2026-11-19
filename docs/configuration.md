@@ -68,6 +68,7 @@ Every derived path resolves from this value, so one override moves everything â€
   "terminal": {
     "backend": "tmux",
     "herdr_session": "cao",
+    "herdr_app_session": "cao",
     "keep_finished": {
       "enabled": false,
       "idle_window_minutes": 60,
@@ -294,11 +295,12 @@ CAO's default backend is [tmux](tmux.md). [herdr](https://herdr.dev/) is an expe
 }
 ```
 
-- `backend`: `"tmux"` (default) or `"herdr"` [EXPERIMENTAL].
+- `backend`: `"tmux"` (default), `"herdr"` [EXPERIMENTAL], or `"herdr-app"` [EXPERIMENTAL] (see [Herdr app backend](herdr-app.md)).
 - `herdr_session`: the herdr session name to connect to (default `"cao"`).
 - `herdr.auto_start`: start a missing herdr server (default `true`). Set it to
   `false` when systemd owns herdr; CAO then fails immediately if the configured
   session is unavailable.
+- `herdr_app_session`: the herdr-core (`hc`) session the `herdr-app` backend uses (default `"cao"`; env `CAO_HERDR_APP_SESSION`).
 - `spawn_mode`: `"window"` (default) or `"pane"` â€” where a terminal created by
   `assign` / `handoff` lands. See [Watching a fleet in one window](#watching-a-fleet-in-one-window).
 - `pane_window`: the window `spawn_mode: "pane"` shares (default `"cao-agents"`).

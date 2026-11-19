@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+from test.fixtures.app_state import app_state_items
 from typing import NoReturn
 
 import pytest
@@ -39,6 +40,6 @@ def default_decision_runtime(tmp_path, monkeypatch):
     from cli_agent_orchestrator.api.main import app
 
     runtime, guard = isolated_runtime(tmp_path)
-    monkeypatch.setattr(app.state, "decision_engine", runtime, raising=False)
+    monkeypatch.setitem(app_state_items(app), "decision_engine", runtime)
     yield runtime
     guard.check()

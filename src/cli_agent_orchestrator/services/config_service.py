@@ -95,6 +95,7 @@ class KeepFinishedConfig(BaseModel):
 class TerminalConfig(BaseModel):
     backend: str = "tmux"
     herdr_session: str = "cao"
+    herdr_app_session: str = "cao"
     spawn_mode: str = "window"
     pane_window: str = "cao-agents"
     pane_layout: str = "tiled"
@@ -188,6 +189,7 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
     "terminal.backend": "tmux",
     "terminal.herdr_session": "cao",
     "herdr.auto_start": True,
+    "terminal.herdr_app_session": "cao",
     "terminal.spawn_mode": "window",
     "terminal.pane_window": "cao-agents",
     "terminal.pane_layout": "tiled",
@@ -216,6 +218,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_TERMINAL_BACKEND": ("terminal.backend", "str", "tmux"),
     "CAO_HERDR_SESSION": ("terminal.herdr_session", "str", "cao"),
     "CAO_HERDR_AUTO_START": ("herdr.auto_start", "bool", True),
+    "CAO_HERDR_APP_SESSION": ("terminal.herdr_app_session", "str", "cao"),
     "CAO_TERMINAL_SPAWN_MODE": ("terminal.spawn_mode", "str", "window"),
     "CAO_TERMINAL_PANE_WINDOW": ("terminal.pane_window", "str", "cao-agents"),
     "CAO_TERMINAL_PANE_LAYOUT": ("terminal.pane_layout", "str", "tiled"),
@@ -754,6 +757,7 @@ class ConfigService:
             terminal=TerminalConfig(
                 backend=_get_value("terminal.backend", default="tmux"),
                 herdr_session=_get_value("terminal.herdr_session", default="cao"),
+                herdr_app_session=_get_value("terminal.herdr_app_session", default="cao"),
                 spawn_mode=_get_value("terminal.spawn_mode", default="window"),
                 pane_window=_get_value("terminal.pane_window", default="cao-agents"),
                 pane_layout=_get_value("terminal.pane_layout", default="tiled"),

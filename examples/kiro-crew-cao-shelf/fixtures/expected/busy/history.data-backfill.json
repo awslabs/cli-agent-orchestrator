@@ -1,0 +1,26 @@
+{
+  "session": "data-backfill",
+  "source": "inbox_rows",
+  "complete": true,
+  "window_rows": 100,
+  "rows_seen": 6,
+  "closed": [
+    {
+      "terminal_id": "b9986ac5",
+      "label": null,
+      "rows": 3,
+      "first_at": "2026-11-06T17:30:00+00:00",
+      "last_at": "2026-11-06T18:00:00+00:00",
+      "last_status": "delivered"
+    },
+    {
+      "terminal_id": "dd03c5e6",
+      "label": null,
+      "rows": 3,
+      "first_at": "2026-11-06T12:30:00+00:00",
+      "last_at": "2026-11-06T13:00:00+00:00",
+      "last_status": "delivered"
+    }
+  ],
+  "external_senders": []
+}

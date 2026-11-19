@@ -713,3 +713,13 @@ def test_lifecycle_set_keeps_nested_and_top_level_siblings(_isolated_settings):
     ConfigService.set("memory.lifecycle.enabled", True)
     original["memory"]["lifecycle"]["enabled"] = True
     assert json.loads(settings.read_text()) == original
+
+
+def test_herdr_app_session_default_and_env(_isolated_settings, monkeypatch):
+    from cli_agent_orchestrator.services.config_service import ENV_REGISTRY
+
+    assert ConfigService.get("terminal.herdr_app_session") == "cao"
+    assert ENV_REGISTRY["CAO_HERDR_APP_SESSION"] == ("terminal.herdr_app_session", "str", "cao")
+    monkeypatch.setenv("CAO_HERDR_APP_SESSION", "x")
+    assert ConfigService.get("terminal.herdr_app_session") == "x"
+    assert ConfigService.get_config().terminal.herdr_app_session == "x"
