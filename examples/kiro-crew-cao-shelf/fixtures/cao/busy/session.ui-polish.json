@@ -1,0 +1,51 @@
+{
+  "session": {
+    "id": "cao-ui-polish",
+    "name": "cao-ui-polish",
+    "status": "detached"
+  },
+  "terminals": [
+    {
+      "id": "7a133a09",
+      "tmux_session": "cao-ui-polish",
+      "tmux_window": "conductor",
+      "provider": "mock_cli",
+      "agent_profile": "supervisor",
+      "description": null,
+      "model": null,
+      "model_honored": null,
+      "ephemeral": false,
+      "working_directory": "/work/example",
+      "engine": null,
+      "deferred_init_failure": null,
+      "deferred_init_external_owner": false,
+      "deferred_init_runtime_reclaimed": false,
+      "session_incarnation_id": "6fb27e99",
+      "kept_until": null,
+      "last_active": "2026-11-09T06:00:00.000000Z",
+      "pending_inbox_count": 0,
+      "status": "idle"
+    },
+    {
+      "id": "36e9845b",
+      "tmux_session": "cao-ui-polish",
+      "tmux_window": "css-fix",
+      "provider": "mock_cli",
+      "agent_profile": "coder",
+      "description": null,
+      "model": null,
+      "model_honored": null,
+      "ephemeral": false,
+      "working_directory": "/work/example",
+      "engine": null,
+      "deferred_init_failure": null,
+      "deferred_init_external_owner": false,
+      "deferred_init_runtime_reclaimed": false,
+      "session_incarnation_id": "6fb27e99",
+      "kept_until": null,
+      "last_active": "2026-11-09T06:00:00.000000Z",
+      "pending_inbox_count": 0,
+      "status": "idle"
+    }
+  ]
+}

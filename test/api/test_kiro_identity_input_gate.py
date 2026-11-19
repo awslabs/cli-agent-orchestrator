@@ -19,6 +19,7 @@ import time
 import tty
 from contextlib import contextmanager
 from pathlib import Path
+from test.fixtures.app_state import app_state_items
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -419,8 +420,8 @@ def agui_routes(monkeypatch, approvals):
     monkeypatch.setenv("CAO_AGUI_ENABLED", "true")
     monkeypatch.delenv("AUTH0_DOMAIN", raising=False)
     monkeypatch.delenv("CAO_AUTH_JWKS_URI", raising=False)
-    monkeypatch.setattr(
-        main_module.app.state, "approval_bridge", ApprovalBridge(construct=approvals), raising=False
+    monkeypatch.setitem(
+        app_state_items(main_module.app), "approval_bridge", ApprovalBridge(construct=approvals)
     )
 
 

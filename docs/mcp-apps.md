@@ -247,6 +247,7 @@ recorded here because they shape how the MCP Apps surface should evolve.
 ## See also
 
 - `examples/mcp-apps/` — a worked enable-and-drive example.
+- [Kiro Crew](kiro-crew.md) — the CAO Shelf, a standing Kiro Crew page that complements `ui://cao/dashboard`.
 - `skills/cao-mcp-apps/SKILL.md` — operator playbook.
 - **Authoritative spec & sources of truth:**
   - [MCP Apps — Overview](https://modelcontextprotocol.io/extensions/apps/overview) ·

@@ -92,6 +92,19 @@ class TestStoreLessonOverHttp:
         assert result["scope"] == "agent"
         assert result["scope_id"] == "transformer"
         assert result["target_agent_profile"] == "transformer"
+        assert "key_truncated" not in result
+        assert "requested_key" not in result
+
+    def test_long_explicit_key_reports_truncation(self, mcp_over_testclient, server_side):
+        requested = "lesson-" + "x" * 64
+
+        with patch(LEARNING_TARGET, return_value=True):
+            result = _run(_store(key=requested))
+
+        assert result["success"] is True, result
+        assert result["key"] == requested[:60]
+        assert result["key_truncated"] is True
+        assert result["requested_key"] == requested
 
     def test_it_posts_to_lessons_and_opens_no_local_service(self, mcp_over_testclient, server_side):
         with patch(LEARNING_TARGET, return_value=True):
