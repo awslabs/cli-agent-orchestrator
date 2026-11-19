@@ -1,0 +1,74 @@
+[
+  {
+    "id": 3,
+    "sender_id": "44d39125",
+    "receiver_id": "efcddc70",
+    "message": "DONE: drafter finished",
+    "status": "delivered",
+    "created_at": "2026-11-12T04:00:00+00:00"
+  },
+  {
+    "id": 2,
+    "sender_id": "44d39125",
+    "receiver_id": "efcddc70",
+    "message": "progress: halfway, no blockers",
+    "status": "delivered",
+    "created_at": "2026-11-12T03:48:00+00:00"
+  },
+  {
+    "id": 1,
+    "sender_id": "44d39125",
+    "receiver_id": "efcddc70",
+    "message": "READY: started, working on the assignment",
+    "status": "delivered",
+    "created_at": "2026-11-12T03:30:00+00:00"
+  },
+  {
+    "id": 6,
+    "sender_id": "27f33cef",
+    "receiver_id": "efcddc70",
+    "message": "DONE: proofreader finished",
+    "status": "delivered",
+    "created_at": "2026-11-11T18:00:00+00:00"
+  },
+  {
+    "id": 5,
+    "sender_id": "27f33cef",
+    "receiver_id": "efcddc70",
+    "message": "progress: halfway, no blockers",
+    "status": "delivered",
+    "created_at": "2026-11-11T17:48:00+00:00"
+  },
+  {
+    "id": 4,
+    "sender_id": "27f33cef",
+    "receiver_id": "efcddc70",
+    "message": "READY: started, working on the assignment",
+    "status": "delivered",
+    "created_at": "2026-11-11T17:30:00+00:00"
+  },
+  {
+    "id": 9,
+    "sender_id": "1cc86efb",
+    "receiver_id": "efcddc70",
+    "message": "DONE: tagger finished",
+    "status": "delivered",
+    "created_at": "2026-11-11T08:00:00+00:00"
+  },
+  {
+    "id": 8,
+    "sender_id": "1cc86efb",
+    "receiver_id": "efcddc70",
+    "message": "progress: halfway, no blockers",
+    "status": "delivered",
+    "created_at": "2026-11-11T07:48:00+00:00"
+  },
+  {
+    "id": 7,
+    "sender_id": "1cc86efb",
+    "receiver_id": "efcddc70",
+    "message": "READY: started, working on the assignment",
+    "status": "delivered",
+    "created_at": "2026-11-11T07:30:00+00:00"
+  }
+]

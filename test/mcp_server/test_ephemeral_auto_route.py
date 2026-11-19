@@ -8,6 +8,7 @@ import asyncio
 import logging
 from dataclasses import replace
 from datetime import timedelta
+from test.fixtures.app_state import app_state_items
 from test.mcp_server.test_ephemeral_launch_handlers import (  # noqa: F401
     CHILD,
     _create_store,
@@ -160,7 +161,7 @@ def e5(launch_http, case, monkeypatch, tmp_path):
         settings_loader=lambda: settings,
         honors_model=lambda *a: True,
     )
-    monkeypatch.setattr(main.app.state, "decision_engine", engine, raising=False)
+    monkeypatch.setitem(app_state_items(main.app), "decision_engine", engine)
     # A persistent portal keeps shadow work on the request loop without app lifespan.
     with start_blocking_portal() as portal:
         launch_http[1].portal = portal
