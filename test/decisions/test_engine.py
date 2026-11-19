@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import replace
+from test.fixtures.app_state import app_state_items
 from unittest.mock import Mock
 
 import pytest
@@ -257,7 +258,7 @@ async def test_module_seam_uses_lifespan_engine(setup_engine, monkeypatch):
     from cli_agent_orchestrator.decisions.engine import bind_launch, launch_note, prepare_launch
 
     engine, req, decider, store, events, settings = setup_engine
-    monkeypatch.setattr(app.state, "decision_engine", engine, raising=False)
+    monkeypatch.setitem(app_state_items(app), "decision_engine", engine)
     plan = await prepare_launch(req)
     bind_launch(plan, terminal_id="worker", model="model-x", honored=True)
     assert launch_note(plan) == "ran on model-x (auto: small 0.91)"
