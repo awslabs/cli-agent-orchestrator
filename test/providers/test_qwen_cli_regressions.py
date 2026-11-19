@@ -110,7 +110,7 @@ async def test_startup_polling_keeps_the_event_loop_responsive():
     with patch("cli_agent_orchestrator.providers.qwen_cli.get_backend") as backend:
         backend.return_value.get_history.side_effect = blocking_history
         tick = asyncio.create_task(heartbeat())
-        await provider()._handle_startup_dialog(timeout=1)
+        await provider()._handle_startup_dialog(outer_timeout=1)
         await tick
     assert events == ["heartbeat", "history"]
 
@@ -198,7 +198,7 @@ async def test_auth_picker_is_left_for_the_operator():
     p = provider()
     with patch("cli_agent_orchestrator.providers.qwen_cli.get_backend") as backend:
         backend.return_value.get_history.return_value = "How would you like to authenticate?"
-        await p._handle_startup_dialog(timeout=0.02)
+        await p._handle_startup_dialog(outer_timeout=0.02)
         backend.return_value.send_special_key.assert_not_called()
 
 
@@ -212,5 +212,5 @@ async def test_qwen_0_28_auth_picker_fails_launch_without_selecting_a_provider()
     with patch("cli_agent_orchestrator.providers.qwen_cli.get_backend") as backend:
         backend.return_value.get_history.return_value = text
         with pytest.raises(ProviderError, match="authentication needs attention"):
-            await p._handle_startup_dialog(timeout=1)
+            await p._handle_startup_dialog(outer_timeout=1)
         backend.return_value.send_special_key.assert_not_called()

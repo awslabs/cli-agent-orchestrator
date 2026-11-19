@@ -76,10 +76,10 @@ from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
-# Local startup-phase budgets, matching the sibling Antigravity provider's
-# shell wait and readiness floor. The readiness phase allows three minutes for
-# Qwen and its first MCP connection (which may fetch cao-mcp-server via uvx).
-# Neither budget includes the separately configured startup-dialog phase.
+# The shell budget and readiness floor match the sibling Antigravity provider.
+# Both dialog handling and readiness allow max(180s, provider_init_timeout),
+# including profile overrides, for a cold Qwen/MCP start (possibly using uvx).
+# The client init allowance already covers this three-phase startup shape.
 SHELL_WAIT_TIMEOUT_S = 10.0
 READY_TIMEOUT_S = 180.0
 
@@ -236,6 +236,7 @@ class QwenCliProvider(BaseProvider):
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        self._launch_profile: Optional[AgentProfile] = None
         self._model = model
         # Per-terminal temp files (the --mcp-config JSON), removed on cleanup().
         self._tmp_paths: list[Path] = []
@@ -372,6 +373,7 @@ class QwenCliProvider(BaseProvider):
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {exc}")
 
         # Explicit launch override wins over the profile default, as in other providers.
+        self._launch_profile = profile
         model = self._model or (profile.model if profile is not None else None)
         if model:
             command_parts.extend(["--model", model])
@@ -434,37 +436,51 @@ class QwenCliProvider(BaseProvider):
         # OpenAI-compatible credentials in the environment qwen skips the auth
         # dialog and lands directly on the input prompt, but a fresh install may
         # still show a theme picker or a folder-trust gate that blocks IDLE.
-        await self._handle_startup_dialog()
+        ready_timeout = max(READY_TIMEOUT_S, self.get_init_timeout(self._launch_profile))
+        await self._handle_startup_dialog(outer_timeout=ready_timeout)
 
         # qwen startup + first MCP connection (cao-mcp-server is fetched via uvx
         # from git on first use) can take a while.
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=READY_TIMEOUT_S,
+            timeout=ready_timeout,
         ):
             raise TimeoutError(
-                f"Qwen Code initialization timed out after {READY_TIMEOUT_S:g} seconds"
+                f"Qwen Code initialization timed out after {ready_timeout:g} seconds"
             )
 
         self._initialized = True
         return True
 
-    async def _handle_startup_dialog(self, timeout: Optional[float] = None) -> None:
+    async def _handle_startup_dialog(
+        self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
+    ) -> None:
         """Dismiss qwen's blocking first-run dialogs (theme / folder-trust).
 
         Mirrors AntigravityCliProvider._handle_startup_dialog / KimiCliProvider.
         Polls the pane and, if a theme picker or a folder-trust gate is showing,
         accepts the pre-selected option with Enter. Both are one-shot on first
         install; once qwen is at its ready input box the loop returns. When
-        credentials are already configured this is typically a no-op.
+        credentials are already configured this is typically a no-op. Before
+        the first answered dialog only the outer cap applies; each answered
+        dialog resets the idle gap, so late and cascading prompts are handled.
         """
-        if timeout is None:
-            timeout = get_server_settings()["startup_prompt_handler_timeout"]
+        if idle_gap is None:
+            idle_gap = get_server_settings()["startup_prompt_handler_timeout"]
+        if outer_timeout is None:
+            outer_timeout = self.get_init_timeout(self._launch_profile)
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        deadline = time.monotonic() + outer_timeout
+        last_prompt_time: Optional[float] = None
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                logger.warning("Qwen startup dialog handler reached its initialization outer cap")
+                return
+            if last_prompt_time is not None and now - last_prompt_time >= idle_gap:
+                return
             output = await asyncio.to_thread(
                 get_backend().get_history, self.session_name, self.window_name
             )
@@ -487,6 +503,7 @@ class QwenCliProvider(BaseProvider):
                     await asyncio.to_thread(
                         get_backend().send_special_key, self.session_name, self.window_name, "Enter"
                     )
+                    last_prompt_time = time.monotonic()
                     await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
                     continue
             await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic())))

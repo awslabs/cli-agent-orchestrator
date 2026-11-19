@@ -181,7 +181,7 @@ async def test_handle_startup_dialog_dismisses_then_returns_on_ready(mock_backen
         "Do you trust the files in this folder?  > Yes, proceed",  # dialog
         "  YOLO mode (shift + tab to cycle)",  # ready input box
     ]
-    await make_provider()._handle_startup_dialog(timeout=5.0)
+    await make_provider()._handle_startup_dialog(outer_timeout=5.0)
     # Accepted the pre-selected option with Enter.
     backend.send_special_key.assert_called_once()
     assert backend.send_special_key.call_args.args[2] == "Enter"
@@ -193,7 +193,7 @@ async def test_handle_startup_dialog_dismisses_then_returns_on_ready(mock_backen
 async def test_handle_startup_dialog_noop_when_already_ready(mock_backend, _sleep):
     backend = mock_backend.return_value
     backend.get_history.return_value = "  YOLO mode (shift + tab to cycle)"
-    await make_provider()._handle_startup_dialog(timeout=5.0)
+    await make_provider()._handle_startup_dialog(outer_timeout=5.0)
     backend.send_special_key.assert_not_called()
 
 
@@ -204,14 +204,89 @@ async def test_handle_startup_dialog_noop_when_already_ready(mock_backend, _slee
 async def test_handle_startup_dialog_default_timeout_and_empty_output(
     mock_backend, _sleep, mock_settings
 ):
-    # timeout=None resolves the server setting; an empty first poll falls through
+    # Default arguments resolve the server settings; an empty first poll falls through
     # to the tail sleep, then the ready footer ends the loop.
-    mock_settings.return_value = {"startup_prompt_handler_timeout": 5.0}
+    mock_settings.return_value = {
+        "startup_prompt_handler_timeout": 5.0,
+        "provider_init_timeout": 30,
+    }
     backend = mock_backend.return_value
     backend.get_history.side_effect = [None, "  YOLO mode (shift + tab to cycle)"]
     await make_provider()._handle_startup_dialog()
     mock_settings.assert_called_once()
     backend.send_special_key.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_startup_waits_for_first_dialog_beyond_idle_gap():
+    now = [0.0]
+
+    async def tick(seconds):
+        now[0] += seconds
+
+    def history(*_args):
+        if now[0] < 25:
+            return "Starting Qwen"
+        if now[0] < 26:
+            return "Do you trust the files in this folder?"
+        return "YOLO mode (shift + tab to cycle)"
+
+    with (
+        patch("cli_agent_orchestrator.providers.qwen_cli.time") as clock,
+        patch("cli_agent_orchestrator.providers.qwen_cli.asyncio.sleep", side_effect=tick),
+        patch("cli_agent_orchestrator.providers.qwen_cli.get_backend") as backend,
+    ):
+        clock.monotonic.side_effect = lambda: now[0]
+        backend.return_value.get_history.side_effect = history
+        await make_provider()._handle_startup_dialog(idle_gap=5, outer_timeout=30)
+        backend.return_value.send_special_key.assert_called_once()
+    assert now[0] == 26
+
+
+@pytest.mark.asyncio
+async def test_startup_resets_idle_gap_after_each_dialog():
+    now = [0.0]
+    frames = iter(
+        [(0, "Do you trust the files in this folder?"), (4, "Select Theme"), (8, "Starting")]
+    )
+
+    async def tick(seconds):
+        now[0] += seconds
+
+    def history(*_args):
+        timestamp, output = next(frames, (now[0], "Starting"))
+        now[0] = timestamp
+        return output
+
+    with (
+        patch("cli_agent_orchestrator.providers.qwen_cli.time") as clock,
+        patch("cli_agent_orchestrator.providers.qwen_cli.asyncio.sleep", side_effect=tick),
+        patch("cli_agent_orchestrator.providers.qwen_cli.get_backend") as backend,
+    ):
+        clock.monotonic.side_effect = lambda: now[0]
+        backend.return_value.get_history.side_effect = history
+        await make_provider()._handle_startup_dialog(idle_gap=5, outer_timeout=30)
+        assert backend.return_value.send_special_key.call_count == 2
+    assert now[0] == 9
+
+
+@pytest.mark.asyncio
+async def test_startup_outer_cap_bounds_wait_without_dialogs():
+    now = [0.0]
+
+    async def tick(seconds):
+        now[0] += seconds
+
+    with (
+        patch("cli_agent_orchestrator.providers.qwen_cli.time") as clock,
+        patch("cli_agent_orchestrator.providers.qwen_cli.asyncio.sleep", side_effect=tick),
+        patch("cli_agent_orchestrator.providers.qwen_cli.get_backend") as backend,
+    ):
+        clock.monotonic.side_effect = lambda: now[0]
+        backend.return_value.get_history.return_value = None
+        await make_provider()._handle_startup_dialog(idle_gap=1, outer_timeout=3)
+        backend.return_value.send_special_key.assert_not_called()
+    assert now[0] == 3
 
 
 def test_screen_resolves_stale_processing_footer_regression():
@@ -646,3 +721,23 @@ class TestInitialize:
         await provider.initialize()
         sent = mock_backend.return_value.send_keys.call_args.args[2]
         assert "--model qwen3-coder-plus" in sent
+
+    @pytest.mark.asyncio
+    @patch(WHICH_QWEN, return_value="/usr/local/bin/qwen")
+    @patch(LOAD_PROFILE)
+    @patch("cli_agent_orchestrator.providers.qwen_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.qwen_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.qwen_cli.get_backend")
+    async def test_initialize_honors_profile_timeout(
+        self, mock_backend, mock_shell, mock_wait, mock_profile, _which
+    ):
+        from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+        mock_profile.return_value = AgentProfile(
+            name="slow", description="Slow first start", prompt="p", provider_init_timeout=300
+        )
+        mock_shell.return_value = mock_wait.return_value = True
+        provider = make_provider(agent_profile="slow")
+        assert await provider.initialize()
+        assert mock_wait.call_args.kwargs["timeout"] == 300
+        provider._handle_startup_dialog.assert_awaited_once_with(outer_timeout=300)

@@ -107,6 +107,11 @@ One Enter submits bracketed-paste input. Response extraction removes tool panels
 and picker rows, and rejects thought-only/empty responses instead of returning
 raw terminal output as an answer.
 
+Initialization honors the server's `provider_init_timeout` and its per-profile
+override, with a 180-second floor for both the startup-dialog phase and the
+readiness phase. The `startup_prompt_handler_timeout` idle gap starts only after
+the first dialog is answered and resets after each subsequent dialog.
+
 ## Tool restrictions and limits
 
 The CLI is launched with `--approval-mode yolo`. CAO `allowedTools` restrictions
@@ -120,6 +125,13 @@ CAO's HTTP resume contract.
 Automatic recovery of a swallowed inbox submit is not supported: this adapter
 does not read back Qwen's composer. If a message remains unsent in the input box,
 inspect the terminal before submitting or retrying it to avoid duplicate input.
+
+Run local slash commands such as `/compress` and `/stats` directly in the Qwen
+terminal, not through CAO's message input box or input API. Qwen does not emit
+the normal user journal event for these commands, so CAO may remain at
+`processing` after they finish, or reject last-answer extraction until the next
+ordinary prompt. This adapter keeps the journal acknowledgement guard to avoid
+mistaking a swallowed submit for successful completion.
 
 ## Development checks
 
