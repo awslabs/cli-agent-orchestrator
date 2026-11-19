@@ -81,6 +81,7 @@ from cli_agent_orchestrator.services.step_result import (
     parse_envelope,
     serialise_envelope,
 )
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 # Captured at import, before any fixture can patch it — see the services file's rationale.
 _PRODUCTION_DATABASE_FILE = Path(constants.DATABASE_FILE)
@@ -306,7 +307,7 @@ def _manufacture_legacy_row(run_id: str, step_id: str, envelope: StepResultEnvel
     """
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
-    with sqlite3.connect(str(DATABASE_FILE)) as conn:
+    with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
         conn.execute(
             "INSERT INTO workflow_run_step "
             "(run_id, step_id, state, attempts, output_json, error, updated_at, "

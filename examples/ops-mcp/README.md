@@ -144,6 +144,7 @@ rather than reporting success.
 
 - [Control planes](../../docs/control-planes.md) — choosing between CLI, MCP, and Web UI
 - [HTTP API](../../docs/api.md) — the REST surface the ops server calls
+- [Kiro Crew](../../docs/kiro-crew.md) — the CAO Shelf's remote control chat, which runs four of these tools
 - [`cao-session-liveness`](../../skills/cao-session-liveness/SKILL.md) — verifying a session is alive
 - [`../assign/`](../assign/) and [`../orchestration/`](../orchestration/) — in-session delegation
 - [`../headless-ci/`](../headless-ci/) — the same lifecycle driven by shell instead of MCP

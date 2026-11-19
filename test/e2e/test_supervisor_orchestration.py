@@ -26,6 +26,8 @@ Run:
     uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -o "addopts=" -k copilot
 """
 
+import hashlib
+import json
 import re
 import time
 import uuid
@@ -575,7 +577,7 @@ def _run_supervisor_assign_test(provider: str):
                 pass
 
 
-def _run_supervisor_assign_three_analysts_test(provider: str):
+def _run_supervisor_assign_three_analysts_test(provider: str, *, result_check=None):
     """Test supervisor assigns A/B/C analysts, receives callbacks, and finalizes report."""
     session_suffix = uuid.uuid4().hex[:6]
     session_name = f"e2e-super-3a-{provider}-{session_suffix}"
@@ -702,6 +704,8 @@ def _run_supervisor_assign_three_analysts_test(provider: str):
         assert re.search(
             r"\b(conclusions?|recommendations?|overall|synthesis|final)\b", cleaned
         ), f"Expected final synthesis/conclusion content in final report output. Got: {output[-500:]}"
+        if result_check is not None:
+            result_check(supervisor_id, terminals, delivered_messages, output)
 
     finally:
         if actual_session:
@@ -918,3 +922,103 @@ class TestMiniMaxCodeSupervisorOrchestration:
 
     def test_supervisor_assign_and_handoff(self, require_minimax_code):
         _run_supervisor_assign_test(provider="mcode")
+
+
+# ---------------------------------------------------------------------------
+# Qwen Code provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestQwenCliSupervisorOrchestration:
+    """E2E supervisor orchestration tests for the Qwen Code provider."""
+
+    def test_supervisor_handoff(self, require_qwen_cli):
+        """Supervisor uses handoff MCP tool to delegate to report_generator."""
+        _run_supervisor_handoff_test(provider="qwen_cli")
+
+    def test_supervisor_assign_and_handoff(self, require_qwen_cli):
+        """Supervisor uses assign + handoff to orchestrate multi-agent workflow."""
+        _run_supervisor_assign_test(provider="qwen_cli")
+
+    def test_supervisor_assign_three_analysts(self, require_qwen_cli, require_cao_server):
+        """Five real Qwen agents delegate, deliver three callbacks, and report.
+
+        Audit native tool events before terminal cleanup removes the journals.
+        Print only orchestration evidence and final answers, never thinking.
+        """
+
+        def check(supervisor_id, terminals, messages, report):
+            assert all(t.get("provider") == "qwen_cli" for t in terminals)
+            analysts = {t["id"] for t in terminals if t.get("agent_profile") == "data_analyst"}
+            reporters = [t for t in terminals if t.get("agent_profile") == "report_generator"]
+            assert len(terminals) == 5 and len(analysts) == 3 and len(reporters) == 1
+            assert analysts <= {m.get("sender_id") for m in messages}
+
+            digest = hashlib.sha256(supervisor_id.encode()).hexdigest()
+            journal = (
+                require_cao_server.home_dir
+                / ".aws/cli-agent-orchestrator/tmp/qwen"
+                / digest
+                / "events.jsonl"
+            )
+            events = [json.loads(line) for line in journal.read_text().splitlines() if line]
+            raw_calls = [
+                block
+                for event in events
+                if event.get("type") == "assistant" and not event.get("parent_tool_use_id")
+                for block in event.get("message", {}).get("content", [])
+                if block.get("type") == "tool_use"
+            ]
+            calls = []
+            for call in raw_calls:
+                # Qwen 0.28 can discover deferred MCP tools with tool_search
+                # and invoke them through tool_call. Audit the resolved name
+                # and arguments, not the wrapper, without allowing native
+                # execution to hide behind tool_call.
+                if call["name"] == "tool_search":
+                    continue
+                if call["name"] == "tool_call":
+                    call = {"name": call["input"]["name"], "input": call["input"]["arguments"]}
+                calls.append(call)
+            # A prompt-only role is not a sandbox: prove that this supervisor
+            # used CAO delegation, without native execution or native subagents.
+            assert calls and all(c["name"].startswith("mcp__cao-mcp-server__") for c in calls)
+            assigns = [c for c in calls if c["name"].endswith("__assign")]
+            handoffs = [c for c in calls if c["name"].endswith("__handoff")]
+            assert len(assigns) == 3 and len(handoffs) == 1
+            assert all(c["input"]["agent_profile"] == "data_analyst" for c in assigns)
+            assert handoffs[0]["input"]["agent_profile"] == "report_generator"
+            for dataset in "ABC":
+                assert re.search(rf"\bdataset\s+{dataset}\b", report, re.I), report
+
+            print(
+                "QWEN_ORCHESTRATION_EVIDENCE="
+                + json.dumps(
+                    {
+                        "terminals": [
+                            {key: t.get(key) for key in ("id", "provider", "agent_profile")}
+                            for t in terminals
+                        ],
+                        "callbacks": [
+                            {key: m.get(key) for key in ("sender_id", "status", "message")}
+                            for m in messages
+                        ],
+                        "supervisor_tools": [
+                            {key: c[key] for key in ("name", "input")} for c in calls
+                        ],
+                        "models": sorted(
+                            {
+                                e["message"]["model"]
+                                for e in events
+                                if e.get("type") == "assistant"
+                                and e.get("message", {}).get("model")
+                            }
+                        ),
+                        "final_report": report,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+        _run_supervisor_assign_three_analysts_test(provider="qwen_cli", result_check=check)

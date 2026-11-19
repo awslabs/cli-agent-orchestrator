@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add the Qwen Code (`qwen_cli`) provider with profile, skill, MCP and model support.
+
 - **herdr backend: event-driven inbox delivery works again on herdr 0.9.x (protocol 22)**.
   herdr ≥0.9 acks a broadcast `pane.updated` subscription but never emits the event, so every
   inbox delivery silently fell back to the 30s reconciliation sweep (measured 51s/83s
@@ -21,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hide. A single event-driven re-delivery loop per terminal carries a message across the
   provider's post-turn flush-wait, offloaded off the event loop and stopping as soon as the
   message lands.
+
 - **Memory inspection and fixture hygiene are safer by default** (#1329).
   This resolves #861 Q3: CLI list/show and REST list/show no longer increment
   `access_count` unless `memory.non_accessing_inspection=false`; MCP recall

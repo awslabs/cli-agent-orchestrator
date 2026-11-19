@@ -191,6 +191,7 @@ class EngineAdapter:
         root = root / uuid.uuid4().hex
         root.mkdir()
         db = create_engine("sqlite:///" + str(root / "engine.db"))
+        self.db = db
         DecisionRecordModel.__table__.create(db, checkfirst=True)
         self.spans: list[dict[str, Any]] = []
         self.store = DecisionStore(
@@ -509,6 +510,8 @@ async def _run_single_case(
         if isinstance(adapter, EngineAdapter) and hasattr(adapter, "engine"):
             await adapter.engine.runner.close()
             await adapter.engine.registry.close()
+        if isinstance(adapter, EngineAdapter):
+            adapter.db.dispose()
 
 
 async def run_case(

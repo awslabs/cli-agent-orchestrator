@@ -1,5 +1,7 @@
 # herdr Backend
 
+Using the Herdr desktop app? See [Herdr app backend](herdr-app.md).
+
 CAO's default backend is [tmux](tmux.md). For agentic workloads, CAO also supports [herdr](https://herdr.dev/) -- a terminal-native agent runtime and multiplexer designed specifically for AI coding agents.
 
 The key difference: tmux has no concept of "agent state," so CAO must poll terminal output and match regex patterns to detect when an agent is idle. herdr exposes a Unix socket API that emits real-time status events (`working`, `idle`, `done`, `blocked`). This eliminates polling entirely and enables instant inbox delivery.
