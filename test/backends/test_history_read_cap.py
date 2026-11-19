@@ -18,12 +18,14 @@ fails here instead of inheriting the bug.
 """
 
 import inspect
+from test.backends.fake_hc import FakeHc
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 import cli_agent_orchestrator.backends as backends_pkg
 from cli_agent_orchestrator.backends.base import TerminalBackend
+from cli_agent_orchestrator.backends.herdr_app_backend import HerdrAppBackend
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
 from cli_agent_orchestrator.constants import HERDR_PANE_READ_MAX_LINES, TMUX_HISTORY_LIMIT
@@ -59,6 +61,8 @@ def _instantiate(cls: type[TerminalBackend]) -> TerminalBackend:
     if cls is HerdrBackend:
         with patch.object(HerdrBackend, "_ensure_session_running"):
             return HerdrBackend()
+    if cls is HerdrAppBackend:
+        return HerdrAppBackend(client=FakeHc())
     pytest.fail(
         f"{cls.__name__} is a new TerminalBackend: teach this test how to build one so its "
         "max_history_lines is checked like the others (#728)"

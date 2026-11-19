@@ -1,0 +1,356 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>11 CAO Shelf | CAO in Kiro Crew</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:#eceef2;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:#1c2230;line-height:1.5}
+a{color:#2f5fb3}
+a:focus-visible,button:focus-visible,select:focus-visible,input:focus-visible,[tabindex]:focus-visible{outline:3px solid #4a8cf0;outline-offset:2px}
+code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9em;background:#e7eaf1;border-radius:4px;padding:1px 4px;overflow-wrap:anywhere}
+.wrap{max-width:1180px;margin:0 auto;padding:0 28px}
+.nav{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:14px 0;font-size:14px}
+.nav .sp{flex:1}
+.nav a{text-decoration:none;background:#fff;border:1px solid #d3d8e2;border-radius:8px;padding:5px 11px;color:#1c2230}
+.nav a:hover{border-color:#1c2230}
+.num{display:inline-block;font:700 13px ui-monospace,Menlo,monospace;background:#1c2230;color:#fff;border-radius:6px;padding:2px 8px;margin-right:8px;vertical-align:3px}
+.tag{display:inline-block;margin-left:8px;font-size:10px;font-weight:700;letter-spacing:.06em;padding:2px 7px;border-radius:10px;vertical-align:3px;text-transform:uppercase}
+.tag.new{background:#e5f6ec;color:#1b7a47}.tag.reworked{background:#e8eef9;color:#34508f}.tag.session{background:#f3ecdf;color:#7a5a1b}.tag.note{background:#eee8f5;color:#5a3d85}
+h1{margin:6px 0 4px;font-size:28px;line-height:1.2}
+h2{font-size:20px;margin:0 0 10px}
+.pitch{font-size:17px;color:#2b3346;margin:4px 0 6px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.chips span{font-size:12px;background:#f1f3f7;border:1px solid #dde1ea;border-radius:12px;padding:3px 10px;color:#3a4358}
+.chips span b{color:#1c2230}
+.panel{background:#fff;border:1px solid #d3d8e2;border-radius:14px;padding:16px 20px;margin:16px 0;box-shadow:0 1px 3px rgba(20,30,50,.06)}
+.panel p{margin:6px 0}
+.panel ul{margin:6px 0;padding-left:22px}
+.panel li{margin:3px 0}
+details{margin:8px 0}
+summary{cursor:pointer;font-weight:600}
+pre.ascii{background:#171c28;color:#cfe0ff;border-radius:10px;padding:14px;overflow:auto;font:12px/1.35 ui-monospace,Menlo,Consolas,monospace}
+footer.pn{display:flex;flex-wrap:wrap;gap:10px;justify-content:space-between;padding:18px 0 40px}
+footer.pn a{text-decoration:none;background:#fff;border:1px solid #d3d8e2;border-radius:8px;padding:8px 14px;color:#1c2230}
+.sr{position:absolute;left:-9999px}
+@media (max-width:820px){.wrap{padding:0 16px}h1{font-size:23px}}
+
+.mockhead{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin:20px 0 6px}
+.mockhead h2{margin:0}
+.reset{font:600 13px system-ui;background:#1c2230;color:#fff;border:0;border-radius:8px;padding:7px 14px;cursor:pointer}
+.reset:hover{background:#34425f}
+.hint{font-size:13.5px;color:#4a5266;margin:2px 0 8px}
+.cap{font-size:12px;color:#58627a;margin:6px 2px 0}
+.frame{border:1px solid #c5ccd9;border-radius:10px;overflow:hidden;background:#f1f3f7;box-shadow:0 1px 3px rgba(20,30,50,.08)}
+.frame .bar{display:flex;align-items:center;gap:6px;height:28px;padding:0 10px;background:#e3e7ee;border-bottom:1px solid #c5ccd9;font-size:11.5px;color:#58627a}
+.frame .bar i{width:8px;height:8px;border-radius:50%;background:#b8c0d0;display:inline-block}
+.frame .bar b{margin-left:6px;font-weight:600}
+#mock{position:relative;overflow:hidden}
+#mock button{font:inherit;cursor:pointer}
+#mock .b{font:600 12px system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;border-radius:7px;padding:5px 11px;border:1px solid currentColor;background:transparent;color:inherit;line-height:1.2}
+#mock .b:hover{filter:brightness(1.12);background:rgba(128,128,128,.12)}
+#mock .b.g{background:#2f8f5b;border-color:#2f8f5b;color:#fff}
+#mock .b.g:hover{background:#27794d}
+#mock .b.bl{background:#3d7fd6;border-color:#3d7fd6;color:#fff}
+#mock .b.rd{color:#e5483f}
+#mock .b[disabled]{opacity:.45;cursor:default}
+#mock .pg{display:inline-flex;align-items:center;gap:0;font-size:11px;vertical-align:middle}
+#mock .pg .pgs{display:inline-flex;align-items:center;gap:4px;opacity:.55}
+#mock .pg .pgs i{width:11px;height:11px;border-radius:50%;border:1.5px solid currentColor;display:inline-block}
+#mock .pg .pgs.on{opacity:1}
+#mock .pg .pgs.on i{background:#35d07f;border-color:#35d07f}
+#mock .pg s{display:inline-block;width:18px;height:2px;background:currentColor;opacity:.4;margin:0 4px}
+#mock .pgnote{font-size:11px;margin-left:8px;opacity:.9}
+.tailbox{font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;margin:6px 0 0;padding:8px 10px;border-radius:8px;background:#161b26;color:#bfe9cf}
+
+.m11{background:#f1ede3;color:#25221b;font:14px/1.4 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;position:relative;min-height:560px;padding-bottom:6px}
+.m11 button{color:inherit}
+.m11 .hd{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;padding:12px 16px 8px;border-bottom:3px solid #8a6a3d;background:#e7dfcd}
+.m11 .hd h3{margin:0;font-size:16px;letter-spacing:.05em;text-transform:uppercase}
+.m11 .hd .sub{font-size:12px;color:#5d5340}
+.m11 .sw{margin-left:auto;display:inline-flex;border:1.5px solid #5d4a2a;border-radius:999px;overflow:hidden}
+.m11 .sw button{background:transparent;border:0;padding:5px 13px;font:600 12px system-ui}
+.m11 .sw button[aria-pressed=true]{background:#3b2f1a;color:#f6e9c8}
+.m11 .tb{display:flex;flex-wrap:wrap;gap:7px;align-items:center;padding:9px 16px 4px}
+.m11 .tt{border:1.5px solid #8b8574;background:#fbf9f3;border-radius:8px;padding:5px 11px;font:600 12.5px system-ui;display:inline-flex;gap:7px;align-items:center}
+.m11 .tt b{font-size:15px}
+.m11 .tt[aria-pressed=false]{background:transparent;color:#7a7462;border-style:dashed}
+.m11 .tt.n{border-color:#d98a00}.m11 .tt.l{border-color:#2f8f5b}.m11 .tt.p{border-color:#5d7a99}.m11 .tt.s{border-color:#9a948a}
+.m11 .tt:focus-visible,.m11 .b:focus-visible,.m11 .ttl:focus-visible,.m11 input:focus-visible{outline:3px solid #3d7fd6;outline-offset:1px}
+.m11 .honest{font-size:12px;color:#5d5340;padding:2px 16px 8px}
+.m11 .honest b{color:#25221b}
+.m11 h4.sec{margin:8px 16px 6px;font-size:11.5px;letter-spacing:.09em;text-transform:uppercase;color:#6b614b;display:flex;align-items:center;gap:10px}
+.m11 h4.sec:after{content:"";flex:1;height:5px;border-radius:3px;background:linear-gradient(#b99b66,#9c7f4c);opacity:.55}
+.m11 .none{margin:2px 16px 8px;font-size:12.5px;color:#7a7462;font-style:italic}
+.m11 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(245px,1fr));gap:12px;padding:0 16px 8px}
+.m11 .card{background:#fffdf7;border:1.5px solid #cfc7b2;border-top:7px solid #5d7a99;border-radius:6px 6px 8px 8px;box-shadow:0 5px 0 -2px #b99b66;padding:0 0 8px;display:flex;flex-direction:column;min-width:0}
+.m11 .k-needs{border-top-color:#d98a00;border-color:#d98a00;background:#fff8e6}
+.m11 .k-live{border-top-color:#2f8f5b}
+.m11 .k-stale{border-top-color:#a9a395;background:#f6f3ea;opacity:.66;filter:saturate(.5)}
+.m11 .k-parked{opacity:.94}
+.m11 .card:hover,.m11 .card:focus-within{opacity:1;filter:none}
+.m11 .ttl{background:transparent;border:0;text-align:left;padding:8px 11px 2px;display:flex;flex-direction:column;gap:1px;width:100%}
+.m11 .nm{font-weight:800;font-size:15px}
+.m11 .tg{font-size:10.5px;letter-spacing:.08em;font-weight:700;color:#6b614b}
+.m11 .k-needs .tg{color:#a15f00}.m11 .k-live .tg{color:#1e7448}
+.m11 .cond{padding:0 11px 4px;font-size:12.5px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;color:#4a4333}
+.m11 .d{display:inline-block;width:9px;height:9px;border-radius:50%;border:1.8px solid #8b8574;flex:none}
+.m11 .d-processing{background:#2f8f5b;border-color:#2f8f5b;animation:m11p 1.2s ease-in-out infinite}
+.m11 .d-waiting_user_answer{background:#d98a00;border-color:#d98a00}
+.m11 .d-completed{background:#3d7fd6;border-color:#3d7fd6}
+.m11 .d-error{background:#d6453d;border-color:#d6453d}
+@keyframes m11p{50%{box-shadow:0 0 0 4px rgba(47,143,91,.2)}}
+@media (prefers-reduced-motion:reduce){.m11 .d-processing{animation:none}}
+.m11 .chips{list-style:none;margin:0;padding:0 11px 4px;display:flex;flex-wrap:wrap;gap:5px}
+.m11 .chip{display:inline-flex;gap:5px;align-items:center;border:1px solid #cfc7b2;background:#f6f1e3;border-radius:999px;padding:2px 9px 2px 7px;font-size:12px}
+.m11 .chip small{color:#6b614b}
+.m11 .chip.orph{border:1.5px dashed #c0392b;background:#fdecea}
+.m11 .chip.orph em{font-style:normal;font-weight:800;font-size:10px;color:#c0392b;letter-spacing:.05em}
+.m11 .need{margin:4px 11px;padding:7px 9px;border-radius:7px;background:#ffe9b3;border:1px solid #d98a00;font-size:12.5px}
+.m11 .need .row{margin-top:6px;display:flex;gap:6px;flex-wrap:wrap}
+.m11 .hof{margin:2px 11px 4px;font-size:12px;color:#1e7448;font-weight:600}
+.m11 .acts{display:flex;gap:6px;flex-wrap:wrap;padding:4px 11px 0;margin-top:auto}
+.m11 .b{font:600 12px system-ui;border-radius:7px;padding:5px 10px;border:1.3px solid #5d5340;background:transparent;cursor:pointer}
+.m11 .b:hover{background:rgba(93,83,64,.12)}
+.m11 .b.g{background:#2f8f5b;border-color:#2f8f5b;color:#fff}
+.m11 .b.rd{color:#b3342b;border-color:#b3342b}
+.m11 .b[disabled]{opacity:.45;cursor:default}
+.m11 .det{margin:4px 11px;font-size:11.5px;border-top:1px dashed #cfc7b2;padding-top:4px}
+.m11 .det table{width:100%;border-collapse:collapse}
+.m11 .det th{text-align:left;color:#6b614b;font-weight:600;padding:1px 4px 1px 0}
+.m11 .det td{padding:1px 4px 1px 0;font-family:ui-monospace,Menlo,monospace;font-size:11px;word-break:break-all}
+.m11 .det p{margin:4px 0 0;color:#6b614b}
+.m11 .hist{margin:6px 11px 0;padding:6px 8px;background:#efe9d8;border-radius:6px;font-size:12px}
+.m11 .hist ul{list-style:none;margin:4px 0 0;padding:0}
+.m11 .hist li{margin:3px 0}
+.m11 .hist small{color:#6b614b;display:block}
+.m11 .hist .rows{margin:3px 0 0;padding-left:8px;border-left:2px solid #b99b66;font-family:ui-monospace,Menlo,monospace;font-size:11px}
+.m11 .askf{display:flex;gap:6px;margin:6px 11px 0}
+.m11 .askf input{flex:1;min-width:0;border:1.5px solid #8b8574;border-radius:7px;padding:5px 8px;font:12.5px system-ui;background:#fff}
+.m11 .ft{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:6px 16px 4px}
+.m11 .ft span{font-size:12px;color:#5d5340}
+.m11 .gh{margin:4px 16px 8px;background:#efe9d8;border:1px solid #cfc7b2;border-radius:8px;padding:8px 12px;font-size:12.5px}
+.m11 .gh ul{margin:4px 0 0;padding-left:18px}
+.m11 .wire{margin:6px 16px 4px;padding:6px 10px;border-radius:7px;background:#25221b;color:#e8dfc6;font-size:12px;min-height:30px;display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center}
+.m11 .wire code{color:#f2c46b;background:transparent;padding:0}
+.m11 .wire .pg{color:#e8dfc6}
+.m11 .ov{position:absolute;inset:0;background:rgba(37,34,27,.5);display:flex;align-items:flex-start;justify-content:center;padding:36px 12px;z-index:5}
+.m11 .dlg{background:#fffdf7;border:2px solid #25221b;border-radius:10px;max-width:520px;width:100%;padding:14px 16px;box-shadow:0 10px 30px rgba(0,0,0,.35);max-height:480px;overflow:auto}
+.m11 .dlg h4{margin:0 0 4px;font-size:16px}
+.m11 .dlg ul{list-style:none;margin:8px 0;padding:0}
+.m11 .dlg li{margin:4px 0}
+.m11 .dlg label{display:flex;gap:8px;align-items:flex-start;font-size:13px}
+.m11 .dlg .warn{background:#fde4e1;border:1px solid #c0392b;border-radius:6px;padding:6px 8px;font-size:12.5px;margin:6px 0}
+.m11 .dlg .row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:10px}
+.m11 .dlg small{color:#6b614b}
+@media (max-width:640px){.m11 .sw{margin-left:0}}
+</style></head><body><div class="wrap"><nav class="nav" aria-label="Page"><a href="index.html">&larr; Gallery</a><a href="10-fleet-palette.html">&larr; 10 Fleet Palette</a><span class="sp"></span><a href="12-conductor-ledger.html">12 Conductor Ledger &rarr;</a></nav><header><h1><span class="num">11</span>CAO Shelf<span class="tag session">Session shape</span></h1><p class="pitch"><strong>&ldquo;Twelve folders on a shelf, the busy ones in front and the forgotten ones faded.&rdquo;</strong> Each CAO session is one card with its conductor as the title and its helpers as small chips; the whole card dims as <code>last_active</code> ages.</p><div class="chips"><span><b>Surface</b> ui.pages (or panelTabs)</span><span><b>Size</b> M</span><span><b>50 agents</b> Yes (stale hidden, chips capped)</span><span><b>Workshop</b> Outside only (text twin /crew shelf)</span><span><b>Glanceable</b> High (needs, live, age)</span><span><b>Steering</b> Ask conductor, approve, history, stop with confirm</span></div></header><section class="panel"><h2>Metaphor mapping</h2><ul>
+<li>Agent: a chip on a folder. Session: the folder itself, titled by its conductor (always exactly one).</li>
+<li>Handoff: a chip tucked under the conductor (from <code>caller_id</code>); a "handoff in flight" line while one is open. Departed helper: an entry in the folder's history drawer, rebuilt from inbox rows.</li>
+<li>Approval: the folder moves to the front shelf, edged amber, with the question and two buttons. Failure: the same, edged red.</li>
+<li>Idle agent: a folder that fades with age (warm under 1 h, parked under 48 h, stale beyond). Orphan: a dashed red chip. Memory: the shelf remembers nothing but the tier toggles you chose.</li>
+</ul></section><div class="mockhead"><h2>Working mock</h2><div><span id="resetmsg" role="status" class="cap"></span> <button type="button" id="reset" class="reset">Reset</button></div></div><p class="hint">Try: use the Needs you, Live, Parked and Stale chips, then on a folder press Approve push, Deny, Ask, History or Stop.... Clean up stale (9)... and All history ask first.</p><div class="frame"><div class="bar"><i></i><i></i><i></i><b>Kiro Crew &middot; ui.pages (or panelTabs)</b></div><div id="mock"></div></div><p class="cap">Mock data, nothing is connected to CAO. All names are invented.</p><section class="panel"><h2>Interaction</h2><ul>
+<li>Tier toggles show or hide Needs you, Live, Parked and Stale. Expand a card for its terminals with <code>status</code>, <code>last_active</code> and <code>caller_id</code>.</li>
+<li>Ask: <code>send_session_message</code> to the card's conductor; the card then shows the conductor processing, completed, and back to idle (a visible "completed decays to idle").</li>
+<li>Approve push or Deny: <code>send_session_message</code> to the waiting helper as typed input.</li>
+<li>History drawer: closed helpers of that session with their last inbox row; "inbox rows" opens the three rows.</li>
+<li>Stop and Clean up: <code>shutdown_session</code> per session, in a dialog that names every session and every terminal it ends, starts with nothing ticked, and warns when something is working.</li>
+</ul></section><section class="panel"><h2>Data honesty</h2><ul>
+<li><code>list_sessions</code> once per poll, then <code>get_terminal_status</code> only for sessions whose conductor was not idle last time (poll per session, not per terminal). Fields: <code>status</code>, <code>last_active</code>, <code>caller_id</code>, profile name, <code>pending_inbox_count</code>.</li>
+<li><code>status</code> is inferred from the screen, so the card says "idle 2 h" (from <code>last_active</code>), never "running". Tier is <code>status</code> first, then <code>last_active</code>; the header counts processing, waiting and idle separately.</li>
+<li>Vanished workers: a blocking handoff deletes its worker, so the history drawer is built from inbox rows whose sender no longer exists (94% of rows in the real data) and labelled "rebuilt from inbox rows". Orphans: a helper whose <code>caller_id</code> points at a gone terminal gets the dashed ORPHAN chip.</li>
+<li>Fit with the real shape: one conductor per session, 0 to 3 helpers, all idle, 9 of 12 over 48 h. The default view is three parked cards with nine stale ones counted behind a toggle.</li>
+</ul></section><section class="panel"><h2>Where it lives in Kiro Crew</h2><p>A <code>ui.pages</code> sidebar page (a <code>panelTabs</code> tab works too, with the grid collapsing to one column). It needs a small backend to poll CAO and keep the inbox-derived history, so the third-party trust grant applies. Limits: v0.8.0 dashboard has no base path and cannot be reached through the workshop code editor's forwarded port; whether the page can call <code>127.0.0.1:9889</code> directly is unverified, so it should go through its own backend.</p></section><section class="panel"><h2>Build size and hardest piece</h2><p>M. Hardest piece: building the per-session history from inbox rows (one request per terminal, capped at 100 rows) without polling every terminal every few seconds.</p></section><section class="panel"><h2>Best for, fails at</h2><p><strong>Best for:</strong> a daily operator who wants to see which sessions are live, which are asking, and which are quietly rotting. <strong>Fails at:</strong> a timeline of what happened while away (cards show state, not events). <strong>Works with 50 agents?</strong> Yes at 50 sessions: stale ones stay hidden and cards cap helper chips at 5 then "+N"; 50 live ones in one session would crowd a card.</p></section><section class="panel"><h2>Workshop fit</h2><p>Outside the workshop only. Inside it, the same grouping prints as a text list from a <code>/crew shelf</code> command (a launch prompt asking the agent to call <code>list_sessions</code> and print needs-you, live, parked, stale counts).</p></section><details class="panel"><summary>Original ASCII drawing</summary><pre class="ascii"> CAO SHELF  12 sessions                       [ Quiet day ] [ Busy day ]
+ [ Needs you 0 ] [ Live 0 ] [ Parked 3 ] [ Stale &gt;48h 9 (hidden) ]
+ 20 terminals: 0 processing, 0 waiting for you, 20 idle. Idle is not running.
+ PARKED (idle under 48 h) -----------------------------------------------
+ +- payments-fix ------------+ +- docs-refresh -----------+
+ | PARKED   conductor idle 2h| | PARKED  conductor idle 5h|
+ |  (o) coder-1   idle 2h    | |  (o) writer-1  idle 5h   |
+ |  (o) tester    idle 2h    | | [Ask] [History 2] [Stop] |
+ |  (o) reviewer  idle 3h    | +--------------------------+
+ | [Ask] [History 3] [Stop..]|
+ +---------------------------+
+ STALE (dimmed; opens with the toggle) ----------------------------------
+ +- search-tuning ----------+ +- onboarding-flow --------+
+ | idle 2d  conductor       | | idle 2d  conductor       |
+ |  (o) probe-1 ORPHAN      | |  (o) yoda (peer)         |
+ |  caller no longer exists | | [Ask] [History 0] [Stop] |
+ +--------------------------+ +--------------------------+
+ [ Clean up stale (9)... ] [ All history: 20 closed helpers ]  asks first
+ Busy day: payments-fix jumps to NEEDS YOU, amber edge:
+   tester asks "push to origin?" 4 min  [ Approve push ] [ Deny ]</pre></details><footer class="pn"><a href="index.html">&larr; Gallery</a><a href="10-fleet-palette.html">&larr; 10 Fleet Palette</a><span ></span><a href="12-conductor-ledger.html">12 Conductor Ledger &rarr;</a></footer></div><script>
+(function(){
+  var T=[],L=[];
+  window.every=function(f,ms){var id=setInterval(f,ms);T.push(id);return id};
+  window.after=function(f,ms){var id=setTimeout(f,ms);T.push(id);return id};
+  window.listen=function(el,ev,fn,o){el.addEventListener(ev,fn,o);L.push(function(){el.removeEventListener(ev,fn,o)})};
+  window.esc=function(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})};
+  window.mmss=function(s){s=Math.max(0,Math.floor(s));return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0')};
+  window.progress=function(el,o){
+    o=o||{};var labels=o.labels||['asked','heard','done'],at=o.at||[0,1100,3000];
+    el.innerHTML='<span class="pg">'+labels.map(function(l){return '<span class="pgs"><i></i>'+l+'</span>'}).join('<s></s>')+'</span><span class="pgnote"></span>';
+    var s=el.querySelectorAll('.pgs'),note=el.querySelector('.pgnote');
+    at.forEach(function(ms,i){after(function(){s[i].classList.add('on');if(o.notes&&o.notes[i])note.textContent=o.notes[i];if(i===at.length-1&&o.done)o.done()},ms)});
+  };
+  window.__mount=function(){
+    T.splice(0).forEach(function(id){clearInterval(id);clearTimeout(id)});
+    L.splice(0).forEach(function(f){f()});
+    var root=document.getElementById('mock');root.innerHTML='';MOCK(root);
+  };
+  document.getElementById('reset').addEventListener('click',function(){window.__mount();var s=document.getElementById('resetmsg');s.textContent='Reset done.';clearTimeout(window.__rt);window.__rt=setTimeout(function(){s.textContent=''},1500)});
+})();
+</script><script>
+/* shared invented fleet: 12 sessions, each session has a first terminal, its conductor (profile supervisor) */
+function fmtAge(h){if(h*60<1)return '<1 min';if(h<1)return Math.round(h*60)+' min';if(h<48)return Math.round(h)+' h';return Math.round(h/24)+' d'}
+function hid(s){var h=7;for(var i=0;i<s.length;i++)h=(h*31+s.charCodeAt(i))>>>0;return ('0000'+h.toString(16)).slice(-4)}
+var CLOSEDMSG={'planner':'plan v2 ready, 6 steps','coder-2':'patch applied, tests green',linter:'lint clean, 0 warnings','outliner':'outline merged into draft','link-check':'3 dead links fixed','schema-diff':'diff reviewed, 2 columns differ','backup-check':'backup verified','dry-run':'dry run finished, no errors','index-plan':'index plan written','baseline':'baseline numbers saved'};
+function closedMsg(n){return CLOSEDMSG[n]||'task complete, result sent to conductor'}
+function inboxRows(c){return [{ago:c.ago+0.5,from:c.n,st:'delivered',text:'READY: started, working on the assignment'},{ago:c.ago+0.2,from:c.n,st:'delivered',text:'progress: halfway, no blockers'},{ago:c.ago,from:c.n,st:'delivered',text:'DONE: '+closedMsg(c.n)}]}
+function mkT(sn,n,role,age,o){var t={n:n,role:role,st:'idle',age:age,since:0,orphan:false,peer:false,q:''};for(var k in o)t[k]=o[k];t.id=(role==='conductor'?'supervisor':n)+'-'+hid(sn+n);return t}
+function fleet(busy){
+  function S(name,cAge,hs,closed){
+    var t=[mkT(name,'conductor','conductor',cAge,{})];
+    hs.forEach(function(h){t.push(mkT(name,h[0],h[2]==='peer'?'peer':'helper',h[1],{orphan:h[2]==='orphan',peer:h[2]==='peer'}))});
+    return {name:name,T:t,closed:closed.map(function(c){return {n:c[0],ago:c[1]}}),handoff:''};
+  }
+  var F=[
+    S('payments-fix',2,[['coder-1',2],['tester',2],['reviewer',3]],[['planner',26],['coder-2',22],['linter',1.6]]),
+    S('docs-refresh',5,[['writer-1',5]],[['outliner',6],['link-check',30]]),
+    S('migrate-db',17,[],[['schema-diff',16],['backup-check',20],['dry-run',28],['index-plan',40]]),
+    S('search-tuning',52,[['probe-1',52,'orphan']],[['baseline',60]]),
+    S('onboarding-flow',48.3,[['yoda',48.3,'peer']],[]),
+    S('infra-audit',216,[],[]),
+    S('release-notes',76,[],[['drafter',80],['proofreader',90],['tagger',100]]),
+    S('api-cleanup',100,[['refactor-1',100]],[['mapper',110],['deprecator',120]]),
+    S('perf-probe',128,[],[['profiler',130]]),
+    S('ui-polish',150,[['css-fix',150]],[['screenshotter',160]]),
+    S('data-backfill',200,[],[['loader',210],['verifier',215]]),
+    S('ci-flakes',288,[],[['reruner',300]])
+  ];
+  if(busy){
+    var p=F[0].T,d=F[1].T;
+    p[0].st='processing';p[0].age=0;
+    p[1].st='processing';p[1].age=0;
+    p[2].st='waiting_user_answer';p[2].age=4/60;p[2].since=4;p[2].q='push to origin?';
+    p[3].age=0.1;
+    d[0].st='processing';d[0].age=0;d[1].st='processing';d[1].age=0;F[1].handoff='writer-1';
+  }
+  return F;
+}
+function tierOf(s){var w=0,p=0,m=1e9;s.T.forEach(function(t){if(t.st==='waiting_user_answer'||t.st==='error')w=1;if(t.st==='processing'||t.st==='completed')p=1;m=Math.min(m,t.age)});return w?'needs':p?'live':m>=48?'stale':'parked'}
+function youngest(s){return Math.min.apply(null,s.T.map(function(t){return t.age}))}
+function termCounts(F){var c={idle:0,processing:0,waiting_user_answer:0,completed:0,error:0,n:0};F.forEach(function(s){s.T.forEach(function(t){c[t.st]++;c.n++})});return c}
+function stText(t){if(t.st==='idle')return 'idle '+fmtAge(t.age);if(t.st==='waiting_user_answer')return 'waiting '+Math.round(t.since)+' min';return t.st}
+function byName(F,n){for(var i=0;i<F.length;i++)if(F[i].name===n)return F[i]}
+
+function MOCK(root){
+  var busy=false,F=fleet(false),tiers={needs:1,live:1,parked:1,stale:0},openC={},histC={},rowsC={},askC={},askV={},modal=null,gh=false,opener='';
+  root.innerHTML='<div class="m11"><div id="m11b"></div><div id="m11w" class="wire" role="status" aria-live="polite"><span>wire: nothing sent yet. Writes appear here as asked, heard, done.</span></div></div>';
+  var B=root.querySelector('#m11b'),W=root.querySelector('#m11w');
+  function wire(call,note,after1,doneFn){
+    W.innerHTML='<code>'+esc(call)+'</code><span class="pw"></span>';
+    progress(W.querySelector('.pw'),{notes:[note||'sent','heard (screen changed)','done'],at:[0,900,2400],done:doneFn});
+    if(after1)window.after(after1,900);
+  }
+  function groups(){var g={needs:[],live:[],parked:[],stale:[]};F.forEach(function(s){g[tierOf(s)].push(s)});return g}
+  function chip(t){
+    var h='<li class="chip'+(t.orphan?' orph':'')+'"><i class="d d-'+t.st+'" aria-hidden="true"></i><span>'+esc(t.n)+'</span><small>'+esc(stText(t))+'</small>';
+    if(t.orphan)h+='<em>ORPHAN</em>';if(t.peer)h+='<small>(peer)</small>';
+    return h+'</li>';
+  }
+  function card(s){
+    var tr=tierOf(s),c=s.T[0],hs=s.T.slice(1),y=youngest(s);
+    var tag=tr==='needs'?'NEEDS YOU':tr==='live'?'LIVE':tr==='stale'?'STALE, idle over 48 h':(y<1?'WARM':'PARKED');
+    var h='<article class="card k-'+tr+'" aria-label="session '+esc(s.name)+'">';
+    h+='<button type="button" class="ttl" data-a="exp" data-s="'+s.name+'" data-k="e-'+s.name+'" aria-expanded="'+(!!openC[s.name])+'"><span class="nm">'+esc(s.name)+'</span><span class="tg">'+tag+'</span></button>';
+    h+='<div class="cond"><i class="d d-'+c.st+'" aria-hidden="true"></i><span>conductor (supervisor)</span><small>'+esc(stText(c))+(c.st==='processing'&&s.handoff?', blocked on handoff':'')+'</small></div>';
+    if(hs.length)h+='<ul class="chips" aria-label="helpers">'+hs.map(chip).join('')+'</ul>';
+    s.T.forEach(function(t){if(t.st==='waiting_user_answer')h+='<div class="need"><b>'+esc(t.n)+'</b> asks: &ldquo;'+esc(t.q)+'&rdquo; <em>'+Math.round(t.since)+' min</em><div class="row"><button type="button" class="b g" data-a="ans" data-s="'+s.name+'" data-v="y" data-k="y-'+s.name+'">Approve push</button><button type="button" class="b rd" data-a="ans" data-s="'+s.name+'" data-v="n">Deny</button></div></div>'});
+    if(s.handoff)h+='<div class="hof">handoff in flight &rarr; '+esc(s.handoff)+'</div>';
+    if(openC[s.name]){
+      h+='<div class="det"><table><tr><th>terminal</th><th>status</th><th>last_active</th><th>caller_id</th></tr>';
+      s.T.forEach(function(t){h+='<tr><td>'+esc(t.id)+'</td><td>'+esc(t.st)+'</td><td>'+esc(t.st==='idle'?fmtAge(t.age)+' ago':'now')+'</td><td>'+(t.role==='conductor'?'none':t.peer?'none (peer)':t.orphan?'ab12 (gone)':'conductor')+'</td></tr>'});
+      h+='</table><p>Status is read off the screen, so treat it as a hint. last_active is the better clock.</p></div>';
+    }
+    h+='<div class="acts"><button type="button" class="b" data-a="ask" data-s="'+s.name+'" data-k="a-'+s.name+'" aria-expanded="'+(!!askC[s.name])+'">Ask</button>';
+    h+='<button type="button" class="b" data-a="hist" data-s="'+s.name+'" data-k="h-'+s.name+'" aria-expanded="'+(!!histC[s.name])+'">History ('+s.closed.length+')</button>';
+    h+='<button type="button" class="b rd" data-a="stop" data-s="'+s.name+'" data-k="x-'+s.name+'">Stop&hellip;</button></div>';
+    if(askC[s.name])h+='<form class="askf" data-s="'+s.name+'"><label class="sr" for="m11q-'+s.name+'">Message to the conductor of '+esc(s.name)+'</label><input id="m11q-'+s.name+'" data-k="q-'+s.name+'" data-s="'+s.name+'" placeholder="Ask the conductor..." value="'+esc(askV[s.name]||'')+'"><button type="submit" class="b g">Send</button></form>';
+    if(histC[s.name]){
+      h+='<div class="hist"><b>Closed helpers</b> <small>rebuilt from inbox rows; their terminals no longer exist</small>';
+      if(!s.closed.length)h+='<small>none recorded</small>';
+      else{h+='<ul>';s.closed.forEach(function(cl){var k=s.name+'/'+cl.n;h+='<li><b>'+esc(cl.n)+'</b> closed '+fmtAge(cl.ago)+' ago <button type="button" class="b" data-a="rows" data-s="'+k+'" data-k="r-'+k+'" aria-expanded="'+(!!rowsC[k])+'">inbox rows</button><small>last row: DONE: '+esc(closedMsg(cl.n))+'</small>';
+        if(rowsC[k])h+='<div class="rows">'+inboxRows(cl).map(function(r){return fmtAge(r.ago)+' ago '+esc(r.from)+' &rarr; conductor ['+r.st+'] '+esc(r.text)}).join('<br>')+'</div>';h+='</li>'});h+='</ul>'}
+      h+='</div>';
+    }
+    return h+'</article>';
+  }
+  function modalHtml(){
+    if(!modal)return '';
+    var names=modal.names,sel=names.filter(function(n){return modal.chk[n]}),nt=0,live=[];
+    sel.forEach(function(n){var s=byName(F,n);nt+=s.T.length;if(tierOf(s)==='live'||tierOf(s)==='needs')live.push(n)});
+    var h='<div class="ov"><div class="dlg" role="dialog" aria-modal="true" aria-labelledby="m11dt"><h4 id="m11dt">'+(modal.bulk?'Clean up stale sessions':'Stop session '+esc(names[0])+'?')+'</h4><small>Calls shutdown_session once per session you tick. Nothing is stopped until you press the red button. A stopped session does not come back.</small><ul>';
+    names.forEach(function(n){var s=byName(F,n);h+='<li><label><input type="checkbox" data-a="chk" data-s="'+n+'" data-k="c-'+n+'"'+(modal.chk[n]?' checked':'')+'><span><b>'+esc(n)+'</b>, idle '+fmtAge(youngest(s))+'<br><small>stops '+s.T.length+' terminal'+(s.T.length>1?'s':'')+': '+s.T.map(function(t){return t.role==='conductor'?'conductor':t.n}).join(', ')+'</small></span></label></li>'});
+    h+='</ul>';
+    if(live.length)h+='<div class="warn"><b>Heads up:</b> '+live.join(', ')+' is working or waiting for you right now. Stopping it throws that work away.</div>';
+    h+='<div class="row">'+(modal.bulk?'<button type="button" class="b" data-a="mall" data-k="m-all">Select all</button>':'')+'<button type="button" class="b" data-a="mcancel" data-k="m-cancel">Cancel</button><button type="button" class="b rd" data-a="mgo" data-k="m-go"'+(sel.length?'':' disabled')+'>Stop '+sel.length+' session'+(sel.length===1?'':'s')+' ('+nt+' terminals)</button></div></div></div>';
+    return h;
+  }
+  function render(){
+    var ae=document.activeElement,fk=ae&&ae.getAttribute?ae.getAttribute('data-k'):null;
+    var g=groups(),tc=termCounts(F),h='';
+    h+='<div class="hd"><h3>CAO Shelf</h3><span class="sub">'+F.length+' CAO sessions at a glance: what needs you, what is working, what is parked.</span><div class="sw" role="group" aria-label="Demo state"><button type="button" data-a="demo" data-v="q" data-k="dq" aria-pressed="'+(!busy)+'">Quiet day</button><button type="button" data-a="demo" data-v="b" data-k="db" aria-pressed="'+busy+'">Busy day</button></div></div>';
+    h+='<div class="tb" role="group" aria-label="Tiers to show"><button type="button" class="tt n" data-a="tier" data-v="needs" data-k="tn" aria-pressed="'+(!!tiers.needs)+'">Needs you <b>'+g.needs.length+'</b></button><button type="button" class="tt l" data-a="tier" data-v="live" data-k="tl" aria-pressed="'+(!!tiers.live)+'">Live <b>'+g.live.length+'</b></button><button type="button" class="tt p" data-a="tier" data-v="parked" data-k="tp" aria-pressed="'+(!!tiers.parked)+'">Parked <b>'+g.parked.length+'</b></button><button type="button" class="tt s" data-a="tier" data-v="stale" data-k="ts" aria-pressed="'+(!!tiers.stale)+'">Stale, over 48 h <b>'+g.stale.length+'</b>'+(tiers.stale?'':' (hidden)')+'</button></div>';
+    h+='<div class="honest"><b>'+tc.n+'</b> terminals: <b>'+tc.processing+'</b> processing, <b>'+tc.waiting_user_answer+'</b> waiting for you, '+(tc.completed?'<b>'+tc.completed+'</b> just completed, ':'')+'<b>'+tc.idle+'</b> idle. Idle is not running.</div>';
+    var meta={needs:['Needs you','Nothing needs you.'],live:['Live now','Nothing is working.'],parked:['Parked, idle under 48 h',''],stale:['Stale, dimmed, hover to wake the colours','']};
+    ['needs','live','parked','stale'].forEach(function(k){
+      if(!tiers[k])return;
+      h+='<h4 class="sec">'+meta[k][0]+' ('+g[k].length+')</h4>';
+      if(!g[k].length){if(meta[k][1])h+='<p class="none">'+meta[k][1]+'</p>';return}
+      h+='<div class="grid">'+g[k].map(card).join('')+'</div>';
+    });
+    h+='<div class="ft"><button type="button" class="b rd" data-a="clean" data-k="clean">Clean up stale ('+g.stale.length+')&hellip;</button><button type="button" class="b" data-a="gh" data-k="gh" aria-expanded="'+gh+'">All history ('+F.reduce(function(a,s){return a+s.closed.length},0)+' closed helpers)</button><span>Cleanup always asks first and starts with nothing ticked.</span></div>';
+    if(gh){
+      var all=[];F.forEach(function(s){s.closed.forEach(function(c){all.push({s:s.name,n:c.n,ago:c.ago})})});all.sort(function(a,b){return a.ago-b.ago});
+      h+='<div class="gh"><b>Closed helpers, newest first</b> (from inbox rows; CAO deleted the terminals)<ul>'+all.slice(0,8).map(function(a){return '<li><b>'+esc(a.n)+'</b> in '+esc(a.s)+', closed '+fmtAge(a.ago)+' ago: '+esc(closedMsg(a.n))+'</li>'}).join('')+'</ul>'+(all.length>8?'<small>and '+(all.length-8)+' older</small>':'')+'</div>';
+    }
+    h+=modalHtml();
+    B.innerHTML=h;
+    if(fk){var el=B.querySelector('[data-k="'+fk+'"]');if(el)el.focus()}
+  }
+  function setProc(s,done){var c=s.T[0];c.st='processing';c.age=0;render();window.after(function(){c.st='completed';render()},2400);window.after(function(){c.st='idle';c.age=0.01;render()},5200)}
+  listen(root,'click',function(e){
+    var el=e.target.closest('[data-a]');if(!el||!root.contains(el))return;
+    var a=el.getAttribute('data-a'),v=el.getAttribute('data-v'),sn=el.getAttribute('data-s');
+    if(a==='demo'){busy=v==='b';F=fleet(busy);W.innerHTML='<span>wire: nothing sent yet.</span>';openC={};histC={};askC={};modal=null;render()}
+    else if(a==='tier'){tiers[v]=tiers[v]?0:1;render()}
+    else if(a==='exp'){openC[sn]=!openC[sn];render()}
+    else if(a==='hist'){histC[sn]=!histC[sn];render()}
+    else if(a==='rows'){rowsC[sn]=!rowsC[sn];render()}
+    else if(a==='ask'){askC[sn]=!askC[sn];render();if(askC[sn]){var i=B.querySelector('input[data-s="'+sn+'"]');if(i)i.focus()}}
+    else if(a==='gh'){gh=!gh;render()}
+    else if(a==='ans'){
+      var s=byName(F,sn),t=s.T.filter(function(x){return x.st==='waiting_user_answer'})[0];if(!t)return;
+      wire('send_session_message '+sn+'/'+t.n+' "'+(v==='y'?'y':'n')+'"',v==='y'?'approve sent':'deny sent');
+      window.after(function(){t.st='processing';t.age=0;t.since=0;t.q='';render()},900);
+    }
+    else if(a==='stop'){opener='x-'+sn;modal={names:[sn],chk:{},bulk:false};modal.chk[sn]=true;render();var b=B.querySelector('[data-k="m-cancel"]');if(b)b.focus()}
+    else if(a==='clean'){opener='clean';modal={names:groups().stale.map(function(s){return s.name}),chk:{},bulk:true};render();var b2=B.querySelector('[data-k="m-cancel"]');if(b2)b2.focus()}
+    else if(a==='chk'){modal.chk[sn]=!modal.chk[sn];render()}
+    else if(a==='mall'){modal.names.forEach(function(n){modal.chk[n]=true});render()}
+    else if(a==='mcancel'){modal=null;render();var o=B.querySelector('[data-k="'+opener+'"]');if(o)o.focus()}
+    else if(a==='mgo'){
+      var sel=modal.names.filter(function(n){return modal.chk[n]});modal=null;
+      F=F.filter(function(s){return sel.indexOf(s.name)<0});
+      wire('shutdown_session '+sel.join(', '),'stop requested',null);
+      render();var o2=B.querySelector('[data-k="clean"]');if(o2)o2.focus();
+    }
+  });
+  listen(root,'input',function(e){var t=e.target;if(t.matches&&t.matches('.askf input'))askV[t.getAttribute('data-s')]=t.value});
+  listen(root,'submit',function(e){
+    e.preventDefault();var f=e.target,sn=f.getAttribute('data-s'),inp=f.querySelector('input'),v=inp.value.trim();if(!v)return;
+    var s=byName(F,sn);askV[sn]='';askC[sn]=false;
+    wire('send_session_message '+sn+'/conductor "'+v.slice(0,40)+'"','sent');
+    window.after(function(){setProc(s)},900);render();
+  });
+  listen(root,'keydown',function(e){if(e.key==='Escape'&&modal){modal=null;render();var o=B.querySelector('[data-k="'+opener+'"]');if(o)o.focus()}});
+  render();
+}
+</script><script>window.__mount();</script></body></html>
