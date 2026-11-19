@@ -14,6 +14,7 @@ const CachePolicy = createRequire(require.resolve('cacheable-request'))(
 require('../../scripts/test-braces-security.cjs')(
   path.resolve(__dirname, '..'),
 );
+require('../../scripts/test-picomatch-security.cjs')(path.resolve(__dirname, '..'));
 
 for (const [name, separator] of [
   ['LF', '\n'],

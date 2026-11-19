@@ -477,6 +477,15 @@ class TerminalBackend(ABC):
         """Focus ``target`` (from ``prepare_web_attach_input``) so input reaches it."""
         return None
 
+    def release_web_input(self, target: str) -> None:
+        """End the input turn ``focus_web_input`` began, once the frame was read.
+
+        Called after every successful ``focus_web_input``, when the client has
+        read the input frame. A backend that holds something across the turn
+        (herdr: a lock shared with its web views) releases it here.
+        """
+        return None
+
     # --- Pipe-pane (logging) ---
 
     @abstractmethod
@@ -514,6 +523,18 @@ class TerminalBackend(ABC):
         instead of using pipe-pane file watching.
 
         Default is False (pipe-pane based delivery).
+        """
+        return False
+
+    def event_inbox_confirms_submit(self) -> bool:
+        """Whether inbox deliveries on this event-inbox backend run the submit confirmation.
+
+        The confirmation (``InboxService._confirm_submitted``) blocks for up to
+        its timeout per attempt. True means this backend's inbox service calls
+        ``deliver_pending`` off the event loop, so blocking there is safe.
+
+        Default is False: the herdr TUI inbox service delivers on its event
+        loop. Backends without an event inbox always confirm and ignore this.
         """
         return False
 
