@@ -219,6 +219,18 @@ class TestEachProviderInjectsTheRealId:
         config = json.loads(command.split("--mcp-config ")[1].strip().strip("'"))
         assert config["my-server"]["env"][CAO_TERMINAL_ID_ENV] == "a1b2c3d4"
 
+    def test_qwen_cli(self, pinned):
+        from cli_agent_orchestrator.providers.qwen_cli import QwenCliProvider
+
+        servers = {"my-server": {"command": "my-server", "env": {CAO_TERMINAL_ID_ENV: pinned}}}
+        provider = QwenCliProvider("a1b2c3d4", "s", "w", agent_profile="worker")
+        path = provider._write_mcp_config(servers)
+        try:
+            config = json.loads(path.read_text(encoding="utf-8"))
+        finally:
+            path.unlink()
+        assert config["mcpServers"]["my-server"]["env"][CAO_TERMINAL_ID_ENV] == "a1b2c3d4"
+
     def test_cursor_cli(self, pinned):
         from cli_agent_orchestrator.providers.cursor_cli import CursorCliProvider
 

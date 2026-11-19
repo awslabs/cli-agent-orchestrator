@@ -211,6 +211,7 @@ ALLOWED: Dict[str, str] = {
     "clients/tmux.py::create_window": EXPORTS_REAL_ID,
     "clients/tmux.py::create_pane": EXPORTS_REAL_ID,
     "backends/herdr_backend.py::_build_env_args": EXPORTS_REAL_ID,
+    "backends/herdr_app_backend.py::_env": EXPORTS_REAL_ID,
     # -- reads of the caller's own identity --------------------------------
     "cli/commands/workflow.py::_attach_terminal_caller": READS_OWN_IDENTITY,
     "mcp_server/server.py::_attach_workflow_caller": READS_OWN_IDENTITY,
@@ -243,6 +244,7 @@ ALLOWED: Dict[str, str] = {
 #: one of these changes, re-read the site and update the number with its reason.
 ALLOWED_OCCURRENCES: Dict[str, int] = {
     "agent_plugins/mcp_delivery.py::_deliverable": 0,
+    "backends/herdr_app_backend.py::_env": 1,
     "backends/herdr_backend.py::_build_env_args": 1,
     "cli/commands/workflow.py::_attach_terminal_caller": 1,
     "clients/tmux.py::create_pane": 1,

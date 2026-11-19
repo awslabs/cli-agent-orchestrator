@@ -539,11 +539,13 @@ class TestCoordinatesAreShapeGated:
         self._resolve({"command": "cmd"}, None)
         assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
-    def test_cao_server_env_has_exactly_two_callers_in_the_package(self):
-        """Every injection of this CAO's coordinates goes through one of two known
-        writers: the shape-gated resolver and the herdr backend's launch
-        environment. A new direct caller of ``cao_server_env()`` is a third place
-        the gate can be bypassed, so it has to update this list on purpose."""
+    def test_every_cao_server_env_caller_in_the_package_is_pinned_here(self):
+        """Every injection of this CAO's coordinates goes through a known writer:
+        the shape-gated resolver, and each herdr backend's launch environment
+        (both build the env of the terminal process CAO itself creates, the same
+        disposition as ``CAO_TERMINAL_ID`` there). A new direct caller of
+        ``cao_server_env()`` is another place the gate can be bypassed, so it has
+        to update this list on purpose."""
         import ast
 
         src = Path(__file__).resolve().parents[2] / "src" / "cli_agent_orchestrator"
@@ -567,7 +569,11 @@ class TestCoordinatesAreShapeGated:
                 if is_call:
                     rel = path.relative_to(src).as_posix()
                     calls_per_file[rel] = calls_per_file.get(rel, 0) + 1
-        # Exactly one call in each of the two known writers. A second call inside
-        # either file (say, on the persisted branch) is as much a new injection
-        # site as a third file, so the count is pinned, not just the membership.
-        assert calls_per_file == {"utils/mcp_resolution.py": 1, "backends/herdr_backend.py": 1}
+        # Exactly one call in each known writer. A second call inside any of
+        # these files (say, on the persisted branch) is as much a new injection
+        # site as a new file, so the count is pinned, not just the membership.
+        assert calls_per_file == {
+            "utils/mcp_resolution.py": 1,
+            "backends/herdr_backend.py": 1,
+            "backends/herdr_app_backend.py": 1,
+        }
