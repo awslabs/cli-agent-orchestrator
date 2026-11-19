@@ -5661,11 +5661,18 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
     @patch("cli_agent_orchestrator.services.terminal_service.update_terminal_shell_command")
-    @patch("cli_agent_orchestrator.services.terminal_service.redeliver_dropped_message")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.redeliver_dropped_message_with_boundary"
+    )
     @patch("cli_agent_orchestrator.services.terminal_service.dispatch_input")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     async def test_a_genuine_early_completion_is_not_hidden_by_the_mask(
-        self, mock_meta, mock_send_input, mock_redeliver, mock_update_shell, mock_notify
+        self,
+        mock_meta,
+        mock_send_input,
+        mock_redeliver_with_boundary,
+        mock_update_shell,
+        mock_notify,
     ):
         """The mirror-image regression, pinned with the REAL confirm loop.
 
@@ -5719,6 +5726,7 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
 
         init_done = threading.Event()
         dispatched = threading.Event()
+        completion_observed = threading.Event()
         dispatched_at = {}
         saw_processing = {"value": False}
 
@@ -5726,6 +5734,7 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
             if dispatched.is_set():
                 if _time.monotonic() - dispatched_at["t"] < COMPLETION_LAG:
                     return TerminalStatus.IDLE
+                completion_observed.set()
                 return TerminalStatus.COMPLETED  # never PROCESSING
             if init_done.is_set():
                 return TerminalStatus.IDLE
@@ -5761,7 +5770,7 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
             return 0  # the dispatch boundary dispatch_input returns
 
         mock_send_input.side_effect = fake_send_input
-        mock_redeliver.return_value = False
+        mock_redeliver_with_boundary.return_value = (True, None)
 
         async def fake_initialize():
             await asyncio.sleep(INIT_SECONDS)
@@ -5781,13 +5790,12 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
             resp.json.return_value = {"status": status}
             return resp
 
-        elapsed = {}
+        poll_returned_after_completion = {}
 
         def run_poll():
-            started = _time.monotonic()
             with patch("cli_agent_orchestrator.utils.terminal.api_http.get", fake_requests_get):
                 poll_until_done(TERMINAL_ID, timeout=30.0, polling_interval=POLL_INTERVAL)
-            elapsed["t"] = _time.monotonic() - started
+            poll_returned_after_completion["value"] = completion_observed.is_set()
 
         with (
             patch("cli_agent_orchestrator.services.status_monitor.status_monitor", fake_monitor),
@@ -5803,11 +5811,14 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
         assert (
             saw_processing["value"] is False
         ), "fixture bug: this must exercise the no-PROCESSING path"
-        assert elapsed["t"] < 3.0, (
-            f"poll_until_done took {elapsed['t']:.2f}s for a turn that completed "
-            f"{COMPLETION_LAG:.2f}s after dispatch — the mask is stranding a genuine "
-            "early completion"
+        assert completion_observed.is_set(), "fixture bug: the turn never reached COMPLETED"
+        assert mock_redeliver_with_boundary.call_count == 0, (
+            "post-dispatch COMPLETED was hidden until the initial confirmation timed out "
+            "and entered the redelivery path"
         )
+        assert (
+            poll_returned_after_completion["value"] is True
+        ), "poll_until_done returned before post-dispatch COMPLETED was observed"
 
 
 class TestListSiblingsMasksPendingDelivery:

@@ -573,7 +573,7 @@ def test_config_set_get_explain_enabled(_isolated_settings, monkeypatch):
 @pytest.mark.parametrize(
     "saved,env,expected",
     [
-        ({}, {}, (True, False, False)),
+        ({}, {}, (True, True, False)),
         (
             {
                 "explain_enabled": False,
@@ -617,7 +617,7 @@ def test_config_set_get_explain_enabled(_isolated_settings, monkeypatch):
         (
             {"lifecycle": {"enabled": False}},
             {"CAO_MEMORY_LIFECYCLE_ENABLED": "yes"},
-            (True, False, True),
+            (True, True, True),
         ),
         (
             {
@@ -632,7 +632,7 @@ def test_config_set_get_explain_enabled(_isolated_settings, monkeypatch):
             },
             (False, True, True),
         ),
-        ({"lifecycle": {"enabled": "yes"}}, {}, (True, False, False)),
+        ({"lifecycle": {"enabled": "yes"}}, {}, (True, True, False)),
         (
             {
                 "lifecycle": {"enabled": True},
@@ -651,7 +651,7 @@ def test_config_set_get_explain_enabled(_isolated_settings, monkeypatch):
             {},
             (True, True, False),
         ),
-        ({"explain_enabled": "maybe"}, {}, (True, False, False)),
+        ({"explain_enabled": "maybe"}, {}, (True, True, False)),
     ],
 )
 def test_typed_memory_config_matches_resolved_flags(
@@ -708,3 +708,13 @@ def test_lifecycle_set_keeps_nested_and_top_level_siblings(_isolated_settings):
     ConfigService.set("memory.lifecycle.enabled", True)
     original["memory"]["lifecycle"]["enabled"] = True
     assert json.loads(settings.read_text()) == original
+
+
+def test_herdr_app_session_default_and_env(_isolated_settings, monkeypatch):
+    from cli_agent_orchestrator.services.config_service import ENV_REGISTRY
+
+    assert ConfigService.get("terminal.herdr_app_session") == "cao"
+    assert ENV_REGISTRY["CAO_HERDR_APP_SESSION"] == ("terminal.herdr_app_session", "str", "cao")
+    monkeypatch.setenv("CAO_HERDR_APP_SESSION", "x")
+    assert ConfigService.get("terminal.herdr_app_session") == "x"
+    assert ConfigService.get_config().terminal.herdr_app_session == "x"

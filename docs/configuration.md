@@ -61,13 +61,14 @@ Every derived path resolves from this value, so one override moves everything â€
     "compile_mode": "llm",
     "flush_threshold": 0.85,
     "explain_enabled": true,
-    "non_accessing_inspection": false,
+    "non_accessing_inspection": true,
     "lifecycle": {"enabled": false},
     "compile_timeout_s": 120.0
   },
   "terminal": {
     "backend": "tmux",
     "herdr_session": "cao",
+    "herdr_app_session": "cao",
     "keep_finished": {
       "enabled": false,
       "idle_window_minutes": 60,
@@ -224,7 +225,7 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 | `compile_mode` | `"llm"` | `llm` or `append`. `append` skips the LLM wiki-compiler entirely. |
 | `lifecycle.enabled` | `false` | Opt-in active supersedes exclusion for injection plus recall demotion/labels. Nested under `memory.lifecycle`; env override `CAO_MEMORY_LIFECYCLE_ENABLED`. Read/validation errors leave it off. |
 | `ranking.default_sort` | `"recency"` | Default query recall ranking: `recency` preserves hybrid recall, while `bm25` opts into BM25-first results. No-query listings remain recency ordered. Nested under `memory.ranking`. |
-| `non_accessing_inspection` | `false` | CLI list/show and HTTP GET memory views skip access counters when on. MCP/internal recall still counts. Env override: `CAO_MEMORY_NON_ACCESSING_INSPECTION`; read errors leave it off. |
+| `non_accessing_inspection` | `true` | CLI list/show and HTTP GET memory views skip access counters when on. MCP recall still counts; internal recall defaults to counting but accepts `record_access=false`. Env override: `CAO_MEMORY_NON_ACCESSING_INSPECTION`; read errors leave non-accessing inspection on. |
 | `explain_enabled` | `true` | On-demand `cao memory list --query Q --explain` diagnostic. Env override: `CAO_MEMORY_EXPLAIN_ENABLED` (env > file > default). Does not alter recall defaults or gate `sort_by="relevance"`. |
 | `flush_threshold` | `0.85` | Context-usage fraction that triggers a memory flush. |
 | `compile_timeout_s` | `120.0` | Wall-clock timeout for the wiki compile call. |
@@ -291,8 +292,9 @@ CAO's default backend is [tmux](tmux.md). [herdr](https://herdr.dev/) is an expe
 }
 ```
 
-- `backend`: `"tmux"` (default) or `"herdr"` [EXPERIMENTAL].
+- `backend`: `"tmux"` (default), `"herdr"` [EXPERIMENTAL], or `"herdr-app"` [EXPERIMENTAL] (see [Herdr app backend](herdr-app.md)).
 - `herdr_session`: the herdr session name to connect to (default `"cao"`).
+- `herdr_app_session`: the herdr-core (`hc`) session the `herdr-app` backend uses (default `"cao"`; env `CAO_HERDR_APP_SESSION`).
 - `spawn_mode`: `"window"` (default) or `"pane"` â€” where a terminal created by
   `assign` / `handoff` lands. See [Watching a fleet in one window](#watching-a-fleet-in-one-window).
 - `pane_window`: the window `spawn_mode: "pane"` shares (default `"cao-agents"`).

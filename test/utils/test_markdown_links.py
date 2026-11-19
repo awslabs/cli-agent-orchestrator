@@ -397,3 +397,91 @@ def test_discovery_excludes_blog_posts_that_link_by_site_route(
     )
 
     assert discover_markdown_files(tmp_path) == [tmp_path / "README.md"]
+
+
+def test_rejects_skill_link_that_resolves_outside_the_skill_directory(tmp_path: Path) -> None:
+    """A skill is installed without ``docs/`` or its sibling skills, so such links dangle."""
+    docs = _write(tmp_path / "docs" / "guide.md", "# Guide\n")
+    other = _write(tmp_path / "skills" / "other-skill" / "SKILL.md", "# Other\n")
+    source = _write(
+        tmp_path / "skills" / "my-skill" / "SKILL.md",
+        "\n".join(
+            (
+                "[docs](../../docs/guide.md)",
+                "[sibling](../other-skill/SKILL.md)",
+                "[root-relative](/docs/guide.md)",
+                "[fragment in docs](../../docs/guide.md#guide)",
+            )
+        ),
+    )
+
+    errors = validate_markdown_links(tmp_path, [source, docs, other])
+
+    assert [(error.line, error.destination) for error in errors] == [
+        (1, "../../docs/guide.md"),
+        (2, "../other-skill/SKILL.md"),
+        (3, "/docs/guide.md"),
+        (4, "../../docs/guide.md#guide"),
+    ]
+    assert all("outside the skill directory" in error.reason for error in errors)
+
+
+def test_rejects_skill_link_outside_the_skill_even_when_target_is_missing(
+    tmp_path: Path,
+) -> None:
+    source = _write(tmp_path / "skills" / "my-skill" / "SKILL.md", "[gone](../../docs/gone.md)\n")
+
+    errors = validate_markdown_links(tmp_path, [source])
+
+    assert [error.reason for error in errors] == [
+        "link resolves outside the skill directory, so it dangles once the skill is installed"
+    ]
+
+
+def test_accepts_skill_links_that_stay_inside_the_skill_directory(tmp_path: Path) -> None:
+    reference = _write(tmp_path / "skills" / "my-skill" / "references" / "detail.md", "# Detail\n")
+    source = _write(
+        tmp_path / "skills" / "my-skill" / "SKILL.md",
+        "\n".join(
+            (
+                "[reference](references/detail.md)",
+                "[round trip](assets/../references/detail.md)",
+                "[directory](references/)",
+                "[self](#my-skill)",
+                "[absolute](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/x.md)",
+                "",
+                "# My Skill",
+            )
+        ),
+    )
+    asset = _write(
+        tmp_path / "skills" / "my-skill" / "assets" / "example.md",
+        "[up to the skill](../SKILL.md)\n",
+    )
+
+    assert validate_markdown_links(tmp_path, [source, reference, asset]) == []
+
+
+def test_links_outside_skills_are_not_subject_to_the_skill_rule(tmp_path: Path) -> None:
+    docs = _write(tmp_path / "docs" / "guide.md", "# Guide\n")
+    source = _write(
+        tmp_path / "docs" / "other.md", "[guide](../docs/guide.md) [up](../README.md)\n"
+    )
+    readme = _write(tmp_path / "README.md", "# Readme\n")
+    skills_index = _write(tmp_path / "skills" / "README.md", "[docs](../docs/guide.md)\n")
+
+    assert validate_markdown_links(tmp_path, [source, docs, readme, skills_index]) == []
+
+
+def test_skill_directory_is_none_for_files_that_are_not_inside_a_skill(tmp_path: Path) -> None:
+    """``validate_markdown_links`` sorts by repo-relative path first, so a file outside the
+    repository never reaches the rule through it; the helper still has to answer safely."""
+    repo = tmp_path / "repo"
+    outside = _write(tmp_path / "elsewhere" / "skills" / "my-skill" / "SKILL.md", "# Skill\n")
+
+    assert markdown_links._skill_directory(repo, outside) is None
+    assert markdown_links._skill_directory(repo, repo / "skills" / "README.md") is None
+    assert markdown_links._skill_directory(repo, repo / "docs" / "a" / "b.md") is None
+    assert markdown_links._skill_directory(repo, repo / "skills" / "my-skill" / "SKILL.md") == (
+        repo / "skills" / "my-skill"
+    )
