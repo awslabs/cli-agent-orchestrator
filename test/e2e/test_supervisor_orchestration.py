@@ -969,13 +969,24 @@ class TestQwenCliSupervisorOrchestration:
                 / "events.jsonl"
             )
             events = [json.loads(line) for line in journal.read_text().splitlines() if line]
-            calls = [
+            raw_calls = [
                 block
                 for event in events
                 if event.get("type") == "assistant" and not event.get("parent_tool_use_id")
                 for block in event.get("message", {}).get("content", [])
                 if block.get("type") == "tool_use"
             ]
+            calls = []
+            for call in raw_calls:
+                # Qwen 0.28 can discover deferred MCP tools with tool_search
+                # and invoke them through tool_call. Audit the resolved name
+                # and arguments, not the wrapper, without allowing native
+                # execution to hide behind tool_call.
+                if call["name"] == "tool_search":
+                    continue
+                if call["name"] == "tool_call":
+                    call = {"name": call["input"]["name"], "input": call["input"]["arguments"]}
+                calls.append(call)
             # A prompt-only role is not a sandbox: prove that this supervisor
             # used CAO delegation, without native execution or native subagents.
             assert calls and all(c["name"].startswith("mcp__cao-mcp-server__") for c in calls)
@@ -1002,6 +1013,14 @@ class TestQwenCliSupervisorOrchestration:
                         "supervisor_tools": [
                             {key: c[key] for key in ("name", "input")} for c in calls
                         ],
+                        "models": sorted(
+                            {
+                                e["message"]["model"]
+                                for e in events
+                                if e.get("type") == "assistant"
+                                and e.get("message", {}).get("model")
+                            }
+                        ),
                         "final_report": report,
                     },
                     ensure_ascii=False,
