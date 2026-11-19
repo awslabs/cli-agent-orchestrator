@@ -80,6 +80,7 @@ jobs:
             --cov=src/cli_agent_orchestrator \
             --cov-branch \
             --cov-report=xml \
+            --cov-report=json \
             --cov-fail-under=80 \
             --cov-report=term-missing \
             -v
@@ -89,7 +90,7 @@ jobs:
         # line % that run (today: 89.28 branch vs 93.10 line, so blended is a
         # harder bar at 80 -- not an invariant, just the current numbers). The
         # authoritative, separately-floored line metric is the ratchet's
-        # (.coverage-baseline.json, python.floor_pct = 87.0) in the cao-mcp-apps
+        # (.coverage-baseline.json, python.floor_pct = 87.0) in the coverage-ratchet
         # job below. If the blend lands under 80 on a first run, lower THIS
         # number -- do not drop the branch data, and do not touch the line floor.
 
@@ -117,6 +118,14 @@ jobs:
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload coverage ratchet report
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-ratchet-python
+          path: coverage.json
+          retention-days: 1
 
   web-build:
     name: Web UI Build
@@ -240,11 +249,12 @@ jobs:
   cao-mcp-apps:
     name: CAO MCP Apps
     runs-on: ubuntu-latest
-    # Bounds a hung test (#1273 review). "Backend coverage" below runs the same
-    # pytest suite as Unit Tests; over 60 runs this job took a mean of 33.3 min
-    # and a max of 37.9, so 60 matches Unit Tests and is 1.6x the slowest.
+    # Bounds a hung step (#1273 review). Since the coverage ratchet moved to its
+    # own job (#1387), this job no longer runs the Python suite: it took 55 s in
+    # this PR's run. It still runs `uv sync` for the HTTP-only guard, and one
+    # `uv sync` took 15.5 min on 2026-11-17, so 30 leaves room for that.
     # Unbounded, a hang held the runner for GitHub's default of 360 min.
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     # Per-tier test timing budgets (Requirement 20.3), surfaced as env so the
     # vitest tiers (Phase II+) and CI can enforce them:
@@ -270,7 +280,7 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
 
-      - name: Install Python deps (for the HTTP-only guard + coverage ratchet)
+      - name: Install Python deps (for the HTTP-only guard)
         run: uv sync --locked --all-extras --dev
 
       - name: Install MCP-apps deps
@@ -308,20 +318,38 @@ jobs:
       - name: HTTP-only MCP boundary guard
         run: uv run pytest test/test_http_only_boundary.py -q
 
-      - name: Backend coverage (for the ratchet floor)
-        # Produces coverage.json (python line + branch floors) consumed by
-        # coverage:ratchet. --cov-branch adds num_branches/covered_branches to
-        # totals; the ratchet floors line and branch SEPARATELY (#1005).
-        run: |
-          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ \
-            --ignore=test/providers/test_kiro_cli_integration.py \
-            --ignore=test/e2e \
-            -m "not e2e" \
-            --cov=src/cli_agent_orchestrator \
-            --cov-branch \
-            --cov-report=json \
-            --cov-fail-under=80 \
-            -q
+      - name: Upload coverage ratchet summary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-ratchet-frontend
+          path: cao_mcp_apps/coverage/coverage-summary.json
+          retention-days: 1
+
+  coverage-ratchet:
+    name: Coverage ratchet
+    needs: [test, cao-mcp-apps]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "20"
+
+      - name: Download Python coverage report
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage-ratchet-python
+
+      - name: Download frontend coverage summary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage-ratchet-frontend
+          path: cao_mcp_apps/coverage
 
       - name: Coverage ratchet
         working-directory: cao_mcp_apps

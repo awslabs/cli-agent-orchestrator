@@ -72,7 +72,7 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 
 | Job | Runs | Blocking? |
 |-----|------|-----------|
-| **Unit Tests** (3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-branch --cov-fail-under=80 --cov-report=term-missing` | **Yes** |
+| **Unit Tests** (3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-branch --cov-fail-under=80 --cov-report=term-missing --cov-report=json` | **Yes** |
 | ↳ step: **Validate Markdown links** | `uv run python scripts/validate_markdown_links.py` — every relative link in every tracked `.md`, including `skills/` | **Yes** |
 | **Code Quality** | black `--check`, isort `--check-only`, `uv run ruff check src/ test/ examples/`, then `uv run python scripts/mypy_ratchet.py` | **Yes** (all four; the mypy step's `continue-on-error` was removed in issue #1005) |
 | **AG-UI demo (shift-left recording)** | boots a `CAO_AGUI_ENABLED` server, drives the viewer, records a GIF artifact | **Yes** |
@@ -80,7 +80,8 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 | **AG-UI stock-client live (AC3)** | drives a real third-party AG-UI client against the surface | **Yes** |
 | **AG-UI operator dashboard** | `examples/ag-ui/ag-ui-operator-dashboard`: installs tmux, then `npm ci`, `test:dependencies`, `tsc`, vitest with a 100% coverage floor on `core/`, `vite build`, and a keyless e2e against a private cao-server with `mock_cli` terminals | **Yes** |
 | **Agent Plugins dog-food (shift-left recording)** | records the plugin pipeline from `examples/agent-plugins/agent-plugins-dogfood/tools` and gates on drift | **Yes** |
-| **CAO MCP Apps** | MCP Apps build + backend coverage ratchet floor | **Yes** |
+| **CAO MCP Apps** | MCP Apps build and frontend coverage summary | **Yes** |
+| **Coverage ratchet** | reads the Unit Tests 3.12 Python report and MCP Apps frontend summary | **Yes** |
 | **CAO MCP Apps E2E (Playwright)** | browser E2E over the `ui://cao/*` views | **Yes** |
 | **Rust TUI** (Linux x86_64 / macOS arm64) | `cargo test` for the `tui/` crate | **Yes** |
 | **Web UI Build** | frontend build | **Yes** |
