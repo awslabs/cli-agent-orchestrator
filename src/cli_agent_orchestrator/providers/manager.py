@@ -343,6 +343,12 @@ class ProviderManager:
             provider.shell_baseline = metadata["shell_command"]
             if hasattr(provider, "_initialized"):
                 provider._initialized = True
+        # Claude Code rows carry no shell_command, but the row's existence still
+        # means the CLI finished startup. accepts_input_while_processing reads
+        # _initialized, so without this eager inbox delivery is refused for every
+        # Claude terminal that outlived a cao-server restart.
+        if isinstance(provider, ClaudeCodeProvider):
+            provider._initialized = True
         logger.info(f"Created provider on-demand for terminal {terminal_id}")
         return provider
 

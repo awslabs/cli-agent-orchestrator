@@ -2890,6 +2890,35 @@ class TestDeliveryOutcome:
             assert self._deliver(report_to_sender=7) == []
         self.term.dispatch_input.assert_not_called()
 
+    def test_busy_claude_receiver_restored_after_restart_gets_the_message_eagerly(self):
+        """A Claude Code terminal that was running when cao-server restarted has
+        its provider rebuilt on demand. With eager delivery on, a message to it
+        while PROCESSING is pasted at once rather than left queued."""
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+
+        self.monitor.get_status.return_value = TerminalStatus.PROCESSING
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.provider_manager",
+                ProviderManager(),
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+                return_value={
+                    "provider": ProviderType.CLAUDE_CODE.value,
+                    "tmux_session": "s1",
+                    "tmux_window": "w1",
+                    "agent_profile": None,
+                    "shell_command": None,
+                },
+            ),
+        ):
+            outcomes = self._deliver(report_to_sender=7)
+
+        assert outcomes == [(7, self._outcome().DELIVERED, None)]
+        self.term.dispatch_input.assert_called_once()
+
     def test_older_message_ahead_reports_only_its_own_outcome(self):
         """Spec scenario "Older messages ahead": the POST's own message gets no outcome."""
         self.pending.return_value = [_make_message(id=3)]
