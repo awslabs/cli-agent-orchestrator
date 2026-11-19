@@ -741,7 +741,8 @@ class TestTabOrder:
             ),
         )
         backend.sync_layout_names()
-        assert self._tab_names(hc) == ["sup", "w1", "mine"]
+        # the tab CAO does not own keeps its slot; CAO's tabs fill the others in order
+        assert self._tab_names(hc) == ["mine", "sup", "w1"]
 
         def boom(session):
             raise RuntimeError("db down")
@@ -794,3 +795,55 @@ class TestTabOrder:
         )
         backend.sync_layout_names()
         assert self._tab_names(hc) == ["sup", "w1", "w1b", "w2", "cli"]
+
+
+class TestTwoServersOneSpace:
+    """Two cao-servers (different homes) that share a session name must not undo each other."""
+
+    def test_sorting_reaches_a_fixed_point(self, hc, monkeypatch, tmp_path):
+        from cli_agent_orchestrator import constants
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.mcp_resolution.cao_server_env", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            lambda tid: {"caller_id": None},
+        )
+        servers = {}
+        for name, ids in (("A", ("aaaa0001", "aaaa0002")), ("B", ("bbbb0001", "bbbb0002"))):
+            monkeypatch.setattr(constants, "CAO_HOME_DIR", tmp_path / name)
+            servers[name] = (HerdrAppBackend(herdr_app_session="cao", client=hc), ids)
+        space = space_id_for("cao-a")
+        for name, (backend, ids) in servers.items():
+            for window, tid in zip(("sup", "w1"), ids):
+                hc.add_terminal(_labels("cao-a", f"{name}-{window}", tid, backend.home_label))
+        # tabs interleaved and each server's pair reversed: both servers have work to do
+        hc.set_doc(
+            "herdr-app",
+            layout_with(
+                space,
+                [("tb4", "", "t4"), ("tb2", "", "t2"), ("tb3", "", "t3"), ("tb1", "", "t1")],
+            ),
+        )
+
+        def sync(name):
+            backend, ids = servers[name]
+            monkeypatch.setattr(
+                "cli_agent_orchestrator.clients.database.list_terminals_by_session",
+                lambda session: [{"id": i} for i in ids],
+            )
+            backend.sync_layout_names()
+
+        for _ in range(3):
+            sync("A")
+            sync("B")
+        settled = len(hc.calls_to("doc.set"))
+        for _ in range(4):
+            sync("A")
+            sync("B")
+        assert len(hc.calls_to("doc.set")) == settled  # no further writes
+        order = [t["name"] for t in hc.docs["herdr-app"]["value"]["spaces"][0]["tabs"]]
+        # each server's tabs are in its own creation order, in the slots they started in
+        assert order.index("A-sup") < order.index("A-w1")
+        assert order.index("B-sup") < order.index("B-w1")

@@ -379,13 +379,14 @@ class HerdrAppBackend(TerminalBackend):
             terminal_ids = {t["address"]: t["labels"].get("cao.terminal_id") for t in live}
             rank = self._creation_order(spaces.values())
 
-            def tab_rank(tab: Any) -> int:
+            def tab_rank(tab: Any) -> Optional[int]:
+                """This server's rank of a tab, or None for a tab it does not own."""
                 ranks = [
                     rank[terminal_ids[a]]
                     for a in _terminals_in(tab.get("root") if isinstance(tab, dict) else None)
                     if terminal_ids.get(a) in rank
                 ]
-                return min(ranks) if ranks else len(rank)  # tabs CAO doesn't know go last
+                return min(ranks) if ranks else None
 
             def mutate(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 changed = False
@@ -402,7 +403,15 @@ class HerdrAppBackend(TerminalBackend):
                             changed = True
                     tabs = space.get("tabs")
                     if rank and isinstance(tabs, list):
-                        ordered = sorted(tabs, key=tab_rank)  # stable: equal ranks keep order
+                        # Reorder this server's tabs among the slots they already
+                        # hold. Tabs it does not own (a person's own tab, another
+                        # cao-server's) stay where they are, so two servers sharing
+                        # a space reach a fixed point instead of undoing each other.
+                        slots = [i for i, tab in enumerate(tabs) if tab_rank(tab) is not None]
+                        mine = sorted((tabs[i] for i in slots), key=lambda tab: tab_rank(tab) or 0)
+                        ordered = list(tabs)
+                        for i, tab in zip(slots, mine):
+                            ordered[i] = tab
                         if ordered != tabs:
                             space["tabs"] = ordered
                             changed = True
