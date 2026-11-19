@@ -314,6 +314,70 @@ requirements = [
         mock_run.assert_called_once_with(["uv", "tool", "upgrade", _PACKAGE, "--reinstall"])
 
     @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._receipt_path")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_constrained_registry_keeps_extra_requirements(
+        self, _which, receipt_path, mock_run, tmp_path
+    ):
+        # `uv tool install <pkg>@latest --upgrade` replaces the receipt's requirements,
+        # so each extra package has to be passed back with --with.
+        receipt_path.return_value = _write(
+            tmp_path,
+            """
+[tool]
+requirements = [
+    { name = "cli-agent-orchestrator", specifier = "==2.1.0" },
+    { name = "cao-decider-example", extras = ["fast"], specifier = ">=1.2" },
+    { name = "cao-decider-wheel", path = "/opt/wheels/cao_decider_wheel-0.1.0-py3-none-any.whl" },
+    { name = "cao-decider-local", directory = "/home/me/decider" },
+]
+""",
+        )
+        mock_run.return_value = _completed(0)
+
+        result = CliRunner().invoke(update, [])
+
+        assert result.exit_code == 0
+        mock_run.assert_called_once_with(
+            [
+                "uv",
+                "tool",
+                "install",
+                f"{_PACKAGE}@latest",
+                "--upgrade",
+                "--with",
+                "cao-decider-example[fast]>=1.2",
+                "--with",
+                "/opt/wheels/cao_decider_wheel-0.1.0-py3-none-any.whl",
+                "--with",
+                "/home/me/decider",
+            ]
+        )
+
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._receipt_path")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_constrained_registry_refuses_extra_it_cannot_rebuild(
+        self, _which, receipt_path, mock_run, tmp_path
+    ):
+        receipt_path.return_value = _write(
+            tmp_path,
+            """
+[tool]
+requirements = [
+    { name = "cli-agent-orchestrator", specifier = "<2.4" },
+    { name = "cao-decider-git", git = "https://example.com/decider.git?rev=v1" },
+]
+""",
+        )
+
+        result = CliRunner().invoke(update, [])
+
+        assert result.exit_code != 0
+        assert "cao-decider-git" in result.output
+        mock_run.assert_not_called()
+
+    @patch(f"{_MOD}.subprocess.run")
     @patch(f"{_MOD}._classify_source", return_value=(_DIR, "/home/me/cli-agent-orchestrator"))
     @patch(f"{_MOD}._receipt_path")
     @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
