@@ -8,6 +8,7 @@ Codex, Kimi CLI, Q CLI) through tmux sessions, providing a unified interface
 for agent management.
 """
 
+import math
 import os
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -32,7 +33,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _env_positive_float(name: str, default: float) -> float:
-    """Read a float env var, falling back when the value is invalid OR non-positive.
+    """Read a float env var, falling back when the value is invalid, non-finite OR non-positive.
 
     For env vars that feed a ``threading.Event.wait(timeout)``-style poll
     interval, a non-positive value isn't just atypical, it's actually
@@ -43,7 +44,7 @@ def _env_positive_float(name: str, default: float) -> float:
     the default — rather than introducing a separate arbitrary floor value.
     """
     value = _env_float(name, default)
-    return value if value > 0 else default
+    return value if math.isfinite(value) and value > 0 else default
 
 
 # =============================================================================
