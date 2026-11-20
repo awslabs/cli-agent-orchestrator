@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add the Qwen Code (`qwen_cli`) provider with profile, skill, MCP and model support.
 
+- **herdr backend: event-driven inbox delivery works again on herdr 0.9.x (protocol 22)**.
+  herdr ≥0.9 acks a broadcast `pane.updated` subscription but never emits the event, so every
+  inbox delivery silently fell back to the 30s reconciliation sweep (measured 51s/83s
+  end-to-end on 0.9.5, slower than the tmux watchdog). The service now subscribes to
+  `pane.agent_status_changed` per managed pane — validated against a live snapshot, because
+  herdr resets the connection when a subscription names an unknown pane — while keeping the
+  broadcast for older herdr versions, and recycles the connection (one `events.subscribe`
+  per connection) when a pane registers later. The subscribe response is now read instead of
+  fire-and-forget, herdr's version/protocol are logged (warning outside the tested range
+  17–22), and delivery log lines name their trigger (`herdr-event`, `herdr-settle`,
+  `settled-sweep`, `reconcile-sweep`, `opencode-poll`) so a dead event path can no longer
+  hide. A single event-driven re-delivery loop per terminal carries a message across the
+  provider's post-turn flush-wait, offloaded off the event loop and stopping as soon as the
+  message lands.
+
 - **Memory inspection and fixture hygiene are safer by default** (#1329).
   This resolves #861 Q3: CLI list/show and REST list/show no longer increment
   `access_count` unless `memory.non_accessing_inspection=false`; MCP recall
