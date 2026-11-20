@@ -413,6 +413,14 @@ class TestGetMemory:
         assert response.status_code == 200
         assert response.json()["content"] == "legacy native project note"
 
+    def test_get_rejects_global_vault_note_for_other_scope_id(self, client, tmp_path, monkeypatch):
+        service, _snapshots = _real_vault_service(tmp_path, monkeypatch, ("vault-global-note",))
+
+        with patch(FACTORY_TARGET, return_value=service):
+            response = client.get("/memory/vault-global-note?scope_id=other")
+
+        assert response.status_code == 404
+
     def test_get_not_found(self, client, mock_service):
         response = client.get("/memory/missing-key")
         assert response.status_code == 404
