@@ -130,12 +130,10 @@ Tests: `test/backends/` (for example `test_herdr_backend.py`,
   ([herdr.md](../herdr.md#session-visible-in-herdr-but-not-in-cao)).
 - **Every CAO terminal vanishes at once (`/sessions` empty, `protocol_mismatch`).** The
   herdr binary was upgraded while its server was running. Diagnose with `herdr status`,
-  then restart the herdr server and relaunch the agents. Seen before 2026-11-19, not
-  re-verified.
+  then restart the herdr server and relaunch the agents. Unverified: reported from use, and nothing in this repo backs it.
 - **Panes that a herdr session restores after a reboot are not CAO's terminals any
   more.** They come back without their launch flags: Codex without `--yolo` or MCP, and
-  Kiro as a bare shell. Replace them with fresh CAO terminals. Seen before 2026-11-19, not
-  re-verified.
+  Kiro as a bare shell. Replace them with fresh CAO terminals. Unverified: reported from use, and nothing in this repo backs it.
 - **Only a short env allowlist reaches tmux agents.** `HOME`, `PATH`, `SHELL`, and the
   `CAO_*`, `KIRO_*`, `MISE_*` and `AWS_*` prefixes. Anything else needs
   `cao launch --env KEY=VALUE` ([tmux.md](../tmux.md#forwarding-env-vars-to-spawned-agents)).

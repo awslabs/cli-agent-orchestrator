@@ -130,4 +130,4 @@ Tests: `test/api/`, `test/utils/test_server_lock.py`, `test/api/test_server_lock
   Checked live on 2026-10-26.
 - **Swapping the Python environment under running `cao-mcp-server` or `cao-tui`
   processes breaks their lazy imports.** Restart them after an upgrade; matching the
-  Python version is not enough. Seen before 2026-11-19, not re-verified.
+  Python version is not enough. Unverified: reported from use, and nothing in this repo backs it.

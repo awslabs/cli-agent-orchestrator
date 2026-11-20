@@ -101,8 +101,8 @@ curl -s "http://localhost:9889/terminals/<terminal-id>/output?mode=last"
 `GET /terminals/<terminal-id>` re-detects the status; `GET /sessions/cao-<id>/terminals`
 lists every terminal with `provider`, `status` and `identity_verified`.
 
-For a real provider, run the same three steps with `--provider claude_code`, `codex` or
-`kiro_cli`. Mock-free provider tests are gated: `CAO_RUN_LIVE_PROVIDER_TESTS=1` with the
+For a real provider, run the same three steps with `--provider <name>`, using any
+provider that shows `installed: true` above. Mock-free provider tests are gated: `CAO_RUN_LIVE_PROVIDER_TESTS=1` with the
 `live_provider` marker, or `pytest -m e2e` (see each provider doc's end-to-end section).
 Unit tests replay captured screens in `test/providers/fixtures/*_output.txt`.
 
@@ -147,8 +147,8 @@ Unit tests replay captured screens in `test/providers/fixtures/*_output.txt`.
 - **A name in `--disallowedTools` that the build doesn't know is not an error.** Claude
   Code starts anyway and only writes a debug-log line, so a typo in a deny list fails
   open. The code notes this for `TeamCreate` and `TeamDelete` on 2.1.318
-  (`utils/tool_mapping.py:165-167`); other names seen on 2.1.318, not re-verified on later
-  builds.
+  (`utils/tool_mapping.py:165-167`); the same holds for other names on 2.1.318, which is
+  unverified on later builds.
 - **`WAITING_USER_ANSWER` means a dialog is open, and the inbox holds messages until it
   closes.** Pasting into Claude Code's choice widget would answer the dialog, so even eager
   delivery (`CAO_EAGER_INBOX_DELIVERY=true`) skips that state
@@ -160,8 +160,7 @@ Unit tests replay captured screens in `test/providers/fixtures/*_output.txt`.
   still count as started ([claude-code.md](../claude-code.md#how-cao-knows-claude-code-has-started)).
 - **A long final message can come back cut short through a workflow `run_step`**, often
   at a Markdown table, which loses anything after it (such as a trailing marker line).
-  The full text is in Claude Code's own session transcript (`.jsonl`). Seen before
-  2026-11-19, not re-verified.
+  The full text is in Claude Code's own session transcript (`.jsonl`). Unverified: reported from use, and nothing in this repo backs it.
 
 ## codex
 
@@ -178,12 +177,11 @@ Unit tests replay captured screens in `test/providers/fixtures/*_output.txt`.
   (`providers/codex.py:1717-1770`; [codex-cli.md](../codex-cli.md#launch-flags)).
 - **Codex's own command rules still apply under `--yolo`.** A rule in
   `~/.codex/rules/` that says "prompt" becomes a refusal, because nobody can answer it.
-  A worker that "can't run `git push`" may be hitting a local rule, not CAO. Seen before
-  2026-11-19 on macOS, not re-verified.
+  A worker that "can't run `git push`" may be hitting a local rule, not CAO. Unverified: reported from use on macOS, and nothing in this repo backs it.
 - **The launch command shows the reasoning effort CAO asked for, not the one Codex
   runs.** CAO sends `model_reasoning_effort` as a `-c` override
   (`providers/codex.py:1468`). The model and effort in the pane's footer are the proof.
-  Seen before 2026-11-19, not re-verified.
+  Unverified: reported from use, and nothing in this repo backs it.
 - **A Codex release with a new folder-trust dialog stalls startup.** CAO knows three
   versions of the dialog, the newest from Codex 0.156 (`providers/codex.py:250-262`).
   If a new release shows different text, the start waits out `provider_init_timeout`.
@@ -213,14 +211,13 @@ Unit tests replay captured screens in `test/providers/fixtures/*_output.txt`.
   ([kiro-cli.md](../kiro-cli.md#faq)).
 - **A handoff to Kiro can return only Kiro's footer line.** The real answer is in the
   terminal's log (`logs/terminal/<terminal-id>.log`, or `.scrollback` after delete).
-  Read it before re-sending a task that writes files. Seen before 2026-11-19, not
-  re-verified.
+  Read it before re-sending a task that writes files. Unverified: reported from use, and nothing in this repo backs it.
 - **An `assign` to Kiro can drop the task.** The pane shows an empty prompt and
   "1 MCP failure", and the status reads `completed`. Check the pane about 60 s after
-  assigning, and resend with `send_message`. Seen before 2026-11-19, not re-verified.
+  assigning, and resend with `send_message`. Unverified: reported from use, and nothing in this repo backs it.
 - **On the `auto` model, Kiro can refuse `send_message` with an explicit
   `receiver_id`,** but it calls the tool with `receiver_id` left out, which replies to
-  the caller. Seen before 2026-11-19, not re-verified.
+  the caller. Unverified: reported from use, and nothing in this repo backs it.
 - **On a loaded machine, a v3 start can outlast the client's wait.** With
   `provider_init_timeout` above about 90 s, `cao launch` reports a failure while the
   server goes on to start the agent ([kiro-cli.md](../kiro-cli.md#known-limitations)).

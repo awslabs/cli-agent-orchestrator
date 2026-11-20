@@ -3,7 +3,8 @@
 ## Why this exists
 
 Coding agents copy what they see and guess what things are called. CAO has many
-moving parts: 13 real providers plus a mock one, three terminal backends, sessions,
+moving parts: 13 real providers plus a mock one (`ProviderType`, `models/provider.py:4-21`),
+three terminal backends (`tmux`, `herdr`, `herdr-app`; `backends/factory.py:27-106`), sessions,
 terminals, an inbox, workflows and memory. The facts about how to check each part are
 spread across `docs/`, test files, skills and PR threads. Some of the most useful facts
 are the traps: a status that reads one thing while the screen shows another.
@@ -32,8 +33,8 @@ depth instead of copying it.
 - Output is pasted from a real run on CAO 2.5.4, shortened with `…`. Ids such as
   `cao-<id>` and `<terminal-id>` stand for the random ids CAO prints.
 - A "what usually lies" item cites the code or doc that backs it (`path:line` on the
-  commit the entry was last checked against). An item that could not be checked in code
-  says "seen on <date>, not re-verified".
+  commit the entry was last checked against). An item that could not be checked against
+  code, a doc or a run says "unverified", so a reader knows to check it before relying on it.
 - To drive an area without touching your real CAO, use a scratch server. It needs a
   home of its own, because the server lock is per home, not per port (see
   [server-and-health](server-and-health.md)):
@@ -84,5 +85,5 @@ first, then sessions and delegation, then the rest, and finally an end-to-end jo
 
 Copy the four headings from an existing file. Write the Drive step by running it, and
 paste the real output. For each "what usually lies" item, cite the code or doc that
-backs it, or mark it "seen on <date>, not re-verified". Then add the file to the table
+backs it, or mark it "unverified". Then add the file to the table
 above.
