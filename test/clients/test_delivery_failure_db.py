@@ -18,6 +18,7 @@ from cli_agent_orchestrator.clients.database import (
     Base,
     InboxModel,
     close_delegation_edge,
+    close_delegation_edge_with_message,
     close_open_edges_for_terminal,
     create_delegation_edge,
     create_inbox_message,
@@ -101,12 +102,15 @@ class TestMigration:
         inbox_cols = _columns(path, "inbox")
         assert inbox_cols.count("delivery_attempts") == 1
         assert inbox_cols.count("last_error") == 1
+        assert inbox_cols.count("is_system_notice") == 1
         with closing_transaction(sqlite3.connect(path)) as conn:
-            inbox_row = conn.execute("SELECT delivery_attempts, last_error FROM inbox").fetchone()
+            inbox_row = conn.execute(
+                "SELECT delivery_attempts, last_error, is_system_notice FROM inbox"
+            ).fetchone()
             edge_row = conn.execute(
                 "SELECT state, reply_message_id FROM delegation_edges"
             ).fetchone()
-        assert inbox_row == (0, None), "legacy rows read as 'no failed attempts'"
+        assert inbox_row == (0, None, 0), "legacy rows read as 'no failed attempts', not a notice"
         assert edge_row == ("open", None), "legacy open edges read as 'no reply in flight'"
 
     def test_database_that_already_has_the_columns_is_left_as_is(self, tmp_path, monkeypatch):
@@ -119,7 +123,11 @@ class TestMigration:
                 "ALTER TABLE inbox ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0"
             )
             conn.execute("ALTER TABLE inbox ADD COLUMN last_error TEXT")
-            conn.execute("UPDATE inbox SET delivery_attempts = 2, last_error = 'lost read'")
+            conn.execute("ALTER TABLE inbox ADD COLUMN is_system_notice INTEGER NOT NULL DEFAULT 0")
+            conn.execute(
+                "UPDATE inbox SET delivery_attempts = 2, last_error = 'lost read', "
+                "is_system_notice = 1"
+            )
             conn.execute("UPDATE delegation_edges SET reply_message_id = 41")
         before = (_columns(path, "inbox"), _columns(path, "delegation_edges"))
         monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
@@ -130,9 +138,11 @@ class TestMigration:
         # Assert
         assert (_columns(path, "inbox"), _columns(path, "delegation_edges")) == before
         with closing_transaction(sqlite3.connect(path)) as conn:
-            inbox_row = conn.execute("SELECT delivery_attempts, last_error FROM inbox").fetchone()
+            inbox_row = conn.execute(
+                "SELECT delivery_attempts, last_error, is_system_notice FROM inbox"
+            ).fetchone()
             edge_row = conn.execute("SELECT reply_message_id FROM delegation_edges").fetchone()
-        assert inbox_row == (2, "lost read")
+        assert inbox_row == (2, "lost read", 1)
         assert edge_row == (41,)
 
     def test_only_the_missing_column_of_a_partly_migrated_table_is_added(
@@ -154,7 +164,35 @@ class TestMigration:
         inbox_cols = _columns(path, "inbox")
         assert inbox_cols.count("delivery_attempts") == 1
         assert inbox_cols.count("last_error") == 1
+        assert inbox_cols.count("is_system_notice") == 1
         assert _columns(path, "delegation_edges").count("reply_message_id") == 1
+
+    def test_only_is_system_notice_is_added_to_a_database_with_the_earlier_columns(
+        self, tmp_path, monkeypatch
+    ):
+        # Arrange: a DB written before the notice mark existed, with a failed attempt on file.
+        path = tmp_path / "before_the_mark.db"
+        self._legacy(path)
+        with closing_transaction(sqlite3.connect(path)) as conn:
+            conn.execute("ALTER TABLE delegation_edges ADD COLUMN reply_message_id INTEGER")
+            conn.execute(
+                "ALTER TABLE inbox ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.execute("ALTER TABLE inbox ADD COLUMN last_error TEXT")
+            conn.execute("UPDATE inbox SET delivery_attempts = 1, last_error = 'lost read'")
+        monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
+
+        # Act
+        database._migrate_delivery_failure_columns()
+        database._migrate_delivery_failure_columns()
+
+        # Assert
+        assert _columns(path, "inbox").count("is_system_notice") == 1
+        with closing_transaction(sqlite3.connect(path)) as conn:
+            row = conn.execute(
+                "SELECT delivery_attempts, last_error, is_system_notice FROM inbox"
+            ).fetchone()
+        assert row == (1, "lost read", 0)
 
     def test_creates_nothing_without_the_tables(self, tmp_path, monkeypatch):
         # Arrange
@@ -226,8 +264,10 @@ class TestInitDbOnALegacyDatabase:
         # Assert
         assert _columns(legacy_home, "delegation_edges").count("reply_message_id") == 1
         assert _columns(legacy_home, "inbox").count("delivery_attempts") == 1
+        assert _columns(legacy_home, "inbox").count("is_system_notice") == 1
         [message] = get_inbox_messages("sup")
         assert (message.delivery_attempts, message.last_error) == (0, None)
+        assert message.is_system_notice is False
         assert find_open_edge("sup", "w1").reply_message_id is None
 
 
@@ -244,6 +284,17 @@ class TestModels:
             created_at=datetime.now(timezone.utc),
         )
         assert (message.delivery_attempts, message.last_error) == (0, None)
+
+    def test_inbox_message_defaults_to_an_ordinary_message(self):
+        message = InboxMessage(
+            id=1,
+            sender_id="w1",
+            receiver_id="sup",
+            message="hi",
+            status=MessageStatus.PENDING,
+            created_at=datetime.now(timezone.utc),
+        )
+        assert message.is_system_notice is False
 
     def test_delegation_edge_defaults_to_no_reply_in_flight(self):
         edge = DelegationEdge(
@@ -282,6 +333,40 @@ class TestInboxRowConversion:
         database.record_delivery_failure(created.id, "lost terminal.read")
         [read] = get_inbox_messages("sup")
         assert (read.delivery_attempts, read.last_error) == (1, "lost terminal.read")
+
+
+class TestSystemNoticeMark:
+    """A notice CAO wrote is marked in its row; text that only looks like one is not."""
+
+    def test_a_message_is_ordinary_unless_marked(self, db):
+        create_terminal("sup", "cao-s", "sup", "claude_code")
+        created = create_inbox_message("w1", "sup", "[CAO worker ended] forwarded by a peer")
+        [read] = get_inbox_messages("sup")
+        assert (created.is_system_notice, read.is_system_notice) == (False, False)
+
+    def test_a_marked_message_reads_back_marked(self, db):
+        create_terminal("sup", "cao-s", "sup", "claude_code")
+        created = create_inbox_message("w1", "sup", "notice", is_system_notice=True)
+        [read] = get_inbox_messages("sup")
+        assert (created.is_system_notice, read.is_system_notice) == (True, True)
+
+    def test_the_notice_queued_with_a_closing_edge_is_marked(self, db):
+        create_terminal("sup", "cao-s", "sup", "claude_code")
+        edge = create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
+        assert close_delegation_edge_with_message(
+            edge.id, EdgeState.WORKER_ENDED, "w1", "sup", "notice", is_system_notice=True
+        )
+        [read] = get_inbox_messages("sup")
+        assert (read.message, read.is_system_notice) == ("notice", True)
+
+    def test_a_message_queued_with_a_closing_edge_is_ordinary_unless_marked(self, db):
+        create_terminal("sup", "cao-s", "sup", "claude_code")
+        edge = create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
+        assert close_delegation_edge_with_message(
+            edge.id, EdgeState.WORKER_ENDED, "w1", "sup", "notice"
+        )
+        [read] = get_inbox_messages("sup")
+        assert read.is_system_notice is False
 
 
 class TestReplyInFlight:
