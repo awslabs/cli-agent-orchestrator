@@ -796,11 +796,10 @@ def show(key, scope):
     _validate_key(key)
     svc = _get_memory_service()
     try:
-        memories = _run_async(
-            svc.recall(
-                query=key,
+        match = _run_async(
+            svc.read_exact_key(
+                key,
                 scope=scope,
-                limit=100,
                 terminal_context=_cwd_context(),
                 scan_all=True,
                 record_access=not is_non_accessing_inspection_enabled(),
@@ -808,13 +807,6 @@ def show(key, scope):
         )
     except Exception as e:
         raise click.ClickException(str(e))
-
-    # Find exact key match
-    match = None
-    for mem in memories:
-        if mem.key == key:
-            match = mem
-            break
 
     if not match:
         raise click.ClickException(f"Memory '{key}' not found.")
