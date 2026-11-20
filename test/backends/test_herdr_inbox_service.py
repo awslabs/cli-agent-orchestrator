@@ -18,6 +18,7 @@ from cli_agent_orchestrator.services.herdr_inbox_service import (
     _ResubscribeRequested,
     _retain_deferred_failure_tombstone,
 )
+from cli_agent_orchestrator.services.inbox_service import DELIVERY_DEFERRED
 
 
 def _run_async(coro):
@@ -1458,6 +1459,35 @@ class TestHerdrInboxServiceSettleRetries:
     re-delivery that closes that gap.
     """
 
+    @pytest.mark.parametrize("result", [0, DELIVERY_DEFERRED, 1])
+    @pytest.mark.parametrize("source", ["herdr-event", "settled-sweep"])
+    @pytest.mark.parametrize("status", ["idle", "done"])
+    def test_only_deferred_delivery_arms_retries(self, result, source, status):
+        callback = MagicMock(return_value=result)
+        service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
+        service._pane_to_terminal = {"w1:p1": "tid1"}
+        pane = {"pane_id": "w1:p1", "agent_status": status}
+
+        async def run():
+            with (
+                patch.object(service, "_arm_settle_retries") as arm,
+                patch.object(service, "_record_agent_status", new=AsyncMock()),
+                patch.object(service, "_fetch_snapshot", return_value={"panes": [pane]}),
+            ):
+                if source == "herdr-event":
+                    await service._dispatch_event(
+                        {"event": "pane.agent_status_changed", "data": pane}
+                    )
+                else:
+                    await service._deliver_settled_panes()
+                callback.assert_called_once_with("tid1", source)
+                if result == DELIVERY_DEFERRED:
+                    arm.assert_called_once_with("tid1")
+                else:
+                    arm.assert_not_called()
+
+        _run_async(run())
+
     def test_idle_event_arms_bounded_retries(self):
         """A done event delivers once immediately, then re-delivers at each
         tick with the herdr-settle source."""
@@ -1466,7 +1496,9 @@ class TestHerdrInboxServiceSettleRetries:
         calls = []
         service = HerdrInboxService(
             socket_path="/tmp/test.sock",
-            delivery_callback=lambda tid, source: calls.append((tid, source)),
+            delivery_callback=lambda tid, source: (calls.append((tid, source)), DELIVERY_DEFERRED)[
+                1
+            ],
         )
         service._pane_to_terminal = {"w1:p1": "tid1"}
         service._terminal_to_pane = {"tid1": "w1:p1"}

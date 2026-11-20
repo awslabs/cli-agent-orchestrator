@@ -30,6 +30,8 @@ import time
 from datetime import datetime, timezone
 from typing import Callable, Dict, Optional, Set
 
+from cli_agent_orchestrator.services.inbox_service import DELIVERY_DEFERRED
+
 logger = logging.getLogger(__name__)
 
 # Exponential backoff parameters
@@ -1092,8 +1094,8 @@ class HerdrInboxService:
                 self._working_since.pop(terminal_id, None)
                 # A pane already settled at connect time has the same flush-wait
                 # gap as a live event, and no event will follow, so carry it too
-                # — but only if the immediate attempt didn't already land.
-                if self._deliver(terminal_id, source="settled-sweep") == 0:
+                # — but only if queued messages are deferred by the readiness gate.
+                if self._deliver(terminal_id, source="settled-sweep") == DELIVERY_DEFERRED:
                     self._arm_settle_retries(terminal_id)
                 delivered += 1
             self._note_activity(terminal_id, pane.get("agent_status"))
@@ -1408,13 +1410,11 @@ class HerdrInboxService:
         if status in ("idle", "done"):
             # Clear working timestamp
             self._working_since.pop(terminal_id, None)
-            # Trigger delivery now; only arm the flush-wait re-check if nothing
-            # landed. This single event is the only agent-status signal herdr
-            # sends for the transition, so if the provider isn't ready yet
-            # (delivered 0) the retry loop carries it; if it already delivered,
-            # arming would just fire one redundant attempt (matches the loop's
-            # own > 0 stop rule).
-            if self._deliver(terminal_id, source="herdr-event") == 0:
+            # Trigger delivery now; only arm the flush-wait re-check when
+            # queued messages are deferred by the readiness gate. Herdr sends
+            # only one agent-status event for this transition, so the retry
+            # loop carries pending messages until the provider is ready.
+            if self._deliver(terminal_id, source="herdr-event") == DELIVERY_DEFERRED:
                 self._arm_settle_retries(terminal_id)
 
         elif status == "working":
@@ -1804,7 +1804,7 @@ class HerdrInboxService:
         self._settle_tasks.clear()
 
     def _deliver(self, terminal_id: str, source: str = "herdr") -> int:
-        """Check and deliver pending messages for a terminal; return the count.
+        """Deliver pending messages; pass through the three-state delivery result.
 
         ``source`` names the trigger (herdr-event, herdr-settle, settled-sweep,
         kiro-supplement) so a delivery in the logs can be told apart from the
