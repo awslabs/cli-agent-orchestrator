@@ -840,6 +840,59 @@ raise an interrupt, resume exactly-once (idempotent), and expire on transition:
 
 ---
 
+## Post-3.0 previews
+
+Three read-only previews of work that waits on the CAO 3.0 tenant model (#778), the
+tenant audit store (#782) and A2UI 1.0. They sit behind one flag,
+`CAO_AGUI_POST3_PREVIEW=true`, and also need the AG-UI surface itself to be on. With
+either flag off the three routes return the same `404 {"detail": "Not Found"}` as an
+unregistered path, the approval route writes nothing, and
+the server behaves as it does without the feature. There is one tenant, `local`, and
+no route takes a tenant from the request.
+
+| Route | Scope | What it returns | Issue |
+|---|---|---|---|
+| `GET /agui/v1/preview/team-composition` | `cao:read` | `agent_card` props per terminal and `metric` props for member and provider counts, capped at 50 cards. No cost metric: CAO records no cost per terminal. | #1162 |
+| `GET /agui/v1/preview/approvals` | `cao:read` | Counts by decision and by provider, and the 20 most recent records, from the local decision log. | #1164 |
+| `POST /agui/v1/preview/a2ui` | `cao:write` | A `metric` as an A2UI v0.9.1 surface on an `ACTIVITY_SNAPSHOT` frame (`activityType: "a2ui-surface"`), and the text a reference renderer draws from it. Publishes no UI frame. An off-list name leaves the same metadata-only refusal record as `emit_ui`. | #1194 |
+
+**Decision log.** While the flag is on, each first approve, deny or edit through
+`POST /agui/v1/interrupts/{id}/resume` appends one JSON line to
+`<CAO home>/agui/decisions/local.jsonl`. The directory and file are set to owner-only
+(`0700`, `0600`) on every write, including a file that already existed with a looser
+mode. The file rotates to `local.jsonl.1` past 1 MiB and one generation is kept; the
+summary reads both files, so counts cover the last one or two generations and the oldest
+records drop off after a second rotation. A line holds the interrupt id, terminal id,
+provider, decision, whether the text was edited, and the outcome. It never holds the
+edited text or the prompt. A repeated resume of a resolved interrupt is not logged
+again. That check is best effort: two first resumes racing can both write, and the
+summary counts the earlier line per interrupt id. A corrupt line is skipped. A failed
+write is logged and does not fail the resume.
+
+The log and the `recent` list hold raw interrupt and terminal ids. Any `cao:read` caller
+can already see terminal ids in the fleet snapshot, so this adds no new exposure; interrupt
+ids are new to that audience but only resolve on a `cao:write` route. This is the one
+write the previews make, apart from the refusal record described under A2UI.
+
+**A2UI.** The allow-list is unchanged and stays the gate. Only `metric` has an A2UI
+rendering; the other five listed components get a `400`, and an off-list name gets the
+same `400` and metadata-only refusal record as `emit_ui`. Text props lose control
+characters, angle brackets, square brackets, parentheses and backticks, and a value that
+looks like a URL becomes empty, so a Markdown-parsing renderer has no link or script to
+follow. A renderer must still treat `Text` as plain text: an HTML entity such as `&lt;` passes through the filter unchanged. The reference renderer understands `Card`, `Column` and `Text` from the A2UI
+Basic Catalog and refuses anything else. Run the
+[example](../examples/ag-ui/a2ui-metric-preview/README.md).
+
+**When the blockers land.** The previews are meant to be replaced, not extended:
+
+- #778 (tenants): `LOCAL_TENANT_ID` becomes the caller's tenant from the server's
+  context, and the team projection filters by it. The routes keep their shape.
+- #782 (audit store): the JSON-lines decision log moves into the tenant-scoped audit
+  store, and `GET /agui/v1/preview/approvals` reads from there.
+- A2UI 1.0: the preview emits v0.9.1 messages. 1.0 changes the version field and
+  `createSurface` can carry the components, so `to_a2ui_operations` is the one function
+  to change, and the reference renderer gives way to the project's own.
+
 ## Privacy boundary
 
 `/agui/v1/stream` redacts message bodies (same contract as the SSE bus and the
