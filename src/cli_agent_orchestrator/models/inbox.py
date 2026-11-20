@@ -43,6 +43,9 @@ class InboxMessage(BaseModel):
     created_at: datetime = Field(..., description="Creation timestamp (UTC)")
     delivery_attempts: int = Field(default=0, description="Failed delivery attempts so far")
     last_error: Optional[str] = Field(default=None, description="Error of the last failed attempt")
+    is_system_notice: bool = Field(
+        default=False, description="True for a notice CAO queued itself, not a peer's message"
+    )
 
     @field_validator("created_at")
     @classmethod

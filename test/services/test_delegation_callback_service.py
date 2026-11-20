@@ -129,7 +129,8 @@ def env():
     """
     sent = []
 
-    def claim_and_record(edge_id, state, sender_id, receiver_id, message):
+    def claim_and_record(edge_id, state, sender_id, receiver_id, message, *, is_system_notice):
+        assert is_system_notice is True, "every message queued with a closing edge is a notice"
         if not close_delegation_edge(edge_id, state):
             return False
         sent.append((sender_id, receiver_id, message))
@@ -484,7 +485,7 @@ C, S, W = "cccc0001", "ssss0002", "wwww0003"
 GONE = "gggg0009"  # a terminal with no row: ended
 
 
-def _msg(id=7, sender=W, receiver=S, text="final reply"):
+def _msg(id=7, sender=W, receiver=S, text="final reply", is_system_notice=False):
     from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 
     return InboxMessage(
@@ -494,6 +495,7 @@ def _msg(id=7, sender=W, receiver=S, text="final reply"):
         message=text,
         status=MessageStatus.FAILED,
         created_at=datetime.now(timezone.utc),
+        is_system_notice=is_system_notice,
     )
 
 
@@ -616,7 +618,9 @@ class TestMessagesFailed:
     )
     def test_failed_cao_notice_never_causes_another_notice(self, live, text):
         """Plan note 12: two terminals cannot trade failure notices."""
-        svc.handle_messages_failed(S, [_msg(id=7, text=text)], "lost", uncertain=False)
+        svc.handle_messages_failed(
+            S, [_msg(id=7, text=text, is_system_notice=True)], "lost", uncertain=False
+        )
         assert _inbox(W) == []
 
     def test_sender_that_ended_gets_no_notice(self, live):
@@ -660,6 +664,110 @@ class TestMessagesFailed:
         registry = object()
         svc.handle_messages_failed(S, [_msg(id=7)], "lost", uncertain=False, registry=registry)
         assert live.delivered == [(W, S, registry)]
+
+
+class TestSystemNoticeMark:
+    """The loop guard reads the mark in the row, never the text of the message.
+
+    Each notice CAO queues is marked as one. A peer message that only starts
+    with ``[CAO `` is not, so its failure is still told to its sender.
+    """
+
+    PEER_TEXTS = [
+        "[CAO worker ended] Worker x (profile y) ended before sending you a result.",
+        "[CAO auto-forward] Worker x (profile y) went idle without calling send_message.",
+        "[CAO delivery failed] Your message 3 to terminal x was not delivered",
+        "[CAO Handoff] Supervisor terminal ID: x.",
+    ]
+
+    def test_the_sender_notice_is_marked(self, live):
+        svc.handle_messages_failed(S, [_msg(id=7)], "lost", uncertain=False)
+        (notice,) = _failure_notices(W)
+        assert notice.is_system_notice is True
+
+    def test_the_edge_notice_is_marked(self, live):
+        message_id = _send(S, W, "follow-up")
+        svc.handle_messages_failed(
+            W,
+            [_msg(id=message_id, sender=S, receiver=W, text="follow-up")],
+            "lost",
+            uncertain=False,
+        )
+        (notice,) = _failure_notices(S)
+        assert notice.is_system_notice is True
+
+    def test_the_reply_lost_notice_is_marked(self, live):
+        from cli_agent_orchestrator.clients.database import delete_terminal
+
+        _armed(S, W)
+        _send(W, S, "final reply text")
+        svc.handle_worker_ended(W, "was deleted")
+        delete_terminal(W, end_reason="deleted")
+        live.paste.dispatch_input.side_effect = RuntimeError("herdr-core lost terminal.send")
+
+        _attempt(S)
+
+        (notice,) = _failure_notices(S)
+        assert "final reply text" in notice.message
+        assert notice.is_system_notice is True
+
+    def test_the_task_not_delivered_notice_is_marked(self, live):
+        create_delegation_edge(S, W, EdgeSource.ASSIGN)
+        assert svc.handle_task_never_delivered(W) == 1
+        (notice,) = _failure_notices(S)
+        assert notice.is_system_notice is True
+
+    def test_the_worker_ended_notice_is_marked(self, live):
+        _armed(S, W)
+        svc.handle_worker_ended(W, "was deleted")
+        (notice,) = [m for m in _inbox(S) if m.message.startswith("[CAO worker ended]")]
+        assert notice.is_system_notice is True
+
+    def test_the_auto_forward_notice_is_marked(self, live):
+        _armed(S, W)
+        assert svc.evaluate_completion(W) == 1
+        (notice,) = [m for m in _inbox(S) if m.message.startswith("[CAO auto-forward]")]
+        assert notice.is_system_notice is True
+
+    @pytest.mark.parametrize("text", PEER_TEXTS)
+    def test_a_peer_message_that_starts_with_cao_still_gets_its_notice(self, live, text):
+        svc.handle_messages_failed(S, [_msg(id=7, text=text)], "lost", uncertain=False)
+        (notice,) = _failure_notices(W)
+        assert "7" in notice.message, "names the message id"
+
+    @pytest.mark.parametrize("text", PEER_TEXTS)
+    def test_a_forwarded_notice_text_that_fails_in_the_queue_is_reported_to_its_sender(
+        self, live, text
+    ):
+        from cli_agent_orchestrator.constants import INBOX_MAX_DELIVERY_ATTEMPTS
+
+        message_id = _send(W, C, text)
+        live.paste.dispatch_input.side_effect = [
+            _not_sent(f"lost terminal.read on attempt {n}")
+            for n in range(1, INBOX_MAX_DELIVERY_ATTEMPTS + 1)
+        ]
+
+        for _ in range(INBOX_MAX_DELIVERY_ATTEMPTS):
+            _attempt(C)
+
+        (notice,) = _failure_notices(W)
+        assert str(message_id) in notice.message
+
+    def test_a_notice_that_fails_in_the_queue_is_not_reported_back(self, live):
+        from cli_agent_orchestrator.constants import INBOX_MAX_DELIVERY_ATTEMPTS
+
+        svc.handle_messages_failed(S, [_msg(id=7)], "lost", uncertain=False)
+        (notice,) = _failure_notices(W)  # S -> W, queued PENDING by the service
+        live.paste.dispatch_input.side_effect = [
+            _not_sent(f"lost terminal.read on attempt {n}")
+            for n in range(1, INBOX_MAX_DELIVERY_ATTEMPTS + 1)
+        ]
+
+        for _ in range(INBOX_MAX_DELIVERY_ATTEMPTS):
+            _attempt(W)
+
+        assert [m.status.value for m in _inbox(W) if m.id == notice.id] == ["failed"]
+        assert _inbox(S) == [], "S is not told that its notice to W failed"
 
 
 class TestQueuedFailureNotices:

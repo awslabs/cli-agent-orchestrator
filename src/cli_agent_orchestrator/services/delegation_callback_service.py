@@ -236,9 +236,12 @@ def _close_and_notify(edge: DelegationEdge, state: EdgeState, sender_id: str, te
     The conditional close is the claim: concurrent evaluators can list the
     same edge, and only the one that closes it may send. The message is
     queued in the same commit as the close (see
-    ``close_delegation_edge_with_message``).
+    ``close_delegation_edge_with_message``). Everything sent here is a notice
+    CAO wrote, so it is marked as one.
     """
-    return close_delegation_edge_with_message(edge.id, state, sender_id, edge.caller_id, text)
+    return close_delegation_edge_with_message(
+        edge.id, state, sender_id, edge.caller_id, text, is_system_notice=True
+    )
 
 
 def _deliver(receiver_id: str, sender_id: str, registry: PluginRegistry | None) -> None:
@@ -466,7 +469,9 @@ def handle_messages_failed(
     flight, so its caller waits on the worker again (D7), and is told with the
     stored reply only when the worker has ended; and any other sender gets
     ``[CAO delivery failed]`` (D6). A failed CAO notice never causes another
-    notice, so two terminals cannot trade failure notices.
+    notice, so two terminals cannot trade failure notices. A notice is told
+    apart by the mark CAO sets on its row, not by its text: a peer message that
+    starts with ``[CAO `` is still reported to its sender.
 
     Args:
         receiver_id: The terminal the messages were for.
@@ -491,13 +496,13 @@ def handle_messages_failed(
         _tell_caller_if_replier_ended(edge, reason, reply.message if reply else None, registry)
 
     for message in messages:
-        if message.id in reported or message.id in told or message.message.startswith("[CAO "):
+        if message.id in reported or message.id in told or message.is_system_notice:
             continue
         if get_terminal_metadata(message.sender_id) is None:
             continue
         notice = build_message_not_delivered_message(receiver_id, message.id, reason, uncertain)
         try:
-            create_inbox_message(receiver_id, message.sender_id, notice)
+            create_inbox_message(receiver_id, message.sender_id, notice, is_system_notice=True)
         except ValueError:
             continue  # the sender's row went away in between
         _deliver(message.sender_id, receiver_id, registry)

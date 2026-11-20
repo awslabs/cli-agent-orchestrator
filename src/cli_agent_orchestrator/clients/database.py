@@ -394,6 +394,9 @@ class InboxModel(Base):
     created_at = Column(UTCDateTime, default=_utcnow)
     delivery_attempts = Column(Integer, nullable=False, default=0, server_default="0")
     last_error = Column(String, nullable=True)
+    # 1 for a notice CAO queued itself (auto-forward, worker ended, delivery
+    # failed). The failure-notice loop guard reads this, never the text.
+    is_system_notice = Column(Integer, nullable=False, default=0, server_default="0")
 
 
 class DelegationEdgeModel(Base):
@@ -1501,6 +1504,9 @@ _DELIVERY_FAILURE_COLUMNS = {
             "ALTER TABLE inbox ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0"
         ),
         "last_error": "ALTER TABLE inbox ADD COLUMN last_error TEXT",
+        "is_system_notice": (
+            "ALTER TABLE inbox ADD COLUMN is_system_notice INTEGER NOT NULL DEFAULT 0"
+        ),
     },
 }
 
@@ -1510,7 +1516,8 @@ def _migrate_delivery_failure_columns() -> None:
 
     PRAGMA table_info gate per table, ALTER TABLE ADD COLUMN only for a missing
     column. A table that does not exist yet is skipped: create_all makes it with
-    the columns. Existing rows read as "no reply in flight" and "no failures".
+    the columns. Existing rows read as "no reply in flight", "no failures" and
+    "not a CAO notice".
     """
     import sqlite3
 
@@ -4031,8 +4038,14 @@ def delete_terminals_by_ids(terminal_ids: List[str], *, end_reason: str) -> int:
     return len(deleted_ids)
 
 
-def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:
+def create_inbox_message(
+    sender_id: str, receiver_id: str, message: str, *, is_system_notice: bool = False
+) -> InboxMessage:
     """Create inbox message with status=MessageStatus.PENDING.
+
+    ``is_system_notice`` marks a notice CAO queues itself, so a failure of that
+    notice is never reported back as a failure (see ``handle_messages_failed``).
+    Only server code sets it; the inbox POST never does.
 
     Raises:
         ValueError: If the receiver terminal does not exist.
@@ -4045,6 +4058,7 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
             receiver_id=receiver_id,
             message=message,
             status=MessageStatus.PENDING.value,
+            is_system_notice=1 if is_system_notice else 0,
         )
         db.add(inbox_msg)
         db.commit()
@@ -4058,6 +4072,7 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
             created_at=inbox_msg.created_at,
             delivery_attempts=inbox_msg.delivery_attempts or 0,
             last_error=inbox_msg.last_error,
+            is_system_notice=bool(inbox_msg.is_system_notice),
         )
 
 
@@ -4132,6 +4147,7 @@ def get_inbox_messages(
                 created_at=msg.created_at,
                 delivery_attempts=msg.delivery_attempts or 0,
                 last_error=msg.last_error,
+                is_system_notice=bool(msg.is_system_notice),
             )
             for msg in messages
         ]
@@ -4526,6 +4542,7 @@ def get_inbox_message(message_id: int) -> Optional[InboxMessage]:
             created_at=row.created_at,
             delivery_attempts=row.delivery_attempts or 0,
             last_error=row.last_error,
+            is_system_notice=bool(row.is_system_notice),
         )
 
 
@@ -4597,7 +4614,13 @@ def close_delegation_edge(
 
 
 def close_delegation_edge_with_message(
-    edge_id: int, state: EdgeState, sender_id: str, receiver_id: str, message: str
+    edge_id: int,
+    state: EdgeState,
+    sender_id: str,
+    receiver_id: str,
+    message: str,
+    *,
+    is_system_notice: bool = False,
 ) -> bool:
     """Close an OPEN edge and queue ``message`` for ``receiver_id`` in one commit.
 
@@ -4611,6 +4634,7 @@ def close_delegation_edge_with_message(
     An edge with a reply in flight is never claimed this way: the worker has
     answered, so no auto-forward or worker-ended notice may go out for it, even
     when the reply was marked after the caller listed the edge (design D2, D8).
+    ``is_system_notice`` marks the queued message as a notice CAO wrote.
     """
     with SessionLocal() as db:
         count = (
@@ -4632,6 +4656,7 @@ def close_delegation_edge_with_message(
                     receiver_id=receiver_id,
                     message=message,
                     status=MessageStatus.PENDING.value,
+                    is_system_notice=1 if is_system_notice else 0,
                 )
             )
         db.commit()
