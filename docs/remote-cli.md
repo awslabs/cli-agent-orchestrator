@@ -1,8 +1,8 @@
 # Remote CLI reference
 
 `cao remote` stores local registrations for experimental Remote CAO boxes and
-checks laptop and remote prerequisites. It never creates cloud resources,
-or changes a registered box during a check. The SSH stage uses the user's SSH
+checks laptop and remote prerequisites. It never creates cloud resources or
+changes a registered box during a check. The SSH stage uses the user's SSH
 configuration, which can open SSM sessions (up to three during a full check).
 
 ```bash

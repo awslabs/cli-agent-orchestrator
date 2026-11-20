@@ -96,7 +96,7 @@ def check_box(
             "installed" if _ok(plugin) else "install the Session Manager plugin",
         )
     )
-    ssh = runner.run(["ssh", "-V"])
+    ssh = runner.run(["ssh", "-o", "ForwardAgent=no", "-V"])
     checks.append(
         Check("OK" if _ok(ssh) else "FIX", "ssh", "installed" if _ok(ssh) else "install OpenSSH")
     )
@@ -185,7 +185,9 @@ def check_box(
     checks.append(
         Check("OK" if online else "FIX", "ssm", "Online" if online else "SSM must be Online")
     )
-    ssh_options = _ssh_options(runner.run(["ssh", "-G", f"cao-{box.name}"]))
+    ssh_options = _ssh_options(
+        runner.run(["ssh", "-o", "ForwardAgent=no", "-G", f"cao-{box.name}"])
+    )
     identity_files = [_identity_path(value, home) for value in ssh_options.get("identityfile", [])]
     key_exists = any(path.exists() for path in identity_files)
     checks.append(
@@ -212,7 +214,9 @@ def check_box(
             ]
         )
         return checks
-    remote = runner.run(["ssh", "-o", "BatchMode=yes", f"cao-{box.name}", "true"])
+    remote = runner.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ForwardAgent=no", f"cao-{box.name}", "true"]
+    )
     checks.append(
         Check(
             "OK" if _ok(remote) else "FIX",
@@ -226,7 +230,15 @@ def check_box(
     if box.mode == "herdr":
         # herdr is in the box user's ~/.local/bin, which only a login shell puts on PATH.
         remote_herdr = runner.run(
-            ["ssh", "-o", "BatchMode=yes", f"cao-{box.name}", "bash -lc 'herdr --version'"]
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ForwardAgent=no",
+                f"cao-{box.name}",
+                "bash -lc 'herdr --version'",
+            ]
         )
         matching = _ok(remote_herdr) and _version(remote_herdr) == _version(laptop_herdr)
         checks.append(
@@ -237,7 +249,9 @@ def check_box(
             )
         )
     else:
-        tmux = runner.run(["ssh", "-o", "BatchMode=yes", f"cao-{box.name}", "tmux", "-V"])
+        tmux = runner.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ForwardAgent=no", f"cao-{box.name}", "tmux", "-V"]
+        )
         supported = _tmux_supported(tmux)
         checks.append(
             Check(
@@ -251,6 +265,8 @@ def check_box(
             "ssh",
             "-o",
             "BatchMode=yes",
+            "-o",
+            "ForwardAgent=no",
             f"cao-{box.name}",
             "curl",
             "-fsS",
