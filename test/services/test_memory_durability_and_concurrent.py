@@ -292,7 +292,7 @@ def test_per_scope_sort_returns_newest_n(tmp_path: Path) -> None:
     block = svc.get_memory_context_for_terminal("term-u4", budget_chars=100_000)
     assert block, "context block must not be empty"
 
-    inner = block.split("<cao-memory>")[1].split("</cao-memory>")[0]
+    inner = block.split(">", 1)[1].split("</cao-memory>")[0]
     global_line_keys: list[str] = []
     for line in inner.splitlines():
         if not line.startswith("- [global] "):

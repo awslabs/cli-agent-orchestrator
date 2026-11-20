@@ -15,7 +15,7 @@ if ! curl -sf http://localhost:9889/health > /dev/null 2>&1; then
 fi
 
 # Check the topology widget (requires no build)
-TOPO_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost:9889/widgets/topology/topology.html 2>/dev/null || echo "000")
+TOPO_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 http://localhost:9889/widgets/topology/topology.html 2>/dev/null || true)
 if [ "$TOPO_STATUS" = "200" ]; then
     echo "PASS: topology widget accessible"
 else
@@ -24,7 +24,7 @@ else
 fi
 
 # Check SSE events endpoint
-EVENTS_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 2 http://localhost:9889/events 2>/dev/null || echo "000")
+EVENTS_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 http://localhost:9889/events 2>/dev/null || true)
 if [ "$EVENTS_STATUS" = "200" ]; then
     echo "PASS: /events SSE endpoint accessible"
 else
@@ -32,7 +32,7 @@ else
 fi
 
 # Check AG-UI stream (shared surface)
-AGUI_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 2 http://localhost:9889/agui/v1/stream 2>/dev/null || echo "000")
+AGUI_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 http://localhost:9889/agui/v1/stream 2>/dev/null || true)
 if [ "$AGUI_STATUS" = "200" ]; then
     echo "PASS: AG-UI stream enabled (CAO_AGUI_ENABLED=true)"
 elif [ "$AGUI_STATUS" = "404" ]; then

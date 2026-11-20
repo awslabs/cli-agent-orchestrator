@@ -121,8 +121,16 @@ class TestCodexClassification:
         assert result == "codex:approval_request"
         assert_valid_reason(result)
 
-    def test_trust_prompt(self):
-        prompt = "Would you like to allow Codex to work in this folder?"
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            "Would you like to allow Codex to work in this folder?",
+            "Do you trust the contents of this directory?",
+            "Trust this folder?\n1. Trust and continue\n2. Back to Agent Command Center",
+        ],
+        ids=["v1", "v2", "v3"],
+    )
+    def test_trust_prompt(self, prompt):
         result = classify_reason("codex", prompt)
         assert result == "codex:trust_prompt"
         assert_valid_reason(result)

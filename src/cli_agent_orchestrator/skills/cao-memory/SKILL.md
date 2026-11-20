@@ -107,10 +107,10 @@ was removed. Inspect `path` when the action reports vault deindexing.
 
 ## Auto-injection (already happening)
 
-On launch, CAO writes the most relevant memories for this working directory into the file
-your CLI reads on startup (Claude Code: `.claude/CLAUDE.md`; Codex: `AGENTS.md`; Kiro:
-`.kiro/steering/cao-memory.md`). So you usually begin a task already knowing the project's
-key facts — `memory_recall` is for digging up anything that wasn't injected.
+On launch, CAO prepends a `<cao-memory>` block to this terminal's first message. The
+deterministic injection path selects memories in scope precedence order (`session`, then
+`project`, then `global`), with per-scope entry and character caps; it is not a relevance
+search. Use `memory_recall` for anything else you need to find.
 
 ## Habits
 

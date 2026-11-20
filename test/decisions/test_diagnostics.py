@@ -17,6 +17,7 @@ import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 CANARY = "synthetic-canary-5f1c09"
 ENGINE_LOGGER = "cli_agent_orchestrator.decisions.engine"
@@ -411,7 +412,7 @@ def _legacy_decision_table(path: Path) -> list[tuple[Any, ...]]:
         (1, "model.route", "fixture", "error", "worker", "assign"),
         (2, "model.route", None, "above_ceiling", "Ramones-x-3f9a", "handoff"),
     ]
-    with sqlite3.connect(path) as db:
+    with closing_transaction(sqlite3.connect(path)) as db:
         db.execute(
             "CREATE TABLE decision_records (id INTEGER PRIMARY KEY, point TEXT, decider TEXT, "
             "reason TEXT, agent_profile TEXT, kind TEXT)"
@@ -428,7 +429,7 @@ def test_target_kind_migration_is_additive_nullable_and_leaves_rows(tmp_path, mo
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
     database._migrate_decision_records_target_kind()
     database._migrate_decision_records_target_kind()
-    with sqlite3.connect(path) as db:
+    with closing_transaction(sqlite3.connect(path)) as db:
         columns = [row for row in db.execute("PRAGMA table_info(decision_records)")]
         migrated = db.execute(
             "SELECT id, point, decider, reason, agent_profile, kind, target_kind "
@@ -447,7 +448,7 @@ def test_target_kind_migration_creates_nothing_without_the_table(tmp_path, monke
     sqlite3.connect(path).close()
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
     database._migrate_decision_records_target_kind()
-    with sqlite3.connect(path) as db:
+    with closing_transaction(sqlite3.connect(path)) as db:
         assert db.execute("SELECT name FROM sqlite_master").fetchall() == []
 
 
@@ -461,7 +462,7 @@ def test_init_db_adds_target_kind_to_an_existing_database(tmp_path, monkeypatch)
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
     with patch.object(database, "Base"):
         database.init_db()
-    with sqlite3.connect(path) as db:
+    with closing_transaction(sqlite3.connect(path)) as db:
         columns = {row[1] for row in db.execute("PRAGMA table_info(decision_records)")}
     assert "target_kind" in columns
 
@@ -670,7 +671,7 @@ def test_status_reads_a_database_from_before_the_migration(tmp_path, monkeypatch
     from cli_agent_orchestrator.decisions.store import read_decider_status
 
     path = tmp_path / "legacy.db"
-    with sqlite3.connect(path) as db:
+    with closing_transaction(sqlite3.connect(path)) as db:
         db.execute(
             "CREATE TABLE decision_records (id INTEGER PRIMARY KEY, created_at TEXT, point TEXT, "
             "decider TEXT, outcome TEXT, reason TEXT, decision_status TEXT)"
@@ -682,7 +683,7 @@ def test_status_reads_a_database_from_before_the_migration(tmp_path, monkeypatch
         )
     status = read_decider_status(path, now=NOW)
     assert status["available"] and status["deciders"]["fixture"]["counts"] == {"timeout": 1}
-    with sqlite3.connect(path) as db:
+    with closing_transaction(sqlite3.connect(path)) as db:
         columns = {row[1] for row in db.execute("PRAGMA table_info(decision_records)")}
     assert "target_kind" not in columns
 

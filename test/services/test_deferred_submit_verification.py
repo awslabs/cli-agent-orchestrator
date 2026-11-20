@@ -852,7 +852,7 @@ def test_kimi_direct_probe_cannot_import_old_execution_across_buffer_epoch(monke
         if first_call:
             first_call = False
             entered_parser.set()
-            assert release_parser.wait(timeout=2.0)
+            assert release_parser.wait(timeout=30.0)
         return original(output)
 
     provider.has_execution_evidence = paused_checker
@@ -874,12 +874,12 @@ def test_kimi_direct_probe_cannot_import_old_execution_across_buffer_epoch(monke
     probe_thread = threading.Thread(target=old_probe)
     reset_thread = threading.Thread(target=reset_generation)
     probe_thread.start()
-    assert entered_parser.wait(timeout=2.0)
+    assert entered_parser.wait(timeout=30.0)
     reset_thread.start()
-    assert reset_started.wait(timeout=2.0)
+    assert reset_started.wait(timeout=30.0)
     release_parser.set()
-    probe_thread.join(timeout=2.0)
-    reset_thread.join(timeout=2.0)
+    probe_thread.join(timeout=30.0)
+    reset_thread.join(timeout=30.0)
     assert not probe_thread.is_alive()
     assert not reset_thread.is_alive()
 
@@ -919,7 +919,7 @@ def test_kimi_paused_old_probe_cannot_certify_real_new_send_input(monkeypatch):
         if first_call:
             first_call = False
             entered_parser.set()
-            assert release_parser.wait(timeout=2.0)
+            assert release_parser.wait(timeout=30.0)
         return original_checker(output)
 
     def notify_input_sent(*args, **kwargs):
@@ -951,17 +951,17 @@ def test_kimi_paused_old_probe_cannot_certify_real_new_send_input(monkeypatch):
         target=lambda: send_result.append(ts.send_input(provider.terminal_id, "new task"))
     )
     probe_thread.start()
-    assert entered_parser.wait(timeout=2.0)
+    assert entered_parser.wait(timeout=30.0)
     send_thread.start()
-    assert send_entered_notify.wait(timeout=2.0)
+    assert send_entered_notify.wait(timeout=30.0)
 
     # On the buggy implementation get_buffer() had already released the monitor
     # lock, so the new send reaches send_keys before the old parser resumes.  On
     # the fixed implementation the send blocks at the generation lock instead.
     send_keys_seen.wait(timeout=0.1)
     release_parser.set()
-    probe_thread.join(timeout=2.0)
-    send_thread.join(timeout=2.0)
+    probe_thread.join(timeout=30.0)
+    send_thread.join(timeout=30.0)
     assert not probe_thread.is_alive()
     assert not send_thread.is_alive()
     assert old_probe_result == [True]

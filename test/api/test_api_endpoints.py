@@ -106,6 +106,25 @@ class TestHealthCheck:
         data = response.json()
         assert data["terminal_backend"] == "herdr"
 
+    def test_health_reports_terminal_backend_herdr_app(self, client):
+        """GET /health reports 'herdr-app' and a herdr-core component for HerdrAppBackend."""
+        from cli_agent_orchestrator.backends.herdr_app_backend import HerdrAppBackend
+
+        mock_app = MagicMock(spec=HerdrAppBackend)
+        with (
+            patch("cli_agent_orchestrator.api.main.get_backend", return_value=mock_app),
+            patch("shutil.which", side_effect=lambda b: "/bin/hc" if b == "hc" else None),
+        ):
+            response = client.get("/health")
+        data = response.json()
+        assert data["terminal_backend"] == "herdr-app"
+        assert data["components"]["herdr-core"] == "ok"
+
+    def test_health_herdr_core_unavailable(self, client):
+        with patch("shutil.which", return_value=None):
+            data = client.get("/health").json()
+        assert data["components"]["herdr-core"] == "unavailable"
+
 
 # ── Agent profiles endpoint ──────────────────────────────────────────
 
@@ -171,13 +190,14 @@ class TestAgentProviders:
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data) == 12
+        assert len(data) == 13
         names = [p["name"] for p in data]
         assert "kiro_cli" in names
         assert "claude_code" in names
         assert "codex" in names
         assert "hermes" in names
         assert "kimi_cli" in names
+        assert "qwen_cli" in names
         assert "copilot_cli" in names
         assert "opencode_cli" in names
         assert "cursor_cli" in names
@@ -236,6 +256,7 @@ class TestAgentProviders:
         assert providers_dict["omp"]["binary"] == "omp"
         assert providers_dict["grok_cli"]["binary"] == "grok"
         assert providers_dict["mcode"]["binary"] == "mcode"
+        assert providers_dict["qwen_cli"]["binary"] == "qwen"
 
     def test_list_providers_preserves_common_wire_contract(self, client):
         """Provider discovery has the same shape consumed by the web and Rust clients."""
@@ -399,12 +420,16 @@ class TestCreateSession:
             engine=None,
             initial_message=None,
             initial_message_orchestration_type=None,
+            inject_memory_at_start=False,
             model=None,
             use_worktree=False,
             idempotency_key=None,
             resume_session_id=None,
             group=None,
             metadata=None,
+            # Off unless the request asks (#724, contract ruled on PR #1036).
+            # This request does not, so it gets the must-exist behavior.
+            create_working_directory=False,
             caller_ceiling=None,
         )
 
@@ -733,6 +758,27 @@ class TestCreateSession:
         assert call_kwargs["initial_message"] == initial_message
         assert call_kwargs["initial_message_orchestration_type"] == OrchestrationType.SEND_MESSAGE
 
+    def test_create_session_forwards_explicit_start_memory_request(self, client):
+        """The opt-in body field reaches the service and defaults off elsewhere."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="codex",
+            agent_profile="developer",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={"provider": "codex", "agent_profile": "developer"},
+                json={"inject_memory_at_start": True},
+            )
+
+        assert response.status_code == 201
+        assert mock_svc.create_session.call_args.kwargs["inject_memory_at_start"] is True
+
     def test_create_session_preserves_env_vars_body_shape(self, client):
         """Existing cao launch --env callers keep using {"env_vars": {...}}."""
         mock_terminal = Terminal(
@@ -1000,9 +1046,14 @@ class TestCreateSession:
         assert response.status_code == 201
         mock_svc.create_session.assert_called_once()
 
+    # "-leading" is deliberately absent here and on DELETE below: GET and
+    # DELETE now prefix-normalize like POST /sessions does (#724), so the
+    # effective name is "cao--leading" -- the very session a
+    # POST /sessions?session_name=-leading creates -- and tmux never sees a
+    # leading dash. POST /sessions/{name}/terminals keeps the raw check.
     @pytest.mark.parametrize(
         "bad_name",
-        ["evil:name", "evil.name", "-leading", "with space"],
+        ["evil:name", "evil.name", "with space"],
     )
     def test_get_session_rejects_unsafe_name(self, client, bad_name):
         """GET /sessions/{name} returns 400 for unsafe names (validation,
@@ -1016,7 +1067,7 @@ class TestCreateSession:
 
     @pytest.mark.parametrize(
         "bad_name",
-        ["evil:name", "evil.name", "-leading", "with space"],
+        ["evil:name", "evil.name", "with space"],
     )
     def test_delete_session_rejects_unsafe_name(self, client, bad_name):
         """DELETE /sessions/{name} returns 400 for unsafe names."""
@@ -1026,6 +1077,18 @@ class TestCreateSession:
         assert response.status_code == 400
         assert "session_name" in response.json()["detail"]
         mock_svc.delete_session.assert_not_called()
+
+    def test_get_and_delete_address_the_session_create_makes_from_a_leading_dash(self, client):
+        """``POST /sessions?session_name=-leading`` validates and creates the
+        EFFECTIVE name ``cao--leading``; GET and DELETE must reach that same
+        session from the same spelling instead of 400ing on the raw one."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.get_session.return_value = {"session": {"id": "cao--leading"}, "terminals": []}
+            mock_svc.delete_session.return_value = {"deleted": ["cao--leading"], "errors": []}
+            assert client.get("/sessions/-leading").status_code == 200
+            assert client.delete("/sessions/-leading").status_code == 200
+        mock_svc.get_session.assert_called_once_with("cao--leading")
+        assert mock_svc.delete_session.call_args.args[0] == "cao--leading"
 
     @pytest.mark.parametrize(
         "bad_name",
@@ -1113,7 +1176,7 @@ class TestGetSession:
         assert data["terminals"][0]["id"] == "abcd1234"
         assert [t["pending_inbox_count"] for t in data["terminals"]] == [123, 0]
         assert all(type(t["pending_inbox_count"]) is int for t in data["terminals"])
-        mock_svc.get_session.assert_called_once_with("test-session")
+        mock_svc.get_session.assert_called_once_with("cao-test-session")
 
     def test_get_session_not_found(self, client):
         """GET /sessions/{name} returns 404 for nonexistent session."""
@@ -1158,7 +1221,7 @@ class TestGetSession:
 
         assert response.status_code == 200
         assert get_session_calls, "session_service.get_session was never dispatched via to_thread"
-        assert get_session_calls[0].args[1] == "test-session"
+        assert get_session_calls[0].args[1] == "cao-test-session"
 
 
 class TestDeleteSession:
@@ -1554,7 +1617,7 @@ def test_launch_model_values_flow_through_real_sqlite_read_surfaces(client, tmp_
 
     database.create_terminal(
         "abc12345",
-        "surface-session",
+        "cao-surface-session",
         "worker-1",
         "codex",
         agent_profile="worker",
@@ -1563,7 +1626,7 @@ def test_launch_model_values_flow_through_real_sqlite_read_surfaces(client, tmp_
     )
     database.create_terminal(
         "def67890",
-        "surface-session",
+        "cao-surface-session",
         "worker-2",
         "mock_cli",
         agent_profile="worker",
@@ -1573,7 +1636,7 @@ def test_launch_model_values_flow_through_real_sqlite_read_surfaces(client, tmp_
 
     backend = MagicMock()
     backend.session_exists.return_value = True
-    backend.list_sessions.return_value = [{"id": "surface-session"}]
+    backend.list_sessions.return_value = [{"id": "cao-surface-session"}]
     monkeypatch.setattr(session_service, "get_backend", lambda: backend)
     monkeypatch.setattr(
         terminal_service.status_monitor,
@@ -1594,18 +1657,18 @@ def test_launch_model_values_flow_through_real_sqlite_read_surfaces(client, tmp_
             terminal_service.get_terminal("def67890"),
         ]
     )
-    assert_launch_values(session_service.get_session("surface-session")["terminals"])
+    assert_launch_values(session_service.get_session("cao-surface-session")["terminals"])
 
     terminal_response = client.get("/terminals/abc12345")
     ignored_response = client.get("/terminals/def67890")
     assert terminal_response.status_code == ignored_response.status_code == 200
     assert_launch_values([terminal_response.json(), ignored_response.json()])
 
-    session_response = client.get("/sessions/surface-session")
+    session_response = client.get("/sessions/cao-surface-session")
     assert session_response.status_code == 200
     assert_launch_values(session_response.json()["terminals"])
 
-    terminals_response = client.get("/sessions/surface-session/terminals")
+    terminals_response = client.get("/sessions/cao-surface-session/terminals")
     assert terminals_response.status_code == 200
     assert_launch_values(terminals_response.json())
 
@@ -2399,6 +2462,20 @@ class TestMainEntryPoint:
 
             mock_create.assert_called_once_with(backend_override="herdr")
             mock_set.assert_called_once_with(mock_create.return_value)
+
+    def test_main_accepts_terminal_herdr_app(self):
+        """cao-server --terminal herdr-app parses and reaches the factory."""
+        with (
+            patch("sys.argv", ["cao-server", "--terminal", "herdr-app"]),
+            patch("uvicorn.run"),
+            patch("cli_agent_orchestrator.backends.factory.BackendFactory.create") as mock_create,
+            patch("cli_agent_orchestrator.backends.registry.set_backend"),
+        ):
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            mock_create.assert_called_once_with(backend_override="herdr-app")
 
     def test_main_no_terminal_flag_leaves_backend_lazy(self):
         """Without --terminal, main() does not eagerly set the backend."""

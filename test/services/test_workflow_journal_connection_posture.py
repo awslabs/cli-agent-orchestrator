@@ -41,6 +41,7 @@ from cli_agent_orchestrator import constants
 from cli_agent_orchestrator.clients import database as database_client
 from cli_agent_orchestrator.services import workflow_journal
 from cli_agent_orchestrator.services.workflow_journal import _MIGRATED_PATHS, _connect
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 
 @pytest.fixture
@@ -93,7 +94,7 @@ def _busy_timeout(conn: sqlite3.Connection) -> int:
 
 
 def _table_names(path: Path) -> set[str]:
-    with sqlite3.connect(str(path)) as conn:
+    with closing_transaction(sqlite3.connect(str(path))) as conn:
         rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     return {r[0] for r in rows}
 
@@ -440,7 +441,7 @@ class TestASilentMigrationFailureIsNotCached:
         Simulated by creating the PRE-#583 table shape and then letting the migrators no-op,
         which is what a locked database does to an ``ALTER``.
         """
-        with sqlite3.connect(str(db_path)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_path))) as conn:
             conn.execute(
                 "CREATE TABLE workflow_run_step ("
                 "run_id TEXT NOT NULL, step_id TEXT NOT NULL, state TEXT NOT NULL, "
@@ -463,7 +464,7 @@ class TestASilentMigrationFailureIsNotCached:
         database_client._migrate_workflow_run()
         database_client._migrate_workflow_run_step()
 
-        with sqlite3.connect(str(db_path)) as conn:
+        with closing_transaction(sqlite3.connect(str(db_path))) as conn:
             run_cols = {r[1] for r in conn.execute("PRAGMA table_info(workflow_run)")}
             step_cols = {r[1] for r in conn.execute("PRAGMA table_info(workflow_run_step)")}
 

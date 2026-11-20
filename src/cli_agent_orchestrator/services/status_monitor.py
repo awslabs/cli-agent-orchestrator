@@ -680,8 +680,29 @@ class StatusMonitor:
                         return
                     super().set_margins(top, bottom)
 
+            class _StatusStream(pyte.Stream):
+                """pyte 0.8.2 stream with HPA bound to its real final byte.
+
+                HPA (horizontal position absolute) is ``CSI Pn ```, as in the
+                DEC VT510 manual and tmux. pyte 0.8.2 (and its master) binds
+                HPA to ``'`` instead, so ``CSI 3 ``` is dropped and the column
+                is not reset. agy sends it after a line feed in place of a
+                carriage return; with it dropped the column keeps growing, the
+                text wraps at the screen width, and the composite drifts rows
+                below the real pane. agy then moves the cursor down by a
+                relative amount from the wrong row, so its ready footer lands
+                on a different row from the one it redraws, and the old
+                ``esc to cancel`` footer survives below it, in the composite
+                only. HPA moves to a column exactly as CHA does, so it maps to
+                the same ``cursor_to_column``. The copy leaves pyte's global
+                table alone, and a pyte that binds HPA itself maps it to the
+                same method.
+                """
+
+                csi = {**pyte.Stream.csi, "`": "cursor_to_column"}
+
             screen = _StatusScreen(PYTE_SCREEN_COLS, PYTE_SCREEN_ROWS)
-            stream = pyte.Stream(screen)
+            stream = _StatusStream(screen)
             scr = (screen, stream)
             self._screens[terminal_id] = scr
         scr[1].feed(chunk)

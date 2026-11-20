@@ -99,6 +99,7 @@ _UNSCOPED_DOCS = [
     # Gained an agent-plugin transport note in review 4 on #584 (item 5). Same
     # situation as the three above: CAO's own noun throughout, no vendor "Plugin".
     "kimi-cli.md",
+    "qwen-cli.md",
     # Gained an agent-plugin working-directory note in review 4 on #584 (item 4).
     # Each had ZERO plugin occurrences before, so the strict rule applies cleanly.
     "antigravity-cli.md",
@@ -138,6 +139,10 @@ _VOCABULARY_BACKLOG_DOCS = [
     # The doc does not cite CAO agent plugins, so it stays out of
     # _THIRD_PARTY_DOCS_CITING_AGENT_PLUGINS.
     "tool-restrictions.md",
+    # Its two bare "plugin" mentions are Claude Code plugins and plugins installed in
+    # Kiro Crew, both reaching the CAO Shelf relay chat's model: third-party extension
+    # systems, not CAO agent or event plugins. It does not cite CAO agent plugins.
+    "kiro-crew.md",
 ]
 
 #: Third-party-plugin docs that **also** legitimately reference CAO's agent

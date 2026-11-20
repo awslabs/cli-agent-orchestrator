@@ -39,6 +39,7 @@ from cli_agent_orchestrator.services.memory_format import (
     normalize_memory_tags,
     parse_index_entry,
 )
+from cli_agent_orchestrator.services.memory_injection import render_memory_block
 from cli_agent_orchestrator.services.vault.binding import VaultBinding
 from cli_agent_orchestrator.services.vault.reader import (
     MEMORY_MANAGER_PROFILE,
@@ -94,6 +95,13 @@ def _matches_all_terms(query: str, content: str) -> bool:
     """Use metadata recall's case-insensitive, all-term substring predicate."""
     content_lower = content.lower()
     return all(term in content_lower for term in query.lower().split())
+
+
+def _first_sentence(content: str) -> str:
+    """Return the first prose sentence, normalised onto one injection line."""
+    normalized = " ".join(content.split())
+    match = re.search(r"[.!?](?=\s|$)", normalized)
+    return normalized[: match.end()] if match else normalized
 
 
 MEMORY_DISABLED_MESSAGE = (
@@ -195,6 +203,23 @@ def _is_memory_enabled() -> bool:
         return is_memory_enabled()
     except Exception:
         return True
+
+
+def normalize_memory_key(key: str) -> str:
+    """Normalize a user-provided key before applying the length cap."""
+    key = key.replace("\x00", "")
+    key = os.path.basename(key)
+    key = key.lower()
+    key = re.sub(r"[^a-z0-9\-]", "", key)
+    key = re.sub(r"-+", "-", key).strip("-")
+    if not key:
+        raise ValueError("Key is empty after sanitization")
+    return key
+
+
+def memory_key_was_truncated(key: str) -> bool:
+    """Return whether sanitization discarded characters past the 60-char cap."""
+    return len(normalize_memory_key(key)) > 60
 
 
 # Per-curator dispatch locks. A worker that fails to acquire its session's
@@ -706,23 +731,23 @@ class MemoryService:
         return slug[:60]
 
     @staticmethod
+    def _normalize_key(key: str) -> str:
+        """Normalize a user-provided key before applying the length cap."""
+        return normalize_memory_key(key)
+
+    @staticmethod
     def _sanitize_key(key: str) -> str:
         """Sanitize a user-provided key to prevent path traversal.
 
         Lowercase slugs only: [a-z0-9\\-], max 60 chars.
         Consistent with auto_generate_key() output format.
         """
-        # Remove null bytes
-        key = key.replace("\x00", "")
-        # Strip directory components — only the basename matters
-        key = os.path.basename(key)
-        # Lowercase, then strip to safe slug characters only
-        key = key.lower()
-        key = re.sub(r"[^a-z0-9\-]", "", key)
-        key = re.sub(r"-+", "-", key).strip("-")
-        if not key:
-            raise ValueError("Key is empty after sanitization")
-        return key[:60]
+        return normalize_memory_key(key)[:60]
+
+    @staticmethod
+    def _key_was_truncated(key: str) -> bool:
+        """Return whether sanitization discarded characters past the 60-char cap."""
+        return memory_key_was_truncated(key)
 
     # -------------------------------------------------------------------------
     # Path helpers
@@ -1831,9 +1856,9 @@ class MemoryService:
     def _parse_related_keys(raw: Optional[str], scope: str = "<unknown>") -> list:
         """Defence-in-depth read of ``MemoryMetadataModel.related_keys``.
 
-        Short-circuit if oversized, drop any token that fails the sanitiser
-        round-trip, dedup, cap at 3. NEVER raises; returns ``[]`` for
-        NULL/empty.
+        Short-circuit if oversized, normalise each token through the same
+        sanitiser used by store/get, dedup, cap at 3. NEVER raises; returns
+        ``[]`` for NULL/empty.
         """
         if not raw:
             return []
@@ -1847,13 +1872,14 @@ class MemoryService:
             if not p:
                 continue
             try:
-                canonical = MemoryService._sanitize_key(p)
+                normalized = MemoryService._normalize_key(p)
             except ValueError:
                 logger.warning("related_keys_unsanitised scope=%s", scope)
                 continue
-            if canonical != p:
+            if normalized != p:
                 logger.warning("related_keys_unsanitised scope=%s", scope)
                 continue
+            canonical = normalized[:60]
             if canonical in seen:
                 continue
             seen.add(canonical)
@@ -2003,11 +2029,12 @@ class MemoryService:
         Memory instance (no cache across recalls).
         """
         try:
-            sanitised = self._sanitize_key(key)
+            normalized = self._normalize_key(key)
         except ValueError:
             return None
-        if sanitised != key:
+        if normalized != key:
             return None
+        sanitised = normalized[:60]
         try:
             wiki_path = self.get_wiki_path(scope, scope_id, sanitised)
         except ValueError:
@@ -2465,8 +2492,8 @@ class MemoryService:
         limit: int = 10,
         terminal_context: Optional[dict] = None,
         scan_all: bool = False,
-        search_mode: str = "hybrid",
-        sort_by: str = "recency",
+        search_mode: Optional[str] = None,
+        sort_by: Optional[str] = None,
         include_related: bool = False,
         *,
         record_access: bool = True,
@@ -2499,6 +2526,21 @@ class MemoryService:
         """
         if not _is_memory_enabled():
             return []
+
+        explicit_search_mode = search_mode is not None
+        explicit_sort_by = sort_by is not None
+        search_mode = "hybrid" if search_mode is None else search_mode
+        sort_by = "recency" if sort_by is None else sort_by
+        if query and query.strip() and not explicit_search_mode and not explicit_sort_by:
+            from cli_agent_orchestrator.services.memory_scoring import validate_default_sort
+            from cli_agent_orchestrator.services.settings_service import get_memory_settings
+
+            ranking = get_memory_settings().get("ranking", {})
+            default_sort = validate_default_sort(
+                ranking.get("default_sort") if isinstance(ranking, dict) else None
+            )
+            if default_sort == "bm25":
+                search_mode = "bm25"
 
         if search_mode not in VALID_SEARCH_MODES:
             raise ValueError(
@@ -4461,33 +4503,63 @@ class MemoryService:
         check = memory_eligibility.begin_check(
             memory_eligibility.EligibilityRequest.from_context("injected_context", terminal_context)
         )
+        from cli_agent_orchestrator.services.settings_service import (
+            is_memory_injection_v1_fixes_enabled,
+        )
+
+        v1_fixes = is_memory_injection_v1_fixes_enabled()
 
         for scope_val in scopes_in_order:
             scope_id = self.resolve_scope_id(scope_val, terminal_context)
             project_dir = self._get_project_dir(scope_val, scope_id)
             wiki_dir = project_dir / "wiki"
-            wiki_resolved = os.path.realpath(str(wiki_dir))
-            index_path = wiki_dir / "index.md"
 
             native_dirs, vault_bindings, max_body_chars, _vault_config = self._resolve_sources(
                 scope_val, terminal_context, scan_all=False
             )
-            scope_entries = []
-            if native_dirs and not vault_bindings and index_path.exists():
-                for e in self._parse_index(index_path):
-                    if e["scope"] != scope_val:
+            scope_entries: list[tuple[Path, str, dict]] = []
+            native_wiki_dirs = (
+                [
+                    native_dir / "wiki"
+                    for native_dir in native_dirs
+                    if native_dir not in {self.base_dir / "global", self.base_dir / "federated"}
+                ]
+                if scope_val == MemoryScope.PROJECT.value and v1_fixes
+                else ([wiki_dir] if native_dirs else [])
+            )
+            if not vault_bindings:
+                for native_wiki_dir in native_wiki_dirs:
+                    index_path = native_wiki_dir / "index.md"
+                    if not index_path.exists():
                         continue
-                    # Session/agent entries embed scope_id in the wiki path and
-                    # share index.md with global, so the scope_id must match the
-                    # caller's. Project entries already live in a per-project
-                    # directory and global has no scope_id by design.
-                    if scope_val in (MemoryScope.SESSION.value, MemoryScope.AGENT.value):
-                        if e.get("scope_id") != scope_id:
+                    wiki_resolved = os.path.realpath(str(native_wiki_dir))
+                    for entry in self._parse_index(index_path):
+                        if entry["scope"] != scope_val:
                             continue
-                    scope_entries.append(e)
+                        # Session/agent entries embed scope_id in the wiki path and
+                        # share index.md with global, so the scope_id must match the
+                        # caller's. Project entries already live in a per-project
+                        # directory and global has no scope_id by design.
+                        if scope_val in (MemoryScope.SESSION.value, MemoryScope.AGENT.value):
+                            if entry.get("scope_id") != scope_id:
+                                continue
+                        scope_entries.append((native_wiki_dir, wiki_resolved, entry))
             # U7 adds injectable vault candidates here. A missing native index
             # must not skip this scope, because a vault-only mapping has none.
-            scope_entries.sort(key=lambda e: e.get("updated_at", ""), reverse=True)
+            scope_entries.sort(key=lambda item: item[2].get("updated_at", ""), reverse=True)
+            if scope_val == MemoryScope.PROJECT.value and v1_fixes:
+                # Alias folders can retain an older copy of a key after project
+                # identity becomes canonical. Keep the newest indexed copy so
+                # injection never presents conflicting versions of one fact.
+                deduplicated_entries: list[tuple[Path, str, dict]] = []
+                seen_keys: set[str] = set()
+                for item in scope_entries:
+                    key = item[2]["key"]
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    deduplicated_entries.append(item)
+                scope_entries = deduplicated_entries
 
             scope_memories: list[Memory] = []
             native_entries = (
@@ -4495,16 +4567,16 @@ class MemoryService:
                 if check is None
                 else check.eligible_in_order(
                     scope_entries,
-                    lambda e: memory_eligibility.MemoryIdentity(
-                        e["key"], scope_val, scope_id, "native"
+                    lambda item: memory_eligibility.MemoryIdentity(
+                        item[2]["key"], scope_val, scope_id, "native"
                     ),
                     MEMORY_MAX_PER_SCOPE,
                 )
             )
-            for entry in native_entries:
+            for native_wiki_dir, wiki_resolved, entry in native_entries:
                 if len(scope_memories) >= MEMORY_MAX_PER_SCOPE:
                     break
-                wiki_file = wiki_dir / entry["relative_path"]
+                wiki_file = native_wiki_dir / entry["relative_path"]
                 resolved_wiki = Path(os.path.realpath(str(wiki_file)))
                 # Guard against a crafted/corrupted index entry (e.g.
                 # ``../<other-project>/wiki/...``) escaping this scope's wiki
@@ -4656,6 +4728,31 @@ class MemoryService:
                         # it and try the next (possibly shorter) one.
                         self._record_vault_related_injection_skip(mem)
                         continue
+                    if v1_fixes:
+                        self._record_vault_injection_clip(scope_val, scope_id, [mem])
+                        if position == 0:
+                            suffix = f" … (full note: {mem.key})"
+                            prefix = f"- [{mem.scope}] {mem.key}{tag}: "
+                            later_lengths = [
+                                len(f"- [{later.scope}] {later.key}: {later.content}") + 1
+                                for later in scope_memories[position + 1 :]
+                                if not getattr(later, "is_related", False)
+                            ]
+                            reserve = min(
+                                (length for length in later_lengths if length <= scope_char_cap),
+                                default=0,
+                            )
+                            available = scope_char_cap - reserve - len(prefix) - len(suffix) - 1
+                            if available > 0:
+                                sentence = _first_sentence(mem.content)
+                                clipped_line = prefix + sentence[:available].rstrip() + suffix
+                                lines.append(clipped_line)
+                                scope_used_chars += len(clipped_line) + 1
+                                if redacted_patterns:
+                                    self._record_vault_injection_redaction(
+                                        mem, len(redacted_patterns)
+                                    )
+                        continue
                     self._record_vault_injection_clip(
                         scope_val,
                         scope_id,
@@ -4675,7 +4772,7 @@ class MemoryService:
             return ""
 
         context = "## Context from CAO Memory\n" + "\n".join(lines)
-        return f"<cao-memory>\n{context}\n</cao-memory>"
+        return render_memory_block(context)
 
     def _record_vault_injection_clip(
         self, scope: str, scope_id: Optional[str], dropped: list[Memory]
@@ -4997,4 +5094,4 @@ class MemoryService:
             return ctx
         except Exception as e:
             logger.warning(f"Could not get terminal context for {terminal_id}: {e}")
-            return None
+            raise RuntimeError(f"Could not get terminal context for {terminal_id}") from e

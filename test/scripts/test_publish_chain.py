@@ -169,7 +169,11 @@ def simulate(
         ctx = dict(context)
         for n in needs:
             ctx[f"needs.{n}.result"] = results[n]
-        evaluate = Evaluator(ctx, {"always": True, "success": needs_ok, "failure": False})
+        evaluate = Evaluator(
+            ctx,
+            # Nothing is cancelled in this simulation: it models a run that completes.
+            {"always": True, "success": needs_ok, "failure": False, "cancelled": False},
+        )
         if evaluate(condition):
             results[name] = (outcome or {}).get(name, "success")
         else:
@@ -346,7 +350,6 @@ RELEASE_ACTIONS = {
     "actions/checkout",
     "actions/setup-python",
     "astral-sh/setup-uv",
-    "taiki-e/install-action",
     "softprops/action-gh-release",
 }
 
@@ -407,10 +410,7 @@ class TestNoJobCanDispatchAWorkflow:
         assert set(RELEASE["jobs"]) == {"preflight", "release"}
 
     def test_no_new_secret_is_introduced(self):
-        assert set(re.findall(r"secrets\.(\w+)", RELEASE_TEXT)) == {
-            "RELEASE_DEPLOY_KEY",
-            "GITHUB_TOKEN",
-        }
+        assert set(re.findall(r"secrets\.(\w+)", RELEASE_TEXT)) == {"RELEASE_DEPLOY_KEY"}
 
 
 class TestReleaseCheckoutPinsTheEventSha:

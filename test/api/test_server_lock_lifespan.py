@@ -14,6 +14,7 @@ import json
 import os
 from contextlib import ExitStack
 from pathlib import Path
+from test.fixtures.app_state import app_state_items
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -98,7 +99,7 @@ async def test_lifespan_holds_the_lock_while_running_and_releases_on_shutdown(
 ) -> None:
     lock_path = tmp_path / "home" / "server.lock"
     monkeypatch.setattr(server_lock, "SERVER_LOCK_FILE", lock_path)
-    monkeypatch.setattr(app.state, "server_port", 4321, raising=False)
+    monkeypatch.setitem(app_state_items(app), "server_port", 4321)
 
     with ExitStack() as stack:
         init_db = _patch_startup_side_effects(stack)
@@ -123,8 +124,7 @@ async def test_lifespan_falls_back_to_configured_port_without_main(
 
     lock_path = tmp_path / "home" / "server.lock"
     monkeypatch.setattr(server_lock, "SERVER_LOCK_FILE", lock_path)
-    if hasattr(app.state, "server_port"):
-        monkeypatch.delattr(app.state, "server_port")
+    monkeypatch.delitem(app_state_items(app), "server_port", raising=False)
     monkeypatch.setattr(api_main, "SERVER_PORT", 6543)
 
     with ExitStack() as stack:
