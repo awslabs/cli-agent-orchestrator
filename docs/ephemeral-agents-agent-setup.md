@@ -166,7 +166,7 @@ Pick a pattern with the user:
 
 | Pattern | Command | Survives a CAO upgrade? | Touches CAO itself? |
 | --- | --- | --- | --- |
-| A: reinstall the tool with the decider added | `uv tool install <CAO source> <each existing extra> --with "cao-decider-jev @ <source>" --reinstall` | For Git and unpinned PyPI installs, `cao update` preserves recorded extras. Version-pinned PyPI and local reinstall guidance are covered below. | Yes: CAO is reinstalled and may move to a newer version |
+| A: reinstall the tool with the decider added | `uv tool install <CAO source> <each existing extra> --with "cao-decider-jev @ <source>" --reinstall` | For Git and unpinned PyPI installs, `cao update` preserves recorded extras. Version-pinned PyPI installs keep them too, with the exceptions covered below, and local installs print reinstall guidance. | Yes: CAO is reinstalled and may move to a newer version |
 | B: add it to the tool's environment | `uv pip install --python "$CAO_PY" "cao-decider-jev @ <source>"` | **No.** The receipt never records it, so any CAO upgrade silently drops it | Not CAO's own package, but it can change dependencies CAO shares (such as `httpx`). Run it with `--dry-run` first and show the user the changes |
 
 **For pattern A, copy the source and the extras from the receipt.** The `cli-agent-orchestrator`
@@ -210,15 +210,20 @@ whether the receipt records it. Upgrade behavior depends on the source:
 - `cao update` on a Git install runs `uv tool upgrade cli-agent-orchestrator --reinstall`.
   It reuses the recorded Git ref and keeps deciders recorded by pattern A;
 - `cao update` on a version-pinned PyPI install (a receipt entry with a `specifier`) runs
-  `uv tool install cli-agent-orchestrator@latest --upgrade` without `--with`, so it removes
-  the decider. An unpinned PyPI install runs `uv tool upgrade`, which keeps recorded deciders;
+  `uv tool install "cli-agent-orchestrator[<extras>]@latest" --upgrade` and passes every
+  recorded `name<spec>`, wheel `path` and `directory` entry back with `--with`, so a decider
+  recorded that way stays. It stops before changing anything, and prints the receipt path and
+  a command to finish by hand, when an entry is a git or URL source, editable, or has a marker
+  (the `"cao-decider-jev @ git+…"` form above is recorded as git), or when the receipt sets an
+  index under `[tool.options]` and a `name<spec>` entry would be looked up on it. An unpinned
+  PyPI install runs `uv tool upgrade`, which keeps recorded deciders;
 - on a local install, `cao update` changes nothing and prints a reinstall command that has no
   `--with` either;
 - after pattern B, any upgrade removes it.
 
 So the user (or you, with their OK) must re-run the check above after **any** CAO upgrade or
-reinstall, reinstall the decider if `jev` is missing, and restart the server. This is a current
-CAO limitation.
+reinstall, reinstall the decider if `jev` is missing, and restart the server. Losing it on a
+local install or after pattern B is a current CAO limitation.
 
 ## 4. Turn on helpers and fill the tier table
 
