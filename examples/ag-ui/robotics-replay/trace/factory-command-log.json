@@ -1,0 +1,102 @@
+{
+ "label": "MOCK agents; real MuJoCo World; simple biped proxies",
+ "final_team_status": {
+  "west": "done",
+  "middle": "done",
+  "east": "done"
+ },
+ "commands": [
+  {
+   "after_tool_calls": 1,
+   "actor_zone": "east",
+   "operation": "form_team",
+   "arguments": [
+    "form-1",
+    "diamond"
+   ],
+   "status": "accepted",
+   "reason": null,
+   "sim_seconds": 0
+  },
+  {
+   "after_tool_calls": 2,
+   "actor_zone": "middle",
+   "operation": "form_team",
+   "arguments": [
+    "form-1",
+    "columns"
+   ],
+   "status": "accepted",
+   "reason": null,
+   "sim_seconds": 0
+  },
+  {
+   "after_tool_calls": 3,
+   "actor_zone": "west",
+   "operation": "form_team",
+   "arguments": [
+    "form-1",
+    "queue"
+   ],
+   "status": "accepted",
+   "reason": null,
+   "sim_seconds": 0
+  },
+  {
+   "after_tool_calls": 3,
+   "actor_zone": "east",
+   "operation": "start_shipping",
+   "arguments": [
+    "ship-1",
+    16,
+    2,
+    [
+     "spin",
+     "turn",
+     "run"
+    ]
+   ],
+   "status": "running",
+   "reason": null,
+   "sim_seconds": 10
+  },
+  {
+   "after_tool_calls": 3,
+   "actor_zone": "middle",
+   "operation": "start_line",
+   "arguments": [
+    "line-1",
+    16,
+    8
+   ],
+   "status": "running",
+   "reason": null,
+   "sim_seconds": 10
+  },
+  {
+   "after_tool_calls": 3,
+   "actor_zone": "west",
+   "operation": "start_line",
+   "arguments": [
+    "line-1",
+    16,
+    2
+   ],
+   "status": "running",
+   "reason": null,
+   "sim_seconds": 10
+  },
+  {
+   "after_tool_calls": 4,
+   "actor_zone": "west",
+   "operation": "set_pace",
+   "arguments": [
+    "pace-1",
+    8
+   ],
+   "status": "finished",
+   "reason": null,
+   "sim_seconds": 28
+  }
+ ]
+}
