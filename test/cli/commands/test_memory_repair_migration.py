@@ -24,6 +24,8 @@ import sys
 import uuid
 from pathlib import Path
 
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
+
 _TOPIC_BODY = (
     "# shared\n"
     "<!-- id: 11111111-1111-1111-1111-111111111111 | scope: global | "
@@ -56,7 +58,7 @@ def _seed_legacy_schema(db_file: Path) -> None:
     engine = create_engine(f"sqlite:///{db_file}")
     Base.metadata.create_all(bind=engine)
     engine.dispose()
-    with sqlite3.connect(str(db_file)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_file))) as conn:
         conn.execute("DROP INDEX IF EXISTS uq_memory_key_scope_null")
         conn.commit()
 
@@ -64,7 +66,7 @@ def _seed_legacy_schema(db_file: Path) -> None:
 def _seed_duplicate_rows(
     db_file: Path, key: str, paths: list[str], *, scope: str = "global"
 ) -> None:
-    with sqlite3.connect(str(db_file)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_file))) as conn:
         for path in paths:
             conn.execute(
                 "INSERT INTO memory_metadata (id, key, memory_type, scope, scope_id, "
@@ -90,7 +92,7 @@ def _run_repair(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 def _index_names(db_file: Path) -> set[str]:
-    with sqlite3.connect(str(db_file)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_file))) as conn:
         return {row[1] for row in conn.execute("PRAGMA index_list('memory_metadata')")}
 
 
@@ -108,7 +110,7 @@ def test_repair_dedupes_and_lands_index_end_to_end(tmp_path: Path) -> None:
     topic.write_text(_TOPIC_BODY, encoding="utf-8")
     _seed_duplicate_rows(db_file, "shared", [str(topic), str(topic.with_name("stale.md"))])
 
-    with sqlite3.connect(str(db_file)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_file))) as conn:
         survivor_id = conn.execute(
             "SELECT id FROM memory_metadata WHERE file_path = ?", (str(topic),)
         ).fetchone()[0]
@@ -116,11 +118,11 @@ def test_repair_dedupes_and_lands_index_end_to_end(tmp_path: Path) -> None:
     result = _run_repair(home, "--apply")
 
     assert result.returncode == 0, result.stdout + result.stderr
-    with sqlite3.connect(str(db_file)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_file))) as conn:
         rows = conn.execute("SELECT id, file_path FROM memory_metadata").fetchall()
     assert rows == [(survivor_id, str(topic))], "canonical row survives with its id"
     assert "uq_memory_key_scope_null" in _index_names(db_file)
-    with sqlite3.connect(str(db_file)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_file))) as conn:
         try:
             conn.execute(
                 "INSERT INTO memory_metadata (id, key, memory_type, scope, scope_id, "
@@ -150,7 +152,7 @@ def test_repair_reports_ambiguous_duplicates_without_data_loss(tmp_path: Path) -
     assert "skipped" in result.stdout and "conflict" in result.stdout
     assert "none is uniquely anchored to the canonical topic path" in result.stdout
     assert "manually" in result.stdout, "manual-resolution guidance must be actionable"
-    with sqlite3.connect(str(db_file)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_file))) as conn:
         count = conn.execute("SELECT COUNT(*) FROM memory_metadata").fetchone()[0]
     assert count == 2, "ambiguous duplicates must be retained without data loss"
     assert "uq_memory_key_scope_null" not in _index_names(db_file)
@@ -183,7 +185,7 @@ def test_repair_reports_no_topic_duplicates_via_the_real_cli(tmp_path: Path) -> 
     assert result.returncode == 1, "apply must fail actionably, not report success"
     assert "total=2" in result.stdout
     assert "no canonical topic maps to it" in result.stdout
-    with sqlite3.connect(str(db_file)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_file))) as conn:
         count = conn.execute("SELECT COUNT(*) FROM memory_metadata").fetchone()[0]
     assert count == 4, "no row may be deleted without a topic anchor"
     assert "uq_memory_key_scope_null" not in _index_names(db_file)
@@ -203,7 +205,7 @@ def test_repair_dedupes_mixed_timestamp_rows_without_crashing(tmp_path: Path) ->
     topic = home / "memory" / "global" / "wiki" / "global" / "shared.md"
     topic.write_text(_TOPIC_BODY, encoding="utf-8")
     _seed_duplicate_rows(db_file, "shared", [str(topic), str(topic.with_name("stale.md"))])
-    with sqlite3.connect(str(db_file)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_file))) as conn:
         conn.execute(
             "UPDATE memory_metadata SET updated_at = '2026-07-01 10:00:00' " "WHERE file_path = ?",
             (str(topic),),
@@ -221,7 +223,7 @@ def test_repair_dedupes_mixed_timestamp_rows_without_crashing(tmp_path: Path) ->
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "TypeError" not in result.stderr
-    with sqlite3.connect(str(db_file)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_file))) as conn:
         rows = conn.execute("SELECT id, file_path FROM memory_metadata").fetchall()
     assert rows == [(survivor_id, str(topic))], "newest (only dated) row survives"
     assert "uq_memory_key_scope_null" in _index_names(db_file)
@@ -277,6 +279,6 @@ def test_repair_surfaces_lock_failed_index_creation_and_recovers(tmp_path: Path)
     retry = _run_repair(home, "--apply")
     assert retry.returncode == 0, retry.stdout + retry.stderr
     assert "uq_memory_key_scope_null" in _index_names(db_file)
-    with sqlite3.connect(str(db_file)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_file))) as conn:
         rows = conn.execute("SELECT COUNT(*) FROM memory_metadata").fetchone()[0]
     assert rows == 1, "the retry completes the dedupe"

@@ -322,6 +322,7 @@ class _JWKSServer:
             def do_GET(self) -> None:  # noqa: N802 — stdlib API name
                 if self.path != target_path:
                     self.send_response(404)
+                    self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
                 self.send_response(200)
@@ -540,8 +541,11 @@ def _start_cao_server(
     process = subprocess.Popen(
         [
             sys.executable,
-            "-m",
-            "cli_agent_orchestrator.api.main",
+            "-c",
+            # Match the console entry point. ``-m ...api.main`` creates a
+            # second app under __main__; the step substrate imports api.main
+            # and then sees an uninitialized decision_engine on that other app.
+            "from cli_agent_orchestrator.api.main import main; main()",
             "--host",
             "127.0.0.1",
             "--port",
