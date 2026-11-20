@@ -33,6 +33,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.services import workflow_journal
 from cli_agent_orchestrator.services.workflow_journal import RunSummaryRow, list_runs
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 
 @pytest.fixture(autouse=True)
@@ -131,7 +132,7 @@ def test_list_runs_limit_clamped_high_to_five_hundred(_patched_journal):
     # A limit above the cap of 500 must return at most 500 rows. Seed 501 rows
     # (via one raw connection for speed) so the clamp is observable directly on
     # the returned row count: 1000 would return all 501 if the clamp were absent.
-    with sqlite3.connect(str(_patched_journal)) as conn:
+    with closing_transaction(sqlite3.connect(str(_patched_journal))) as conn:
         conn.executemany(
             "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, "
@@ -187,7 +188,7 @@ def test_list_runs_state_metacharacters_bind_as_literal():
     # And the table still exists (the injection did not execute).
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
-    with sqlite3.connect(str(DATABASE_FILE)) as conn:
+    with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
         row = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='workflow_run'"
         ).fetchone()

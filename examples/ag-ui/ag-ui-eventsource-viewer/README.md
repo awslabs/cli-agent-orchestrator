@@ -100,6 +100,11 @@ npm install && npm run playwright:install
 npm run record   # -> docs/media/ag-ui-eventsource-viewer-demo.gif (+ .webm)
 ```
 
+`ffmpeg` is provided by the `ffmpeg-static` npm package (gif-capable), so no
+system ffmpeg install is needed. Override with `FFMPEG_BIN=/path/to/ffmpeg`.
+On Linux or WSL, install Chromium's system libraries once with
+`npx playwright install-deps chromium`.
+
 `tools/` is dev/CI tooling only — the shipped viewer (`index.html`) stays dependency-free.
 
 ## Why dependency-free

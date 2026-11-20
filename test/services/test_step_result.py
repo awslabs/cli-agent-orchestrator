@@ -37,6 +37,7 @@ from cli_agent_orchestrator.services.step_result import (
     parse_envelope,
     serialise_envelope,
 )
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 # A synthetic value matching ``secret_gate``'s ``aws_access_key`` pattern
 # (``(?:AKIA|ASIA)[0-9A-Z]{16}``). NOT a real credential: the body spells TESTONLY and the
@@ -264,7 +265,7 @@ def patched_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _step_columns(db_path: Path) -> dict:
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_path))) as conn:
         rows = conn.execute("PRAGMA table_info(workflow_run_step)").fetchall()
     return {r[1]: r for r in rows}  # (cid, name, type, notnull, dflt_value, pk)
 
@@ -291,7 +292,7 @@ def test_migration_is_idempotent(patched_db: Path) -> None:
     """BR-7: a second run adds nothing, raises nothing, and preserves existing rows."""
     _migrate_workflow_run_step()
     before = set(_step_columns(patched_db))
-    with sqlite3.connect(str(patched_db)) as conn:
+    with closing_transaction(sqlite3.connect(str(patched_db))) as conn:
         conn.execute(
             "INSERT INTO workflow_run_step "
             "(run_id, step_id, state, attempts, updated_at) "
@@ -302,7 +303,7 @@ def test_migration_is_idempotent(patched_db: Path) -> None:
     _migrate_workflow_run_step()  # must be a no-op
 
     assert set(_step_columns(patched_db)) == before
-    with sqlite3.connect(str(patched_db)) as conn:
+    with closing_transaction(sqlite3.connect(str(patched_db))) as conn:
         count = conn.execute("SELECT COUNT(*) FROM workflow_run_step").fetchone()[0]
     assert count == 1
 
@@ -315,7 +316,7 @@ def test_row_written_without_an_envelope_reads_as_absent(patched_db: Path) -> No
     guards agree instead of disagreeing.
     """
     _migrate_workflow_run_step()
-    with sqlite3.connect(str(patched_db)) as conn:
+    with closing_transaction(sqlite3.connect(str(patched_db))) as conn:
         conn.execute(
             "INSERT INTO workflow_run_step "
             "(run_id, step_id, state, attempts, updated_at) "

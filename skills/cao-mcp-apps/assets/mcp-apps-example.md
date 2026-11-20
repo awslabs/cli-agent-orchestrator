@@ -1,7 +1,7 @@
 # Example: the MCP Apps fleet UI
 
 A minimal walk-through of enabling CAO's host-rendered MCP Apps surface and
-driving it. Full reference: [`docs/mcp-apps.md`](../../../docs/mcp-apps.md).
+driving it. Full reference: [`docs/mcp-apps.md`](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/mcp-apps.md).
 
 ## 1. Start CAO with the surface enabled
 

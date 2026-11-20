@@ -175,7 +175,8 @@ class InboxService:
         num_messages: int = 1,
         registry: PluginRegistry | None = None,
         after_dispatch: Optional[Callable[[], None]] = None,
-    ) -> None:
+        source: Optional[str] = None,
+    ) -> int:
         """Deliver pending message(s) to a ready terminal. Use num_messages=0 for all.
 
         Status comes from the StatusMonitor (the event-driven source of truth).
@@ -211,7 +212,9 @@ class InboxService:
 
         try:
             with self._delivery_lock(terminal_id):
-                self._deliver_pending_locked(terminal_id, num_messages, registry, notify)
+                return self._deliver_pending_locked(
+                    terminal_id, num_messages, registry, notify, source=source
+                )
         finally:
             notify()
 
@@ -221,14 +224,24 @@ class InboxService:
         num_messages: int,
         registry: PluginRegistry | None,
         after_dispatch: Callable[[], None] = lambda: None,
-    ) -> None:
+        source: Optional[str] = None,
+    ) -> int:
+        """Return the number of messages actually handed to the pane.
+
+        The count lets an event-driven caller (the herdr settle-retry) stop
+        re-checking once a delivery lands, instead of running out its whole
+        window. Zero covers both "nothing pending" and "pending but the
+        readiness gate is still closed"; the caller only needs the positive
+        signal.
+        """
         limit = num_messages if num_messages > 0 else 100
         messages = get_pending_messages(terminal_id, limit=limit)
         if not messages:
-            return
+            return 0
 
         status = status_monitor.get_status(terminal_id)
         eager = False
+        delivered_count = 0
         if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
             # Not ready on the normal path. Eager delivery (#251) lets providers
             # that accept input mid-turn receive messages while PROCESSING or
@@ -256,7 +269,7 @@ class InboxService:
                 ):
                     eager_eligible = False
             if not eager_eligible:
-                return
+                return 0
             eager = True
 
         # Mark DELIVERED before sending (#164). send_input() types into the tmux
@@ -268,6 +281,18 @@ class InboxService:
         for message in messages:
             update_message_status(message.id, MessageStatus.DELIVERED)
 
+        # Event-inbox backends whose service delivers off the event loop
+        # (herdr-app) run the submit confirmation too. They have no output
+        # generation, so pickup is judged by a transition from the status read
+        # just before each dispatch, as the first-task path does for them
+        # (terminal_service._wait_for_post_dispatch_start).
+        confirm = INBOX_SUBMIT_CONFIRMATION and not eager
+        native_confirm = (
+            confirm
+            and get_backend().supports_event_inbox()
+            and get_backend().event_inbox_confirms_submit() is True
+        )
+
         # Deliver in contiguous runs of the same sender. With the default
         # num_messages=1 this is a single run; when draining all pending messages
         # (num_messages=0) a batch can span multiple senders, so each run is sent
@@ -277,6 +302,9 @@ class InboxService:
             batch = list(group)
             combined = "\n".join(m.message for m in batch)
             try:
+                pre_dispatch_status = (
+                    status_monitor.get_status(terminal_id) if native_confirm else None
+                )
                 # Taken from dispatch_input's return value -- sampled AFTER the
                 # monitor is armed and the rolling buffer cleared, before any key
                 # reaches the pane (terminal_service.py:4008-4022). That is the
@@ -305,7 +333,17 @@ class InboxService:
                         sender_id=sender_id,
                         orchestration_type=OrchestrationType.SEND_MESSAGE,
                     )
-                logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
+                # Name the trigger when the caller supplied one: an event-driven
+                # delivery and a reconciliation-sweep delivery are otherwise
+                # indistinguishable here, which is exactly how a dead event path
+                # (herdr 0.9.x pane.updated) went unnoticed.
+                logger.info(
+                    "Delivered %d message(s) to terminal %s%s",
+                    len(batch),
+                    terminal_id,
+                    f" (trigger: {source})" if source else "",
+                )
+                delivered_count += len(batch)
                 # The paste is in the pane: the immediate-delivery caller may
                 # answer now. Everything below is confirmation and recovery.
                 after_dispatch()
@@ -318,19 +356,21 @@ class InboxService:
                 # that the receiver started on its last input keeps an
                 # unpicked delivery from forwarding the previous answer, and
                 # its pickup timeout tells the caller if it never starts.
-                if INBOX_SUBMIT_CONFIRMATION and not eager:
-                    if get_backend().supports_event_inbox():
-                        # Event-inbox backends (herdr) push delivery synchronously
-                        # inline on their single asyncio event loop thread
-                        # (herdr_inbox_service.py's _event_loop -> _deliver, with
-                        # no asyncio.to_thread offload -- see the TODO at
-                        # herdr_inbox_service.py:1276-1277). _confirm_submitted's
-                        # blocking time.sleep() would stall that whole session's
-                        # event processing for up to
+                if confirm:
+                    if get_backend().supports_event_inbox() and not native_confirm:
+                        # The herdr TUI backend pushes live-event delivery
+                        # inline on its single asyncio event loop thread
+                        # (herdr_inbox_service.py's _event_loop -> _deliver). The
+                        # settle-retry path is offloaded via asyncio.to_thread,
+                        # but this on-event path is not, so _confirm_submitted's
+                        # blocking time.sleep() here would stall that whole
+                        # session's event processing for up to
                         # INBOX_SUBMIT_CONFIRM_TIMEOUT * (1 + INBOX_SUBMIT_MAX_RESUBMITS)
-                        # seconds. Skip confirmation there until that offload
-                        # exists -- the drop stays undetected on herdr, same as
-                        # before this fix, instead of freezing the session.
+                        # seconds. Skip confirmation there until the live-event
+                        # path is driven off-loop too (tracked as a follow-up to
+                        # the delivery-ready-signal work) -- the drop stays
+                        # undetected on herdr, same as before this fix, instead
+                        # of freezing the session.
                         logger.debug(
                             "Skipping inbox submit confirmation for terminal %s: "
                             "event-inbox backend delivery runs on the API event loop",
@@ -355,6 +395,8 @@ class InboxService:
                             boundary,
                             registry=registry,
                             sender_id=sender_id,
+                            native=native_confirm,
+                            pre_dispatch_status=pre_dispatch_status,
                         )
                 self._arm_message_edges(terminal_id, batch)
             except TerminalNotFoundError as e:
@@ -413,6 +455,8 @@ class InboxService:
                     logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
                     update_message_status(message.id, MessageStatus.FAILED)
                 self._close_message_edges(terminal_id, batch, _short_reason(e), registry)
+
+        return delivered_count
 
     def deliver_pending_in_background(
         self, terminal_id: str, registry: PluginRegistry | None = None
@@ -521,6 +565,9 @@ class InboxService:
         self,
         terminal_id: str,
         boundary: int,
+        *,
+        native: bool = False,
+        pre_dispatch_status: TerminalStatus | None = None,
     ) -> bool:
         """Wait for a started status that is EVIDENCE OF THIS DELIVERY.
 
@@ -531,15 +578,33 @@ class InboxService:
         causal pair from ``status_observation`` is required -- the generation the
         status was EARNED at must exceed the delivery boundary.
 
-        Callers never pass event-inbox (herdr) terminals here: that backend
-        pushes delivery inline on its own asyncio event loop thread, so
-        ``_deliver_pending_locked`` skips confirmation for it entirely rather
-        than block that loop (see the caller).
+        The herdr TUI backend never gets here: it pushes delivery inline on
+        its own asyncio event loop thread, so ``_deliver_pending_locked`` skips
+        confirmation for it rather than block that loop (see the caller).
+
+        ``native`` (herdr-app, which delivers off the loop): status is derived
+        on demand and has no output generation, so ``boundary`` cannot be
+        used. The rule is the first-task path's for event-inbox backends
+        (``terminal_service._wait_for_post_dispatch_start``): a started status
+        counts if it is PROCESSING or differs from ``pre_dispatch_status``, the
+        reading taken just before the dispatch. Native activity after the send
+        (herdr-core reported ``working``, ``status_monitor.started_on_last_input``)
+        also counts: herdr-core's terminal.send itself waits up to 5 s for the
+        agent to start, so a short turn can be over before the wait begins.
         """
         deadline = time.monotonic() + INBOX_SUBMIT_CONFIRM_TIMEOUT
         while True:
             observation = status_monitor.status_observation(terminal_id)
-            if (
+            if native:
+                if (
+                    observation.status in _SUBMIT_STARTED_STATUSES
+                    and (
+                        observation.status == TerminalStatus.PROCESSING
+                        or observation.status != pre_dispatch_status
+                    )
+                ) or status_monitor.started_on_last_input(terminal_id) is True:
+                    return True
+            elif (
                 observation.status in _SUBMIT_STARTED_STATUSES
                 and observation.output_generation is not None
                 and observation.output_generation > boundary
@@ -557,6 +622,8 @@ class InboxService:
         *,
         registry: PluginRegistry | None,
         sender_id: str | None,
+        native: bool = False,
+        pre_dispatch_status: TerminalStatus | None = None,
     ) -> bool:
         """Confirm the receiver began processing this delivery; re-submit if not.
 
@@ -590,7 +657,15 @@ class InboxService:
         DELIVERED either way: it HAS been typed into the pane, so reverting it to
         PENDING would let the reconcile sweep paste it a second time.
         """
-        if self._wait_for_pickup(terminal_id, boundary):
+
+        def picked_up(since: int) -> bool:
+            # ``native``: judged against the pre-dispatch reading every time, as
+            # the first-task path keeps one reading across its resubmits.
+            return self._wait_for_pickup(
+                terminal_id, since, native=native, pre_dispatch_status=pre_dispatch_status
+            )
+
+        if picked_up(boundary):
             return True
 
         for attempt in range(1, INBOX_SUBMIT_MAX_RESUBMITS + 1):
@@ -637,7 +712,7 @@ class InboxService:
             # The recency bar advances per attempt: evidence has to be earned
             # after THIS re-submission, not after the original send.
             boundary = new_boundary
-            if self._wait_for_pickup(terminal_id, boundary):
+            if picked_up(boundary):
                 return True
 
         logger.error(
@@ -653,6 +728,7 @@ class InboxService:
         terminal_ids: Iterable[str],
         registry: PluginRegistry | None,
         failure_label: str,
+        source: Optional[str] = None,
     ) -> None:
         """Run ``deliver_pending`` for every receiver, in parallel, failures isolated.
 
@@ -667,7 +743,9 @@ class InboxService:
             return
         with ThreadPoolExecutor(max_workers=min(len(ids), INBOX_SWEEP_FANOUT)) as pool:
             futures = {
-                pool.submit(self.deliver_pending, terminal_id, registry=registry): terminal_id
+                pool.submit(
+                    self.deliver_pending, terminal_id, registry=registry, source=source
+                ): terminal_id
                 for terminal_id in ids
             }
             for future in as_completed(futures):
@@ -687,6 +765,7 @@ class InboxService:
             list_pending_receiver_ids_by_provider(ProviderType.OPENCODE_CLI.value),
             registry,
             "OpenCode inbox poll",
+            source="opencode-poll",
         )
 
     def reconcile_orphaned_messages(self, registry: PluginRegistry | None = None) -> None:
@@ -724,6 +803,7 @@ class InboxService:
             list_pending_receiver_ids_older_than(INBOX_RECONCILE_GRACE_SECONDS),
             registry,
             "Inbox reconciliation",
+            source="reconcile-sweep",
         )
 
 

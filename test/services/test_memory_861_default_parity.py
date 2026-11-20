@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from test.services.test_scoring import _row, _stamp_updated_at
 from test.services.vault.test_vault_injection_renderer import _injectable_renderer
@@ -25,6 +26,12 @@ STAMP = datetime(2026, 1, 1, tzinfo=timezone.utc)
 CTX = {"cwd": "/pins/project", "session_name": "pin-session", "caller_scope": "global"}
 
 
+def _without_generated_stamp(block: str) -> str:
+    pattern = r'<cao-memory generated="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z">'
+    assert re.search(pattern, block)
+    return re.sub(pattern, "<cao-memory>", block, count=1)
+
+
 @pytest.fixture(params=["absent", "explicit"])
 def defaults(request, monkeypatch):
     for name, value in {
@@ -36,6 +43,7 @@ def defaults(request, monkeypatch):
             monkeypatch.setenv(name, value)
         else:
             monkeypatch.delenv(name, raising=False)
+    return request.param
 
 
 def _guard_distinct_bm25_matches(monkeypatch):
@@ -292,7 +300,7 @@ class TestInjectionParity:
             db.query(MemoryMetadataModel).filter_by(key="cap-00").update({"related_keys": "cap-10"})
             db.commit()
         _edge(factory, "cap-00", "project", "pin-project", "cap-01")
-        assert svc.get_memory_context(CTX) == (
+        assert _without_generated_stamp(svc.get_memory_context(CTX)) == (
             "<cao-memory>\n## Context from CAO Memory\n"
             "- [session] session-pin: pin pin body\n"
             "- [project] cap-00: body 00\n- [project] cap-01: body 01\n"
@@ -326,7 +334,7 @@ class TestInjectionParity:
                 .count()
                 == 1
             )
-        assert svc.get_memory_context_for_terminal("worker") == (
+        assert _without_generated_stamp(svc.get_memory_context_for_terminal("worker")) == (
             "<cao-memory>\n## Context from CAO Memory\n"
             "- [project] design: Design\n- [project] replacement: Replacement\n</cao-memory>"
         )
@@ -334,7 +342,7 @@ class TestInjectionParity:
 
 class TestInspectionParity:
     @pytest.mark.parametrize("surface", ["list", "show", "http-list", "http-show"])
-    def test_operator_reads_bump_access(self, corpus, monkeypatch, surface):
+    def test_operator_reads_follow_inspection_setting(self, corpus, monkeypatch, surface, defaults):
         from cli_agent_orchestrator.api import main
         from cli_agent_orchestrator.cli.commands import memory
 
@@ -355,4 +363,4 @@ class TestInspectionParity:
                 params={"scope": "global"},
             )
             assert response.status_code == 200, response.text
-        assert _row(engine, "global-new").access_count == before + 1
+        assert _row(engine, "global-new").access_count == before + int(defaults == "explicit")

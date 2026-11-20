@@ -50,6 +50,7 @@ Install:
   [Kiro CLI](docs/kiro-cli.md), [Claude Code](docs/claude-code.md),
   [Codex CLI](docs/codex-cli.md), [Antigravity CLI](docs/antigravity-cli.md),
   [Hermes](docs/hermes.md), [Kimi CLI](docs/kimi-cli.md),
+  [Qwen Code](docs/qwen-cli.md),
   [MiniMax Code](docs/minimax-code.md),
   [GitHub Copilot CLI](docs/copilot-cli.md),
   [OpenCode CLI](docs/opencode-cli.md), [Oh My Pi(OMP) CLI](docs/omp-cli.md),
@@ -128,6 +129,9 @@ provider override while keeping the same sequence.
   CLI, operations MCP server, or plugins.
 - [Web UI](docs/web-ui.md) and [MCP Apps](docs/mcp-apps.md): browser and
   host-rendered fleet interfaces.
+- [Kiro Crew](docs/kiro-crew.md): see, steer, start, and stop CAO sessions
+  from the Kiro Crew dashboard with the CAO Shelf App, and remote control a
+  session from a Kiro Crew chat.
 - [Flows](docs/flows.md) and [workflows](docs/workflows.md): scheduled runs and
   multi-step pipelines.
 - [Launch decisions](docs/decisions.md): local routing settings and content-free records.
@@ -174,6 +178,7 @@ provider override while keeping the same sequence.
   [Kiro CLI](docs/kiro-cli.md), [Claude Code](docs/claude-code.md),
   [Codex CLI](docs/codex-cli.md), [Antigravity CLI](docs/antigravity-cli.md),
   [Hermes](docs/hermes.md), [Kimi CLI](docs/kimi-cli.md),
+  [Qwen Code](docs/qwen-cli.md),
   [MiniMax Code](docs/minimax-code.md),
   [GitHub Copilot CLI](docs/copilot-cli.md),
   [OpenCode CLI](docs/opencode-cli.md), [Oh My Pi(OMP) CLI](docs/omp-cli.md),

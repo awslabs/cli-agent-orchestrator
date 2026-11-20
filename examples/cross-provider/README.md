@@ -143,7 +143,8 @@ mcpServers:
 ```
 
 Valid provider values: `kiro_cli`, `claude_code`, `codex`, `antigravity_cli`,
-`kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`.
+`kimi_cli`, `qwen_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`, `hermes`,
+`grok_cli`, `omp`, `mcode`.
 
 ## E2E Tests
 

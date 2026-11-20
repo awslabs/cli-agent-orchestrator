@@ -111,6 +111,7 @@ PROVIDER_TRANSPORTS: Dict[str, frozenset] = {
     "opencode_cli": _STDIO_ONLY,
     "codex": _STDIO_ONLY,
     "antigravity_cli": _STDIO_ONLY,
+    "qwen_cli": _STDIO_ONLY,
     # Serializers that can express a url entry as well as a local command.
     # ``grok_cli`` emits a TOML ``[mcp_servers.<name>]`` table with ``url``/``type``
     # (its ``type`` vocabulary differs from CAO's — see ``GROK_URL_TRANSPORTS``);
@@ -171,6 +172,7 @@ PROVIDER_CWD_DELIVERY: Dict[str, str] = {
     "kimi_cli": "native",
     "codex": "native",
     "antigravity_cli": "native",
+    "qwen_cli": "native",
     "grok_cli": "shim",
     "mcode": "shim",
     "kiro_cli": "shim",

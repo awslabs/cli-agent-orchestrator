@@ -41,6 +41,10 @@ _EXCLUDED_FILES = (
 # written by the build with links correct for their location.
 _GENERATED_PACKAGE_ROOT = Path("agent-plugin")
 _GENERATED_PACKAGE_SKILLS = "skills"
+# A skill is installed on its own (wheel, agent plugin), without ``docs/`` or the other
+# skills, so a relative link that leaves ``skills/<name>/`` dangles after installation even
+# though it resolves in a checkout.
+_SKILLS_ROOT = Path("skills")
 _PUNCTUATION_RE = re.compile(r"[^\w\-\s]", flags=re.UNICODE)
 _WHITESPACE_RE = re.compile(r"\s")
 
@@ -501,6 +505,14 @@ def _validate_destination(
 
     if not resolved.is_relative_to(repo_root):
         return MarkdownLinkError(source, line, destination, "path escapes the repository")
+    skill_directory = _skill_directory(repo_root, source)
+    if skill_directory is not None and not resolved.is_relative_to(skill_directory):
+        return MarkdownLinkError(
+            source,
+            line,
+            destination,
+            "link resolves outside the skill directory, so it dangles once the skill is installed",
+        )
     if not resolved.exists():
         return MarkdownLinkError(source, line, destination, "target does not exist")
     if resolved.is_dir():
@@ -528,6 +540,18 @@ def _validate_destination(
                 f"heading fragment #{decoded_fragment} does not exist",
             )
     return None
+
+
+def _skill_directory(repo_root: Path, source: Path) -> Path | None:
+    """Return ``skills/<name>`` when ``source`` is a file inside a skill, else ``None``."""
+
+    try:
+        parts = source.relative_to(repo_root).parts
+    except ValueError:
+        return None
+    if len(parts) < 3 or parts[0] != _SKILLS_ROOT.name:
+        return None
+    return repo_root / _SKILLS_ROOT / parts[1]
 
 
 def _directory_document(directory: Path) -> Path | None:

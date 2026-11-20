@@ -1,0 +1,9 @@
+{
+  "session": "onboarding-flow",
+  "source": "inbox_rows",
+  "complete": true,
+  "window_rows": 100,
+  "rows_seen": 0,
+  "closed": [],
+  "external_senders": []
+}
