@@ -18,6 +18,7 @@ import pytest
 from cli_agent_orchestrator import constants
 from cli_agent_orchestrator.clients import database as database_client
 from cli_agent_orchestrator.services import approval_store
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 
 @pytest.fixture()
@@ -37,7 +38,7 @@ def db_path(tmp_path, monkeypatch):
 
 
 def _columns(path):
-    with sqlite3.connect(str(path)) as conn:
+    with closing_transaction(sqlite3.connect(str(path))) as conn:
         return {row[1]: row for row in conn.execute("PRAGMA table_info(workflow_plan_approval)")}
 
 

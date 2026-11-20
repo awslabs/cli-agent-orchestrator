@@ -587,7 +587,7 @@ class TestHerdrBusyTimeFromEvents:
                 _service(callback),
                 [_pane_event("pane-1", "working"), _pane_event("pane-1", "idle")],
             )
-        callback.assert_called_once_with("h1")
+        callback.assert_called_once_with("h1", "herdr-event")
 
     def test_connect_time_snapshot_records_the_current_status(self, monkeypatch):
         """A transition missed while disconnected surfaces at reconnect."""

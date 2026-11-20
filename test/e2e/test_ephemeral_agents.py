@@ -18,6 +18,7 @@ import pytest
 import requests
 
 from cli_agent_orchestrator.utils import orchestration
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 pytestmark = [
     pytest.mark.e2e,
@@ -127,7 +128,7 @@ def create_name(server, creator, brief):
 
 
 def assert_collected(server, name):
-    with sqlite3.connect(server.db_path) as db:
+    with closing_transaction(sqlite3.connect(server.db_path)) as db:
         assert db.execute(
             "SELECT state FROM ephemeral_agents WHERE name=?", (name,)
         ).fetchone() == ("gc",)

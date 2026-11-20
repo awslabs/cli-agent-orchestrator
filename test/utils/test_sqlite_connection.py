@@ -11,6 +11,7 @@ import os
 import sqlite3
 import sys
 import warnings
+from pathlib import Path
 
 import pytest
 
@@ -101,6 +102,17 @@ class TestClosingTransaction:
             with closing_transaction(sqlite3.connect(path)) as conn:
                 conn.execute("SELECT 1")
         assert _open_fds() == before
+
+    def test_test_suite_uses_the_closing_transaction_for_file_databases(self):
+        """Test code must not retain a SQLite FD until cyclic GC happens."""
+        test_root = Path(__file__).parents[1]
+        offenders = []
+        for path in test_root.rglob("*.py"):
+            if path == Path(__file__):
+                continue
+            if "with sqlite3.connect(" in path.read_text(encoding="utf-8"):
+                offenders.append(str(path.relative_to(test_root.parent)))
+        assert offenders == []
 
 
 def _exercise_db_paths(i: int, scan_dir: str) -> None:
