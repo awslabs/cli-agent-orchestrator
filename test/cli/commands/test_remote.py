@@ -405,34 +405,26 @@ def test_remote_add_validates_arguments(tmp_path, monkeypatch):
     assert "box must match" in result.output
 
 
-@pytest.mark.parametrize(
-    ("user", "profile"),
-    [
-        ("bad\nuser", "work"),
-        ("user", "bad\tprofile"),
-    ],
-)
-def test_remote_add_rejects_control_characters_in_user_and_profile(
-    tmp_path, monkeypatch, user, profile
-):
+def test_remote_add_rejects_control_characters_in_user_and_profile(tmp_path, monkeypatch, box):
     monkeypatch.setattr(registry, "CAO_HOME_DIR", tmp_path)
-    result = CliRunner().invoke(
-        cli,
-        [
-            "remote",
-            "add",
-            "box-1",
-            "--instance-id",
-            "i-0123456789abcdef",
-            "--region",
-            "us-east-1",
-            "--profile",
-            profile,
-            "--user",
-            user,
-        ],
-    )
-    assert result.exit_code == 2
+    for user, profile in (("bad\nuser", "work"), ("user", "bad\tprofile")):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "remote",
+                "add",
+                box.name,
+                "--instance-id",
+                box.instance_id,
+                "--region",
+                box.region,
+                "--profile",
+                profile,
+                "--user",
+                user,
+            ],
+        )
+        assert result.exit_code == 2
 
 
 def test_ssh_checks_use_ssh_config_resolution_and_its_identity_file(box, tmp_path):
@@ -453,26 +445,27 @@ def test_ssh_checks_use_ssh_config_resolution_and_its_identity_file(box, tmp_pat
     assert ("ssh", "-G", "cao-box-1") in runner.argv
 
 
-@pytest.mark.parametrize("content", ["not an ini file", "[work]\na = b\n[work]\nc = d\n"])
-def test_malformed_configured_aws_files_are_fix_not_traceback(box, tmp_path, monkeypatch, content):
+def test_malformed_configured_aws_files_are_fix_not_traceback(box, tmp_path, monkeypatch):
     home = ready_home(tmp_path, box)
-    configured = tmp_path / "configured-credentials"
-    configured.write_text(content, encoding="utf-8")
-    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(configured))
-    checks = checks_by_name(check_box(box, FakeRunner(command_responses(box)), home))
-    assert checks["aws-credentials"].status == "FIX"
-    assert str(configured) in checks["aws-credentials"].detail
+    for content in ("not an ini file", "[work]\na = b\n[work]\nc = d\n"):
+        configured = tmp_path / "configured-credentials"
+        configured.write_text(content, encoding="utf-8")
+        monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(configured))
+        checks = checks_by_name(check_box(box, FakeRunner(command_responses(box)), home))
+        assert checks["aws-credentials"].status == "FIX"
+        assert str(configured) in checks["aws-credentials"].detail
 
 
-@pytest.mark.parametrize("version", ["tmux 3.3a", "tmux 3.10", "tmux 4.0", "tmux next-3.6"])
-def test_tmux_version_accepts_3_3_or_newer(box, tmp_path, version):
+def test_tmux_version_accepts_3_3_or_newer(box, tmp_path):
     tmux_box = RemoteBox(box.name, box.instance_id, box.region, box.aws_profile, mode="tmux")
-    responses = command_responses(box)
-    responses.pop(("herdr", "--version"))
-    responses.pop(("ssh", "-o", "BatchMode=yes", "cao-box-1", "bash -lc 'herdr --version'"))
-    responses[("ssh", "-o", "BatchMode=yes", "cao-box-1", "tmux", "-V")] = RunResult(0, version)
-    checks = checks_by_name(check_box(tmux_box, FakeRunner(responses), ready_home(tmp_path, box)))
-    assert checks["tmux"].status == "OK"
+    home = ready_home(tmp_path, box)
+    for version in ("tmux 3.3a", "tmux 3.10", "tmux 4.0", "tmux next-3.6"):
+        responses = command_responses(box)
+        responses.pop(("herdr", "--version"))
+        responses.pop(("ssh", "-o", "BatchMode=yes", "cao-box-1", "bash -lc 'herdr --version'"))
+        responses[("ssh", "-o", "BatchMode=yes", "cao-box-1", "tmux", "-V")] = RunResult(0, version)
+        checks = checks_by_name(check_box(tmux_box, FakeRunner(responses), home))
+        assert checks["tmux"].status == "OK"
 
 
 def test_remote_docs_describe_ssh_sessions_and_no_setup_commands():
@@ -522,27 +515,28 @@ def test_load_and_remove_missing_raise_clear_error(tmp_path, monkeypatch):
         remove("box-1")
 
 
-@pytest.mark.parametrize(
-    "content",
-    [
-        '{"instance_id": "i-0123456789abcdef", "name": "box-1", "region": "us-east-1"}',
+def test_bad_registration_is_usage_error_and_list_keeps_others(tmp_path, monkeypatch, box):
+    monkeypatch.setattr(registry, "CAO_HOME_DIR", tmp_path)
+    for content in (
+        json.dumps({"instance_id": box.instance_id, "name": box.name, "region": box.region}),
         "null",
         '"x"',
         None,
-    ],
-)
-def test_bad_registration_is_usage_error_and_list_keeps_others(tmp_path, monkeypatch, content):
-    monkeypatch.setattr(registry, "CAO_HOME_DIR", tmp_path)
-    save(RemoteBox("box-2", "i-0123456789abcdef", "us-east-1", "work"))
-    target = tmp_path / "remote" / "box-1.json"
-    if content is None:
-        target.mkdir()
-    else:
-        target.write_text(content, encoding="utf-8")
-    runner = CliRunner()
-    checked = runner.invoke(cli, ["remote", "check", "box-1"])
-    listed = runner.invoke(cli, ["remote", "list"])
-    assert checked.exit_code == 2
-    assert "invalid configuration" in checked.output
-    assert listed.exit_code == 0
-    assert listed.output.startswith("box-2\t")
+    ):
+        save(RemoteBox("box-2", box.instance_id, box.region, "work"))
+        target = tmp_path / "remote" / f"{box.name}.json"
+        if content is None:
+            target.mkdir()
+        else:
+            target.write_text(content, encoding="utf-8")
+        runner = CliRunner()
+        checked = runner.invoke(cli, ["remote", "check", box.name])
+        listed = runner.invoke(cli, ["remote", "list"])
+        assert checked.exit_code == 2
+        assert "invalid configuration" in checked.output
+        assert listed.exit_code == 0
+        assert listed.output.startswith("box-2\t")
+        if target.is_file():
+            target.unlink()
+        else:
+            target.rmdir()
