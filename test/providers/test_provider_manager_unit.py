@@ -544,9 +544,10 @@ def test_get_provider_no_shell_baseline_when_metadata_missing_shell_command():
 
 
 def test_get_provider_marks_a_restored_claude_code_provider_initialized():
-    """A Claude Code row has no shell_command, yet its CLI finished startup
-    before cao-server restarted. The rebuilt provider must accept input while
-    processing, or eager inbox delivery is refused for that terminal."""
+    """A Claude Code row has no shell_command, and a terminal that outlived a
+    cao-server restart is taken to have finished startup. The rebuilt provider
+    must accept input while processing, or eager inbox delivery is refused for
+    that terminal. A restart during initialize() is a known, accepted gap."""
     from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 
     manager = ProviderManager()
