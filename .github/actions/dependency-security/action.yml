@@ -1,25 +1,27 @@
 name: Dependency Security
-description: Full dependency inventory, HIGH/CRITICAL gate, and installed mitigation checks
+description: >
+  Full dependency inventory, a HIGH/CRITICAL gate on the shipped set (#1398), toolchain-only
+  findings reported without blocking, and installed mitigation checks
 runs:
   using: composite
   steps:
     - name: Install Trivy
       uses: ./.github/actions/install-trivy
 
-    - name: Audit all locked dependencies
+    # `uv export` (the wheel's runtime closure) and the script's PyYAML need uv and the
+    # locked runtime environment. `--no-install-project` avoids building the wheel here.
+    - name: Set up uv
+      if: ${{ !cancelled() }}
+      uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:
+        enable-cache: false
+
+    - name: Install the locked runtime environment for the gate script
       if: ${{ !cancelled() }}
       shell: bash
-      run: python3 scripts/dependency_security.py --output-dir "$RUNNER_TEMP/dependency-security"
+      run: uv sync --locked --no-dev --no-install-project
 
-    - name: Publish dependency inventory and findings
-      if: ${{ !cancelled() }}
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-      with:
-        name: dependency-security-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/dependency-security/
-        if-no-files-found: error
-
-    - name: Set up Node.js for mitigation checks
+    - name: Set up Node.js for mitigation checks and the shipped bundles
       if: ${{ !cancelled() }}
       uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       with:
@@ -48,3 +50,63 @@ runs:
           fi
         done
         exit "$result"
+
+    # The recorder's own tests (worker bundles, externals, injected helpers) run with the
+    # same `node --test` runner as the braces checks, before it is trusted below.
+    - name: Test the shipped-set recorder
+      if: ${{ !cancelled() }}
+      shell: bash
+      run: node --test scripts/test-shipped-packages.mjs
+
+    # The shipped set is measured from the real builds: each bundler plugin records the npm
+    # packages it bundled under <project>/.shipped/. If a build fails, or records nothing,
+    # the gate script below reports an error and the job fails (it never defaults to
+    # "nothing shipped, so pass").
+    - name: Build the shipped bundles (records what each one bundles)
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        HUSKY: "0"
+      run: |
+        set -euo pipefail
+        npm run build --prefix web
+        npm run build:all --prefix cao_mcp_apps
+        npm run build --prefix docusaurus
+
+    # The new-with-a-fix tier compares this change's lockfiles with the PR base, and ignore
+    # entries are dated from git history (a shallow clone cannot date them), so the gate
+    # needs full history and, on a pull request, the base commit. Without them the gate
+    # script exits 2 (fail closed). Push and schedule runs have no base and skip the
+    # base comparison with a warning.
+    - name: Fetch history and the pull request base
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        set -euo pipefail
+        set -- --no-tags
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          set -- "$@" --unshallow
+        fi
+        set -- "$@" origin
+        if [ -n "${BASE_SHA:-}" ]; then
+          set -- "$@" "$BASE_SHA"
+        fi
+        git fetch "$@"
+
+    - name: Audit all locked dependencies, gate the shipped set
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        # Empty outside pull requests; the script then skips the base comparisons.
+        CAO_DEPSEC_BASE_REV: ${{ github.event.pull_request.base.sha }}
+      run: uv run --no-sync python scripts/dependency_security.py --output-dir "$RUNNER_TEMP/dependency-security"
+
+    - name: Publish dependency inventory and findings
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: dependency-security-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/dependency-security/
+        if-no-files-found: error

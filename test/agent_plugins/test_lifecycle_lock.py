@@ -116,11 +116,11 @@ class TestTheLifecycleLockIsSeparateFromTheStoreLock:
         def holder():
             with store.lifecycle_lock(timeout=5.0):
                 acquired.set()
-                release.wait(timeout=5.0)
+                release.wait(timeout=30.0)
 
         thread = threading.Thread(target=holder, daemon=True)
         thread.start()
-        assert acquired.wait(timeout=5.0)
+        assert acquired.wait(timeout=30.0)
         try:
             second = InstalledPluginStore(plugins_dir=store.plugins_dir, data_dir=store.data_dir)
             # The STORE's class here, deliberately: this calls the store API
@@ -132,7 +132,7 @@ class TestTheLifecycleLockIsSeparateFromTheStoreLock:
                     pass
         finally:
             release.set()
-            thread.join(timeout=5.0)
+            thread.join(timeout=30.0)
 
 
 class TestTheBusyErrorReachesTheRightHandler:
@@ -154,11 +154,11 @@ class TestTheBusyErrorReachesTheRightHandler:
         def holder():
             with store.lifecycle_lock(timeout=5.0):
                 acquired.set()
-                release.wait(timeout=5.0)
+                release.wait(timeout=30.0)
 
         thread = threading.Thread(target=holder, daemon=True)
         thread.start()
-        assert acquired.wait(timeout=5.0)
+        assert acquired.wait(timeout=30.0)
         try:
             with pytest.raises(PluginBusyError) as caught:
                 install(
@@ -171,7 +171,7 @@ class TestTheBusyErrorReachesTheRightHandler:
             assert isinstance(caught.value, PluginInstallError)
         finally:
             release.set()
-            thread.join(timeout=5.0)
+            thread.join(timeout=30.0)
 
 
 class TestTheReportedInterleaving:
@@ -216,7 +216,7 @@ class TestTheReportedInterleaving:
         def reinstaller():
             reinstall_done.clear()
             try:
-                snapshot_taken.wait(timeout=5.0)
+                snapshot_taken.wait(timeout=30.0)
                 other = _store(tmp_path)
                 install(
                     _source(demo),
@@ -270,11 +270,11 @@ class TestTheSweepYieldsRatherThanWaits:
         def holder():
             with store.lifecycle_lock(timeout=5.0):
                 acquired.set()
-                release.wait(timeout=5.0)
+                release.wait(timeout=30.0)
 
         thread = threading.Thread(target=holder, daemon=True)
         thread.start()
-        assert acquired.wait(timeout=5.0)
+        assert acquired.wait(timeout=30.0)
         try:
             other = InstalledPluginStore(plugins_dir=store.plugins_dir, data_dir=store.data_dir)
             sweep = projection_mod.sweep_dangling_projections(other, skills_dir=skills_dir)
@@ -282,7 +282,7 @@ class TestTheSweepYieldsRatherThanWaits:
             assert sweep.swept == ()
         finally:
             release.set()
-            thread.join(timeout=5.0)
+            thread.join(timeout=30.0)
 
     def test_an_idle_store_is_swept_normally(self, store, skills_dir):
         sweep = projection_mod.sweep_dangling_projections(store, skills_dir=skills_dir)

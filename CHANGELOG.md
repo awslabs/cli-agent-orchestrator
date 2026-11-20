@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add the Qwen Code (`qwen_cli`) provider with profile, skill, MCP and model support.
+
+- **herdr backend: event-driven inbox delivery works again on herdr 0.9.x (protocol 22)**.
+  herdr ≥0.9 acks a broadcast `pane.updated` subscription but never emits the event, so every
+  inbox delivery silently fell back to the 30s reconciliation sweep (measured 51s/83s
+  end-to-end on 0.9.5, slower than the tmux watchdog). The service now subscribes to
+  `pane.agent_status_changed` per managed pane — validated against a live snapshot, because
+  herdr resets the connection when a subscription names an unknown pane — while keeping the
+  broadcast for older herdr versions, and recycles the connection (one `events.subscribe`
+  per connection) when a pane registers later. The subscribe response is now read instead of
+  fire-and-forget, herdr's version/protocol are logged (warning outside the tested range
+  17–22), and delivery log lines name their trigger (`herdr-event`, `herdr-settle`,
+  `settled-sweep`, `reconcile-sweep`, `opencode-poll`) so a dead event path can no longer
+  hide. A single event-driven re-delivery loop per terminal carries a message across the
+  provider's post-turn flush-wait, offloaded off the event loop and stopping as soon as the
+  message lands.
+
 - **Memory inspection and fixture hygiene are safer by default** (#1329).
   This resolves #861 Q3: CLI list/show and REST list/show no longer increment
   `access_count` unless `memory.non_accessing_inspection=false`; MCP recall
@@ -29,6 +46,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of skipping them, while `--apply --add-headings` first writes a `.md.bak` copy and then adds
   the heading. Recency-ranked keyword results can shift because previously invisible notes now
   participate; a later phase adds the BM25 default.
+- **Provider memory file writes now default off** (#1335). CAO delivers each terminal's
+  memory without writing it into project files that can be committed. Interactive
+  `cao launch` sessions using a runtime start-prompt provider — Claude Code, Codex,
+  Kimi CLI, Antigravity CLI, OMP, Grok CLI, MiniMax Code, or Qwen Code — receive it in that
+  prompt; orchestrated terminals retain task-aware first-message delivery. Set
+  `memory.injection.write_project_files=true` to opt back into the legacy provider-file
+  behavior. With `memory.enabled=false`, CAO does not inspect or clean up those files.
+
+- **Memory injection no longer leaves stale provider context or drops a scope behind one
+  long note** (#1329). Claude Code, Codex and Kiro provider files receive UTC-stamped
+  blocks, including an explicit empty block when no memories are selected. A launch whose
+  selected memory body is unchanged preserves the provider file byte-for-byte, including
+  its prior stamp, so tracked files do not gain stamp-only diffs. The v1 builder clips an
+  oversized first note, continues to later notes that fit, and follows recorded project
+  `cwd_hash` aliases. `memory.injection.clear_on_empty` and
+  `memory.injection.v1_fixes` both default to `true`; setting either to `false` restores
+  its legacy behavior.
 - **Docs: the retrospector profile, the `store_lesson` description, the self-learning guides and the `cao-learning` skill no longer say lessons reach future sessions or can be recalled by a curator or supervisor, or that they are injected into new sessions** (#1335, #1329).
   A lesson is found only by the owning agent's `memory_recall` or a promoted `## Learned Patterns` block.
   A supervisor's recall returns only lessons under its own profile, so it tells the worker to recall.

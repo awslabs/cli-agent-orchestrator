@@ -1387,8 +1387,8 @@ class TestPollOpenCodePendingMessages:
 
         mock_list_receivers.assert_called_once_with("opencode_cli")
         assert svc.deliver_pending.call_args_list == [
-            call("receiver-1", registry=None),
-            call("receiver-2", registry=None),
+            call("receiver-1", registry=None, source="opencode-poll"),
+            call("receiver-2", registry=None, source="opencode-poll"),
         ]
 
     @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_by_provider")
@@ -1438,7 +1438,9 @@ class TestReconcileOrphanedMessages:
         svc.deliver_pending = MagicMock()
         svc.reconcile_orphaned_messages()
 
-        svc.deliver_pending.assert_called_once_with("receiver-1", registry=None)
+        svc.deliver_pending.assert_called_once_with(
+            "receiver-1", registry=None, source="reconcile-sweep"
+        )
 
     @patch(
         "cli_agent_orchestrator.services.inbox_service.fail_orphaned_pending_messages",
@@ -1455,8 +1457,8 @@ class TestReconcileOrphanedMessages:
 
         mock_list_receivers.assert_called_once_with(INBOX_RECONCILE_GRACE_SECONDS)
         assert svc.deliver_pending.call_args_list == [
-            call("receiver-1", registry=None),
-            call("receiver-2", registry=None),
+            call("receiver-1", registry=None, source="reconcile-sweep"),
+            call("receiver-2", registry=None, source="reconcile-sweep"),
         ]
 
     @patch(
@@ -1651,7 +1653,7 @@ class TestDeliveryIsolation:
         release_a = threading.Event()
         delivered = {}
 
-        def deliver(terminal_id, registry=None):
+        def deliver(terminal_id, registry=None, source=None):
             delivered[terminal_id] = time.monotonic()
             if terminal_id == "term-A":
                 release_a.wait(5)
@@ -1690,7 +1692,7 @@ class TestDeliveryIsolation:
         calls = []
         started = threading.Event()
 
-        def deliver(terminal_id, registry=None):
+        def deliver(terminal_id, registry=None, source=None):
             calls.append(time.monotonic())
             if len(calls) == 1:
                 started.set()
@@ -1808,7 +1810,7 @@ class TestDeliveryIsolation:
         release_a = threading.Event()
         delivered = {}
 
-        def deliver(terminal_id, registry=None):
+        def deliver(terminal_id, registry=None, source=None):
             delivered[terminal_id] = time.monotonic()
             if terminal_id == "term-A":
                 release_a.wait(5)
@@ -2303,6 +2305,9 @@ class TestInboxRecoveryCoverageByProvider:
         "grok_cli",
         "hermes",
         "kimi_cli",
+        # Qwen has no composer reader, so a swallowed submit cannot be retried
+        # safely without risking duplicate input.
+        "qwen_cli",
         "omp",
         "mock_cli",
         # Probe but no composer reader: the probe can confirm a working agent
@@ -2653,7 +2658,7 @@ class TestDeliverPendingInBackground:
         registry = MagicMock()
         seen = []
 
-        def deliver(terminal_id, registry=None):
+        def deliver(terminal_id, registry=None, source=None):
             seen.append((terminal_id, registry, threading.current_thread().name))
 
         with patch.object(service, "deliver_pending", side_effect=deliver):

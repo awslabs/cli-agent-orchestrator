@@ -176,6 +176,7 @@ LAUNCH_CASES: dict[str, _LaunchCase] = {
     "claude_code": _LaunchCase("claude_code", "ClaudeCodeProvider", "_build_claude_command"),
     "codex": _LaunchCase("codex", "CodexProvider", "_build_codex_command"),
     "kimi_cli": _LaunchCase("kimi_cli", "KimiCliProvider", "_build_kimi_command"),
+    "qwen_cli": _LaunchCase("qwen_cli", "QwenCliProvider", "_build_qwen_command"),
     "cursor_cli": _LaunchCase(
         "cursor_cli", "CursorCliProvider", "_build_cursor_command", _cursor_artifact
     ),
@@ -259,6 +260,7 @@ class TestEveryDeliveringProviderIsCovered:
 #: ``_with_plugin_mcp``. ``mcode``/``minimax_code`` is the one place these differ,
 #: which is exactly the mistake the guard below exists to catch.
 _PROVIDER_MODULE_VALUES = {
+    "qwen_cli": "qwen_cli",
     "antigravity_cli": "antigravity_cli",
     "claude_code": "claude_code",
     "codex": "codex",

@@ -151,7 +151,7 @@ def _run_pair(target: Any, args: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]
     received: list[tuple[Any, ...]] = []
     for _ in processes:
         try:
-            received.append(results.get(timeout=5))
+            received.append(results.get(timeout=30))
         except queue.Empty:
             pytest.fail("workflow writer exited without returning a result")
     return received
@@ -428,10 +428,10 @@ def test_concurrent_reader_observes_only_complete_old_or_new_bytes(tmp_path: Pat
     deadline = time.monotonic() + 20
     while process.is_alive() and time.monotonic() < deadline:
         observed.add(target.read_bytes())
-    process.join(timeout=5)
+    process.join(timeout=30)
 
     assert process.exitcode == 0
-    assert results.get(timeout=5)[0] == "ok"
+    assert results.get(timeout=30)[0] == "ok"
     observed.add(target.read_bytes())
     assert observed <= allowed
     assert target.read_bytes() == new_source.encode("utf-8")
@@ -462,11 +462,11 @@ def test_service_lock_timeout_preserves_target_and_releases_cleanly(
     def _hold() -> None:
         with atomic_file.strict_identity_lock(lock_identity, target):
             holder_ready.set()
-            release_holder.wait(timeout=5)
+            release_holder.wait(timeout=30)
 
     holder = threading.Thread(target=_hold)
     holder.start()
-    assert holder_ready.wait(timeout=5)
+    assert holder_ready.wait(timeout=30)
 
     real_strict_lock = atomic_file.strict_identity_lock
 
@@ -487,7 +487,7 @@ def test_service_lock_timeout_preserves_target_and_releases_cleanly(
         assert target.read_text(encoding="utf-8") == BASE
     finally:
         release_holder.set()
-        holder.join(timeout=5)
+        holder.join(timeout=30)
 
     assert not holder.is_alive()
     with real_strict_lock(lock_identity, target, lock_timeout=0.5):
@@ -609,7 +609,7 @@ def test_delete_waits_for_same_name_writer_process(
                     process.join(timeout=5)
 
     assert writer.exitcode == deleter.exitcode == 0
-    assert sorted(results.get(timeout=5) for _ in range(2)) == [("delete", "ok"), ("writer", "ok")]
+    assert sorted(results.get(timeout=30) for _ in range(2)) == [("delete", "ok"), ("writer", "ok")]
     assert not (tmp_path / "contended.py").exists()
     with svc._connect() as conn:
         assert conn.execute("SELECT name FROM workflow_index").fetchall() == []

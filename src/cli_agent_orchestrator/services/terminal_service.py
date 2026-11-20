@@ -779,6 +779,48 @@ def inject_memory_context(
     return first_message
 
 
+def _memory_start_prompt(skill_prompt: Optional[str], terminal_id: str) -> Optional[str]:
+    """Add memory to an interactive provider's launch prompt exactly once.
+
+    A configured context manager needs the real first task, so those terminals
+    stay on ``inject_memory_context``.  Uncurated interactive launches have no
+    CAO-delivered first message; their provider start prompt is the only
+    available injection seam.
+    """
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    if not is_memory_enabled():
+        return skill_prompt
+
+    service = MemoryService()
+    try:
+        terminal_context = service._get_terminal_context(terminal_id)
+        session_name = (terminal_context or {}).get("session_name")
+        if session_name and service._find_context_manager_terminal(session_name):
+            return skill_prompt
+    except Exception as e:
+        logger.warning(f"Failed to check memory manager for terminal {terminal_id}: {e}")
+
+    with _memory_injected_lock:
+        if terminal_id in _memory_injected_terminals:
+            return skill_prompt
+
+    try:
+        context = memory_context_for_terminal(terminal_id)
+    except Exception as e:
+        # Leave the terminal unmarked so a later CAO-delivered first message
+        # can retry through the established injection path.
+        logger.warning(f"Failed to inject start memory for terminal {terminal_id}: {e}")
+        return skill_prompt
+
+    with _memory_injected_lock:
+        _memory_injected_terminals.add(terminal_id)
+
+    if not context:
+        return skill_prompt
+    return f"{context}\n\n{skill_prompt}" if skill_prompt else context
+
+
 class OutputMode(str, Enum):
     """Output mode for terminal history retrieval.
 
@@ -799,6 +841,7 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CLAUDE_CODE.value,
     ProviderType.CODEX.value,
     ProviderType.KIMI_CLI.value,
+    ProviderType.QWEN_CLI.value,
     ProviderType.ANTIGRAVITY_CLI.value,
     ProviderType.OMP.value,
     ProviderType.GROK_CLI.value,
@@ -1411,6 +1454,7 @@ def _request_fingerprint(
     description: Optional[str] = None,
     caller_ceiling: Optional[List[str]] = None,
     delegating_terminal_id: Optional[str] = None,
+    inject_memory_at_start: bool = False,
 ) -> str:
     """Fingerprint the create-terminal request an idempotency key stands for.
 
@@ -1618,6 +1662,8 @@ def _request_fingerprint(
         )
     if delegating_terminal_id is not None:
         parts.extend(["delegating_terminal_id", delegating_terminal_id])
+    if inject_memory_at_start:
+        parts.extend(["inject_memory_at_start", "1"])
     return hashlib.sha256(
         "\x00".join(_fingerprint_component(part) for part in parts).encode("utf-8")
     ).hexdigest()
@@ -1952,6 +1998,8 @@ async def create_terminal(
     launch_plan: "LaunchPlan | None" = None,
     delegating_terminal_id: Optional[str] = None,
     caller_ceiling: Optional[list[str]] = None,
+    *,
+    inject_memory_at_start: bool = False,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -2064,12 +2112,14 @@ async def create_terminal(
             hashed or excluded-with-a-reason. Adding a parameter to either
             endpoint means classifying it here.
 
-            HASHED (11) -- these determine what the terminal IS, or what
+            HASHED (14) -- these determine what the terminal IS, or what
             privileges and context it launches with:
             ``provider``, ``agent_profile``, ``session_name``,
             ``working_directory``, ``caller_id``, ``model``, ``use_worktree``,
             ``engine``, ``allowed_tools``, ``env_vars``,
-            ``resume_session_id``.
+            ``resume_session_id``, ``initial_message``,
+            ``initial_message_orchestration_type``,
+            ``inject_memory_at_start``.
 
             EXCLUDED, each for a checked reason:
 
@@ -2080,10 +2130,6 @@ async def create_terminal(
               the ``update_metadata`` MCP tool, so a create-time key is not
               their integrity boundary -- a caller who cares about their value
               cannot rely on creation to fix it anyway.
-            - ``initial_message`` and ``initial_message_orchestration_type``.
-              The delivered payload and its routing, not the terminal: neither
-              is persisted on the row, and a genuine retry re-sends the same
-              message. These create endpoints do not own the prompt.
             - ``delegation_message`` and ``delegation_kind``. These never reach
               this function: the handler converts them into a launch plan that
               selects a decision, not the terminal's identity. A genuine retry
@@ -2239,6 +2285,7 @@ async def create_terminal(
             launch_plan=launch_plan,
             delegating_terminal_id=delegating_terminal_id,
             caller_ceiling=caller_ceiling,
+            inject_memory_at_start=inject_memory_at_start,
             ephemeral_state=state,
         )
     except BaseException as exc:
@@ -2283,6 +2330,7 @@ async def _create_terminal_unguarded(
     delegating_terminal_id: Optional[str] = None,
     caller_ceiling: Optional[list[str]] = None,
     *,
+    inject_memory_at_start: bool = False,
     ephemeral_state: _EphemeralLaunchState,
 ) -> Terminal:
     """Create body; the caller compensates an unbound claim or a cancelled bind."""
@@ -2319,6 +2367,7 @@ async def _create_terminal_unguarded(
             description,
             caller_ceiling=caller_ceiling,
             delegating_terminal_id=delegating_terminal_id,
+            inject_memory_at_start=inject_memory_at_start,
         )
         # Issue #944: look up, store and delete under the fingerprint-scoped
         # key, never the bare one. A different request under the same key
@@ -3444,6 +3493,22 @@ async def _create_terminal_unguarded(
             session_id=fresh_claude_session_id,
             **provider_launch_options,
         )
+        # Interactive prompt-capable providers have no CAO first message, so
+        # inject memory through their launch prompt. Resolve after provider
+        # registration: context lookup can involve a remote owner and must not
+        # widen the row-visible/runtime-missing teardown race. Initialization
+        # has not started yet, so updating the prompt here still precedes command
+        # construction. Immediate orchestrated launches retain the task-aware
+        # first-message path (and workflow frozen-memory semantics).
+        if (
+            inject_memory_at_start
+            and provider in RUNTIME_SKILL_PROMPT_PROVIDERS
+            and initial_message is None
+        ):
+            provider_instance._skill_prompt = await asyncio.to_thread(
+                _memory_start_prompt, skill_prompt, terminal_id
+            )
+
         # The provider owns the helper's home now: its cleanup removes it.
         ephemeral_state.kiro_home = None
 

@@ -82,3 +82,6 @@ target/
 # committing one would put a multi-MB executable into the history the weekly
 # gitleaks sweep scans, for the same reason target/ is ignored. (#321)
 wheelhouse/
+
+# Shipped-package records written by builds for the dependency gate (#1398)
+.shipped/

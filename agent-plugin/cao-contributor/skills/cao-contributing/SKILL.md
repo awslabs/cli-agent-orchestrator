@@ -72,22 +72,24 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 
 | Job | Runs | Blocking? |
 |-----|------|-----------|
-| **Unit Tests** (3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-branch --cov-fail-under=80 --cov-report=term-missing` | **Yes** |
+| **Unit Tests** (3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ examples/remote/ec2/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-branch --cov-fail-under=80 --cov-report=term-missing --cov-report=json` | **Yes** |
 | ↳ step: **Validate Markdown links** | `uv run python scripts/validate_markdown_links.py` — every relative link in every tracked `.md`, including `skills/` | **Yes** |
+| ↳ step: **Check links inside each built agent plugin package** | `make check-agent-plugin-links` — builds each `agent-plugin/` package on its own and checks its links, including the generated `README.md` and `CHANGELOG.md` | **Yes** |
 | **Code Quality** | black `--check`, isort `--check-only`, `uv run ruff check src/ test/ examples/`, then `uv run python scripts/mypy_ratchet.py` | **Yes** (all four; the mypy step's `continue-on-error` was removed in issue #1005) |
 | **AG-UI demo (shift-left recording)** | boots a `CAO_AGUI_ENABLED` server, drives the viewer, records a GIF artifact | **Yes** |
 | **AG-UI construct demos (shift-left recordings)** | same pattern for the L2 construct library | **Yes** |
 | **AG-UI stock-client live (AC3)** | drives a real third-party AG-UI client against the surface | **Yes** |
 | **AG-UI operator dashboard** | `examples/ag-ui/ag-ui-operator-dashboard`: installs tmux, then `npm ci`, `test:dependencies`, `tsc`, vitest with a 100% coverage floor on `core/`, `vite build`, and a keyless e2e against a private cao-server with `mock_cli` terminals | **Yes** |
 | **Agent Plugins dog-food (shift-left recording)** | records the plugin pipeline from `examples/agent-plugins/agent-plugins-dogfood/tools` and gates on drift | **Yes** |
-| **CAO MCP Apps** | MCP Apps build + backend coverage ratchet floor | **Yes** |
+| **CAO MCP Apps** | MCP Apps build and frontend coverage summary | **Yes** |
+| **Coverage ratchet** | reads the Unit Tests 3.12 Python report and MCP Apps frontend summary | **Yes** |
 | **CAO MCP Apps E2E (Playwright)** | browser E2E over the `ui://cao/*` views | **Yes** |
 | **Rust TUI** (Linux x86_64 / macOS arm64) | `cargo test` for the `tui/` crate | **Yes** |
 | **Web UI Build** | frontend build | **Yes** |
 | **AI-DLC Portfolio Example** | example project builds | **Yes** |
 | **Security Scan** | Trivy | **Yes** |
 | **CodeQL** | GitHub Actions, JavaScript/TypeScript, Python, and Rust analysis and upload in the same CI run, including forks after required workflow approval | **Yes** — no project build; the hosted scan/status rules remain as documented in `SECURITY.md` |
-| **Dependency Security** | Full locked npm, Bun, uv, and Cargo inventories, including development dependencies and unfixed advisories; independent clean-install mitigation checks | **Yes** — every HIGH/CRITICAL finding or scan error fails; locally, `scripts/security-scan.sh dependencies` with Trivy installed |
+| **Dependency Security** | Full locked npm, Bun, uv, and Cargo inventories, including development dependencies and unfixed advisories, classified against a shipped set measured from the builds; independent clean-install mitigation checks | **Yes** — every HIGH/CRITICAL finding in the shipped set (wheel runtime closure, bundled web/MCP App/docs packages, TUI crates), a malware advisory anywhere, a toolchain HIGH/CRITICAL with a fix that the PR adds or changes, or any scan, completeness or shipped-set error, fails; other toolchain-only findings are listed and do not block; locally, build the bundles first, then `scripts/security-scan.sh dependencies` with Trivy installed |
 | **Dependency Review** | `actions/dependency-review-action` over the PR's dependency delta: `fail-on-severity: high` plus denied licences `GPL-3.0`/`AGPL-3.0` | **Yes** — CI-only; there is nothing to run locally, and it is skipped on forks (`if: github.repository == 'awslabs/cli-agent-orchestrator'`), so a green run on your fork has not exercised it |
 
 CodeQL's four language jobs are part of `ci.yml`, so **Re-run all jobs** includes
@@ -210,8 +212,11 @@ to rediscover.
    It exits 11, but the pipe reports `grep`'s status, so a floor read off a stale wheel looks
    like a pass.
 4. **Run the dependency gate locally** with the Trivy version CI pins (see `SECURITY.md`):
-   `uv run python scripts/dependency_security.py`. Every HIGH or CRITICAL finding blocks, and
-   local mitigations are not exemptions.
+   `uv run python scripts/dependency_security.py` (after `npm run build` in `web/`,
+   `npm run build:all` in `cao_mcp_apps/` and `npm run build` in `docusaurus/`, which record
+   the shipped set). Every HIGH or CRITICAL finding in the shipped set blocks, and local
+   mitigations are not exemptions; a finding only in the build or test toolchain is listed
+   and does not block (see `SECURITY.md`, "Shipped set and toolchain findings").
 
 ## Refreshing the Playwright image digest
 
@@ -255,8 +260,9 @@ digest together:
    stays in lockstep (`test/test_skill_packaging_parity.py` enforces it). A skill that also
    ships in a plugin package under `agent-plugin/` has a *third* copy: rebuild it with
    `make agent-plugin-keep-pin` (`build_agent_plugin.py --keep-committed-pin`), commit
-   `agent-plugin/`, and finish with `make check-agent-plugin`, or the Unit Tests job's step
-   of that name goes red. It rebuilds at the version the committed packages already pin,
+   `agent-plugin/`, and finish with `make check-agent-plugin` and
+   `make check-agent-plugin-links`, or the Unit Tests job's steps of those names go red
+   (the second step is named "Check links inside each built agent plugin package"). It rebuilds at the version the committed packages already pin,
    because the release workflow's `regenerate-agent-plugin` job moves that pin after
    publishing and a contributor PR should not; it contacts no PyPI, and it refuses with the
    reason when the committed packages disagree. `git diff agent-plugin/` should then show

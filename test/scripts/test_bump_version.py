@@ -299,7 +299,8 @@ class TestTheBumpPassesThePublishCheck:
 
     def test_a_drifting_lock_leaves_the_whole_tree_as_it_was(self, tree, monkeypatch, capsys):
         originals = {
-            rel: (tree / rel).read_text("utf-8") for rel in ("pyproject.toml", "uv.lock", FEATURE)
+            rel: (tree / rel).read_text("utf-8")
+            for rel in ("pyproject.toml", "uv.lock", FEATURE, "CHANGELOG.md")
         }
 
         def re_resolves(text: str) -> str:
@@ -341,7 +342,8 @@ class TestMainRestoresOnAnyException:
     )
     def test_every_snapshotted_file_is_restored_on_any_exception(self, tree, monkeypatch, exc):
         originals = {
-            rel: (tree / rel).read_text("utf-8") for rel in ("pyproject.toml", "uv.lock", FEATURE)
+            rel: (tree / rel).read_text("utf-8")
+            for rel in ("pyproject.toml", "uv.lock", FEATURE, "CHANGELOG.md")
         }
         runner = _RaisingRunner(exc)
         real = bv.update_uv_lock
@@ -352,6 +354,33 @@ class TestMainRestoresOnAnyException:
         for rel, text in originals.items():
             assert (tree / rel).read_text("utf-8") == text, rel
         assert runner.calls == [["uv", "lock"]], "the second uv call never runs"
+
+
+class TestMainRestoresTheLockWhenWritingTheChangelogFails:
+    def test_every_version_carrier_is_restored(self, tree, monkeypatch):
+        originals = {
+            rel: (tree / rel).read_bytes()
+            for rel in ("pyproject.toml", "uv.lock", FEATURE, "CHANGELOG.md")
+        }
+        new_changelog = bv.promoted_changelog(bv.bump("patch", _current(tree)))
+        write_bytes = Path.write_bytes
+
+        def fail_only_the_new_changelog(path, data):
+            if path == bv.CHANGELOG and data == new_changelog:
+                raise OSError("disk full")
+            return write_bytes(path, data)
+
+        monkeypatch.setattr(Path, "write_bytes", fail_only_the_new_changelog)
+        uv = FakeUv(tree / "uv.lock", _moves_version(bv.bump("patch", _current(tree))))
+        real = bv.update_uv_lock
+        monkeypatch.setattr(bv, "update_uv_lock", lambda old, new: real(old, new, run=uv))
+        monkeypatch.setattr(sys, "argv", ["bump_version.py", "patch"])
+
+        with pytest.raises(OSError, match="disk full"):
+            bv.main()
+
+        for rel, before in originals.items():
+            assert (tree / rel).read_bytes() == before, rel
 
 
 class TestMainRefusesInvalidChangelogBeforeWriting:

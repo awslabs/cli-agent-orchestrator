@@ -334,10 +334,14 @@ class TestReaderThreadLifecycle:
         target_soft_limit = 4096 if hard_limit == resource.RLIM_INFINITY else min(hard_limit, 4096)
         if target_soft_limit < 1100:
             pytest.skip("descriptor limit cannot reach FD_SETSIZE")
-        try:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (target_soft_limit, hard_limit))
-        except (OSError, ValueError):
-            pytest.skip("unable to raise file descriptor limit for this regression")
+        limit_changed = False
+        if soft_limit < target_soft_limit:
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (target_soft_limit, hard_limit))
+                limit_changed = True
+            except (OSError, ValueError):
+                pytest.skip("unable to raise file descriptor limit for this regression")
+        assert resource.getrlimit(resource.RLIMIT_NOFILE)[0] >= soft_limit
 
         held_fds = []
         writer = -1
@@ -372,7 +376,8 @@ class TestReaderThreadLifecycle:
         finally:
             for fd in reversed(held_fds):
                 os.close(fd)
-            resource.setrlimit(resource.RLIMIT_NOFILE, (soft_limit, hard_limit))
+            if limit_changed:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (soft_limit, hard_limit))
 
 
 class TestReaderLoopCoalescing:
