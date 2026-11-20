@@ -20,6 +20,7 @@ import pytest
 import requests
 
 from cli_agent_orchestrator.utils.opencode_cli import detect_opencode_major
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 
 @pytest.fixture
@@ -168,7 +169,7 @@ def test_codex_handoff_to_opencode_v2(delegation_server, require_codex, require_
         assert "SUPERVISOR_RECEIVED" in output and "MINI_WORKER_OK" in output, output
         # A returned model claim alone cannot prove delegation: require the
         # durable handoff record as evidence that a separate worker ran.
-        with sqlite3.connect(cao_server.db_path) as db:
+        with closing_transaction(sqlite3.connect(cao_server.db_path)) as db:
             rows = db.execute(
                 "SELECT state, terminal_id, last_message FROM handoff_results"
             ).fetchall()

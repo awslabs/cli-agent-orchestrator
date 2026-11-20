@@ -24,6 +24,12 @@ _DEFAULTS = {
 
 _BOOL_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _BOOL_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+# Single source for every ``memory.injection.*`` flag and its safe fallback.
+MEMORY_INJECTION_DEFAULTS = {
+    "clear_on_empty": True,
+    "v1_fixes": True,
+    "write_project_files": False,
+}
 
 
 class SettingsUnreadableError(RuntimeError):
@@ -814,6 +820,7 @@ def get_memory_settings() -> Dict[str, Any]:
         "explain_enabled": True,
         "non_accessing_inspection": True,
         "lifecycle": {"enabled": False},
+        "injection": dict(MEMORY_INJECTION_DEFAULTS),
         "ranking": {"default_sort": "recency"},
     }
     saved = settings.get("memory", {})
@@ -822,6 +829,14 @@ def get_memory_settings() -> Dict[str, Any]:
         saved = {}
     result = dict(defaults)
     result.update(saved)
+    saved_injection = saved.get("injection", {})
+    if not isinstance(saved_injection, dict):
+        logger.warning(
+            "Invalid settings.memory.injection=%r (expected object); using defaults",
+            saved_injection,
+        )
+        saved_injection = {}
+    result["injection"] = {**MEMORY_INJECTION_DEFAULTS, **saved_injection}
     # Vault config has cross-field safety invariants and is intentionally
     # available only through get_vault_config().
     result.pop("vault", None)
@@ -882,6 +897,45 @@ def get_memory_settings() -> Dict[str, Any]:
 
     result["lint_enabled"] = is_memory_lint_enabled(settings=settings)
     return result
+
+
+def _memory_injection_flag(key: str) -> bool:
+    """Read one injection flag; invalid/read errors use its safe default."""
+    default = MEMORY_INJECTION_DEFAULTS[key]
+    try:
+        injection = get_memory_settings().get("injection", {})
+        value = injection.get(key, default) if isinstance(injection, dict) else default
+        if isinstance(value, bool):
+            return value
+        logger.warning(
+            "Invalid memory.injection.%s=%r (expected bool); defaulting to %s",
+            key,
+            value,
+            default,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to read memory.injection.%s, defaulting to %s: %s",
+            key,
+            default,
+            exc,
+        )
+    return default
+
+
+def is_memory_injection_clear_on_empty_enabled() -> bool:
+    """Whether empty builds replace stale provider blocks (default true)."""
+    return _memory_injection_flag("clear_on_empty")
+
+
+def is_memory_injection_v1_fixes_enabled() -> bool:
+    """Whether the v1 builder skips/clips and follows aliases (default true)."""
+    return _memory_injection_flag("v1_fixes")
+
+
+def is_memory_injection_write_project_files_enabled() -> bool:
+    """Whether provider plugins write memory into project files (default false)."""
+    return _memory_injection_flag("write_project_files")
 
 
 def get_vault_config(*, canonicalize: bool = True):
@@ -1279,6 +1333,9 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``enabled`` (bool) — master switch for the memory subsystem.
         ``explain_enabled`` (bool) — on-demand CLI relevance diagnostic.
         ``lifecycle.enabled`` (bool) — opt-in supersedes lifecycle.
+        ``injection.clear_on_empty`` (bool) — replace stale provider blocks on empty retrieval.
+        ``injection.v1_fixes`` (bool) — enable injection traversal and clipping fixes.
+        ``injection.write_project_files`` (bool) — opt-in provider project-file writes.
         ``ranking.default_sort`` (str) — ``recency`` or ``bm25`` query recall default.
         ``non_accessing_inspection`` (bool) — operator reads without access bumps.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
@@ -1328,6 +1385,10 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
                 f"ranking.default_sort must be one of {sorted(DEFAULT_SORT_VALUES)}, got {value!r}"
             )
         coerced = value
+    elif key.startswith("injection.") and key.split(".", 1)[1] in MEMORY_INJECTION_DEFAULTS:
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} must be a bool")
+        coerced = value
     elif key in {"explain_enabled", "non_accessing_inspection"}:
         if not isinstance(value, bool):
             raise ValueError(f"{key} must be a bool, got {type(value).__name__}")
@@ -1361,6 +1422,11 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
             if not isinstance(lifecycle, dict):
                 lifecycle = {}
             memory["lifecycle"] = {**lifecycle, "enabled": coerced}
+        elif key.startswith("injection."):
+            injection = memory.get("injection", {})
+            if not isinstance(injection, dict):
+                injection = {}
+            memory["injection"] = {**injection, key.split(".", 1)[1]: coerced}
         elif key == "ranking.default_sort":
             ranking = memory.get("ranking", {})
             if not isinstance(ranking, dict):

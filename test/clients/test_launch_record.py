@@ -12,6 +12,7 @@ from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients import database as db_mod
 from cli_agent_orchestrator.clients.database import Base
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 CANARY = "synthetic-canary-9f3c1e"
 T0 = datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -123,7 +124,7 @@ def _assert_launch_schema(conn):
 
 def test_schema_shape_and_no_content_columns(fresh_db):
     db_path, _ = fresh_db
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_path))) as conn:
         _assert_launch_schema(conn)
 
 
@@ -134,7 +135,7 @@ def test_init_db_creates_tables_on_an_existing_database(tmp_path, monkeypatch):
     db_path = tmp_path / "existing.db"
     engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
     Base.metadata.create_all(bind=engine)
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_path))) as conn:
         conn.execute("DROP TABLE launch_records")
         conn.execute("DROP TABLE launch_status_events")
         conn.execute(
@@ -150,7 +151,7 @@ def test_init_db_creates_tables_on_an_existing_database(tmp_path, monkeypatch):
     db_mod.init_db()
     db_mod.init_db()  # rerun: no error, no duplicate
 
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing_transaction(sqlite3.connect(str(db_path))) as conn:
         _assert_launch_schema(conn)
         assert conn.execute("SELECT id FROM terminals").fetchall() == [("pre00001",)]
     _launch("pre00001")
