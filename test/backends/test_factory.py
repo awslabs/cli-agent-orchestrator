@@ -7,6 +7,7 @@ and clear the relevant CAO_* env vars so each test is isolated.
 """
 
 import json
+import os
 from unittest.mock import patch
 
 import pytest
@@ -36,6 +37,7 @@ def _isolated_settings(tmp_path, monkeypatch):
     )
     monkeypatch.delenv("CAO_TERMINAL_BACKEND", raising=False)
     monkeypatch.delenv("CAO_HERDR_SESSION", raising=False)
+    monkeypatch.delenv("CAO_HERDR_AUTO_START", raising=False)
     monkeypatch.delenv("CAO_HERDR_APP_SESSION", raising=False)
     return fake_settings
 
@@ -93,7 +95,7 @@ class TestBackendFactoryHerdr:
     def test_disabled_auto_start_reaches_herdr_backend(self, _isolated_settings):
         """Factory-launched herdr must honor the service-manager setting."""
         _isolated_settings.write_text(
-            json.dumps({"terminal": {"backend": "herdr"}, "herdr": {"auto_start": False}})
+            json.dumps({"terminal": {"backend": "herdr", "herdr_auto_start": False}})
         )
         with (
             patch(
@@ -106,6 +108,30 @@ class TestBackendFactoryHerdr:
             BackendFactory.create()
 
         mock_popen.assert_not_called()
+
+    def test_default_auto_start_starts_herdr_server(self, _isolated_settings):
+        """With no terminal.herdr_auto_start, a missing server is started."""
+        _write_terminal_config(_isolated_settings, backend="herdr")
+        real_exists = os.path.exists
+        socket_states = [False, True]
+
+        def exists(path):
+            if str(path).endswith("herdr.sock"):
+                return socket_states.pop(0) if socket_states else True
+            return real_exists(path)
+
+        with (
+            patch(
+                "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+                side_effect=exists,
+            ),
+            patch("time.sleep"),
+            patch("subprocess.Popen") as mock_popen,
+        ):
+            BackendFactory.create()
+
+        mock_popen.assert_called_once()
+        assert mock_popen.call_args[0][0] == ["herdr", "--session", "cao", "server"]
 
 
 class TestBackendFactoryOverride:

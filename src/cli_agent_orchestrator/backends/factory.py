@@ -79,7 +79,7 @@ class BackendFactory:
             from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 
             herdr_session = ConfigService.get("terminal.herdr_session", default="cao")
-            herdr_auto_start = ConfigService.get("herdr.auto_start", default=True)
+            herdr_auto_start = ConfigService.get("terminal.herdr_auto_start", default=True)
             logger.info(
                 "[EXPERIMENTAL] terminal_backend='herdr' is experimental. "
                 "Report issues at https://github.com/awslabs/cli-agent-orchestrator/issues"

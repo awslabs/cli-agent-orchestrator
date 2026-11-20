@@ -68,6 +68,7 @@ Every derived path resolves from this value, so one override moves everything â€
   "terminal": {
     "backend": "tmux",
     "herdr_session": "cao",
+    "herdr_auto_start": true,
     "herdr_app_session": "cao",
     "keep_finished": {
       "enabled": false,
@@ -75,9 +76,6 @@ Every derived path resolves from this value, so one override moves everything â€
       "max_per_session": 5,
       "on_cap": "teardown_oldest"
     }
-  },
-  "herdr": {
-    "auto_start": true
   },
   "apps": {
     "enabled": false,
@@ -290,14 +288,15 @@ CAO's default backend is [tmux](tmux.md). [herdr](https://herdr.dev/) is an expe
 {
   "terminal": {
     "backend": "herdr",
-    "herdr_session": "my-session"
+    "herdr_session": "my-session",
+    "herdr_auto_start": true
   }
 }
 ```
 
 - `backend`: `"tmux"` (default), `"herdr"` [EXPERIMENTAL], or `"herdr-app"` [EXPERIMENTAL] (see [Herdr app backend](herdr-app.md)).
 - `herdr_session`: the herdr session name to connect to (default `"cao"`).
-- `herdr.auto_start`: start a missing herdr server (default `true`). Set it to
+- `herdr_auto_start`: start a missing herdr server (default `true`). Set it to
   `false` when systemd owns herdr; CAO then fails immediately if the configured
   session is unavailable.
 - `herdr_app_session`: the herdr-core (`hc`) session the `herdr-app` backend uses (default `"cao"`; env `CAO_HERDR_APP_SESSION`).
@@ -540,7 +539,7 @@ Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved t
 |---|---|---|
 | `CAO_TERMINAL_BACKEND` | `terminal.backend` | str |
 | `CAO_HERDR_SESSION` | `terminal.herdr_session` | str |
-| `CAO_HERDR_AUTO_START` | `herdr.auto_start` | bool |
+| `CAO_HERDR_AUTO_START` | `terminal.herdr_auto_start` | bool |
 | `CAO_TERMINAL_SPAWN_MODE` | `terminal.spawn_mode` | str |
 | `CAO_TERMINAL_PANE_WINDOW` | `terminal.pane_window` | str |
 | `CAO_TERMINAL_PANE_LAYOUT` | `terminal.pane_layout` | str |

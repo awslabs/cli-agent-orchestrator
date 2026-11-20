@@ -106,13 +106,14 @@ class TestConfigSet:
         assert on_disk["terminal"]["backend"] == "herdr"
 
     def test_set_herdr_auto_start_false_round_trips(self, runner, _isolated_settings):
-        result = runner.invoke(config, ["set", "herdr.auto_start", "false"])
+        result = runner.invoke(config, ["set", "terminal.herdr_auto_start", "false"])
         assert result.exit_code == 0
         assert (
-            json.loads(_isolated_settings["settings"].read_text())["herdr"]["auto_start"] is False
+            json.loads(_isolated_settings["settings"].read_text())["terminal"]["herdr_auto_start"]
+            is False
         )
 
-        get_result = runner.invoke(config, ["get", "herdr.auto_start"])
+        get_result = runner.invoke(config, ["get", "terminal.herdr_auto_start"])
         assert get_result.exit_code == 0
         assert json.loads(get_result.output) is False
 

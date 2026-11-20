@@ -1242,7 +1242,7 @@ class TestEnsureSessionRunning:
 
         assert (
             str(exc_info.value)
-            == "herdr isn't running for session 'systemd-cao', and herdr.auto_start is false. "
+            == "herdr isn't running for session 'systemd-cao', and terminal.herdr_auto_start is false. "
             "Start the herdr server that owns this session (for example, its systemd service), "
             "then retry."
         )

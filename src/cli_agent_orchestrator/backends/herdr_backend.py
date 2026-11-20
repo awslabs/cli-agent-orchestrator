@@ -1215,7 +1215,7 @@ class HerdrBackend(TerminalBackend):
         """Ensure the herdr session server is available.
 
         Checks for the session socket file. If absent and auto-start is enabled,
-        starts the server headlessly and waits up to 5 seconds for the socket.
+        starts the server headlessly and waits up to about 15 seconds for the socket.
         Otherwise, fails immediately so a service-managed herdr is never
         inherited by CAO's process tree. When auto-start is enabled but the
         socket never appears, logs a warning and lets the first herdr operation
@@ -1228,7 +1228,7 @@ class HerdrBackend(TerminalBackend):
         if not self._auto_start:
             raise TerminalBackendError(
                 f"herdr isn't running for session '{self._herdr_session}', and "
-                "herdr.auto_start is false. Start the herdr server that owns this "
+                "terminal.herdr_auto_start is false. Start the herdr server that owns this "
                 "session (for example, its systemd service), then retry."
             )
 
