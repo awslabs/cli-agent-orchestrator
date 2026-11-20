@@ -528,14 +528,23 @@ jobs:
   # publish in this repo's history is a `workflow_dispatch`, and all three `release`-event
   # runs failed — so the guard excluded the only path that publishes.
   #
-  # `needs: publish-pypi` is the real gate and always was: it means a PyPI publish
-  # SUCCEEDED. A TestPyPI dispatch skips `publish-pypi` entirely, so a skipped dependency
-  # skips this job too and the committed pin cannot be rewritten to a version PyPI does not
-  # have. The event guard added no protection that `needs:` did not already provide.
+  # The gate is the `if:` below: a PyPI publish must have SUCCEEDED. A TestPyPI dispatch
+  # skips `publish-pypi` entirely, and the job stays skipped because of that explicit
+  # result check, not because of `needs:`, so the committed pin cannot be rewritten to a
+  # version PyPI does not have. The event guard added no protection the result check did
+  # not already provide.
   # `test_agent_plugin_pin_boundedness.py` parses this file and asserts both halves.
   regenerate-agent-plugin:
     name: Regenerate the committed agent-plugin packages
     needs: publish-pypi
+    # `!cancelled()` plus an explicit result check, not the implicit `success()`. The implicit
+    # form is false when any ancestor job was skipped, and a `pypi` dispatch skips
+    # `smoke-test`, so a successful publish still left this job skipped and the committed
+    # packages at the previous release (run 39339505140: 2.5.4 published, packages left at
+    # 2.5.3, #1384). The one dependency that matters is that a PyPI publish SUCCEEDED.
+    # Not `always()`: that also runs the job when someone cancels the run, and a cancel
+    # could then not stop the push to `main`.
+    if: ${{ !cancelled() && needs.publish-pypi.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

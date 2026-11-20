@@ -1112,12 +1112,76 @@ def run_check(*, require_current_pin: bool = False) -> int:
     return 0
 
 
+def package_link_problems(config: PackageConfig, version: str, scratch: Path) -> List[str]:
+    """Check the local Markdown links of ONE package, exactly as the build writes it (#1384).
+
+    ``scripts/validate_markdown_links.py`` already rejects a link that leaves its skill's
+    directory in ``skills/``. It does not see the files the build generates around the
+    skills (``README.md``, ``CHANGELOG.md``), and it checks the tree as a whole rather
+    than one package at a time. A package is installed on its own, so the question is
+    whether every link resolves *inside the package*. The package is therefore built into
+    its own directory and that directory is made the link root: a link that escapes it, or
+    that leaves its skill's own directory, is reported for that package by name.
+    #1343 and #1365 each found such links by hand.
+    """
+    from cli_agent_orchestrator.utils.markdown_links import validate_markdown_links
+
+    package_dir = build_package(config, version, scratch)
+    markdown = sorted(package_dir.rglob("*.md"))
+    root = package_dir.resolve()
+    problems: List[str] = []
+    for error in validate_markdown_links(package_dir, files=markdown):
+        relative = Path(error.source).resolve().relative_to(root).as_posix()
+        problems.append(f"{relative}:{error.line}: {error.destination!r}: {error.reason}")
+    return problems
+
+
+def run_check_links() -> int:
+    """Link-check every package as built, one package at a time, in a fresh directory.
+
+    Each package gets its own scratch root so one package's files can never satisfy
+    another's link, and every package is reported even when an earlier one fails.
+    The version is the one the committed packages were built at, as in ``--check``;
+    link correctness does not depend on it.
+    """
+    import tempfile
+
+    version = committed_package_version() or package_version()
+    failed: Dict[str, List[str]] = {}
+    for config in PACKAGES:
+        with tempfile.TemporaryDirectory(prefix="cao-agent-plugin-links-") as scratch:
+            try:
+                problems = package_link_problems(config, version, Path(scratch))
+            except Exception as exc:  # keep going: the other packages still get checked
+                problems = [f"link check raised: {exc}"]
+        if problems:
+            failed[config.name] = problems
+        print(f"{'FAIL' if problems else 'ok  '} {config.name}: {len(problems)} broken link(s)")
+    if failed:
+        print("\nLinks that do not resolve inside the installed package:", file=sys.stderr)
+        for name, problems in failed.items():
+            print(f"\n  {name}:", file=sys.stderr)
+            for problem in problems:
+                print(f"    - {problem}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--check",
         action="store_true",
         help="Verify the committed packages instead of regenerating them.",
+    )
+    parser.add_argument(
+        "--check-links",
+        action="store_true",
+        help=(
+            "Build each package into its own directory and check its Markdown links "
+            "there, so a link that resolves in the repository but escapes the installed "
+            "package fails. Offline; writes nothing under agent-plugin/."
+        ),
     )
     parser.add_argument(
         "--skip-publish-check",
@@ -1167,8 +1231,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     if args.keep_committed_pin and args.check:
         parser.error("--keep-committed-pin builds; it cannot be combined with --check")
+    if args.check_links and (
+        args.check
+        or args.keep_committed_pin
+        or args.skip_publish_check
+        or args.require_bounded_client
+        or args.require_current_pin
+    ):
+        parser.error("--check-links is its own mode; it cannot be combined with another flag")
 
     try:
+        if args.check_links:
+            return run_check_links()
         if args.check:
             return run_check(require_current_pin=args.require_current_pin)
         return run_build(
