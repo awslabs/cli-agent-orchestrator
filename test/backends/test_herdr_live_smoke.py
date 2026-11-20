@@ -20,8 +20,12 @@ own herdr session) and never touches a developer's live server.
 
 Enable with::
 
-    CAO_HERDR_LIVE=1 [CAO_HERDR_LIVE_PROFILE=worker-sonnet] \\
+    CAO_TEST_REAL_HOME=1 CAO_HERDR_LIVE=1 [CAO_HERDR_LIVE_PROFILE=worker-sonnet] \\
         uv run pytest test/backends/test_herdr_live_smoke.py
+
+``CAO_TEST_REAL_HOME=1`` is required because the harness decides HOME isolation
+at import; without it the agent profile resolves inside an empty isolated home
+and the test skips.
 """
 
 from __future__ import annotations

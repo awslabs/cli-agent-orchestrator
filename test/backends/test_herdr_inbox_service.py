@@ -184,11 +184,37 @@ class TestHerdrInboxServiceSubscription:
     herdr resets the connection on a second events.subscribe (measured on 0.7.5
     and 0.9.5), so all subscriptions must be sent in a SINGLE events.subscribe
     call: one pane.agent_status_changed per managed pane (herdr ≥0.9 accepts a
-    broadcast pane.updated subscription but never emits the event), the
-    broadcast pane.updated kept for older herdr versions, plus the two
-    lifecycle events. The response must be read: herdr answers a subscription
-    naming an unknown pane with pane_not_found and then resets the connection.
+    broadcast pane.updated subscription but no longer emits it on agent-status
+    transitions), the broadcast pane.updated kept for older herdr versions,
+    plus the two lifecycle events. The response must be read: herdr answers a
+    subscription naming an unknown pane with pane_not_found and then resets the
+    connection.
     """
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_subscribe_clears_pending_resubscribe_request(self, mock_snap):
+        """A pending resubscribe request is consumed by the subscribe itself.
+
+        Without the clear, the request that triggered this connection would
+        recycle the NEXT connection immediately too: an endless recycle loop
+        (one every backoff-free iteration) re-running the blocking snapshot
+        subprocess on the API event loop, while every suite stays green.
+        """
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._writer = AsyncMock()
+        service._pane_to_terminal = {"pane-1": "tid1"}
+        mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
+
+        async def run():
+            service._resubscribe_requested = asyncio.Event()
+            service._resubscribe_requested.set()
+            reader = asyncio.StreamReader()
+            reader.feed_data(_SUBSCRIBE_OK_ACK)
+            service._reader = reader
+            await service._subscribe_all_events()
+            return service._resubscribe_requested.is_set()
+
+        assert _run_async(run()) is False
 
     @patch.object(HerdrInboxService, "_fetch_snapshot")
     def test_subscribe_sends_per_pane_and_broadcast_in_one_call(self, mock_snap):
