@@ -3,6 +3,7 @@ right files with the right modes and never calls IMDS or a system command."""
 
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 
@@ -638,7 +639,8 @@ def test_an_unsafe_settings_file_is_refused(sandbox, case) -> None:
         message = "inside the box user's home"
     else:
         write_settings(kit, settings_lines())
-        stat_says(sandbox, kit, "1001 600")  # as if the box user (uid 1001) owned it
+        other_uid = 1001 if os.getuid() != 1001 else 1002
+        stat_says(sandbox, kit, f"{other_uid} 600")  # as if another user owned it
         message = "must be yours"
     result = sandbox.run("bootstrap.sh", "--dry-run", "--root", str(root), "--settings", str(kit))
     assert result.returncode == 1, result.stdout + result.stderr

@@ -879,6 +879,8 @@ if [ -n "$BOX_SSH_PUBLIC_KEY" ]; then
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '[dry-run] would, as %s: install .ssh (0700) and authorized_keys (0600) without duplicating BOX_SSH_PUBLIC_KEY\n' "$BOX_USER"
   elif system_step; then
+    # The inner bash expands $1..$3.
+    # shellcheck disable=SC2016
     runuser -u "$BOX_USER" -- env HOME="$BOX_HOME" PATH="$USER_PATH" bash -c \
       'install -d -m 0700 "$2"; touch "$3"; chmod 0600 "$3"; grep -qxF -- "$1" "$3" || printf "%s\n" "$1" >> "$3"' \
       box-key "$BOX_SSH_PUBLIC_KEY" "$ssh_dir" "$authorized_keys"
