@@ -895,35 +895,46 @@ class TestPostHandOffAfterTheBound:
     ):
         """Drive both orders; whichever wins, exactly one of the two paths reports.
 
-        classify_first: the failure is classified while the event loop is held
-        past the bound, so the POST's timeout and the outcome are both ready
-        when the loop resumes. The POST must still report the failure.
+        classify_first: the failure is offered to the hand-off before the POST
+        gives up. The POST's give-up is held until the attempt has offered its
+        outcome, so the order holds however slowly the worker thread gets to
+        its dispatch and no timing bound is involved. The POST must still
+        report the failure.
         """
         import threading
-        import time
 
-        loop = asyncio.get_running_loop()
+        from cli_agent_orchestrator.services.inbox_service import DeliveryHandOff
+
         answered = threading.Event()
+        offered = threading.Event()
+        real_offer = DeliveryHandOff.offer
+        real_abandon = DeliveryHandOff.abandon
 
-        def hold_loop_until_classified():
-            # Runs on the event loop thread: nothing on the loop moves until the
-            # attempt has settled the message and the bound has passed.
-            started = time.monotonic()
-            deadline = started + 5
-            while _stored(C).status.value == "delivered" and time.monotonic() < deadline:
-                time.sleep(0.01)
-            time.sleep(max(0.0, self.BOUND * 4 - (time.monotonic() - started)))
+        def offer(hand_off, outcome, error):
+            try:
+                return real_offer(hand_off, outcome, error)
+            finally:
+                offered.set()
+
+        def abandon(hand_off):
+            if order == "classify_first":
+                # Runs on the event loop thread; the worker thread that offers
+                # does not need the loop, so blocking here cannot deadlock.
+                assert offered.wait(10), "the attempt never offered an outcome"
+            return real_abandon(hand_off)
 
         def dispatch(*_args, **_kwargs):
             if order == "abandon_first":
                 assert answered.wait(10), "the POST never answered"
-            else:
-                loop.call_soon_threadsafe(hold_loop_until_classified)
             raise self._failure(kind)
 
         live.paste.dispatch_input.side_effect = dispatch
         try:
-            body = await self._post_with(dispatch)
+            with (
+                patch.object(DeliveryHandOff, "offer", offer),
+                patch.object(DeliveryHandOff, "abandon", abandon),
+            ):
+                body = await self._post_with(dispatch)
         finally:
             answered.set()
         await TestCreateInboxMessageResponseTiming._drain_background_tasks()
