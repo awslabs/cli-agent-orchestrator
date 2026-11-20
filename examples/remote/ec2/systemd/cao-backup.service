@@ -1,0 +1,20 @@
+# Nightly CAO database backup (see backup.sh). Started by cao-backup.timer.
+# bootstrap.sh fills in @BOX_USER@ and @BOX_HOME@.
+# /etc/cao-box/backup.env holds BACKUP_S3_URI (not a secret). S3 access comes
+# from the instance role.
+
+[Unit]
+Description=Back up the CAO SQLite database
+After=cao-server.service
+
+[Service]
+Type=oneshot
+User=@BOX_USER@
+Group=@BOX_USER@
+EnvironmentFile=-/etc/cao-box/backup.env
+Environment=HOME=@BOX_HOME@
+Environment=PATH=@BOX_HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=AWS_REGION=ap-southeast-2
+ExecStart=/usr/local/lib/cao-box/backup.sh
+Nice=10
+IOSchedulingClass=idle

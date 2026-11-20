@@ -404,14 +404,21 @@ To run steps concurrently, use a `concurrent.futures.ThreadPoolExecutor` and giv
 **every concurrent `run_step` an explicit, stable `step_id`**:
 
 ```python
+import hashlib
+import re
 from concurrent.futures import ThreadPoolExecutor
 from cao_workflow import run_step, emit_output, ShimError
+
+def step_id_for(name):
+    # [A-Za-z0-9_-], at most 64 chars; the digest keeps "a b" and "a.b" apart
+    slug = re.sub(r"[^A-Za-z0-9_-]", "_", name)[:40]
+    return f"summarize-{slug}-{hashlib.sha256(name.encode()).hexdigest()[:12]}"
 
 def summarize(name):
     try:
         h = run_step("claude_code", "reviewer",
                      f"Summarize {name}. Return the summary only.",
-                     step_id=f"summarize:{name}")   # STABLE, explicit step_id (required)
+                     step_id=step_id_for(name))     # STABLE, explicit step_id (required)
         return name, h.output
     except ShimError as exc:                          # per-unit tolerance
         return name, f"ERROR: {exc}"
@@ -430,6 +437,11 @@ Why these rules:
   results and raise `ReplayDivergenceError`. `validate` warns when it sees executor use
   without a `step_id`; treat the warning as load-bearing.
 - **`sorted()` your inputs** so the item→`step_id` mapping is stable across runs.
+- **A `step_id` is 1-64 characters from `[A-Za-z0-9_-]`.** `validate` checks the literal
+  text of an f-string id, so every value formatted into it must obey the rule too. Item
+  names such as file names usually don't, hence the slug plus digest above. Don't key on
+  the list index: if the inputs change between a halt and a resume, the same id points at a
+  different item and replays the wrong stored result.
 - **`max_workers=2` is a sensible default for `claude_code`** (measured: higher values
   starved the heaviest step). Tune it — expose it as an input — when steps are light.
 
