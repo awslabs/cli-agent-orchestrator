@@ -116,6 +116,7 @@ def mock_service():
     svc = MagicMock()
     svc.base_dir = MEMORY_BASE
     svc.recall = AsyncMock(return_value=[])
+    svc.read_exact_key = AsyncMock(return_value=None)
     svc.forget = AsyncMock(return_value=True)
     with patch(FACTORY_TARGET, return_value=svc):
         yield svc
@@ -347,9 +348,9 @@ class TestGetMemory:
     """Tests for GET /memory/{key}."""
 
     def test_get_success(self, client, mock_service):
-        mock_service.recall.return_value = [
-            _make_memory(key="my-key", content="Full content here.")
-        ]
+        mock_service.read_exact_key.return_value = _make_memory(
+            key="my-key", content="Full content here."
+        )
         response = client.get("/memory/my-key")
 
         assert response.status_code == 200
@@ -357,31 +358,68 @@ class TestGetMemory:
         assert data["key"] == "my-key"
         assert data["content"] == "Full content here."
         assert "file_path" not in data
-        mock_service.recall.assert_awaited_once_with(
-            query="my-key",
+        mock_service.read_exact_key.assert_awaited_once_with(
+            "my-key",
             scope=None,
-            limit=1000,
+            scope_id=None,
             scan_all=True,
-            search_mode="metadata",
             record_access=False,
         )
 
-    def test_get_exact_match_only(self, client, mock_service):
-        """Substring recall hits that aren't exact key matches are skipped."""
-        mock_service.recall.return_value = [_make_memory(key="my-key-extended")]
-        response = client.get("/memory/my-key")
-        assert response.status_code == 404
-        assert "Memory 'my-key' not found" in response.json()["detail"]
-
     def test_get_narrows_by_scope_id(self, client, mock_service):
-        mock_service.recall.return_value = [
-            _make_memory(key="dup", scope="project", project_dir="proj-other"),
-            _make_memory(key="dup", scope="project", project_dir="proj-mine"),
-        ]
+        mock_service.read_exact_key.return_value = _make_memory(
+            key="dup", scope="project", project_dir="proj-mine"
+        )
         response = client.get("/memory/dup?scope=project&scope_id=proj-mine")
 
         assert response.status_code == 200
         assert response.json()["scope_id"] == "proj-mine"
+        mock_service.read_exact_key.assert_awaited_once_with(
+            "dup",
+            scope="project",
+            scope_id="proj-mine",
+            scan_all=True,
+            record_access=False,
+        )
+
+    def test_get_project_alias_reads_listed_native_folder(self, client, tmp_path, monkeypatch):
+        from cli_agent_orchestrator.clients.database import record_project_alias
+
+        alias = "legacy-project"
+        service = MemoryService(base_dir=tmp_path / "native")
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(
+            settings_service, "get_vault_config", lambda: VaultConfig(enabled=False)
+        )
+        monkeypatch.setattr(
+            service,
+            "resolve_scope_id",
+            lambda scope, _context: alias if scope == "project" else None,
+        )
+        asyncio.run(
+            service.store(
+                content="legacy native project note",
+                scope="project",
+                memory_type="reference",
+                key="legacy-note",
+                terminal_context={"cwd": str(tmp_path / "project")},
+            )
+        )
+        record_project_alias("canonical-project", alias, "cwd_hash")
+
+        with patch(FACTORY_TARGET, return_value=service):
+            response = client.get(f"/memory/legacy-note?scope=project&scope_id={alias}")
+
+        assert response.status_code == 200
+        assert response.json()["content"] == "legacy native project note"
+
+    def test_get_rejects_global_vault_note_for_other_scope_id(self, client, tmp_path, monkeypatch):
+        service, _snapshots = _real_vault_service(tmp_path, monkeypatch, ("vault-global-note",))
+
+        with patch(FACTORY_TARGET, return_value=service):
+            response = client.get("/memory/vault-global-note?scope_id=other")
+
+        assert response.status_code == 404
 
     def test_get_not_found(self, client, mock_service):
         response = client.get("/memory/missing-key")
@@ -397,7 +435,7 @@ class TestGetMemory:
         # not from our not-found path) — the property that matters is that
         # the service is never reached
         assert client.get("/memory/%2E%2E%2Fetc").status_code == 404
-        mock_service.recall.assert_not_awaited()
+        mock_service.read_exact_key.assert_not_awaited()
 
     def test_get_disabled_returns_404(self, client, mock_service):
         with patch(ENABLED_TARGET, return_value=False):
@@ -406,7 +444,7 @@ class TestGetMemory:
         assert "disabled" in response.json()["detail"]
 
     def test_get_server_error_returns_500(self, client, mock_service):
-        mock_service.recall.side_effect = Exception("boom")
+        mock_service.read_exact_key.side_effect = Exception("boom")
         response = client.get("/memory/my-key")
         assert response.status_code == 500
         assert "Failed to get memory" in response.json()["detail"]
