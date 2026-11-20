@@ -99,6 +99,7 @@ _UNSCOPED_DOCS = [
     # Gained an agent-plugin transport note in review 4 on #584 (item 5). Same
     # situation as the three above: CAO's own noun throughout, no vendor "Plugin".
     "kimi-cli.md",
+    "qwen-cli.md",
     # Gained an agent-plugin working-directory note in review 4 on #584 (item 4).
     # Each had ZERO plugin occurrences before, so the strict rule applies cleanly.
     "antigravity-cli.md",

@@ -176,8 +176,8 @@ def main() -> None:
     update_pyproject(new)
     update_devcontainer_feature(new)
     try:
-        update_uv_lock(old, new)
         CHANGELOG.write_bytes(new_changelog)
+        update_uv_lock(old, new)
     except LockDrift as exc:
         for path, text in originals.items():
             path.write_text(text)
