@@ -28,6 +28,9 @@ _EDITABLE = "editable"  # local editable clone — user must reinstall --editabl
 # Local source kinds have no remote to advance; `cao update` prints guidance.
 _LOCAL_KINDS = (_DIRECTORY, _PATH, _EDITABLE)
 
+# Receipt ``[tool.options]`` keys that say where packages are resolved from.
+_INDEX_OPTIONS = ("index", "index-url", "extra-index-url", "find-links", "no-index")
+
 
 def _receipt_path() -> Optional[Path]:
     """Path to uv's install receipt for CAO, or None if it can't be located.
@@ -62,18 +65,31 @@ def _cao_requirement(receipt: Path) -> Optional[dict]:
     return None
 
 
-def _requirements(receipt: Path) -> Optional[list]:
-    """Return the receipt's requirement list, or None if it is missing or malformed."""
+def _tool_table(receipt: Path) -> Optional[dict]:
+    """Return the receipt's ``[tool]`` table, or None if it is missing or malformed."""
     try:
         data = tomllib.loads(receipt.read_text())
     except (OSError, ValueError):
         return None
     # tomllib always returns a dict at the root, so `data` is a mapping here.
     tool = data.get("tool")
-    if not isinstance(tool, dict):
-        return None
-    requirements = tool.get("requirements")
+    return tool if isinstance(tool, dict) else None
+
+
+def _requirements(receipt: Path) -> Optional[list]:
+    """Return the receipt's requirement list, or None if it is missing or malformed."""
+    tool = _tool_table(receipt)
+    requirements = tool.get("requirements") if tool else None
     return requirements if isinstance(requirements, list) else None
+
+
+def _index_options(receipt: Path) -> List[str]:
+    """The ``_INDEX_OPTIONS`` keys the receipt records under ``[tool.options]``."""
+    tool = _tool_table(receipt)
+    options = tool.get("options") if tool else None
+    if not isinstance(options, dict):
+        return []
+    return [key for key in _INDEX_OPTIONS if key in options]
 
 
 def _str_field(req: dict, key: str) -> Optional[str]:
@@ -134,12 +150,20 @@ def _classify_source(receipt: Optional[Path]) -> Tuple[str, Optional[str]]:
     return (_REGISTRY, None)
 
 
+def _extras(req: dict) -> Optional[List[str]]:
+    """``req["extras"]`` if it is a list of non-empty strings (``[]`` when absent), else None."""
+    extras = req.get("extras", [])
+    if not isinstance(extras, list) or not all(isinstance(e, str) and e for e in extras):
+        return None
+    return extras
+
+
 def _with_requirement(req: object) -> Optional[str]:
     """The ``--with`` value that reinstalls one extra receipt requirement, or None.
 
     Covers the shapes uv records for a ``<name>[extras]<specifier>`` requirement, a
-    wheel ``path`` and a ``directory``. Any other shape, such as a git or URL source
-    or a marker, returns None.
+    wheel ``path`` and a ``directory``. Any other shape, such as a git or URL source,
+    an editable install or a marker, returns None.
     """
     if not isinstance(req, dict):
         return None
@@ -152,38 +176,71 @@ def _with_requirement(req: object) -> Optional[str]:
         return _str_field(req, "path") or _str_field(req, "directory")
     if set(req) - {"name", "extras", "specifier"}:
         return None
-    extras = req.get("extras", [])
+    extras = _extras(req)
     specifier = req.get("specifier", "")
-    if not isinstance(extras, list) or not all(isinstance(e, str) and e for e in extras):
-        return None
-    if not isinstance(specifier, str):
+    if extras is None or not isinstance(specifier, str):
         return None
     return name + (f"[{','.join(extras)}]" if extras else "") + specifier
 
 
-def _with_args(receipt: Optional[Path]) -> List[str]:
-    """``--with`` arguments for every requirement in the receipt other than CAO.
+def _unpin_args(receipt: Optional[Path]) -> List[str]:
+    """The arguments after ``uv tool install`` that unpin CAO and keep the rest of the receipt.
 
-    ``uv tool install <pkg>@latest --upgrade`` replaces the recorded requirements, so
-    uv uninstalls any extra package (for example a decider) that is not passed again.
+    ``uv tool install <pkg>@latest --upgrade`` writes a new receipt from its command
+    line and does not read the old one, unlike ``uv tool upgrade``. So everything the
+    receipt records has to be passed again or it is lost: CAO's own extras, every
+    other requirement (as ``--with``) and the index settings under ``[tool.options]``.
+    If any of that can't be rebuilt, raise before uv runs, naming the receipt and
+    printing a command the user can finish by hand.
     """
-    args: List[str] = []
+    cao = f"{_PACKAGE}@latest"
+    with_args: List[str] = []
+    problems: List[str] = []
+    carries_registry_package = False
     for req in (_requirements(receipt) if receipt else None) or []:
         if isinstance(req, dict) and req.get("name") == _PACKAGE:
+            extras = _extras(req)
+            if extras is None or set(req) - {"name", "extras", "specifier"}:
+                problems.append("CAO's own requirement records more than extras and a version")
+                cao = f"{_PACKAGE}[<extras>]@latest"
+            elif extras:
+                cao = f"{_PACKAGE}[{','.join(extras)}]@latest"
             continue
         value = _with_requirement(req)
         if value is None:
-            name = req.get("name") if isinstance(req, dict) else req
-            raise click.ClickException(
-                f"CAO was installed with the extra package {name!r}, which `cao update` "
-                "can't carry over while unpinning CAO. Reinstall both yourself: "
-                f"uv tool install {_PACKAGE}@latest --upgrade --with <{name} source>"
-            )
-        args += ["--with", value]
+            name = _str_field(req, "name") if isinstance(req, dict) else None
+            label = repr(name) if name else "an unnamed requirement"
+            problems.append(f"the extra package {label} is from a source it can't rebuild")
+            with_args += ["--with", f"<{name or 'requirement'} source>"]
+            continue
+        if not ("path" in req or "directory" in req):
+            carries_registry_package = True
+        with_args += ["--with", value]
+
+    index_keys = _index_options(receipt) if receipt else []
+    if index_keys and carries_registry_package:
+        # Without them uv looks the extra packages up on the default index, which can
+        # fail, or install a different package that happens to have the same name.
+        problems.append(
+            f"the install sets {', '.join(index_keys)}, which uv would not reuse for the "
+            "extra packages"
+        )
+        with_args.append("<the [tool.options] settings as uv flags>")
+
+    args = [cao, "--upgrade", *with_args]
+    if problems:
+        raise click.ClickException(
+            "`cao update` can't unpin CAO without losing part of the install: "
+            f"{'; '.join(problems)}. The install is recorded in {receipt}. Reinstall it "
+            "yourself, replacing each <...> with what that file records:\n  "
+            f"{shlex.join(['uv', 'tool', 'install', *args])}"
+        )
     return args
 
 
-def _build_command(kind: str, detail: Optional[str], with_args: Sequence[str] = ()) -> List[str]:
+def _build_command(
+    kind: str, detail: Optional[str], unpin_args: Optional[Sequence[str]] = None
+) -> List[str]:
     """The uv invocation that advances CAO for a remote-backed install kind.
 
     - git: ``uv tool upgrade <pkg> --reinstall`` lets uv reuse the receipt,
@@ -192,8 +249,8 @@ def _build_command(kind: str, detail: Optional[str], with_args: Sequence[str] = 
     - registry (unconstrained): ``uv tool upgrade`` re-resolves to the latest.
     - registry (constrained): ``uv tool upgrade`` honours the constraint and can
       report "Nothing to upgrade"; ``uv tool install <pkg>@latest --upgrade``
-      unpins to the latest published release. That replaces the receipt's
-      requirements, so ``with_args`` passes the extra packages back.
+      unpins to the latest published release. That replaces the receipt, so
+      ``unpin_args`` (from ``_unpin_args``) carries what the receipt recorded.
 
     Local (directory/path/editable) kinds have no remote to advance and are
     handled by the command before reaching here.
@@ -201,7 +258,9 @@ def _build_command(kind: str, detail: Optional[str], with_args: Sequence[str] = 
     if kind == _GIT and detail:
         return ["uv", "tool", "upgrade", _PACKAGE, "--reinstall"]
     if kind == _REGISTRY_CONSTRAINED:
-        return ["uv", "tool", "install", f"{_PACKAGE}@latest", "--upgrade", *with_args]
+        if unpin_args is None:
+            unpin_args = [f"{_PACKAGE}@latest", "--upgrade"]
+        return ["uv", "tool", "install", *unpin_args]
     return ["uv", "tool", "upgrade", _PACKAGE]
 
 
@@ -259,8 +318,8 @@ def update():
             f"`cao update` can't advance a local install; {_local_fix_hint(kind, detail)}"
         )
 
-    with_args = _with_args(receipt) if kind == _REGISTRY_CONSTRAINED else []
-    command = _build_command(kind, detail, with_args)
+    unpin_args = _unpin_args(receipt) if kind == _REGISTRY_CONSTRAINED else None
+    command = _build_command(kind, detail, unpin_args)
 
     if kind == _GIT:
         source_desc = f"git ({detail})"

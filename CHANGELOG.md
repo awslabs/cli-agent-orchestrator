@@ -24,9 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider's post-turn flush-wait, offloaded off the event loop and stopping as soon as the
   message lands.
 
-- **`cao update` keeps `--with` packages when it unpins a constrained install** (#1260).
-  `uv tool install cli-agent-orchestrator@latest --upgrade` rewrote the receipt with only CAO in it, so extra
-  packages such as a decider were uninstalled. Extras that `cao update` can't rebuild are refused before uv runs.
+- **`cao update` keeps CAO's extras and its `--with` packages when it unpins a version-pinned install** (#1260).
+  `uv tool install cli-agent-orchestrator@latest --upgrade` rewrote the receipt with only a bare CAO in it,
+  so CAO's own extras (`[agui]`, `[otel]`) and extra packages such as a decider were uninstalled. Both are
+  now passed back. If the receipt holds something `cao update` can't pass back (a git, URL, editable or
+  marker entry, or index settings under `[tool.options]` that a carried package needs), it stops before uv
+  runs and prints the receipt path and a command to finish by hand.
 - **Memory inspection and fixture hygiene are safer by default** (#1329).
   This resolves #861 Q3: CLI list/show and REST list/show no longer increment
   `access_count` unless `memory.non_accessing_inspection=false`; MCP recall
