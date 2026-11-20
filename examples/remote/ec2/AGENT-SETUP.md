@@ -1009,16 +1009,18 @@ Get the user's OK, then:
 aws ec2 stop-instances --region <region> --instance-ids <instance-id>
 ```
 
-**Remove everything.** First, get the user's OK to terminate the instance, then terminate it:
+**Remove everything.** Terminating the instance deletes its root volume and everything on it.
+While the box is still running, have the user download what they want to keep. Then get the
+user's OK to terminate the instance, and terminate it:
 
 ```bash
 aws ec2 terminate-instances --region <region> --instance-ids <instance-id>
 aws ec2 wait instance-terminated --region <region> --instance-ids <instance-id>
 ```
 
-Before deleting any remaining data, show the user the exact data volume id, every snapshot id
-with its date, the backup bucket, and the KMS key id. The user downloads what they want to keep.
-Get a separate explicit OK to delete that data, then:
+Before deleting the remaining data, show the user the exact data volume id, every snapshot id
+with its date, the backup bucket, and the KMS key id. Get a separate explicit OK to delete that
+data, then:
 
 ```bash
 aws ec2 delete-volume --region <region> --volume-id <data-volume-id>
