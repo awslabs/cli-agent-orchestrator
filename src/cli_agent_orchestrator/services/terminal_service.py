@@ -180,7 +180,11 @@ from cli_agent_orchestrator.services.session_env import (
     set_session_env,
 )
 from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
-from cli_agent_orchestrator.services.settings_service import get_max_terminals
+from cli_agent_orchestrator.services.settings_service import (
+    SettingsUnreadableError,
+    get_max_terminals,
+    set_session_label,
+)
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.utils import agent_profiles, delegation
@@ -196,6 +200,11 @@ from cli_agent_orchestrator.utils.enforcement import (
 )
 from cli_agent_orchestrator.utils.ephemeral_capabilities import capability_for
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
+from cli_agent_orchestrator.utils.paths import (
+    WorkingDirectoryError,
+    ensure_working_directory,
+    validate_working_directory,
+)
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
@@ -770,6 +779,48 @@ def inject_memory_context(
     return first_message
 
 
+def _memory_start_prompt(skill_prompt: Optional[str], terminal_id: str) -> Optional[str]:
+    """Add memory to an interactive provider's launch prompt exactly once.
+
+    A configured context manager needs the real first task, so those terminals
+    stay on ``inject_memory_context``.  Uncurated interactive launches have no
+    CAO-delivered first message; their provider start prompt is the only
+    available injection seam.
+    """
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    if not is_memory_enabled():
+        return skill_prompt
+
+    service = MemoryService()
+    try:
+        terminal_context = service._get_terminal_context(terminal_id)
+        session_name = (terminal_context or {}).get("session_name")
+        if session_name and service._find_context_manager_terminal(session_name):
+            return skill_prompt
+    except Exception as e:
+        logger.warning(f"Failed to check memory manager for terminal {terminal_id}: {e}")
+
+    with _memory_injected_lock:
+        if terminal_id in _memory_injected_terminals:
+            return skill_prompt
+
+    try:
+        context = memory_context_for_terminal(terminal_id)
+    except Exception as e:
+        # Leave the terminal unmarked so a later CAO-delivered first message
+        # can retry through the established injection path.
+        logger.warning(f"Failed to inject start memory for terminal {terminal_id}: {e}")
+        return skill_prompt
+
+    with _memory_injected_lock:
+        _memory_injected_terminals.add(terminal_id)
+
+    if not context:
+        return skill_prompt
+    return f"{context}\n\n{skill_prompt}" if skill_prompt else context
+
+
 class OutputMode(str, Enum):
     """Output mode for terminal history retrieval.
 
@@ -790,6 +841,7 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CLAUDE_CODE.value,
     ProviderType.CODEX.value,
     ProviderType.KIMI_CLI.value,
+    ProviderType.QWEN_CLI.value,
     ProviderType.ANTIGRAVITY_CLI.value,
     ProviderType.OMP.value,
     ProviderType.GROK_CLI.value,
@@ -1028,6 +1080,44 @@ def _roll_back_backend_create_locked(
                 )
         except Exception:
             logger.exception(f"Rollback: failed to kill window {session_name}:{window_name}")
+
+
+def _clear_stale_session_state(session_name: str) -> None:
+    """Drop every piece of name-keyed state a prior incarnation may have left behind.
+
+    Called from the locked ``new_session`` branch of the create, once the
+    duplicate-session check has proved the name is free. tmux session names are
+    reusable labels, and CAO keeps state outside tmux keyed by exactly that
+    label, so anything not wiped here is silently inherited by the new session.
+
+    Two stores today:
+
+    - the forwarded-env mapping (issue #248), so a no-env relaunch cannot
+      inherit a prior ``cao launch --env``;
+    - the display label (#724; haofeif, PR #1036 review, P3-2). Only
+      ``delete_session`` and an explicit ``POST /sessions/{name}/label`` with an
+      empty label used to remove it, and plenty of ways to end a session skip
+      ``delete_session`` entirely: ``delete_terminal`` killing the last window,
+      a flow run recycling its session, the herdr reconcile killing an empty
+      workspace, or the tmux server / host restarting. The label then sat in
+      settings.json and the next same-name session showed it in the dashboard
+      and in ``GET /sessions``.
+
+    Deliberately one function rather than two call sites: the defect was that a
+    name-keyed store got added without this branch learning about it, so the
+    next one goes here and is cleared for free.
+
+    An unreadable settings.json is a warning, not a failed create: nothing was
+    written, nothing was lost (the label is inside the file nobody can read),
+    and refusing to launch a session over it would be a worse outcome than
+    showing a stale alias. Same judgement ``delete_session`` makes (plauzy,
+    #724 review, item 4).
+    """
+    clear_session_env(session_name)
+    try:
+        set_session_label(session_name, "")
+    except SettingsUnreadableError as e:
+        logger.warning(f"Not clearing a stale label for {session_name}: {e}")
 
 
 def _still_owns_incarnation(session_name: str, terminal_id: Optional[str]) -> bool:
@@ -1364,6 +1454,7 @@ def _request_fingerprint(
     description: Optional[str] = None,
     caller_ceiling: Optional[List[str]] = None,
     delegating_terminal_id: Optional[str] = None,
+    inject_memory_at_start: bool = False,
 ) -> str:
     """Fingerprint the create-terminal request an idempotency key stands for.
 
@@ -1571,6 +1662,8 @@ def _request_fingerprint(
         )
     if delegating_terminal_id is not None:
         parts.extend(["delegating_terminal_id", delegating_terminal_id])
+    if inject_memory_at_start:
+        parts.extend(["inject_memory_at_start", "1"])
     return hashlib.sha256(
         "\x00".join(_fingerprint_component(part) for part in parts).encode("utf-8")
     ).hexdigest()
@@ -1901,9 +1994,12 @@ async def create_terminal(
     lookup_only: bool = False,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
+    create_working_directory: bool = False,
     launch_plan: "LaunchPlan | None" = None,
     delegating_terminal_id: Optional[str] = None,
     caller_ceiling: Optional[list[str]] = None,
+    *,
+    inject_memory_at_start: bool = False,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -2016,12 +2112,14 @@ async def create_terminal(
             hashed or excluded-with-a-reason. Adding a parameter to either
             endpoint means classifying it here.
 
-            HASHED (11) -- these determine what the terminal IS, or what
+            HASHED (14) -- these determine what the terminal IS, or what
             privileges and context it launches with:
             ``provider``, ``agent_profile``, ``session_name``,
             ``working_directory``, ``caller_id``, ``model``, ``use_worktree``,
             ``engine``, ``allowed_tools``, ``env_vars``,
-            ``resume_session_id``.
+            ``resume_session_id``, ``initial_message``,
+            ``initial_message_orchestration_type``,
+            ``inject_memory_at_start``.
 
             EXCLUDED, each for a checked reason:
 
@@ -2032,10 +2130,6 @@ async def create_terminal(
               the ``update_metadata`` MCP tool, so a create-time key is not
               their integrity boundary -- a caller who cares about their value
               cannot rely on creation to fix it anyway.
-            - ``initial_message`` and ``initial_message_orchestration_type``.
-              The delivered payload and its routing, not the terminal: neither
-              is persisted on the row, and a genuine retry re-sends the same
-              message. These create endpoints do not own the prompt.
             - ``delegation_message`` and ``delegation_kind``. These never reach
               this function: the handler converts them into a launch plan that
               selects a decision, not the terminal's identity. A genuine retry
@@ -2149,6 +2243,10 @@ async def create_terminal(
 
     Raises:
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
+        WorkingDirectoryError: If the ``working_directory`` the caller supplied
+            is refused: it does not exist and ``create_working_directory`` is
+            not set, the path policy blocks it, or it cannot be created. A 400
+            on all three create routes.
         IdempotencyKeyNotFound: If ``lookup_only`` and no terminal is
             recorded for this key AND this request (HTTP 404)
         TerminalRecordCorruptError: If the terminal a key maps to has a stored
@@ -2183,9 +2281,11 @@ async def create_terminal(
             idempotency_key=idempotency_key,
             lookup_only=lookup_only,
             claim_id=claim_id,
+            create_working_directory=create_working_directory,
             launch_plan=launch_plan,
             delegating_terminal_id=delegating_terminal_id,
             caller_ceiling=caller_ceiling,
+            inject_memory_at_start=inject_memory_at_start,
             ephemeral_state=state,
         )
     except BaseException as exc:
@@ -2225,10 +2325,12 @@ async def _create_terminal_unguarded(
     lookup_only: bool = False,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
+    create_working_directory: bool = False,
     launch_plan: "LaunchPlan | None" = None,
     delegating_terminal_id: Optional[str] = None,
     caller_ceiling: Optional[list[str]] = None,
     *,
+    inject_memory_at_start: bool = False,
     ephemeral_state: _EphemeralLaunchState,
 ) -> Terminal:
     """Create body; the caller compensates an unbound claim or a cancelled bind."""
@@ -2265,6 +2367,7 @@ async def _create_terminal_unguarded(
             description,
             caller_ceiling=caller_ceiling,
             delegating_terminal_id=delegating_terminal_id,
+            inject_memory_at_start=inject_memory_at_start,
         )
         # Issue #944: look up, store and delete under the fingerprint-scoped
         # key, never the bare one. A different request under the same key
@@ -2898,7 +3001,40 @@ async def _create_terminal_unguarded(
         # so resolving earlier would both launch tmux in the pre-worktree directory
         # (defeating the isolation #100 provides) and persist that stale path as the
         # terminal's working_directory. This is the effective launch cwd either way.
-        resolved_working_directory = _resolve_working_directory(working_directory)
+        try:
+            # The must-exist resolution every caller has always had, and the
+            # one seam test harnesses stub (release_runtime maps a fictional
+            # /workspace onto a tmp dir here).
+            #
+            # Who gets past a refusal here, exactly: only a caller that asked
+            # for creation. ``create_working_directory`` is false by default
+            # and false for every caller that does not set it, which includes
+            # the MCP ``handoff`` and ``assign`` tools -- they POST to the two
+            # create routes without the flag, so a path with a typo is still
+            # refused here and the agent can correct it. The Web UI sets it.
+            resolved_working_directory = _resolve_working_directory(working_directory)
+        except ValueError as e:
+            if working_directory is None:
+                raise  # the server's own cwd, not a client error
+            if not create_working_directory:
+                # The caller supplied this path and did not ask for creation,
+                # so the refusal is the caller's to correct. As a plain
+                # ValueError it reached the generic arm of the two in-session
+                # routes, whose 404 means "session not found"; the documented
+                # answer is a 400 on every create route (PR #1036 review).
+                raise WorkingDirectoryError(str(e)) from e
+            # Refused as must-exist by an HTTP create endpoint (#724): the
+            # operator may be pointing at a directory that does not exist yet.
+            # Re-judge it with the SAME policy but allow_create: a missing
+            # target is judged by its nearest existing ancestor (#345 D5), with
+            # no side effects. A target that is blocked, or exists and is not a
+            # directory, is refused again right here with the policy's own
+            # wording, now as WorkingDirectoryError (a 400 on the terminal
+            # endpoint, not its ValueError-means-404). The mkdir itself waits
+            # until the locked section below has passed the duplicate-session /
+            # session-not-found checks, so a rejected request leaves no
+            # directory behind.
+            resolved_working_directory = validate_working_directory(working_directory)
 
         # Step 1c: a Kiro launch must name an agent kiro-cli will load. kiro-cli
         # does not refuse an unknown --agent; it starts its built-in kiro_default
@@ -3091,12 +3227,15 @@ async def _create_terminal_unguarded(
                     if get_backend().session_exists(session_name):
                         raise ValueError(f"Session '{session_name}' already exists")
 
-                    # Wipe any stale mapping a prior aborted lifecycle for this
-                    # name may have left behind, so a no-env relaunch can't
-                    # inherit them.
-                    clear_session_env(session_name)
+                    _clear_stale_session_state(session_name)
 
                     session_incarnation_id = uuid.uuid4().hex
+
+                    if create_working_directory:
+                        # Point of use (#724): every check that can refuse this
+                        # request has passed, so creating the operator's
+                        # directory now cannot leave an orphan behind.
+                        ensure_working_directory(resolved_working_directory)
 
                     # Create new tmux session with initial window
                     effective_env = dict(env_vars or {})
@@ -3130,6 +3269,9 @@ async def _create_terminal_unguarded(
                     # joins an existing session (issue #408).
                     effective_env = {**get_session_env(session_name), **(env_vars or {})}
                     _add_kiro_home_to_window_env(effective_env, kiro_launch)
+                    if create_working_directory:
+                        # Point of use, as in the new-session branch above.
+                        ensure_working_directory(resolved_working_directory)
                     created_window_name = get_backend().create_window(
                         session_name,
                         window_name,
@@ -3351,6 +3493,22 @@ async def _create_terminal_unguarded(
             session_id=fresh_claude_session_id,
             **provider_launch_options,
         )
+        # Interactive prompt-capable providers have no CAO first message, so
+        # inject memory through their launch prompt. Resolve after provider
+        # registration: context lookup can involve a remote owner and must not
+        # widen the row-visible/runtime-missing teardown race. Initialization
+        # has not started yet, so updating the prompt here still precedes command
+        # construction. Immediate orchestrated launches retain the task-aware
+        # first-message path (and workflow frozen-memory semantics).
+        if (
+            inject_memory_at_start
+            and provider in RUNTIME_SKILL_PROMPT_PROVIDERS
+            and initial_message is None
+        ):
+            provider_instance._skill_prompt = await asyncio.to_thread(
+                _memory_start_prompt, skill_prompt, terminal_id
+            )
+
         # The provider owns the helper's home now: its cleanup removes it.
         ephemeral_state.kiro_home = None
 
@@ -4850,9 +5008,9 @@ def _message_in_composer(terminal_id: str, message: str) -> Optional[bool]:
       bare Enter submits exactly what is there.
     - ``False``: the composer was extracted and the message is NOT in it. The
       paste itself was dropped, so a full re-send cannot double anything.
-    - ``None``: the composer cannot be read -- the provider has no
-      ``extract_current_composer``, the capture failed, or the message is too
-      short to probe for. Nothing is known about what a full re-send would land
+    - ``None``: the composer cannot be read, the match depends on an ambiguous
+      tail, or the message is too short to probe for. Nothing is known about
+      what a full re-send would land
       on top of. A caller that must not duplicate (the inbox path) sends nothing
       in this case; the deferred-init path's ``_message_visible_in_box`` keeps
       treating it like ``False`` (its worker is fresh, see
@@ -4869,7 +5027,12 @@ def _message_in_composer(terminal_id: str, message: str) -> Optional[bool]:
     composer = _capture_current_composer_region(terminal_id)
     if composer is None:
         return None
-    return probe in _normalized_box_text(composer)
+    certain = getattr(composer, "certain_prefix", composer)
+    if probe in _normalized_box_text(certain):
+        return True
+    if certain != composer and probe in _normalized_box_text(composer):
+        return None
+    return False
 
 
 def _message_visible_in_box(terminal_id: str, message: str) -> bool:

@@ -1,0 +1,287 @@
+--- a/lib/parse.js
++++ b/lib/parse.js
+@@ -139,26 +139,51 @@
+   return value.replace(/\\(.)/g, '$1');
+ };
+
+-const hasRepeatedCharPrefixOverlap = branches => {
+-  const values = branches.map(normalizeSimpleBranch).filter(Boolean);
+-
+-  for (let i = 0; i < values.length; i++) {
+-    for (let j = i + 1; j < values.length; j++) {
+-      const a = values[i];
+-      const b = values[j];
+-      const char = a[0];
+-
+-      if (!char || a !== char.repeat(a.length) || b !== char.repeat(b.length)) {
+-        continue;
+-      }
+-
+-      if (a === b || a.startsWith(b) || b.startsWith(a)) {
+-        return true;
+-      }
++const normalizeQuotedLiteral = (branch, options) => {
++  let quoted = false;
++  let value = '';
++  for (const ch of branch) {
++    if (ch === '"') {
++      quoted = !quoted;
++      if (options.keepQuotes === true) value += ch;
++    } else {
++      // Escapes can denote regex syntax, not just literal characters.
++      if (ch === '\\' || (!quoted && !isPlainBranch(ch))) return;
++      value += ch;
+     }
+   }
++  if (!quoted) return value;
++};
+
+-  return false;
++const hasLiteralOverlap = (branches, options) => {
++  const ignoreCase = options.flags ? options.flags.includes('i') : options.nocase;
++  const unicodeCase = ignoreCase && /[uv]/.test(options.flags || '');
++  const hasQuotes = branches.some(branch => branch.includes('"'));
++  const values = [];
++  for (const branch of branches) {
++    if (/\\[A-Za-z0-9]/.test(branch)) return true;
++    const literal = hasQuotes
++      ? normalizeQuotedLiteral(branch, options)
++      : normalizeSimpleBranch(branch);
++    if (!literal) {
++      if (hasQuotes) return true;
++      continue;
++    }
++    // Unicode regexp folding includes compatibility letters. Fold per code point
++    // to avoid context-sensitive whole-word mappings; expansions are conservative.
++    values.push(unicodeCase ? Array.from(literal, ch => ch.toLowerCase().toUpperCase()).join('')
++      : ignoreCase ? literal.toUpperCase() : literal);
++  }
++
++  // A literal and all its extensions are adjacent in lexicographic order.
++  const hasPrefix = words => words.sort().some((word, i, sorted) =>
++    i > 0 && word.startsWith(sorted[i - 1]));
++  if (!hasPrefix(values)) return false;
++
++  // Suffix-free literal alternatives are uniquely decodable from the other end.
++  // Don't discard their normal matches just because they share a prefix.
++  return values.length !== branches.length ||
++    hasPrefix(values.map(value => value.split('').reverse().join('')));
+ };
+
+ const parseRepeatedExtglob = (pattern, requireEnd = true) => {
+@@ -270,6 +295,74 @@
+   return chars;
+ };
+
++// A segment with an unrestricted star is closed under concatenation: repeating
++// it cannot match more strings than a single copy. Only collapse syntax whose
++// stars can absorb every character matched by the surrounding literals.
++const analyzeStarBranch = branch => {
++  let escaped = false;
++  let bracket = false;
++  let quote = false;
++  let groups = 0;
++  let star = false;
++  let collapsible = true;
++
++  for (let i = 0; i < branch.length; i++) {
++    const ch = branch[i];
++
++    if (escaped === true) {
++      if (ch === '/' || ch === '\\') collapsible = false;
++      escaped = false;
++      continue;
++    }
++
++    if (ch === '\\') {
++      escaped = true;
++      continue;
++    }
++
++    if (ch === '/') collapsible = false;
++
++    if (quote === true) {
++      if (ch === '"') quote = false;
++      continue;
++    }
++
++    if (bracket === true) {
++      if (ch === '[') collapsible = false;
++      if (ch === ']') bracket = false;
++      continue;
++    }
++
++    if (ch === '"') {
++      quote = true;
++      continue;
++    }
++
++    if (ch === '[') {
++      bracket = true;
++      continue;
++    }
++
++    if (ch === '@' && branch[i + 1] === '(') {
++      groups++;
++      i++;
++      continue;
++    }
++
++    if (ch === ')' && groups > 0) {
++      groups--;
++      continue;
++    }
++
++    if (ch === '*' && branch[i + 1] !== '(') star = true;
++    if (/[/(){}|!+@]/.test(ch) || (ch === '*' && branch[i + 1] === '(')) {
++      collapsible = false;
++    }
++  }
++
++  return { star, collapsible: collapsible && !escaped && !bracket && !quote && groups === 0 };
++};
++
+ const repeatedExtglobRecursion = pattern => {
+   let depth = 0;
+   let value = pattern.trim();
+@@ -300,7 +393,7 @@
+     if (
+       branches.some(branch => branch === '') ||
+       branches.some(branch => /^[*?]+$/.test(branch)) ||
+-      hasRepeatedCharPrefixOverlap(branches)
++      hasLiteralOverlap(branches, options)
+     ) {
+       return { risky: true };
+     }
+@@ -343,6 +436,13 @@
+       : { risky: true };
+   }
+
++  if (branches.length === 1) {
++    const branch = analyzeStarBranch(branches[0]);
++    if (branch.star) {
++      return branch.collapsible ? { risky: false, collapse: true } : { risky: true };
++    }
++  }
++
+   return { risky: false };
+ };
+
+@@ -539,7 +639,65 @@
+   const extglobClose = token => {
+     const literal = input.slice(token.startIndex, state.index + 1);
+     const body = input.slice(token.startIndex + 2, state.index);
+-    const analysis = analyzeRepeatedExtglob(body, opts);
++    const repeated = token.type === 'plus' || token.type === 'star';
++    let analysis = repeated ? analyzeRepeatedExtglob(body, opts) : { risky: false };
++    if (analysis.collapse || (analysis.risky && body.includes('['))) {
++      const parts = tokens.slice(token.tokensIndex + 2);
++      const bash = opts.bash === true;
++      const flags = opts.flags || '';
++      const alphabet = bash ? '.' : QMARK;
++      const outside = bash ? '[\\n\\r\\u2028\\u2029]' : SLASH_LITERAL;
++      const excluded = bash ? (flags.includes('s') ? [] : ['\n', '\r', '\u2028', '\u2029'])
++        : opts.windows ? ['/', '\\'] : ['/'];
++      const isGlobStar = t => t.type === 'star' && t.output === (bash ? '.*?' : star);
++      if (analysis.collapse && !parts.some(isGlobStar)) {
++        // regex:true can emit a regex quantifier rather than a glob star.
++        // Leave explicit regex syntax to upstream; the glob collapse does not apply.
++        analysis = { risky: !(opts.regex && parts.some(t => t.type === 'star' && t.output === '*')) };
++      }
++      for (const part of parts) {
++        if (!analysis.collapse && !analysis.risky) break;
++        const source = part.output ?? part.value;
++        const charClass = part.charClass || source;
++        const bracket = part.type === 'bracket' || part.type === 'qmark';
++        const text = part.type === 'text' && (/\\[A-Za-z0-9]/.test(source) || excluded.some(s => source.includes(s)));
++        if (!bracket && !text) continue;
++        // Unicode-set classes may match strings, not just single characters.
++        const single = bracket ? charClass.startsWith('[') && charClass.endsWith(']')
++          : source.length === 1 || /^\\(?:[dDsSwWfnrtv]|x[\dA-Fa-f]{2}|u[\dA-Fa-f]{4})$/.test(source);
++        if (!single || flags.includes('v')) {
++          analysis = { risky: true };
++          break;
++        }
++        const simple = parts.length === 2 && parts.some(t => isGlobStar(t) && t.value === '*');
++        if (!simple && !analysis.collapse) break;
++        try {
++          // Use the parser's actual class, including ranges and platform options.
++          const member = new RegExp(`^(?:${charClass})$`, flags.replace(/[gy]/g, ''));
++          if (part.charClass && excluded.some(s => charClass.includes(s) && !member.test(s))) {
++            analysis = { risky: true };
++            break;
++          }
++          if (!excluded.some(s => member.test(s))) {
++            if (simple) analysis = { collapse: true };
++            continue;
++          }
++        } catch {
++          analysis = { risky: true };
++          break;
++        }
++
++        analysis = { risky: true };
++        if (simple) {
++          // For a one-character class C and segment alphabet A, (A* C)+ = (A ∪ C)* C.
++          // The two alphabet choices are disjoint. The mirror identity covers (C A*)+.
++          const union = `(?:${alphabet}|(?=${outside})${charClass})*?`;
++          const flat = parts[0] === part ? source + union : union + source;
++          analysis.safeOutput = token.type === 'plus' ? flat : `(?:${flat})?`;
++        }
++        break;
++      }
++    }
+
+     if ((token.type === 'plus' || token.type === 'star') && analysis.risky) {
+       const safeOutput = analysis.safeOutput
+@@ -549,7 +707,7 @@
+
+       open.type = 'text';
+       open.value = literal;
+-      open.output = safeOutput || utils.escapeRegex(literal);
++      open.output = safeOutput || utils.escapeRegex(literal.replace(/\\/g, '\\\\'));
+
+       for (let i = token.tokensIndex + 1; i < tokens.length; i++) {
+         tokens[i].value = '';
+@@ -565,6 +723,12 @@
+       return;
+     }
+
++    // Repeating a star-containing segment introduces nested quantifiers. The
++    // analyzer proves when one occurrence (or zero for `*`) is equivalent.
++    if (analysis.collapse === true && (token.type === 'plus' || token.type === 'star')) {
++      token.close = token.type === 'plus' ? ')' : ')?';
++    }
++
+     let output = token.close + (opts.capture ? ')' : '');
+     let rest;
+
+@@ -869,6 +1033,7 @@
+       }
+
+       // when the user specifies nothing, try to match both
++      prev.charClass = prev.value;
+       prev.value = `(${capture}${escaped}|${prev.value})`;
+       state.output += prev.value;
+       continue;
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+-  "name": "picomatch",
+-  "description": "Blazing fast and accurate glob matcher written in JavaScript, with no dependencies and full support for standard and extended Bash glob features, including braces, extglobs, POSIX brackets, and regular expressions.",
+-  "version": "4.0.7",
++  "name": "cao-picomatch-guard",
++  "description": "CAO backport of picomatch 4.0.7 with repeated-extglob guards",
++  "version": "4.0.7-cao.3",
+   "homepage": "https://github.com/micromatch/picomatch",
+   "author": "Jon Schlinkert (https://github.com/jonschlinkert)",
+   "funding": "https://github.com/sponsors/jonschlinkert",
+@@ -79,5 +79,6 @@
+       "nanomatch",
+       "picomatch"
+     ]
+-  }
++  },
++  "private": true
+ }

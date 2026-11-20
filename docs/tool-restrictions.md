@@ -116,6 +116,7 @@ No `role` is needed — `allowedTools` is the full specification of what tools t
 | `web_fetch` | Fetch URLs / search the web | `WebFetch`, `WebSearch` | (not mapped) |
 | `@builtin` | Selector naming the provider's own built-in tool set; **grants nothing by itself** on any provider. Kept in the role defaults for readability; list `fs_*`/`execute_bash` explicitly for the access you want | (no-op) | (no-op) |
 | `@cao-mcp-server` | Every CAO MCP tool: `handoff`, `assign`, `send_message`, Hermes prompt answers via `answer_user_prompt`, memory (`memory_store`/`memory_recall`/`memory_forget`), workflows, `delete_terminal`, and the rest of the `cao-mcp-server` surface | Same | Same |
+| `@cao-ops-mcp-server` | Every operations control-plane tool: `launch_session`, `install_profile`, `shutdown_session`, `send_session_message`, the session/terminal readers, and the `decisions_*` controls. **Not implied by `@cao-mcp-server`** | Same | Same |
 | `discovery` | Sibling discovery/metadata (`list_siblings`, `update_metadata`) | Same | Same |
 | `*` | Everything (unrestricted) | All tools | All tools |
 
@@ -123,7 +124,22 @@ CAO translates these to each provider's native tool names automatically. You wri
 
 #### `@cao-mcp-server` gates the whole CAO MCP tool surface, not just delegation
 
-Every tool `cao-mcp-server` registers is denied to a bound terminal whose effective allowlist omits `@cao-mcp-server` and `*` (#671) — not only the delegation tools (`assign`, `handoff`, `assign_elastic`, the `workflow_run` family, `create_ephemeral_agent`) that carried their own check before this. A single `on_call_tool` middleware enforces this once, ahead of every tool, so a tool registered later is covered by default. Four tools stay reachable regardless of the grant because they are the callback protocol an assigned worker depends on to report back and cannot be mistaken for a capability: `send_message`, `complete_assignment`, `workflow_return`, `answer_user_prompt`. The two `discovery`-gated tools (`list_siblings`, `update_metadata`) pass this gate on `discovery` alone, per the carve-out below — they do not need `@cao-mcp-server` too. This gate covers `cao-mcp-server` only; `cao-ops-mcp-server` (the inbound control-plane server for external agents — see [Control Planes](control-planes.md)) is operator-granted and out of its scope.
+Every tool `cao-mcp-server` registers is denied to a bound terminal whose effective allowlist omits `@cao-mcp-server` and `*` (#671) — not only the delegation tools (`assign`, `handoff`, `assign_elastic`, the `workflow_run` family, `create_ephemeral_agent`) that carried their own check before this. A single `on_call_tool` middleware enforces this once, ahead of every tool, so a tool registered later is covered by default. Four tools stay reachable regardless of the grant because they are the callback protocol an assigned worker depends on to report back and cannot be mistaken for a capability: `send_message`, `complete_assignment`, `workflow_return`, `answer_user_prompt`. The two `discovery`-gated tools (`list_siblings`, `update_metadata`) pass this gate on `discovery` alone, per the carve-out below — they do not need `@cao-mcp-server` too.
+
+#### `@cao-ops-mcp-server` gates the operations control plane separately
+
+`cao-ops-mcp-server` (the control-plane server — see [Control Planes](control-planes.md)) carries the same gate on its own selector, `@cao-ops-mcp-server` (#1062). It was knowingly ungated when #671 landed, and that gap was real: `CAO_TERMINAL_ID` is forwarded into **every** server in a profile's `mcpServers` map, so a profile that listed this server handed a bound terminal `launch_session`, `install_profile`, `shutdown_session`, `send_session_message` and the seven `decisions_*` controls with its allowlist unconsulted, **including a profile whose explicit `allowedTools` left the server out**. The gate now consults it.
+
+**Listing the server can still grant it.** A profile with no explicit `allowedTools:` (and no `--allowed-tools` at launch) still gets `@<server>` appended for every server it declares itself (#772, see [How Overrides Work](#how-overrides-work)), so a role-default profile (developer, `supervisor` or `reviewer`) that declares the server under the key `cao-ops-mcp-server` holds `@cao-ops-mcp-server` and reaches every tool, short of lifting a halt. **To declare the server and withhold the control plane, pin `allowedTools:` without the grant.** The Kiro `tools:` field is a different list and withholds nothing here.
+
+The gate reads the fixed selector, not the key the server is declared under. A profile that declares the server itself under another key (`cao-ops-mcp` as in the [Control Planes](control-planes.md) example) is appended `@<that key>`, which the gate refuses. A server an agent plugin provides (the operator agent-plugin's `cao-ops`) is never appended; the operator names it. Either way the profile names `@cao-ops-mcp-server` as well. A glob that covers both names (`@cao-ops*`) satisfies this gate and CAO's own server selection; whether a provider that receives the entry verbatim expands a server glob is that provider's behavior, so the two explicit entries are the portable form.
+
+The two surfaces are granted independently and neither implies the other: `@cao-mcp-server` is delegation within the caller's own assign/handoff tree, `@cao-ops-mcp-server` acts on the node. A glob that covers both names (`@cao-*`, `@*`) grants both, so a profile that lists both servers and means delegation only names `@cao-mcp-server`. Two carve-outs, mirroring the callback exemption above:
+
+- `decisions_off` stays reachable without the grant. It is argument-free and off-only — the operator's kill switch (#955) — and a fail-safe that needs a grant is not a fail-safe. The call is not authorized, but it is recorded: a bound terminal that makes it is named, by the `CAO_TERMINAL_ID` it claims, in a WARNING on the operations server's log.
+- Lifting a halt is refused for any bound terminal, grant or not. `decisions_set_point` to `shadow` or `on` removes the halt marker, so allowing it here would let a caller undo an operator's `cao decisions off` through the same surface. The CLI path is unaffected. See [Decisions](decisions.md).
+
+An operator context — an MCP host with no `CAO_TERMINAL_ID`, which includes `cao-ops` in the operator agent-plugin when a client runs it outside CAO — is unchanged on both surfaces. The test is the server's environment, not how it was configured: a `cao-ops-mcp-server` process that sees `CAO_TERMINAL_ID` is bound and gated. That is the case when CAO delivers the agent plugin to an agent it launches (`cao install <profile>`); see [Agent Plugins](agent-plugins.md) for the two entries that profile needs.
 
 #### `discovery` is a separate opt-in, not part of `@cao-mcp-server`
 
@@ -324,6 +340,7 @@ As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-
 | **OpenCode CLI** | Hard | `permission:` YAML frontmatter enforced natively at install time; launch-time `--allowed-tools` and role overrides select the installed agent and do not change its permissions |
 | **Grok Build CLI** | Native (mapped families) | Restricted profiles use deny-by-default `--permission-mode dontAsk` with explicit native/MCP allows and defense-in-depth denies; native subagents are disabled |
 | **Kimi CLI** | Soft | Security system prompt only |
+| **Qwen Code** | Soft | Security system prompt only; tool calls auto-approved |
 | **MiniMax Code** | Soft | Security bootstrap prompt only |
 | **OMP** | Soft | Security system prompt only |
 | **Codex** | Soft | Security system prompt only |

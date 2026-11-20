@@ -97,6 +97,29 @@ PYPI_TIMEOUT_S = 30
 # Files copied into every package alongside its generated manifest.
 SHARED_FILES = ["LICENSE"]
 
+# Marketplace catalogs (#1409). The Agent Plugins specification defines one
+# manifest per plugin and no marketplace format, so each client that can install
+# from a repository reads its own catalog file at the repo root. Both are written
+# from the same ``PACKAGES`` list that writes the per-package manifests, so a
+# catalog cannot name a package that does not exist or disagree with it.
+MARKETPLACE_NAME = "cli-agent-orchestrator"
+MARKETPLACE_OWNER = "awslabs"
+MARKETPLACE_DESCRIPTION = (
+    "CLI Agent Orchestrator (CAO) Agent Plugins: drive multi-agent sessions, "
+    "contribute to CAO, and author AG-UI and Agent Plugins packages."
+)
+MARKETPLACE_DISPLAY_NAME = "CLI Agent Orchestrator"
+# Catalog locations relative to the directory that holds ``agent-plugin/``, so a
+# build redirected at another ``PACKAGES_DIR`` writes its catalogs beside it and
+# never into the real checkout.
+CLAUDE_MARKETPLACE_REL = Path(".claude-plugin") / "marketplace.json"
+CODEX_MARKETPLACE_REL = Path(".agents") / "plugins" / "marketplace.json"
+# Codex documents ``policy.installation`` values AVAILABLE, INSTALLED_BY_DEFAULT
+# and NOT_AVAILABLE, and ``policy.authentication`` as install-time or first-use.
+# AVAILABLE lists the plugin without installing it unasked. These packages call
+# no authenticated service, so the documented example value is used.
+CODEX_POLICY = {"installation": "AVAILABLE", "authentication": "ON_INSTALL"}
+
 
 @dataclass(frozen=True)
 class PackageConfig:
@@ -125,6 +148,9 @@ class PackageConfig:
     """
 
     extra_manifest: Dict[str, object] = field(default_factory=dict)
+
+    category: str = "Developer Tools"
+    """Catalog category shown by marketplace clients (#1409)."""
 
 
 OPERATOR = PackageConfig(
@@ -293,6 +319,76 @@ def render_claude_code_manifest(config: PackageConfig, version: str) -> str:
         "description": config.description,
     }
     return json.dumps(manifest, indent=2) + "\n"
+
+
+def render_claude_marketplace(version: str) -> str:
+    """Render ``.claude-plugin/marketplace.json`` for Claude Code, deterministically."""
+    catalog = {
+        "name": MARKETPLACE_NAME,
+        "owner": {"name": MARKETPLACE_OWNER},
+        "metadata": {"description": MARKETPLACE_DESCRIPTION, "version": version},
+        "plugins": [
+            {
+                "name": config.name,
+                "source": f"./agent-plugin/{config.name}",
+                "description": config.description,
+                "version": version,
+                "category": config.category,
+            }
+            for config in PACKAGES
+        ],
+    }
+    return json.dumps(catalog, indent=2) + "\n"
+
+
+def render_codex_marketplace(version: str) -> str:
+    """Render ``.agents/plugins/marketplace.json`` for Codex, deterministically.
+
+    ``version`` is accepted for symmetry with the Claude renderer; Codex reads a
+    plugin's version from the plugin's own manifest, not from the catalog.
+    """
+    catalog = {
+        "name": MARKETPLACE_NAME,
+        "interface": {"displayName": MARKETPLACE_DISPLAY_NAME},
+        "plugins": [
+            {
+                "name": config.name,
+                "source": {"source": "local", "path": f"./agent-plugin/{config.name}"},
+                "policy": dict(CODEX_POLICY),
+                "category": config.category,
+            }
+            for config in PACKAGES
+        ],
+    }
+    return json.dumps(catalog, indent=2) + "\n"
+
+
+def catalog_targets(version: str) -> Dict[Path, str]:
+    """Every marketplace catalog and its expected bytes."""
+    root = PACKAGES_DIR.parent
+    return {
+        root / CLAUDE_MARKETPLACE_REL: render_claude_marketplace(version),
+        root / CODEX_MARKETPLACE_REL: render_codex_marketplace(version),
+    }
+
+
+def write_catalogs(version: str) -> None:
+    for path, text in catalog_targets(version).items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        print(f"  wrote {path.relative_to(PACKAGES_DIR.parent)}")
+
+
+def check_catalogs(version: str) -> List[str]:
+    """Problems with the committed catalogs; empty means they match the packages."""
+    problems: List[str] = []
+    for path, expected in catalog_targets(version).items():
+        rel = path.relative_to(PACKAGES_DIR.parent)
+        if not path.is_file():
+            problems.append(f"MISSING {rel}")
+        elif path.read_text(encoding="utf-8") != expected:
+            problems.append(f"CONTENT DIFFERS in {rel}")
+    return problems
 
 
 def render_manifest(config: PackageConfig, version: str) -> str:
@@ -993,6 +1089,7 @@ def run_build(
     for config in PACKAGES:
         build_package(config, version, PACKAGES_DIR)
         print(f"  built agent-plugin/{config.name}/ ({len(config.skills)} skill(s))")
+    write_catalogs(version)
     print(f"Built {len(PACKAGES)} agent plugin package(s) at version {version}")
     return 0
 
@@ -1016,6 +1113,7 @@ def _build_at_committed_pin() -> int:
     for config in PACKAGES:
         build_package(config, version, PACKAGES_DIR)
         print(f"  built agent-plugin/{config.name}/ ({len(config.skills)} skill(s))")
+    write_catalogs(version)
     print(
         f"Built {len(PACKAGES)} agent plugin package(s) at the committed version "
         f"{version} (pyproject.toml is at {package_version()}; the pin was not moved)"
@@ -1068,6 +1166,10 @@ def run_check(*, require_current_pin: bool = False) -> int:
             except Exception as exc:  # keep going: the other package still gets checked
                 all_problems[config.name] = [f"check raised: {exc}"]
 
+    catalog_problems = check_catalogs(version)
+    if catalog_problems:
+        all_problems["marketplace catalogs"] = catalog_problems
+
     ordering = pin_ordering_problems(version, current_version)
     if ordering:
         all_problems.setdefault(PACKAGES[0].name, []).extend(ordering)
@@ -1112,12 +1214,76 @@ def run_check(*, require_current_pin: bool = False) -> int:
     return 0
 
 
+def package_link_problems(config: PackageConfig, version: str, scratch: Path) -> List[str]:
+    """Check the local Markdown links of ONE package, exactly as the build writes it (#1384).
+
+    ``scripts/validate_markdown_links.py`` already rejects a link that leaves its skill's
+    directory in ``skills/``. It does not see the files the build generates around the
+    skills (``README.md``, ``CHANGELOG.md``), and it checks the tree as a whole rather
+    than one package at a time. A package is installed on its own, so the question is
+    whether every link resolves *inside the package*. The package is therefore built into
+    its own directory and that directory is made the link root: a link that escapes it, or
+    that leaves its skill's own directory, is reported for that package by name.
+    #1343 and #1365 each found such links by hand.
+    """
+    from cli_agent_orchestrator.utils.markdown_links import validate_markdown_links
+
+    package_dir = build_package(config, version, scratch)
+    markdown = sorted(package_dir.rglob("*.md"))
+    root = package_dir.resolve()
+    problems: List[str] = []
+    for error in validate_markdown_links(package_dir, files=markdown):
+        relative = Path(error.source).resolve().relative_to(root).as_posix()
+        problems.append(f"{relative}:{error.line}: {error.destination!r}: {error.reason}")
+    return problems
+
+
+def run_check_links() -> int:
+    """Link-check every package as built, one package at a time, in a fresh directory.
+
+    Each package gets its own scratch root so one package's files can never satisfy
+    another's link, and every package is reported even when an earlier one fails.
+    The version is the one the committed packages were built at, as in ``--check``;
+    link correctness does not depend on it.
+    """
+    import tempfile
+
+    version = committed_package_version() or package_version()
+    failed: Dict[str, List[str]] = {}
+    for config in PACKAGES:
+        with tempfile.TemporaryDirectory(prefix="cao-agent-plugin-links-") as scratch:
+            try:
+                problems = package_link_problems(config, version, Path(scratch))
+            except Exception as exc:  # keep going: the other packages still get checked
+                problems = [f"link check raised: {exc}"]
+        if problems:
+            failed[config.name] = problems
+        print(f"{'FAIL' if problems else 'ok  '} {config.name}: {len(problems)} broken link(s)")
+    if failed:
+        print("\nLinks that do not resolve inside the installed package:", file=sys.stderr)
+        for name, problems in failed.items():
+            print(f"\n  {name}:", file=sys.stderr)
+            for problem in problems:
+                print(f"    - {problem}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--check",
         action="store_true",
         help="Verify the committed packages instead of regenerating them.",
+    )
+    parser.add_argument(
+        "--check-links",
+        action="store_true",
+        help=(
+            "Build each package into its own directory and check its Markdown links "
+            "there, so a link that resolves in the repository but escapes the installed "
+            "package fails. Offline; writes nothing under agent-plugin/."
+        ),
     )
     parser.add_argument(
         "--skip-publish-check",
@@ -1167,8 +1333,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     if args.keep_committed_pin and args.check:
         parser.error("--keep-committed-pin builds; it cannot be combined with --check")
+    if args.check_links and (
+        args.check
+        or args.keep_committed_pin
+        or args.skip_publish_check
+        or args.require_bounded_client
+        or args.require_current_pin
+    ):
+        parser.error("--check-links is its own mode; it cannot be combined with another flag")
 
     try:
+        if args.check_links:
+            return run_check_links()
         if args.check:
             return run_check(require_current_pin=args.require_current_pin)
         return run_build(

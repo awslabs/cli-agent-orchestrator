@@ -23,6 +23,16 @@ audit = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(audit)
 
 
+@pytest.fixture(autouse=True)
+def _no_ci_event(monkeypatch):
+    """CI sets GITHUB_EVENT_NAME=pull_request, which makes the gate require a base revision.
+
+    These tests choose their mode explicitly, so the runner's own event must not leak in.
+    """
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    monkeypatch.delenv("CAO_DEPSEC_BASE_REV", raising=False)
+
+
 def result(path="package-lock.json", ecosystem="npm", severity=None, fixed=""):
     record = {
         "Target": path,
@@ -53,6 +63,20 @@ def repository(tmp_path, monkeypatch):
     subprocess.run(["git", "add", "."], cwd=root, check=True)
     monkeypatch.setattr(audit, "__file__", str(root / "scripts" / "dependency_security.py"))
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    # These #884 tests exercise the scanner and error boundaries on generic lockfiles with no
+    # build behind them, so every input counts as shipped here. The shipped-set producers
+    # and the classification are covered in test_dependency_security_shipped.py.
+    monkeypatch.setattr(
+        audit,
+        "collect_shipped_sets",
+        lambda _root, inputs: {
+            path.as_posix(): {
+                "producer": "test",
+                "packages": [{"name": "example-library", "version": "1.0.0"}],
+            }
+            for path in inputs
+        },
+    )
     return root
 
 
@@ -297,9 +321,9 @@ def test_cargo_manifest_does_not_make_trivy_drop_development_dependencies(reposi
     assert Path("another-project/Cargo.toml") not in inputs
 
 
-# must_run("unit"): only the 3.12 Unit Tests leg installs Trivy, and it is the
-# single place this assertion ever runs. If that install step goes away the
-# skipif would quietly make this a no-op on every leg.
+# must_run("unit"): only the 3.12 Unit Tests leg and the nightly Python 3.14 job
+# install Trivy, and they are the only places this assertion runs. If the 3.12
+# install step goes away, the skipif makes this a no-op on both ci.yml legs.
 @pytest.mark.must_run("unit")
 @pytest.mark.skipif(shutil.which("trivy") is None, reason="Requires the CI-pinned Trivy binary")
 def test_real_trivy_keeps_dev_only_packages_in_published_inventory(repository, tmp_path):
@@ -422,6 +446,37 @@ def test_ci_and_scheduled_dependency_gates_are_identical_and_unconditional():
     events = scheduled.get("on", scheduled.get(True))
     assert events == {"schedule": [{"cron": "0 8 * * 1"}], "workflow_dispatch": None}
     assert "pull_request_target" not in ci.get("on", ci.get(True))
+
+
+def test_issues_write_exists_only_on_the_schedule_tracking_job():
+    """#1398: the tracking issue needs `issues: write`, and nothing that gates may hold it.
+
+    The gate job stays byte-identical in ci.yml and the schedule workflow with
+    `contents: read`; the separate `toolchain-tracking` job is the only holder, it runs
+    after the gate, and it cannot change the verdict.
+    """
+    workflows = ROOT / ".github" / "workflows"
+    ci = yaml.safe_load((workflows / "ci.yml").read_text())
+    scheduled = yaml.safe_load((workflows / "dependency-security.yml").read_text())
+
+    def holders(doc):
+        top = (doc.get("permissions") or {}).get("issues")
+        found = {"<workflow>"} if top == "write" else set()
+        for name, job in doc["jobs"].items():
+            if (job.get("permissions") or {}).get("issues") == "write":
+                found.add(name)
+        return found
+
+    assert holders(ci) == set(), "ci.yml (pull requests) must never hold issues: write"
+    assert holders(scheduled) == {"toolchain-tracking"}
+    tracking = scheduled["jobs"]["toolchain-tracking"]
+    assert tracking["needs"] == "dependency-security"
+    assert "schedule" in tracking["if"] and "cancelled()" in tracking["if"]
+    assert tracking["permissions"] == {"contents": "read", "issues": "write"}
+    assert not any("checkout" in step.get("uses", "") for step in tracking["steps"])
+    gate = scheduled["jobs"]["dependency-security"]
+    assert gate["permissions"] == {"contents": "read"}
+    assert gate["steps"] == ci["jobs"]["dependency-security"]["steps"]
 
 
 def test_audit_reports_and_mitigations_are_not_skipped_after_scanner_setup_failure():

@@ -25,15 +25,31 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    forward_terminal_identity,
+    resolve_mcp_server_config,
+)
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
-# Captured from OMP 17.2.10 in test/providers/fixtures. The tool-execution
-# indicator is a separate live state emitted after the model's Working… phase.
-_WORKING_PATTERN = re.compile(r"(?:\bWorking…\s+⟨esc⟩|\bRunning [^\n]*\s+⟨esc⟩)")
+# Working row, from the 17.2.10 and 18.20 fixtures: 17.x appends the interrupt
+# key (``Working… ⟨esc⟩``, ``Running … ⟨esc⟩``); 18.x leads with the Escape
+# keycap and the verb or tool intent (``⎋ Working…``, ``⎋ Run requested delay``).
+_WORKING_PATTERN = re.compile(
+    r"(?:\bWorking…\s+⟨esc⟩|\bRunning [^\n]*\s+⟨esc⟩|^[ \t]*⎋[ \t]+\S[^\n]*$)",
+    re.MULTILINE,
+)
+# OMP 18.x draws the spinner and elapsed time in the status row above the
+# composer (``╭── ⠹ 3s > … ╮`` on a box composer, `` ⠹ 3s > …`` on a band) and
+# ``π`` there when idle. Only this row is repainted per frame, so its latest
+# copy is the freshest screen state.
+_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_WORKING_STATUS_ROW_PATTERN = re.compile(
+    rf"^(?:╭──)?[ \t]*[{_SPINNER}][ \t]+\d[^\n>]*>[^\n]*$", re.MULTILINE
+)
+_READY_STATUS_ROW_PATTERN = re.compile(r"^(?:╭──)?[ \t]*π[ \t]+>[^\n]*$", re.MULTILINE)
 _WAITING_PATTERN = re.compile(r"^\s*Allow tool:\s+\S+", re.MULTILINE)
 # Kept as a source-compatible ready-frame anchor. OMP's rendered terminal can
 # omit this row, but raw/screen buffers from configurations that show it use the
@@ -46,12 +62,20 @@ _STATUS_LINE_PATTERN = re.compile(
 # Generic ``Error:`` prose belongs to the assistant response and must never
 # change lifecycle state.
 _ERROR_PATTERN = re.compile(r"^\s*Error:\s+No model selected\.\s*$", re.MULTILINE)
-# The bottom OMP title frame is present in the captured idle/completed viewport.
-_READY_FRAME_PATTERN = re.compile(r"^╰─.*─╯\s*$", re.MULTILINE)
-_WORKING_LIVE_FRAME_TAIL_PATTERN = re.compile(r"\s*╭── OMP session [^\n]*╮\s*\n╰─[^\n]*─╯\s*\Z")
+# The bottom OMP composer frame is present in the captured idle/completed
+# viewport. OMP 17.x and OMP 18.x with ``composer.shape: box`` close it as
+# ``╰─ … ─╯``; OMP 18.x's default ``band`` composer leaves a bare ``╰─``.
+_READY_FRAME_PATTERN = re.compile(r"^╰─(?:.*─╯)?[ \t]*$", re.MULTILINE)
+# The status row above it: ``╭── OMP session … ╮`` (17.x), ``╭── π > … ╮``
+# (18.x box) or `` π > … `` (18.x band).
+_LIVE_STATUS_ROW = r"(?:╭──[^\n]*╮|[ \t]*\S+(?:[ \t]+\d+s)?[ \t]+>[ \t][^\n]*)"
+_WORKING_LIVE_FRAME_TAIL_PATTERN = re.compile(rf"\s*{_LIVE_STATUS_ROW}[ \t]*\n\s*╰─[^\n]*\s*\Z")
+# After a spinner status row only the composer frame follows; raw redraws can
+# leave blank rows in between.
+_STATUS_ROW_LIVE_TAIL_PATTERN = re.compile(r"[ \t]*\n\s*╰─[^\n]*\s*\Z")
 _ERROR_LIVE_FRAME_TAIL_PATTERN = re.compile(
     r"\s*Use /login,[^\n]*\nThen use /model[^\n]*\n"
-    r"\s*╭── OMP session [^\n]*╮\s*\n╰─[^\n]*─╯\s*\Z"
+    rf"\s*{_LIVE_STATUS_ROW}[ \t]*\n\s*╰─[^\n]*\s*\Z"
 )
 
 # OMP 17.2.10 renders user turns on the terminal's page background and begins
@@ -59,11 +83,29 @@ _ERROR_LIVE_FRAME_TAIL_PATTERN = re.compile(
 # capture until the final assistant block is isolated; ANSI stripping alone
 # would make a canceled user turn indistinguishable from an assistant response.
 _ASSISTANT_BLOCK_START_PATTERN = re.compile(r"\x1b\[49m[ \t]*")
-_USER_BLOCK_START_PATTERN = re.compile(r"\x1b\[48;2;5;5;5m(?:\r?\n)?\s*")
+# The page background is theme-defined (``5;5;5`` on 17.2.10, ``15;18;22``
+# under 18.x ``titanium``), so any truecolor background that ends its line opens
+# a user turn. An 18.x box status row keeps text after its background.
+_USER_BLOCK_START_PATTERN = re.compile(
+    r"\x1b\[48;2;5;5;5m(?:\r?\n)?\s*|\x1b\[48;2;\d{1,3};\d{1,3};\d{1,3}m\r?\n\s*"
+)
+
+# Drawn only while a turn runs: the 18.x spinner with elapsed time, or the
+# 17.x interrupt hint.
+_TURN_ACTIVITY_PATTERN = re.compile(rf"[{_SPINNER}][ \t]+\d|⟨esc⟩")
+# OSC 7501 Program Status (``ESC ] 7501 ; state=working:app=omp ST``), written
+# by OMP 18.8.7+ on each state change while stdout is a TTY: idle, working,
+# blocked, done, error or clear. Escape stripping removes it, so it is read from
+# raw chunks.
+_PROGRAM_STATUS_PATTERN = re.compile(r"\x1b\]7501;state=([a-z]+)[^\x07\x1b]*(?:\x07|\x1b\\)")
+_OSC_START = "\x1b]"
+_OSC_CARRY_MAX = 4096
+
 
 _TOOL_BORDER_PATTERN = re.compile(r"^[╭╰├│].*[╮╯┤│]$|^─{20,}$")
 _OMP_CHROME_PATTERN = re.compile(
-    r"^(?:[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+(?:Working…|Running .*⟨esc⟩)|"
+    r"^(?:[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+(?:Working…|Running .*⟨esc⟩)|⎋\s+.*|"
+    r"(?:π|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+\d+s)\s+>\s.*|"
     r"Allow tool:.*|Command:.*|up/down navigate.*|❯\s*Approve|Deny|"
     r"Advisor \d+ note|(?:▎\s*)?⟨nit⟩.*|Task already complete\.|"
     r"⟨(?:Wall|Timeout):.*⟩)$"
@@ -72,6 +114,12 @@ _OMP_CHROME_PATTERN = re.compile(
 
 class ProviderError(Exception):
     """Raised for OMP-specific setup failures."""
+
+
+# OMP 18.3.1+ opens a "Pasted N lines" menu for pastes of
+# ``paste.largeMenuThreshold`` (100) lines or more, and CAO's submitting Enter
+# would pick its first entry. This ``--config`` overlay turns only that off.
+_INPUT_CONFIG_OVERLAY = "paste:\n  largeMenuThreshold: 0\n"
 
 
 class OmpProvider(BaseProvider):
@@ -105,6 +153,12 @@ class OmpProvider(BaseProvider):
         self._initialized = False
         self._turns = 0
         self._artifact_dir: Optional[Path] = None
+        # Dispatch attribution; see _ready_status_for.
+        self._awaiting_turn = False
+        self._turn_activity_seen = False
+        self._dispatch_recorded = False
+        self._program_status: Optional[str] = None
+        self._osc_carry = ""
 
     @property
     def paste_enter_count(self) -> int:
@@ -171,6 +225,10 @@ class OmpProvider(BaseProvider):
         if model:
             command.extend(["--model", model])
 
+        overlay_path = self._artifact_root() / "cao-input.yml"
+        self._write_private_file(overlay_path, _INPUT_CONFIG_OVERLAY)
+        command.extend(["--config", str(overlay_path)])
+
         context = ""
         if profile is not None:
             context = profile.system_prompt or profile.prompt or ""
@@ -209,10 +267,9 @@ class OmpProvider(BaseProvider):
                 config = raw_config.model_dump(exclude_none=True)
             config = resolve_mcp_server_config(config, persisted=False, name=name)
             if "command" in config:
-                env = dict(config.get("env") or {})
-                if "CAO_TERMINAL_ID" not in env:
-                    env["CAO_TERMINAL_ID"] = self.terminal_id
-                    config["env"] = env
+                # This terminal's own id always wins: the CAO MCP gates authorize
+                # on it, so a profile does not get to declare it (#1062).
+                config = forward_terminal_identity(config, self.terminal_id, server_name=name)
             servers[name] = config
 
         self._write_private_file(
@@ -224,12 +281,30 @@ class OmpProvider(BaseProvider):
     def _ready_status(self) -> TerminalStatus:
         return TerminalStatus.COMPLETED if self._turns else TerminalStatus.IDLE
 
+    def _ready_status_for(self) -> TerminalStatus:
+        """Report a ready frame, attributing it to the pending dispatch if any.
+
+        After a recorded dispatch, a ready frame completes the turn only once
+        the turn was seen running (a ``working`` report, a spinner row or the
+        17.x interrupt hint). Before that it is a redraw of the previous screen:
+        the startup paint, the paste not yet submitted, the turn's first frame.
+        """
+        if not self._awaiting_turn or not self._dispatch_recorded:
+            # A bare mark_input_received carries no text to attribute against.
+            return self._ready_status()
+        if self._turn_activity_seen:
+            self._awaiting_turn = False
+            return self._ready_status()
+        return TerminalStatus.PROCESSING
+
     @staticmethod
     def _has_later_ready_frame(
         clean: str,
         marker_start: int,
         marker_end: int,
         live_frame_tail_pattern: Optional[re.Pattern] = None,
+        retired_by_frame: bool = True,
+        turn_ran: bool = False,
     ) -> bool:
         if any(
             match.start() > marker_start
@@ -238,9 +313,33 @@ class OmpProvider(BaseProvider):
         ):
             return True
 
-        ready_frames = [
-            match for match in _READY_FRAME_PATTERN.finditer(clean) if match.start() > marker_start
+        # OMP 18 draws ``╰─`` mid-turn too (band frame, tool-box bottoms), so
+        # it does not retire a spinner row; only ``π`` or a status line does.
+        ready_frames = (
+            [
+                match
+                for match in _READY_FRAME_PATTERN.finditer(clean)
+                if match.start() > marker_start
+            ]
+            if retired_by_frame
+            else []
+        )
+        # ``π`` retires the marker once the turn has run: after a spinner row
+        # at or after the marker, or when the dispatched turn was seen running
+        # (OMP redraws the working row after the last spinner frame). A ``π``
+        # right after ``⎋ Working…`` is only the turn's first frame.
+        spinner_rows = [
+            match.start()
+            for match in _WORKING_STATUS_ROW_PATTERN.finditer(clean)
+            if match.start() >= marker_start
         ]
+        anchor = spinner_rows[0] if spinner_rows else (marker_start if turn_ran else None)
+        if anchor is not None:
+            ready_frames += [
+                match
+                for match in _READY_STATUS_ROW_PATTERN.finditer(clean)
+                if match.start() > anchor
+            ]
         if not ready_frames:
             return False
 
@@ -261,28 +360,80 @@ class OmpProvider(BaseProvider):
             if current_cmd == self.shell_baseline:
                 return TerminalStatus.ERROR
 
+        screen = self._get_screen_status(clean)
+        program = self._program_status_verdict()
+        if program is None:
+            return screen
+        # Before 18.18.9 OMP reported tool approvals as ``working``; the drawn
+        # approval dialog stays authoritative.
+        if screen == TerminalStatus.WAITING_USER_ANSWER:
+            return screen
+        return program
+
+    def _program_status_verdict(self) -> Optional[TerminalStatus]:
+        """Map the latest OSC 7501 report onto CAO's lifecycle, if OMP sent one."""
+        state = self._program_status
+        if state is None or state == "clear":
+            return None
+        if state == "working":
+            return TerminalStatus.PROCESSING
+        if state == "blocked":
+            return TerminalStatus.WAITING_USER_ANSWER
+        if state not in ("idle", "done", "error"):
+            return None
+        if self._awaiting_turn and self._dispatch_recorded and not self._turn_activity_seen:
+            # OMP reports ``idle`` once more as it accepts the paste, before
+            # ``working``; an earlier turn's ``done``/``error`` is no verdict either.
+            return TerminalStatus.PROCESSING
+        if state == "error":
+            self._awaiting_turn = False
+            return TerminalStatus.ERROR
+        return self._ready_status_for()
+
+    def _get_screen_status(self, clean: str) -> TerminalStatus:
+        """Classify the rendered viewport or stripped raw text by its drawn markers."""
         if not clean.strip():
             return TerminalStatus.UNKNOWN
         candidates = []
-        for pattern, status, live_frame_tail_pattern in (
-            (_WAITING_PATTERN, TerminalStatus.WAITING_USER_ANSWER, None),
-            (_ERROR_PATTERN, TerminalStatus.ERROR, _ERROR_LIVE_FRAME_TAIL_PATTERN),
-            (_WORKING_PATTERN, TerminalStatus.PROCESSING, _WORKING_LIVE_FRAME_TAIL_PATTERN),
+        for pattern, status, live_frame_tail_pattern, retired_by_frame in (
+            (_WAITING_PATTERN, TerminalStatus.WAITING_USER_ANSWER, None, True),
+            (_ERROR_PATTERN, TerminalStatus.ERROR, _ERROR_LIVE_FRAME_TAIL_PATTERN, True),
+            (_WORKING_PATTERN, TerminalStatus.PROCESSING, _WORKING_LIVE_FRAME_TAIL_PATTERN, True),
+            (
+                _WORKING_STATUS_ROW_PATTERN,
+                TerminalStatus.PROCESSING,
+                _STATUS_ROW_LIVE_TAIL_PATTERN,
+                False,
+            ),
         ):
             matches = list(pattern.finditer(clean))
             if not matches:
                 continue
             marker = matches[-1]
             if not self._has_later_ready_frame(
-                clean, marker.start(), marker.end(), live_frame_tail_pattern
+                clean,
+                marker.start(),
+                marker.end(),
+                live_frame_tail_pattern,
+                retired_by_frame,
+                self._turn_activity_seen,
             ):
                 candidates.append((marker.start(), status))
 
         if candidates:
-            return max(candidates, key=lambda candidate: candidate[0])[1]
+            status = max(candidates, key=lambda candidate: candidate[0])[1]
+            if status == TerminalStatus.PROCESSING and self._awaiting_turn:
+                self._turn_activity_seen = self._turn_activity_seen or bool(
+                    _TURN_ACTIVITY_PATTERN.search(clean)
+                )
+            return status
 
-        if _STATUS_LINE_PATTERN.search(clean) or _READY_FRAME_PATTERN.search(clean):
-            return self._ready_status()
+        if (
+            _STATUS_LINE_PATTERN.search(clean)
+            or _READY_FRAME_PATTERN.search(clean)
+            or _READY_STATUS_ROW_PATTERN.search(clean)
+        ):
+            return self._ready_status_for()
         return TerminalStatus.UNKNOWN
 
     def get_status(self, buffer: Optional[str]) -> TerminalStatus:
@@ -348,7 +499,44 @@ class OmpProvider(BaseProvider):
         self._artifact_dir = None
         self._initialized = False
         self._turns = 0
+        self._awaiting_turn = False
+        self._turn_activity_seen = False
+        self._dispatch_recorded = False
+        self._program_status = None
+        self._osc_carry = ""
 
     def mark_input_received(self) -> None:
         super().mark_input_received()
         self._turns += 1
+        self._awaiting_turn = True
+        self._turn_activity_seen = False
+        self._dispatch_recorded = False
+
+    def record_status_chunk(self, chunk: str, epoch: int) -> None:
+        """Track OSC 7501 reports and turn activity before the monitor crops output.
+
+        Runs under the monitor lock for every chunk, so it only updates flags.
+        OMP sends each report once, and a long turn's first frames leave the
+        cropped buffer, so both are read here.
+        """
+        data = self._osc_carry + chunk
+        reports = _PROGRAM_STATUS_PATTERN.findall(data)
+        if reports:
+            self._program_status = reports[-1]
+        if self._awaiting_turn and ("working" in reports or _TURN_ACTIVITY_PATTERN.search(data)):
+            self._turn_activity_seen = True
+        # Keep an OSC sequence split across FIFO reads for the next chunk.
+        start = data.rfind(_OSC_START)
+        unterminated = start != -1 and not re.search(r"\x07|\x1b\\", data[start + 2 :])
+        if unterminated:
+            self._osc_carry = data[start:][-_OSC_CARRY_MAX:]
+        elif data.endswith("\x1b"):
+            # A chunk can end on the ESC that opens the next report, which OMP
+            # never repeats.
+            self._osc_carry = "\x1b"
+        else:
+            self._osc_carry = ""
+
+    def record_dispatched_message(self, message: str) -> None:
+        super().record_dispatched_message(message)
+        self._dispatch_recorded = True

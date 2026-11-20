@@ -1,0 +1,60 @@
+/* `make dev` only: the look of the host classes the SDK UI stub (ui/test/sdk-stub/ui.tsx) emits, from
+   the host's own token values (Kiro Crew v0.12.2, website/src/components/ui.tsx, Modal.tsx,
+   ErrorNotice.tsx, styles/focus-and-state-cues.css and index.css). An approximation for iteration:
+   screenshots of record come from the real host through `make e2e`. */
+*,*::before,*::after{box-sizing:border-box}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button,input,select,textarea{font:inherit}
+.flex{display:flex}.inline-flex{display:inline-flex}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}
+.flex-1{flex:1 1 0%}.shrink-0{flex-shrink:0}.min-w-0{min-width:0}.min-h-0{min-height:0}.w-full{width:100%}
+.items-center{align-items:center}.items-start{align-items:flex-start}.items-end{align-items:flex-end}
+.justify-center{justify-content:center}.justify-between{justify-content:space-between}.justify-end{justify-content:flex-end}
+.gap-2{gap:8px}.gap-3{gap:12px}.gap-1\.5{gap:6px}.gap-2\.5{gap:10px}.gap-x-4{column-gap:16px}.gap-y-2{row-gap:8px}
+.px-3{padding-left:12px;padding-right:12px}.px-4{padding-left:16px;padding-right:16px}.px-5{padding-left:20px;padding-right:20px}
+.py-2{padding-top:8px;padding-bottom:8px}.py-3{padding-top:12px;padding-bottom:12px}.py-4{padding-top:16px;padding-bottom:16px}
+.py-12{padding-top:48px;padding-bottom:48px}.pt-2{padding-top:8px}.pb-3{padding-bottom:12px}.pb-8{padding-bottom:32px}.p-1\.5{padding:6px}
+.mt-1{margin-top:4px}.mt-2{margin-top:8px}.mb-4{margin-bottom:16px}
+@media (min-width:768px){.md\:px-6{padding-left:24px;padding-right:24px}}
+.overflow-y-auto{overflow-y:auto}.truncate{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.whitespace-pre-wrap{white-space:pre-wrap}.text-center{text-align:center}.select-none{user-select:none}
+.text-sm{font-size:14px}.text-base{font-size:16px}.text-2xl{font-size:24px;line-height:32px}.text-\[13px\]{font-size:13px}.text-\[40px\]{font-size:40px}
+.font-medium{font-weight:500}.font-semibold{font-weight:600}.font-bold{font-weight:700}.font-normal{font-weight:400}.font-mono{font-family:var(--mono)}
+.tracking-tight{letter-spacing:-.025em}.opacity-\[\.12\]{opacity:.12}
+.text-text{color:var(--text)}.text-text-strong{color:var(--text-strong)}.text-muted{color:var(--muted)}.text-danger{color:var(--danger)}
+.text-danger-text{color:var(--danger-text)}.text-accent-fg{color:var(--accent-fg)}
+.rounded-md{border-radius:var(--radius-md)}.rounded-lg{border-radius:var(--radius-lg)}.rounded-xl{border-radius:var(--radius-xl)}.rounded-full{border-radius:9999px}
+.border{border-width:1px;border-style:solid}.border-b{border-bottom:1px solid}.border-t{border-top:1px solid}
+.border-border{border-color:var(--border)}.border-accent{border-color:var(--accent)}.border-danger\/40{border-color:color-mix(in srgb,var(--danger) 40%,transparent)}
+.bg-card{background:var(--card)}.bg-accent{background:var(--accent)}.bg-border{background:var(--border)}.bg-transparent{background:transparent}
+.bg-bg-elevated{background:var(--bg-elevated)}.bg-bg-hover{background:var(--bg-hover)}.bg-danger\/10{background:color-mix(in srgb,var(--danger) 10%,transparent)}
+.shadow-sm{box-shadow:var(--shadow-sm)}.pointer-events-none{pointer-events:none}.pointer-events-auto{pointer-events:auto}
+.fixed{position:fixed}.relative{position:relative}.absolute{position:absolute}.inset-0{inset:0}
+.z-\[100\]{z-index:100}.z-\[101\]{z-index:101}.p-safe-or-8{padding:32px}.bg-bg\/60{background:color-mix(in srgb,var(--bg) 60%,transparent)}
+.min-h-12{min-height:48px}.animate-pulse{animation:hk-pulse 2s cubic-bezier(.4,0,.6,1) infinite}
+@keyframes hk-pulse{50%{opacity:.5}}
+/* Btn: px-2.5 py-1 gap-1.5, hover and disabled per variant, busy dims */
+.busy-cue{padding:4px 10px;gap:6px;cursor:pointer;font-family:var(--font-body)}
+.busy-cue:hover{border-color:var(--border-strong);background:var(--bg-hover)}
+.busy-cue:disabled{opacity:.3;cursor:not-allowed}
+.busy-cue-primary:hover{background:var(--accent-hover);border-color:var(--accent)}
+.busy-cue-primary:disabled{background:var(--bg-hover);color:var(--muted);border-color:transparent;opacity:.6}
+.busy-cue-danger:hover{color:var(--danger-text);border-color:var(--danger);background:var(--danger-subtle)}
+.busy-cue[data-busy]{cursor:default;opacity:.3}
+.busy-cue-primary[data-busy]{background:var(--bg-hover);color:var(--muted)}
+/* Input: px-3 py-2; Badge: gap-1 px-2 py-[2px]; Card: py-5 px-2 md:px-5; CardTitle mb-3.5 */
+[data-kit="Input"]{padding:8px 12px;flex:1;min-width:0;outline:none}
+[data-kit="Badge"]{gap:4px;padding:2px 8px;font-weight:500}
+.bg-ok-subtle{background:var(--ok-subtle)}.text-ok-text{color:var(--ok-text)}
+.bg-danger-subtle{background:var(--danger-subtle)}.bg-warn-subtle{background:var(--warn-subtle)}.text-warn-text{color:var(--warn-text)}
+.bg-\[var\(--bg-hover\)\]{background:var(--bg-hover)}.text-\[var\(--muted\)\]{color:var(--muted)}
+[data-kit="Card"]{padding:20px 8px}
+@media (min-width:768px){[data-kit="Card"]{padding:20px 20px}}
+h3.text-sm{margin:0 0 14px;letter-spacing:-.025em;display:flex;align-items:center;gap:8px}
+/* Toggle: 36x20 track, 16 px white knob */
+[role="switch"].w-9{width:36px;height:20px}[role="switch"]>div{top:2px;width:16px;height:16px;background:#fff;transform:translateX(2px);transition:transform .15s}
+[role="switch"][aria-checked="true"]>div{transform:translateX(18px)}[role="switch"].opacity-40{opacity:.4;cursor:not-allowed}
+/* Modal panel: max-h 90vh comes from the stub's inline style */
+[data-kit="Modal"] button[aria-label="Close"]{background:transparent;border:0;cursor:pointer;color:var(--muted)}
+[data-kit="Modal"] button[aria-label="Close"]:hover{background:var(--bg-hover);color:var(--text)}
+/* Select: the stub renders the native list (the host touch path); give it the trigger's box */
+[data-kit="Select"]{background:var(--bg-elevated);color:var(--text);border:1px solid var(--border);border-radius:var(--radius-md);padding:8px 12px;font-size:14px}

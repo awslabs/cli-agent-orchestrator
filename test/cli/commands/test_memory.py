@@ -4,6 +4,7 @@ CLI command tests mock MemoryService to isolate command logic.
 """
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from test.fixtures.vault_factory import build_vault_fixture
@@ -61,7 +62,12 @@ def _make_memory(
     )
 
 
-def _real_vault_service(tmp_path: Path, monkeypatch, keys: tuple[str, ...]):
+def _real_vault_service(
+    tmp_path: Path,
+    monkeypatch,
+    keys: tuple[str, ...],
+    contents: dict[str, str] | None = None,
+):
     """Index real vault notes and return their service and immutable byte snapshots."""
     engine = create_engine(f"sqlite:///{tmp_path / 'state.db'}")
     Base.metadata.create_all(engine)
@@ -80,7 +86,7 @@ def _real_vault_service(tmp_path: Path, monkeypatch, keys: tuple[str, ...]):
     for key in keys:
         stored = asyncio.run(
             service.store(
-                content=f"body for {key}",
+                content=(contents or {}).get(key, f"body for {key}"),
                 scope="global",
                 memory_type="reference",
                 key=key,
@@ -188,16 +194,69 @@ class TestMemoryList:
 class TestMemoryShow:
     """U8.3: cao memory show — finds key and displays content."""
 
+    def test_memory_show_finds_vault_key_absent_from_body(self, tmp_path, monkeypatch):
+        """An exact vault key lookup must not depend on body search terms."""
+        key = "deploy-checklist"
+        service, _snapshots = _real_vault_service(
+            tmp_path,
+            monkeypatch,
+            (key, *(f"other-note-{number}" for number in range(8))),
+            {key: "Checklist: run the deploy only after tests pass."},
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.memory._get_memory_service",
+            lambda: service,
+        )
+
+        result = CliRunner().invoke(show, [key])
+
+        assert result.exit_code == 0
+        assert "Checklist: run the deploy only after tests pass." in result.output
+
+    def test_memory_show_finds_exact_key_with_bm25_default(self, tmp_path, monkeypatch):
+        """A BM25 query must not hide an exact key outside its top 100 results."""
+        engine = create_engine(f"sqlite:///{tmp_path / 'memory.db'}")
+        Base.metadata.create_all(engine)
+        service = MemoryService(base_dir=tmp_path / "native", db_engine=engine)
+        settings_service.SETTINGS_FILE.write_text(
+            json.dumps({"memory": {"ranking": {"default_sort": "bm25"}}}),
+            encoding="utf-8",
+        )
+        asyncio.run(
+            service.store(
+                content="the requested note",
+                key="exact-key",
+                scope="global",
+                memory_type="reference",
+            )
+        )
+        for number in range(100):
+            asyncio.run(
+                service.store(
+                    content="exact-key exact-key exact-key",
+                    key=f"ranked-note-{number}",
+                    scope="global",
+                    memory_type="reference",
+                )
+            )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.memory._get_memory_service",
+            lambda: service,
+        )
+
+        result = CliRunner().invoke(show, ["exact-key"])
+
+        assert result.exit_code == 0
+        assert "the requested note" in result.output
+
     @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
     def test_memory_show_displays_content(self, mock_get_svc):
         """show command should display full memory content."""
         mock_svc = MagicMock()
-        mock_svc.recall = AsyncMock(
-            return_value=[
-                _make_memory(
-                    key="my-key", content="Detailed memory content here", tags="tag1,tag2"
-                ),
-            ]
+        mock_svc.read_exact_key = AsyncMock(
+            return_value=_make_memory(
+                key="my-key", content="Detailed memory content here", tags="tag1,tag2"
+            )
         )
         mock_get_svc.return_value = mock_svc
 
@@ -208,7 +267,7 @@ class TestMemoryShow:
         assert "my-key" in result.output
         assert "Detailed memory content here" in result.output
         # Verify CWD context and scan_all are passed so project memories are found
-        call_kwargs = mock_svc.recall.call_args.kwargs
+        call_kwargs = mock_svc.read_exact_key.call_args.kwargs
         assert call_kwargs.get("scan_all") is True
         assert "cwd" in (call_kwargs.get("terminal_context") or {})
 
@@ -216,7 +275,7 @@ class TestMemoryShow:
     def test_memory_show_not_found(self, mock_get_svc):
         """show command should error when key not found."""
         mock_svc = MagicMock()
-        mock_svc.recall = AsyncMock(return_value=[])
+        mock_svc.read_exact_key = AsyncMock(return_value=None)
         mock_get_svc.return_value = mock_svc
 
         runner = CliRunner()
@@ -943,23 +1002,29 @@ class TestNonAccessingInspection:
         service.recall = AsyncMock(
             return_value=[_make_memory(key="inspection-key", scope="global")]
         )
+        service.read_exact_key = AsyncMock(
+            return_value=_make_memory(key="inspection-key", scope="global")
+        )
         monkeypatch.setattr(
             "cli_agent_orchestrator.cli.commands.memory._get_memory_service", lambda: service
         )
-        if enabled:
-            monkeypatch.setenv("CAO_MEMORY_NON_ACCESSING_INSPECTION", "true")
-        else:
+        if enabled is None:
             monkeypatch.delenv("CAO_MEMORY_NON_ACCESSING_INSPECTION", raising=False)
-        for command, args in [
-            (list_memories, ["--scope", "global"]),
-            (show, ["inspection-key", "--scope", "global"]),
+        else:
+            monkeypatch.setenv("CAO_MEMORY_NON_ACCESSING_INSPECTION", str(enabled).lower())
+        for command, args, read in [
+            (list_memories, ["--scope", "global"], service.recall),
+            (show, ["inspection-key", "--scope", "global"], service.read_exact_key),
         ]:
             result = CliRunner().invoke(command, args)
             assert result.exit_code == 0, result.output
-            assert service.recall.await_args.kwargs["record_access"] is (not enabled)
+            assert read.await_args.kwargs["record_access"] is (enabled is False)
 
     def test_on_passes_false(self, monkeypatch):
         self._assert_record_access(monkeypatch, True)
 
-    def test_default_passes_true(self, monkeypatch):
+    def test_off_passes_true(self, monkeypatch):
         self._assert_record_access(monkeypatch, False)
+
+    def test_default_passes_false(self, monkeypatch):
+        self._assert_record_access(monkeypatch, None)

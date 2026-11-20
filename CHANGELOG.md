@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add the Qwen Code (`qwen_cli`) provider with profile, skill, MCP and model support.
+
+- **`cao memory show` finds an existing key when recall ranks by BM25** (#1329).
+- **herdr backend: event-driven inbox delivery works again on herdr 0.9.x (protocol 22)**.
+  herdr ≥0.9 acks a broadcast `pane.updated` subscription but never emits the event, so every
+  inbox delivery silently fell back to the 30s reconciliation sweep (measured 51s/83s
+  end-to-end on 0.9.5, slower than the tmux watchdog). The service now subscribes to
+  `pane.agent_status_changed` per managed pane — validated against a live snapshot, because
+  herdr resets the connection when a subscription names an unknown pane — while keeping the
+  broadcast for older herdr versions, and recycles the connection (one `events.subscribe`
+  per connection) when a pane registers later. The subscribe response is now read instead of
+  fire-and-forget, herdr's version/protocol are logged (warning outside the tested range
+  17–22), and delivery log lines name their trigger (`herdr-event`, `herdr-settle`,
+  `settled-sweep`, `reconcile-sweep`, `opencode-poll`) so a dead event path can no longer
+  hide. A single event-driven re-delivery loop per terminal carries a message across the
+  provider's post-turn flush-wait, offloaded off the event loop and stopping as soon as the
+  message lands.
+
+- **Workflow scripts with an f-string `step_id` whose own text breaks the step id rule are refused** (#1396).
+  A `step_id` must be 1-64 characters from `[A-Za-z0-9_-]`. `step_id=f"review:{name}"` used to pass
+  validation and then get a 422 from `POST /terminals/run-step` on every call, since no value of
+  `name` can remove the colon. The lint gate now flags it, so `workflow validate`, workflow create and
+  update, and `cao workflow run` all refuse such a script before any step starts. A stored workflow
+  written that way needs its ids changed. The fan-out example in the `cao-workflow` skill and in
+  `docs/workflows.md` used this shape and now builds a valid id from each file name.
+- **Memory inspection and fixture hygiene are safer by default** (#1329).
+  This resolves #861 Q3: CLI list/show and REST list/show no longer increment
+  `access_count` unless `memory.non_accessing_inspection=false`; MCP recall
+  still counts, while internal recall accepts `record_access=false` for
+  benchmarks. Lesson promotion reads `access_count`, so inspection can no
+  longer make a lesson promotion-eligible. Long key truncation is visible in
+  `memory_store` results and long links resolve through the same sanitiser.
+  `cao memory doctor --fixtures` inventories synthetic residue and audit volume
+  as a dry-run; `--apply` requires a backup and moves fixture topic files to
+  quarantine without deleting them. Audit-log day files are report-only and
+  remain in place because they can also hold real events. The test harness now
+  refuses unmarked access to a real-home memory directory and relocates memory
+  for live-provider test runs.
+- **FIFO output readers continue working when a busy server has allocated a descriptor above 1023** (#1350).
+- **Provider memory file writes now default off** (#1335). CAO delivers each terminal's
+  memory without writing it into project files that can be committed. Interactive
+  `cao launch` sessions using a runtime start-prompt provider — Claude Code, Codex,
+  Kimi CLI, Antigravity CLI, OMP, Grok CLI, MiniMax Code, or Qwen Code — receive it in that
+  prompt; orchestrated terminals retain task-aware first-message delivery. Set
+  `memory.injection.write_project_files=true` to opt back into the legacy provider-file
+  behavior. With `memory.enabled=false`, CAO does not inspect or clean up those files.
+
+- **Memory injection no longer leaves stale provider context or drops a scope behind one
+  long note** (#1329). Claude Code, Codex and Kiro provider files receive UTC-stamped
+  blocks, including an explicit empty block when no memories are selected. A launch whose
+  selected memory body is unchanged preserves the provider file byte-for-byte, including
+  its prior stamp, so tracked files do not gain stamp-only diffs. The v1 builder clips an
+  oversized first note, continues to later notes that fit, and follows recorded project
+  `cwd_hash` aliases. `memory.injection.clear_on_empty` and
+  `memory.injection.v1_fixes` both default to `true`; setting either to `false` restores
+  its legacy behavior.
+- **Docs: the retrospector profile, the `store_lesson` description, the self-learning guides and the `cao-learning` skill no longer say lessons reach future sessions or can be recalled by a curator or supervisor, or that they are injected into new sessions** (#1335, #1329).
+  A lesson is found only by the owning agent's `memory_recall` or a promoted `## Learned Patterns` block.
+  A supervisor's recall returns only lessons under its own profile, so it tells the worker to recall.
+  Lessons live in agent scope, which the session-start `<cao-memory>` block does not include, so an agent
+  finds them through `memory_recall` or a promoted `## Learned Patterns` block. Promotion happens only when
+  an operator runs `cao memory promote --apply`, and lessons filed under an ephemeral agent's generated name
+  are not found by a later one.
+- **Approval effect:** This release edits the bundled `retrospector` profile, and bundled profiles are part of every script-tier plan identity, so after upgrading every `plan_id` changes and the first new run of each script-tier plan is refused until you re-approve it with `cao workflow approve <plan_id>`. A run admitted before the upgrade resumes on its frozen `plan_id`, but its next `retrospector` step is refused with "changed after this run was approved", and you start a new run. YAML workflows and runs with approval enforcement off are unaffected. If you ran `cao install retrospector` for a provider, that install saved a local copy of the profile. That copy takes precedence over the bundled profile, so this upgrade and `cao install retrospector` do not change the prompt, and this edit does not change your `plan_id`s. To use the new prompt, install the bundled file by its path for each provider that you installed it for, for example `cao install <CAO package dir>/agent_store/retrospector.md --provider copilot_cli`. Then re-approve, because the new copy changes every `plan_id`.
+- **Memory recall can opt into BM25-first query ranking** with
+  `memory.ranking.default_sort="bm25"` (#1329). The default remains `recency`;
+  explicit `search_mode` and `sort_by` arguments keep precedence, and no-query listings
+  remain recency ordered.
 - **Codex "Trust this folder?" dialogs (0.156 and later) are accepted before the first input** (#1319).
   Recognise the "Trust this folder?" header and its "enter continue · esc back", "esc quit"
   and "esc cancel" footers while keeping earlier wordings and ignoring dismissed dialogs
@@ -848,6 +916,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the mode on: the `cao` CLI and the bundled Web UI send no bearer yet, and the
   token is inherited by every agent pane's environment.
 
+- Operator ergonomics on the HTTP API: `working_directory` on `POST /sessions`,
+  `POST /sessions/{name}/terminals` and `POST /sessions/{name}/terminals:operator`
+  accepts the spellings an operator pastes from a browser on WSL (quoted, `~`,
+  Windows drive paths mapped to the `/mnt` interop mount); `GET /fs/dirs` lists
+  server-side subdirectories for a folder picker; `POST /sessions/{name}/label`
+  gives a session a display alias surfaced on the session listings; every
+  handled response carries an `X-Server-Time` header, exposed through CORS, so
+  a browser can correct for clock skew
+
+- New request parameter `create_working_directory` (default `false`) on
+  `POST /sessions`, `POST /sessions/{name}/terminals` and
+  `POST /sessions/{name}/terminals:operator`: opt in to CREATING a missing
+  `working_directory`. The default is the must-exist behaviour every caller has
+  always had, so the MCP `handoff`/`assign` tools keep the fail-fast contract
+  their descriptions state -- an agent's typo'd path stays a correctable error
+  instead of an empty tree a worker silently starts in. The Web UI sends it
+  whenever the operator typed a path. When a request opts in, the folder is
+  judged under the same path policy as the MCP tools (a missing target by its
+  nearest existing ancestor) and created at the point of use, after every check
+  that can refuse the request, so a rejected request leaves nothing behind
+
 - Profiles tab in the Web UI: browse, search, create (from template with live
   preview, or from scratch via a schema-driven form), edit, clone, and delete
   agent profiles over the profile management APIs, with validate-before-save
@@ -855,6 +944,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The release job now promotes the hand-written `## [Unreleased]` section to the dated
+  release section and inserts a fresh empty one instead of replacing the changelog with
+  commit subjects through git-cliff (#1353).
 - The `memory_store` and `memory_forget` MCP tools now honor the caller's local memory switch
   when a remote memory owner is configured (#1087). `memory_recall` checked the switch before
   branching to the owner, but the write and delete tools did not, so a caller with memory off
@@ -1342,6 +1434,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frame a few times instead of failing an otherwise-valid login start on a
   single capture (#731)
 
+- **`GET /fs/dirs` froze the whole server while it listed a folder (#724).**
+  The handler ran its `realpath`, `exists`, `is_dir`, `iterdir` and per-entry
+  `stat` calls inline on the event loop, so a large directory on a slow mount
+  (a WSL `/mnt/c` path, an NFS or SMB mount) stalled every other request for
+  the duration -- `/health`, the SSE streams, and the MCP calls of running
+  agents. Measured at 7.6s for `C:\Windows\System32`, with a concurrent
+  `/health` waiting 7.3s. The listing now runs on a worker thread; no response
+  changed.
+
+- **a new session could show an old session's display label (#724).** Labels
+  are keyed by session name and outlive the server, but only `DELETE
+  /sessions/{name}` and an explicit empty-label `POST` removed one. A session
+  that ended any other way -- its last terminal deleted, a flow run recycling
+  it, the herdr reconcile, a tmux or host restart -- left its label behind for
+  the next session created with that name. Creating a session now clears any
+  stale label for the name, alongside the stale forwarded-env mapping it
+  already cleared.
+
+- **a session label that fit was refused for being too long (#724).** `POST
+  /sessions/{name}/label` measured its 60-character cap on the raw request body
+  while storing the trimmed value, so a 58-character label pasted with
+  surrounding spaces was a `422`. The cap is now measured after trimming.
+
+- **a settings write over an unreadable `settings.json` deleted every other
+  setting (#737, fixed in #997).** Each writer loaded the file leniently, so one
+  that existed but did not parse loaded as `{}`, and the write then persisted
+  that empty fallback with only the section being written. The `settings_service`
+  writers (`POST /settings/*`, the session label endpoint) and the
+  `config_service` writers behind `cao config set` now share one locked,
+  atomically published read-modify-write that refuses to run when the file is
+  present but cannot be read or parsed (`500` over HTTP, file untouched); two
+  concurrent writers can no longer lose each other's update either.
+
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as
   the strict `MemoryKey` (`^[a-z0-9-]{1,60}$`), while the MCP tools have always
@@ -1610,6 +1735,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently, so `limit=500` keeps working rather than becoming a 422.
 
 ### Security
+
+- **`cao-ops-mcp-server` is gated on the caller's `tools:` allowlist** (#1062). #972 gated every
+  `cao-mcp-server` tool on that allowlist and recorded the operations control plane as knowingly
+  ungated. The gap: `CAO_TERMINAL_ID` is forwarded into **every** server in a profile's
+  `mcpServers` map, so a bound terminal whose profile listed `cao-ops-mcp-server` reached all
+  18 ops tools — `launch_session`, `install_profile`, `shutdown_session`, `send_session_message`,
+  the session/terminal readers and the seven `decisions_*` controls — with its allowlist
+  unconsulted, and could lift an operator's `cao decisions off` by setting a point back to `shadow`
+  or `on`. Every ops tool now requires the new `@cao-ops-mcp-server` grant (or `*`, or a glob
+  covering it), which `@cao-mcp-server` does **not** imply. Two deliberate carve-outs:
+  `decisions_off` stays reachable without the grant, because an argument-free off-only kill switch
+  that needs a grant is not a fail-safe; and lifting a halt is refused for any bound terminal even
+  *with* the grant, so it takes an operator context — `cao decisions set` on the CLI, or an MCP host
+  running the operations server with no `CAO_TERMINAL_ID`. That refusal is enforced inside the
+  mutation: `set_point` takes the exclusive egress lock, re-reads the halt marker under it, refuses a
+  bound caller before writing anything, and removes the marker only if it observed it under that
+  lock — so a halt an operator publishes beside a call in flight survives. `decisions_off` does
+  **not** wait for that lock to publish its marker (the shared side is held for the whole of an
+  outstanding decision request, and a kill switch that waits on one is not a kill switch), which is
+  exactly why the removal is conditional rather than the publication locked. An operator setter that
+  finds the lock busy proceeds with a logged warning, because the CLI must not lose the only way to
+  lift a halt; a bound caller is refused instead. The middleware refuses early
+  only to say so sooner. An operator MCP host, with
+  no `CAO_TERMINAL_ID`, is unchanged on both counts. A caller that claims an identity CAO cannot
+  resolve — including an explicitly empty `CAO_TERMINAL_ID` — is refused rather than treated as an
+  operator, and a `CAO_TERMINAL_ID` that a profile or an agent plugin declares in a server's `env`
+  is no longer written into a provider's MCP configuration. The providers that write it at launch
+  inject the launching terminal's own id, overriding (and logging) a pinned one. Three have no id
+  to inject and drop
+  (and log) a pinned one instead, so the server takes the id of the terminal that launches it:
+  antigravity, because its config file is shared across that terminal's siblings (#940), and Kiro
+  CLI and OpenCode, because `cao install` writes theirs (`~/.kiro/agents/<agent>.json`,
+  `opencode.json`) before any terminal exists. Those two carried a pinned value verbatim until
+  review of this change; a file installed earlier keeps it until the next `cao install` of that
+  agent. A bound terminal that pulls the `decisions_off` kill switch is now named in a WARNING on
+  the operations server's log, since the call needs no grant and only an operator can undo it. The
+  launching CAO's coordinates (`CAO_API_HOST`/`CAO_API_PORT`/`CAO_HOME_DIR`, #1075/#1089) are now
+  gated on the same shape predicate as the identity: both are injected only into an entry that
+  launches the bundled server (bare script, absolute path, `.exe`, module entrypoint, or the script
+  named in a `uvx` entry's args), the entry's name in `mcpServers` is no longer trusted for either,
+  and an entry merely named `cao-mcp-server` that launches something else gains nothing and is
+  logged. The gate is #972's own middleware, moved to `security/mcp_tool_gate.py` and installed on
+  both surfaces, and the `@server` spelling rule is now
+  `tool_mapping.mcp_reference_covers` — the same matcher the provider layer uses — so a documented
+  glob grant such as `@cao-*` authorizes here what it already authorized there.
+  **How this slipped through:** the surface was recorded as ungated on purpose. #972's own guard
+  declared it in `UNGATED_SURFACES` with the reason and the shape of the risk written out, and the
+  suite stayed green because the declaration was the assertion. The follow-up had no owner and no
+  issue until #1062. `UNGATED_SURFACES` is now empty, and both surfaces are enumerated by
+  introspection in the per-tool coverage test, so a new ops tool is gated by default rather than by
+  someone remembering.
+  **Who holds the grant.** The #772 rule is unchanged: a profile with no explicit `allowedTools:`
+  (and no `--allowed-tools` at launch) still gets `@<server>` appended for each server it declares,
+  so a role-default profile (developer, `supervisor`, `reviewer`) that declares the server under the
+  key `cao-ops-mcp-server` holds the grant and reaches every ops tool, short of lifting a halt. Only
+  an explicit `allowedTools:` withholds it (the Kiro `tools:` field does not); to declare the server
+  and withhold the control plane, pin `allowedTools:` without the grant. The gate reads the fixed
+  selector, not the key the server is declared under.
+  **Migration:** inside a CAO terminal, (1) a profile that lists `cao-ops-mcp-server` in
+  `mcpServers` and pins an explicit `allowedTools:` must add `@cao-ops-mcp-server` to it; (2) a
+  profile that reaches the server under **another key** must name `@cao-ops-mcp-server` as well.
+  This includes the operator agent-plugin delivered through `cao install`, whose server key is
+  `cao-ops`: `allowedTools: [..., "@cao-ops"]` becomes `[..., "@cao-ops", "@cao-ops-mcp-server"]`,
+  and `@cao-ops` alone is now refused on every tool except `decisions_off`
+  (`docs/agent-plugins.md`). A role-default profile that declares the server itself under another
+  key is refused the same way, because the entry appended for it is `@<that key>`. (3) Review
+  any profile that lists both servers and already grants a glob: `@cao-*` and `@*` cover
+  `@cao-ops-mcp-server`, so such a profile holds the control plane as well as delegation, not
+  delegation alone. Name `@cao-mcp-server` instead of the glob to withhold it. Profiles
+  granting `*`, and operator MCP hosts outside CAO (no `CAO_TERMINAL_ID`, which is how a client runs
+  the agent plugin itself), need no change.
 
 - **Vault `secret_gate: "warn"` no longer forwards raw secret matches to a model** (#644 AC10).
   Under `warn` a secret-bearing note is still indexed and recallable, but every match is replaced by

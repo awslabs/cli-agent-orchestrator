@@ -1792,7 +1792,7 @@ def _materialize_opencode_mcp(
         # server that was not delivered.
         grantable = set(granted_mcp_servers(allowed_tools, merged_servers))
         for mcp_name, mcp_cfg in merged_servers.items():
-            opencode_mcp_cfg = translate_mcp_server_config(dict(mcp_cfg))
+            opencode_mcp_cfg = translate_mcp_server_config(dict(mcp_cfg), name=mcp_name)
             existing = existing_before.get(mcp_name)
             if (
                 mcp_name in plugin_derived

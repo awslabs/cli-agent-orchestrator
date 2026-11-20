@@ -7,7 +7,8 @@ compatibility: Requires CAO_MCP_APPS_ENABLED=true, cao-server running, and an MC
 # CAO MCP Apps
 
 Operator + developer playbook for CAO's host-rendered fleet UI. Reference docs:
-[`docs/mcp-apps.md`](../../docs/mcp-apps.md); example: [`examples/mcp-apps/`](../../examples/mcp-apps/).
+[`docs/mcp-apps.md`](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/mcp-apps.md);
+example: [`examples/mcp-apps/`](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/mcp-apps).
 
 **Authoritative spec & sources of truth:**
 [MCP Apps Overview](https://modelcontextprotocol.io/extensions/apps/overview) ·
@@ -35,6 +36,10 @@ It is packaged as the built-in `mcp_apps` plugin (`cao.plugins` entry-point). Th
 plugin's `on_mcp_server` hook registers the `ui://cao/*` resources, the five app
 tools, the topology widget, and advertises the `io.modelcontextprotocol/ui`
 capability — best-effort and default-off, so nothing changes when the flag is unset.
+
+To check a running server, run this skill's `scripts/validate.sh`. It curls `localhost:9889`
+and reports whether the topology widget, the `/events` stream and the AG-UI stream answer. It
+prints `SKIP` and exits 0 when no server is up.
 
 ## What the operator gets
 
@@ -118,7 +123,7 @@ After building or modifying views, regenerate the demo media:
 cd cao_mcp_apps && npm run build:all && npm run demo
 ```
 
-This runs `scripts/record-demo.mjs` which:
+This runs `cao_mcp_apps/scripts/record-demo.mjs` (in the CAO repository, not in this skill) which:
 1. Boots the E2E harness server (serves built bundles in a real MCP-host iframe)
 2. Drives Chromium through: dashboard → agent detail → unified → event-stream
 3. Records video (`docs/media/mcp-apps-demo.webm`)

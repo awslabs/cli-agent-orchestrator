@@ -1142,13 +1142,13 @@ def test_launch_forwards_env_in_json_body_not_url():
             "env_vars": {
                 "MNEMOSYNE_DIR": "/root/mnemosyne",
                 "ISAAC_CHANNEL": "room:engineering",
-            }
+            },
+            "inject_memory_at_start": True,
         }
 
 
-def test_launch_without_env_omits_request_body():
-    """A launch with no --env must not send a JSON body — preserves
-    backward compatibility with callers that ignore an unexpected body."""
+def test_interactive_launch_without_env_sends_only_start_memory_signal():
+    """A launch with no --env sends only its explicit start-memory signal."""
     runner = CliRunner()
 
     with (
@@ -1167,7 +1167,7 @@ def test_launch_without_env_omits_request_body():
         result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
 
         assert result.exit_code == 0
-        assert "json" not in mock_post.call_args.kwargs
+        assert mock_post.call_args.kwargs["json"] == {"inject_memory_at_start": True}
 
 
 def test_launch_rejects_blocked_env_prefix_before_calling_api():
@@ -1569,7 +1569,8 @@ class TestAsyncLaunchWaitsForADurableDeliveryOutcome:
 def test_launch_headless_no_message_omits_initial_message():
     """A headless launch with no MESSAGE must not put the terminal on the
     deferred-init path — it has nothing to deliver, and deferring would report
-    UNKNOWN instead of IDLE to a caller that expects a ready terminal."""
+    UNKNOWN instead of IDLE to a caller that expects a ready terminal. It does
+    ask the server for launch-time memory because there will be no first message."""
     runner = CliRunner()
 
     with patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post:
@@ -1578,7 +1579,9 @@ def test_launch_headless_no_message_omits_initial_message():
         result = runner.invoke(launch, ["--agents", "test-agent", "--headless", "--yolo"])
 
         assert result.exit_code == 0
-        assert "json" not in mock_post.call_args.kwargs
+        body = mock_post.call_args.kwargs["json"]
+        assert "initial_message" not in body
+        assert body["inject_memory_at_start"] is True
 
 
 def test_launch_non_headless_does_not_defer_init():
@@ -1603,7 +1606,9 @@ def test_launch_non_headless_does_not_defer_init():
         result = runner.invoke(launch, ["--agents", "test-agent", "--yolo", "do something"])
 
         assert result.exit_code == 0
-        assert "json" not in mock_post.call_args.kwargs
+        body = mock_post.call_args.kwargs["json"]
+        assert "initial_message" not in body
+        assert body["inject_memory_at_start"] is True
         assert mock_post.call_count == 1
 
 

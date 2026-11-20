@@ -1,0 +1,37 @@
+# Laptop side: add to ~/.ssh/config. Replace the <...> placeholders.
+#
+# SSH runs inside an SSM Session Manager session (AWS-StartSSHSession), so the
+# box needs NO inbound port. The laptop needs the AWS CLI, the Session Manager
+# plugin, and credentials allowed to call ssm:StartSession on the instance.
+
+Host cao-box
+  HostName <instance-id>
+  User <box-user>
+  IdentityFile ~/.ssh/<your-key>
+  ProxyCommand sh -c "aws ssm start-session --region ap-southeast-2 --target %h --document-name AWS-StartSSHSession --parameters 'portNumber=%p'"
+  ForwardAgent no
+  ServerAliveInterval 30
+  ServerAliveCountMax 4
+
+# The CAO dashboard, on demand: `ssh -N cao-box-dash`, then open
+# http://127.0.0.1:19889 on the laptop. A separate entry so herdr's shared
+# connection does not try to bind the port too; 19889 so it never clashes
+# with a cao-server on the laptop's own 9889.
+Host cao-box-dash
+  HostName <instance-id>
+  User <box-user>
+  IdentityFile ~/.ssh/<your-key>
+  ProxyCommand sh -c "aws ssm start-session --region ap-southeast-2 --target %h --document-name AWS-StartSSHSession --parameters 'portNumber=%p'"
+  LocalForward 19889 127.0.0.1:9889
+  ExitOnForwardFailure yes
+
+# Fallback without SSM: plain SSH, with the security group allowing port 22
+# from your own /32 only.
+# Host cao-box
+#   HostName <elastic-ip-or-dns-name>
+#   User <box-user>
+#   IdentityFile ~/.ssh/<your-key>
+
+# Then save the box as a herdr machine (pin the same herdr version on both):
+#   herdr machine add cao-box --remote-session cao-<instance-id> --label cao-box
+# If it offers to stop the remote server, answer No (the default).

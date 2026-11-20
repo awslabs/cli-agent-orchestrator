@@ -342,6 +342,36 @@ class TestAssignElastic:
         post.assert_not_called()
 
 
+@pytest.mark.parametrize("value", ["", " ", "\t"])
+@pytest.mark.parametrize("tool", DELEGATION_TOOLS)
+class TestAnEmptyIdentityIsNotAnOperatorContext:
+    """A PRESENT-but-empty ``CAO_TERMINAL_ID`` is a bound caller, and refused.
+
+    Found by independent review of #1062 on the ops surface, but the boundness
+    predicate is shared, so the same bypass stood here: ``bool(os.environ.get(
+    "CAO_TERMINAL_ID"))`` read ``""`` as "no identity claimed" and allowed every
+    delegation tool without a lookup. The truth table lives in
+    ``test/security/test_mcp_tool_gate_boundness.py``; the provider half -- how a
+    profile could get an empty value forwarded in the first place -- is
+    ``test/providers/test_terminal_identity_forwarding.py``.
+    """
+
+    def test_denies(self, tool, value):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": value}):
+            reason = server._tool_denied_reason(tool)
+        assert reason is not None, (
+            f"{tool} allowed a caller whose CAO_TERMINAL_ID is {value!r}; an empty "
+            "value is an unresolvable identity, not the operator context"
+        )
+        assert "CAO_TERMINAL_ID" in reason
+
+    def test_denies_without_looking_up_a_terminal(self, tool, value):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": value}):
+            with patch.object(server.mcp_utils, "get_json", side_effect=AssertionError) as lookup:
+                assert server._tool_denied_reason(tool) is not None
+            lookup.assert_not_called()
+
+
 class TestThroughTheRealContextHelper:
     """The other classes stub ``_get_terminal_context_from_env``, so nothing there
     exercises the terminal record actually carrying ``allowed_tools``. These drive

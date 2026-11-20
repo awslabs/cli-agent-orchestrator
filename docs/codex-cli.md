@@ -66,11 +66,11 @@ The provider supports two output formats for status detection:
 
 The `USER_PREFIX_PATTERN` uses `[^\S\n]` (horizontal whitespace only) to prevent matching across newline boundaries, correctly distinguishing `› ` (idle prompt) from `› text` (user input).
 
-**Completion footer (Codex 0.155 and later).** Codex streams the final answer with no spinner, so a frame of a streaming answer looks like a finished turn. From 0.155, Codex ends each successful turn with a dim footer under the final message: `Worked for 32s • 4:19 PM` (0.159 and later), `Worked for 1m 5s · done 4:19 PM` or `done 4:19 PM` (0.155), and a bare `4:19 PM` for short turns on 0.156 to 0.158. The footer always has the time. When `initialize()` reads such a release in the startup banner, and the status bar is one that `TUI_FOOTER_PATTERN` knows, the rendered screen follows these rules:
+**Completion footer (Codex 0.155 and later).** Codex streams the final answer with no spinner, so a frame of a streaming answer looks like a finished turn. From 0.155, Codex ends each successful turn with a dim footer under the final message: `Worked for 32s • 4:19 PM` (0.159 and later), `Worked for 1m 5s · done 4:19 PM` or `done 4:19 PM` (0.155), and a bare `4:19 PM` for short turns on 0.156 to 0.158. The footer always has the time. When `initialize()` reads such a release in the startup banner, and the bottom TUI rows match `TUI_FOOTER_PATTERN`, the rendered screen follows these rules:
 
-- A turn is COMPLETED when the last row above the composer is the footer, under a reply or tool row. An empty turn is also COMPLETED when CAO recorded the exact dispatched message, its full rendered echo is visible after a pre-dispatch screen capture, and a valid footer follows it with no response rows in between. Without that attribution, an empty-looking frame remains UNKNOWN. An error cell (`■ ...`) also ends a turn.
+- A turn is COMPLETED when the last relevant row above the composer is the completion footer, under a reply or tool row. A complete `N background terminals running · /ps to view · /stop to close` notice may appear between that footer and the composer; CAO excludes it only when a recognized completion footer precedes it (allowing blank rows). An empty turn is also COMPLETED when CAO recorded the exact dispatched message, its full rendered echo is visible after a pre-dispatch screen capture, and a valid footer follows it with no response rows in between. Without that attribution, an empty-looking frame remains UNKNOWN. An error cell (`■ ...`) also ends a turn.
 - A user message with rows under it and no footer is PROCESSING. A user message with nothing under it is UNKNOWN, which keeps the last status.
-- A frame without the status bar is a redraw in progress: UNKNOWN, unless a spinner or the footer decides.
+- A frame without recognizable bottom TUI rows may be a redraw: UNKNOWN, unless a spinner or the completion footer decides. The configurable status line can be absent; shortcut hints can still identify the TUI area.
 - A spinner above the footer of a finished turn is history (for example, a spinner line that a tool result quotes).
 - Extraction removes the footer row from the reply. For an attributed empty turn it returns `""`; manual input, incomplete echoes, stale screens, and ambiguous captures do not imply an empty answer.
 
@@ -124,10 +124,13 @@ CAO also sets `tool_timeout_sec=600.0` (10 minutes) for each MCP server to allow
 
 ### Memory Injection
 
-When CAO's memory system is enabled, the built-in `codex_memory` event plugin auto-injects
-relevant memories into the project on terminal creation. On `post_create_terminal` for a
-`codex` terminal, it writes a delimited block into `<cwd>/AGENTS.md` — the file Codex CLI
-reads from the working directory as project instructions:
+When CAO's memory system is enabled, interactive Codex terminals receive relevant
+memories through the provider start prompt. Orchestrated terminals receive them
+with their first CAO-delivered message. Neither route changes the project tree.
+
+The legacy project-file route is available only when
+`memory.injection.write_project_files=true`. In that mode, the built-in
+`codex_memory` event plugin writes a delimited block into `<cwd>/AGENTS.md`:
 
 ```markdown
 <!-- cao-memory:begin -->
@@ -143,9 +146,9 @@ Because `AGENTS.md` is a user-authored, repo-root file, the event plugin owns **
 delimited block and replaces it in place on each run — any hand-written content around it
 is preserved (the same approach as the Claude Code `CLAUDE.md` event plugin, not Kiro's
 whole-file ownership). The event plugin is observer-only: it runs after the terminal is created,
-logs-and-skips on any error, and never crashes `cao-server`. It writes nothing when memory
-is disabled or there are no relevant memories. See [memory.md](memory.md) for the full
-memory system.
+logs-and-skips on any error, and never crashes `cao-server`. With memory disabled,
+it does not inspect, create, rewrite, or clean up memory files. See
+[memory.md](memory.md) for the full memory system.
 
 ### Launch Flags
 
@@ -353,7 +356,7 @@ PY
 - Exiting a Codex terminal uses `/exit` (`POST /terminals/{terminal_id}/exit`).
 - **Exit check**: when the pane's command is again the shell that ran before Codex, the status is ERROR, so that the inbox does not type into the shell. The lookup costs about 0.1 s of tmux calls, so a ready verdict (IDLE or COMPLETED) reads it every time, and other verdicts read it at most every 2 s (`EXIT_CHECK_INTERVAL_S`).
 - **Handoff message context**: `_handoff_impl()` prepends a `[CAO Handoff]` prefix to the task message so the worker agent knows this is a blocking handoff. Without this, Codex agents proactively try to use `send_message` to notify the supervisor, which fails because the worker doesn't have the supervisor's terminal ID. The prefix tells the agent to simply output results and finish — the orchestrator captures the response automatically.
-- **TUI footer handling** (`--no-alt-screen` mode): Codex always renders a TUI footer at the bottom, even during processing. The footer format varies by version: v0.110 and earlier use `› [suggestion hint]` + `? for shortcuts` + `N% context left`; v0.111+ (PR #13202) use `› [suggestion hint]` + `model · N% left · path`. `TUI_FOOTER_PATTERN` detects both formats, and `_compute_tui_footer_cutoff()` finds the precise start of the footer area. Both `get_status()` and `extract_last_message_from_script()` use this cutoff to exclude footer lines from user-message matching — preventing false IDLE and extraction contamination.
+- **TUI footer handling** (`--no-alt-screen` mode): The composer and bottom TUI rows are distinct from the completion footer above the composer. Older formats include `› [suggestion hint]` + `? for shortcuts` + `N% context left` (v0.110 and earlier) and `› [suggestion hint]` + `model · N% left · path` (v0.111+, PR #13202). In 0.169 the composer is followed by a status line and then shortcut hints; the configurable status line can be absent. `TUI_FOOTER_PATTERN` recognizes known bottom rows, and `_compute_tui_footer_cutoff()` uses them to exclude TUI chrome from user-message matching in `get_status()` and `extract_last_message_from_script()`. This is a visual heuristic: reply text imitating a completion footer and background-terminal notice can be mistaken for chrome. A truncated notice is not recognized and can leave a completed turn appearing PROCESSING; narrow or resized views can also hide identifying rows.
 - **TUI progress spinner**: During processing, Codex shows `• [text] (Ns • esc to interrupt)` inline. The `•` would falsely match `ASSISTANT_PREFIX_PATTERN`, and the TUI `›` hint would match idle prompt — triggering false COMPLETED. `TUI_PROGRESS_PATTERN` detects the spinner and returns PROCESSING before the COMPLETED check. codex-cli 0.153.x alternates the leading glyph between `•` and `◦` as the spinner animates, so the pattern accepts either; a frame that lands on the hollow glyph used to read IDLE.
 
 ### Status Values

@@ -40,6 +40,8 @@ machine; `cao fleet` and `cao worker` reach the same routes on a *remote*
 The browser dashboard is bundled with `cao-server` and is the simplest surface
 for interactively inspecting sessions and terminals. Its setup, remote-access,
 and frontend-development details live in the [Web UI guide](web-ui.md).
+To see and steer sessions from the Kiro Crew dashboard instead, use the CAO
+Shelf App described in the [Kiro Crew guide](kiro-crew.md).
 
 ## Shell CLI
 
@@ -137,6 +139,12 @@ For Claude Code, add this stdio server to `.mcp.json`:
 }
 ```
 
+This is the operator setup: the client runs outside CAO, the server sees no
+`CAO_TERMINAL_ID`, and no grant is needed. A `cao-ops-mcp-server` process that
+does see `CAO_TERMINAL_ID` (one started inside a CAO terminal) is gated on that
+terminal's allowlist and needs `@cao-ops-mcp-server`; see
+[Tool Restrictions](tool-restrictions.md#cao-ops-mcp-server-gates-the-operations-control-plane-separately).
+
 For other MCP clients, configure the equivalent stdio command:
 
 ```bash
@@ -176,6 +184,7 @@ Choose the surface by caller:
 | Caller | Preferred surface |
 |---|---|
 | Human in a browser | Web UI |
+| Human in the Kiro Crew dashboard or a Kiro Crew chat | [CAO Shelf](kiro-crew.md) |
 | Shell script, CI step, or cron job | `cao session` |
 | External MCP-capable agent | `cao-ops-mcp` |
 | Agent that can execute shell but not MCP | `cao session` through the skill |
@@ -198,6 +207,7 @@ scaffolding.
 ## Related reading
 
 - [Web UI](web-ui.md)
+- [Kiro Crew and the CAO Shelf](kiro-crew.md)
 - [HTTP API and PTY WebSocket](api.md)
 - [Event Plugin guide](plugins.md)
 - [Session-management skill](../skills/cao-session-management/SKILL.md)

@@ -27,7 +27,7 @@ Two rules apply to every launch from an agent:
 A reported status is inferred from the rendered terminal screen, so it can disagree
 with reality. Before reporting readiness, progress, or completion to a user,
 corroborate the status with an output read; see
-[cao-session-liveness](../cao-session-liveness/SKILL.md).
+the `cao-session-liveness` skill.
 
 ## Discovering Available Profiles
 
@@ -40,7 +40,7 @@ provider runs them. To find available profiles:
 | Profiles matching a keyword | `cao profile find "<keywords>"` |
 | Custom/local profile files only | `ls ~/.aws/cli-agent-orchestrator/agent-store/` |
 | Profiles installed via `cao install <name>` | `ls ~/.aws/cli-agent-orchestrator/agent-context/` |
-| Profile installation and keyword discovery | see [Agent profile installation](../../docs/agent-profile.md#installation) and [profile discovery](../../docs/agent-profile.md#profile-discovery) |
+| Profile installation and keyword discovery | see [Agent profile installation](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/agent-profile.md#installation) and [profile discovery](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/agent-profile.md#profile-discovery) |
 | Provider-native list (`kiro_cli` only) | `kiro-cli agent list`, useful because CAO mirrors profiles into `~/.kiro/agents/` |
 
 `cao profile list` and the HTTP endpoint return the same list. Discovery scans the

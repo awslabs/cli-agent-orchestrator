@@ -3,6 +3,7 @@
 import asyncio
 import os
 import threading
+import time
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -832,6 +833,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @pytest.mark.parametrize("provider_name", ["claude_code", "codex"])
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog")
     @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_create_terminal_appends_skill_catalog(
@@ -849,8 +851,10 @@ class TestCreateTerminal:
         mock_fifo_manager,
         mock_status_monitor,
         mock_delete_terminals_by_session,
+        provider_name,
+        monkeypatch,
     ):
-        """Providers that consume runtime prompts should receive the global skill catalog."""
+        """Interactive prompt providers receive memory and the global skill catalog once."""
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
@@ -876,19 +880,61 @@ class TestCreateTerminal:
         mock_log_path = MagicMock()
         mock_log_dir.__truediv__.return_value = mock_log_path
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+        memory_calls = []
+        heartbeat_ticks = 0
+        ticks_during_lookup = []
 
-        await create_terminal("codex", "developer", new_session=True)
+        async def heartbeat():
+            nonlocal heartbeat_ticks
+            while not ticks_during_lookup:
+                heartbeat_ticks += 1
+                await asyncio.sleep(0)
 
-        skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
-        assert skill_prompt == (
-            "## Available Skills\n\n"
-            "The following skills are available exclusively in this CAO orchestration context. "
-            "To load a skill's full content, use the `load_skill` MCP tool provided by the "
-            "CAO MCP server. These skills are not accessible through provider-native skill "
-            "commands or directories.\n\n"
-            "- **cao-worker-protocols**: Worker communication\n"
-            "- **python-testing**: Pytest conventions"
+        def slow_memory_owner(terminal_id, task_description=""):
+            before = heartbeat_ticks
+            time.sleep(0.1)
+            ticks_during_lookup.append(heartbeat_ticks - before)
+            memory_calls.append((terminal_id, task_description))
+            return "<cao-memory>start memory</cao-memory>"
+
+        monkeypatch.setattr(
+            terminal_service,
+            "memory_context_for_terminal",
+            slow_memory_owner,
         )
+        terminal_service._memory_injected_terminals.discard("test1234")
+
+        try:
+            heartbeat_task = asyncio.create_task(heartbeat())
+            await asyncio.sleep(0)
+            await create_terminal(
+                provider_name,
+                "developer",
+                new_session=True,
+                inject_memory_at_start=True,
+            )
+            await heartbeat_task
+
+            skill_prompt = mock_provider._skill_prompt
+            assert skill_prompt == (
+                "<cao-memory>start memory</cao-memory>\n\n"
+                "## Available Skills\n\n"
+                "The following skills are available exclusively in this CAO orchestration "
+                "context. To load a skill's full content, use the `load_skill` MCP tool "
+                "provided by the CAO MCP server. These skills are not accessible through "
+                "provider-native skill commands or directories.\n\n"
+                "- **cao-worker-protocols**: Worker communication\n"
+                "- **python-testing**: Pytest conventions"
+            )
+            assert memory_calls == [("test1234", "")]
+            assert ticks_during_lookup[0] > 0
+            assert (
+                terminal_service.inject_memory_context("orchestrated task", "test1234")
+                == "orchestrated task"
+            )
+            assert memory_calls == [("test1234", "")]
+        finally:
+            terminal_service._memory_injected_terminals.discard("test1234")
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
@@ -904,7 +950,15 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog")
     @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
-    async def test_create_terminal_without_skills_is_unchanged(
+    @pytest.mark.parametrize("provider_name", ["claude_code", "codex"])
+    @pytest.mark.parametrize(
+        ("frozen_memory", "expected"),
+        [
+            ("<cao-memory>FROZEN</cao-memory>", "<cao-memory>FROZEN</cao-memory>\n\ntask"),
+            ("", "task"),
+        ],
+    )
+    async def test_orchestrated_create_preserves_frozen_first_message(
         self,
         mock_load_profile,
         mock_build_skill_catalog,
@@ -919,8 +973,12 @@ class TestCreateTerminal:
         mock_fifo_manager,
         mock_status_monitor,
         mock_delete_terminals_by_session,
+        provider_name,
+        frozen_memory,
+        expected,
+        monkeypatch,
     ):
-        """Providers should receive an empty skill prompt when no skills are installed."""
+        """Workflow and handoff creates keep memory on the frozen first-message route."""
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
@@ -938,13 +996,40 @@ class TestCreateTerminal:
         mock_log_path = MagicMock()
         mock_log_dir.__truediv__.return_value = mock_log_path
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+        memory_calls = []
+        monkeypatch.setattr(
+            terminal_service,
+            "memory_context_for_terminal",
+            lambda terminal_id, task_description="": memory_calls.append(
+                (terminal_id, task_description)
+            )
+            or "<cao-memory>LIVE</cao-memory>",
+        )
+        terminal_service._memory_injected_terminals.discard("test1234")
 
-        await create_terminal("codex", "developer", new_session=True)
+        try:
+            await create_terminal(provider_name, "developer", new_session=True)
 
-        skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
-        assert skill_prompt == ""
-        # No `skills` field on the profile → catalog built with no filter (None).
-        mock_build_skill_catalog.assert_called_once_with(None)
+            skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
+            assert skill_prompt == ""
+            assert memory_calls == []
+            assert (
+                terminal_service.inject_memory_context(
+                    "task", "test1234", frozen_memory=frozen_memory
+                )
+                == expected
+            )
+            assert (
+                terminal_service.inject_memory_context(
+                    "second task", "test1234", frozen_memory=frozen_memory
+                )
+                == "second task"
+            )
+            assert memory_calls == []
+            # No `skills` field on the profile → catalog built with no filter (None).
+            mock_build_skill_catalog.assert_called_once_with(None)
+        finally:
+            terminal_service._memory_injected_terminals.discard("test1234")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("provider_name", ["kiro_cli", "copilot_cli"])
@@ -1600,7 +1685,15 @@ class TestReplayDuringInitializationBehaviour:
         mock_tmux.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
-        mock_get_terminal.return_value = dict(_PRIOR_ROW, id="test1234")
+        replay_observed_row = asyncio.Event()
+        replay_created = False
+
+        def get_row(terminal_id):
+            if replay_created:
+                replay_observed_row.set()
+            return dict(_PRIOR_ROW, id=terminal_id)
+
+        mock_get_terminal.side_effect = get_row
 
         committed = asyncio.Event()
         release_init = asyncio.Event()
@@ -1623,17 +1716,26 @@ class TestReplayDuringInitializationBehaviour:
         original = asyncio.ensure_future(
             create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
         )
-        await asyncio.wait_for(committed.wait(), timeout=2)
+        await asyncio.wait_for(committed.wait(), timeout=30)
 
         replay = asyncio.ensure_future(
             create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
         )
-        await asyncio.sleep(0.1)
+        replay_created = True
+        await asyncio.wait_for(replay_observed_row.wait(), timeout=30)
         replay_returned_early = replay.done()
 
         release_init.set()
-        await asyncio.wait_for(original, timeout=2)
-        result = await asyncio.wait_for(replay, timeout=2)
+        try:
+            async with asyncio.timeout(30):
+                await original
+        except TimeoutError:
+            pytest.fail("original create did not finish within 30 seconds")
+        try:
+            async with asyncio.timeout(30):
+                result = await replay
+        except TimeoutError:
+            pytest.fail("replay create did not finish within 30 seconds")
 
         assert not replay_returned_early, "replay returned while the provider was initializing"
         assert result.id == "test1234"
@@ -1673,7 +1775,15 @@ class TestReplayDuringInitializationBehaviour:
         mock_tmux.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
-        mock_get_terminal.return_value = dict(_PRIOR_ROW, id="test1234")
+        replay_observed_row = asyncio.Event()
+        replay_created = False
+
+        def get_row(terminal_id):
+            if replay_created:
+                replay_observed_row.set()
+            return dict(_PRIOR_ROW, id=terminal_id)
+
+        mock_get_terminal.side_effect = get_row
 
         committed = asyncio.Event()
         release_init = asyncio.Event()
@@ -1694,20 +1804,34 @@ class TestReplayDuringInitializationBehaviour:
         original = asyncio.ensure_future(
             create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
         )
-        await asyncio.wait_for(committed.wait(), timeout=2)
+        await asyncio.wait_for(committed.wait(), timeout=30)
         replay = asyncio.ensure_future(
             create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
         )
-        await asyncio.sleep(0.1)
+        replay_created = True
+        await asyncio.wait_for(replay_observed_row.wait(), timeout=30)
         assert not replay.done()
 
         release_init.set()
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(original, timeout=2)
+        try:
+            async with asyncio.timeout(30):
+                with pytest.raises(
+                    TimeoutError,
+                    match="Antigravity CLI initialization timed out after 180.0 seconds",
+                ):
+                    await original
+        except TimeoutError:
+            pytest.fail("original create did not finish within 30 seconds")
         # The replay gets the original's failure as its own distinct error, and
         # no second provider is started for the key.
-        with pytest.raises(terminal_service.IdempotentCreateFailed, match="timed out after 180"):
-            await asyncio.wait_for(replay, timeout=2)
+        try:
+            async with asyncio.timeout(30):
+                with pytest.raises(
+                    terminal_service.IdempotentCreateFailed, match="timed out after 180"
+                ):
+                    await replay
+        except TimeoutError:
+            pytest.fail("replay create did not finish within 30 seconds")
         mock_provider_manager.create_provider.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1756,8 +1880,12 @@ class TestReplayDuringInitializationBehaviour:
 
         deleted = threading.Event()
         mock_db_delete.side_effect = lambda *a, **k: deleted.set()
+        replay_observed_row = asyncio.Event()
+        replay_created = False
 
         def get_row(terminal_id):
+            if replay_created:
+                replay_observed_row.set()
             if deleted.is_set():
                 raise ValueError(f"Terminal '{terminal_id}' not found")
             return dict(_PRIOR_ROW, id=terminal_id)
@@ -1784,16 +1912,27 @@ class TestReplayDuringInitializationBehaviour:
         original = asyncio.ensure_future(
             create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
         )
-        await asyncio.wait_for(committed.wait(), timeout=2)
+        await asyncio.wait_for(committed.wait(), timeout=30)
         replay = asyncio.ensure_future(
             create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
         )
-        await asyncio.sleep(0.1)
+        replay_created = True
+        await asyncio.wait_for(replay_observed_row.wait(), timeout=30)
         release_init.set()
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(original, timeout=2)
-        with pytest.raises(terminal_service.IdempotentCreateFailed) as exc_info:
-            await asyncio.wait_for(replay, timeout=2)
+        try:
+            async with asyncio.timeout(30):
+                with pytest.raises(
+                    TimeoutError, match="Grok CLI initialization timed out after 180.0 seconds"
+                ):
+                    await original
+        except TimeoutError:
+            pytest.fail("original create did not finish within 30 seconds")
+        try:
+            async with asyncio.timeout(30):
+                with pytest.raises(terminal_service.IdempotentCreateFailed) as exc_info:
+                    await replay
+        except TimeoutError:
+            pytest.fail("replay did not finish within 30 seconds")
 
         assert deleted.is_set() is not cleanup_deferred
         if cleanup_deferred:
@@ -2172,6 +2311,7 @@ class TestIdempotencyKeyRequestFingerprint:
             # was discarded with no conflict and no delivery.
             ("initial_message", "a different task"),
             ("initial_message_orchestration_type", OrchestrationType.HANDOFF),
+            ("inject_memory_at_start", True),
         ],
     )
     @pytest.mark.asyncio
@@ -5607,11 +5747,18 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
     @patch("cli_agent_orchestrator.services.terminal_service.update_terminal_shell_command")
-    @patch("cli_agent_orchestrator.services.terminal_service.redeliver_dropped_message")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.redeliver_dropped_message_with_boundary"
+    )
     @patch("cli_agent_orchestrator.services.terminal_service.dispatch_input")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     async def test_a_genuine_early_completion_is_not_hidden_by_the_mask(
-        self, mock_meta, mock_send_input, mock_redeliver, mock_update_shell, mock_notify
+        self,
+        mock_meta,
+        mock_send_input,
+        mock_redeliver_with_boundary,
+        mock_update_shell,
+        mock_notify,
     ):
         """The mirror-image regression, pinned with the REAL confirm loop.
 
@@ -5665,6 +5812,7 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
 
         init_done = threading.Event()
         dispatched = threading.Event()
+        completion_observed = threading.Event()
         dispatched_at = {}
         saw_processing = {"value": False}
 
@@ -5672,6 +5820,7 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
             if dispatched.is_set():
                 if _time.monotonic() - dispatched_at["t"] < COMPLETION_LAG:
                     return TerminalStatus.IDLE
+                completion_observed.set()
                 return TerminalStatus.COMPLETED  # never PROCESSING
             if init_done.is_set():
                 return TerminalStatus.IDLE
@@ -5707,7 +5856,7 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
             return 0  # the dispatch boundary dispatch_input returns
 
         mock_send_input.side_effect = fake_send_input
-        mock_redeliver.return_value = False
+        mock_redeliver_with_boundary.return_value = (True, None)
 
         async def fake_initialize():
             await asyncio.sleep(INIT_SECONDS)
@@ -5727,13 +5876,12 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
             resp.json.return_value = {"status": status}
             return resp
 
-        elapsed = {}
+        poll_returned_after_completion = {}
 
         def run_poll():
-            started = _time.monotonic()
             with patch("cli_agent_orchestrator.utils.terminal.api_http.get", fake_requests_get):
                 poll_until_done(TERMINAL_ID, timeout=30.0, polling_interval=POLL_INTERVAL)
-            elapsed["t"] = _time.monotonic() - started
+            poll_returned_after_completion["value"] = completion_observed.is_set()
 
         with (
             patch("cli_agent_orchestrator.services.status_monitor.status_monitor", fake_monitor),
@@ -5749,11 +5897,14 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
         assert (
             saw_processing["value"] is False
         ), "fixture bug: this must exercise the no-PROCESSING path"
-        assert elapsed["t"] < 3.0, (
-            f"poll_until_done took {elapsed['t']:.2f}s for a turn that completed "
-            f"{COMPLETION_LAG:.2f}s after dispatch — the mask is stranding a genuine "
-            "early completion"
+        assert completion_observed.is_set(), "fixture bug: the turn never reached COMPLETED"
+        assert mock_redeliver_with_boundary.call_count == 0, (
+            "post-dispatch COMPLETED was hidden until the initial confirmation timed out "
+            "and entered the redelivery path"
         )
+        assert (
+            poll_returned_after_completion["value"] is True
+        ), "poll_until_done returned before post-dispatch COMPLETED was observed"
 
 
 class TestListSiblingsMasksPendingDelivery:

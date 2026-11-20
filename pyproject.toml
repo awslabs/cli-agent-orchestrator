@@ -491,6 +491,16 @@ warn_return_any = true
 warn_unused_configs = true
 
 [tool.pytest.ini_options]
+# CPython 3.13+ emits a ResourceWarning for an unclosed sqlite3.Connection, but Python ignores
+# ResourceWarning by default. pytest-cov (enabled by addopts, CI, and the nightly --cov job)
+# adds a global `default` filter for exactly this message in its `pytest_runtestloop` wrapper,
+# so the warning is recorded; pytest keeps every recorded WarningMessage, pinning the connection
+# and its file descriptor for the session. pytest applies ini `filterwarnings` after global
+# filters for each test, so this `ignore` entry wins over pytest-cov's `default` entry.
+# This is containment; explicit test closures and the guard test are the real fix.
+filterwarnings = [
+    "ignore:^unclosed database in <sqlite3\\.Connection:ResourceWarning",
+]
 markers = [
     "asyncio: marks tests that use asyncio",
     "integration: marks integration tests",
@@ -546,8 +556,8 @@ addopts = "--cov=src --cov-branch --cov-report=term-missing -m 'not e2e'"
 # explicit CI invocation in `.github/workflows/ci.yml`; the line-only floor is
 # the ratchet's `python.floor_pct` in `.coverage-baseline.json`, not this flag.
 #
-# NOTE for anyone reading ci.yml: the separate "Coverage ratchet" step there
-# belongs to cao_mcp_apps (the TypeScript subproject), not to this suite.
+# NOTE for anyone reading ci.yml: the separate "Coverage ratchet" job reads
+# this suite's Unit Tests (3.12) report.
 #
 # CAUTION (#1005): with `--cov-branch` on, coverage.py's `totals.percent_covered`
 # becomes a BLENDED line+branch figure -- (covered_lines + covered_branches) /

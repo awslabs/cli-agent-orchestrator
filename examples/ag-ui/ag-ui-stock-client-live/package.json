@@ -8,7 +8,7 @@
     "client": "node client.mjs"
   },
   "dependencies": {
-    "@ag-ui/client": "1.0.3",
+    "@ag-ui/client": "1.0.4",
     "rxjs": "7.8.2"
   },
   "overrides": {
