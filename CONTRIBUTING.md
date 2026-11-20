@@ -63,6 +63,12 @@ See [`changelog.d/README.md`](changelog.d/README.md) for the format. The release
 bump collects these fragments alongside any hand-written `[Unreleased]` notes;
 you do not need to edit `CHANGELOG.md` in your pull request.
 
+## Feature map
+
+[`docs/feature-map/`](docs/feature-map/README.md) describes each feature area for people and coding
+agents: what exists, how to reach it, how to run it, and what usually misleads. If your change alters
+how an area behaves, update that area's entry in the same PR.
+
 
 ## Type checking: the mypy ratchet
 
