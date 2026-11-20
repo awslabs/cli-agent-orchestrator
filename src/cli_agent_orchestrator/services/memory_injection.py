@@ -1,0 +1,61 @@
+"""Pure helpers for rendering stamped CAO memory injection blocks."""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, timezone
+
+_OPENING_TAG_RE = re.compile(r"<cao-memory(?:\s[^>]*)?>")
+_CLOSING_TAG = "</cao-memory>"
+
+
+def _generated_at() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def render_memory_block(body: str, *, generated_at: str | None = None) -> str:
+    """Wrap ``body`` in a memory block stamped with its UTC build time."""
+    timestamp = generated_at or _generated_at()
+    return f'<cao-memory generated="{timestamp}">\n{body}\n</cao-memory>'
+
+
+def empty_memory_block(*, generated_at: str | None = None) -> str:
+    """Return the explicit tombstone used to replace stale provider context."""
+    return render_memory_block("<!-- no memories selected -->", generated_at=generated_at)
+
+
+def stamp_memory_block(block: str, *, generated_at: str | None = None) -> str:
+    """Add or refresh ``generated`` on the first memory opening tag.
+
+    Provider plugins may receive a block from a remote owner running an older
+    CAO version, so the final writer enforces the stamp as well as the local
+    deterministic builder.
+    """
+    timestamp = generated_at or _generated_at()
+    return _OPENING_TAG_RE.sub(f'<cao-memory generated="{timestamp}">', block, count=1)
+
+
+def memory_blocks_have_same_body(existing: str, proposed: str) -> bool:
+    """Compare memory bodies while ignoring opening-tag metadata."""
+
+    def body(block: str) -> str | None:
+        opening = _OPENING_TAG_RE.search(block)
+        closing = block.rfind(_CLOSING_TAG)
+        if opening is None or closing < opening.end():
+            return None
+        return block[opening.end() : closing]
+
+    existing_body = body(existing)
+    proposed_body = body(proposed)
+    return (
+        existing_body is not None and proposed_body is not None and existing_body == proposed_body
+    )
+
+
+def uniquely_delimited_block(content: str, begin_marker: str, end_marker: str) -> str | None:
+    """Return one well-formed managed section, rejecting ambiguous files."""
+    if content.count(begin_marker) != 1 or content.count(end_marker) != 1:
+        return None
+    begin = content.find(begin_marker) + len(begin_marker)
+    end = content.find(end_marker, begin)
+    return content[begin:end] if end >= begin else None

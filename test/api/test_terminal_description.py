@@ -11,6 +11,7 @@ from cli_agent_orchestrator.clients import database as db
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.services import session_service, terminal_service
 from cli_agent_orchestrator.utils.description import normalize_description
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 
 @pytest.fixture
@@ -28,13 +29,13 @@ def description_db(tmp_path, monkeypatch):
 
 def test_migration_preserves_old_rows(tmp_path, monkeypatch):
     path = tmp_path / "legacy.db"
-    with sqlite3.connect(path) as conn:
+    with closing_transaction(sqlite3.connect(path)) as conn:
         conn.execute("CREATE TABLE terminals (id TEXT PRIMARY KEY)")
         conn.execute("INSERT INTO terminals VALUES ('old')")
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
     db._migrate_terminals_schema()
     db._migrate_terminals_schema()
-    with sqlite3.connect(path) as conn:
+    with closing_transaction(sqlite3.connect(path)) as conn:
         assert conn.execute("SELECT description FROM terminals").fetchall() == [(None,)]
         assert [row[1] for row in conn.execute("PRAGMA table_info(terminals)")].count(
             "description"

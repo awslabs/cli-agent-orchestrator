@@ -6,7 +6,7 @@
 
 .PHONY: refresh-ext-apps-skills check-ext-apps-skills \
         refresh-agent-plugins-schemas check-agent-plugins-schemas \
-        agent-plugin agent-plugin-keep-pin check-agent-plugin \
+        agent-plugin agent-plugin-keep-pin check-agent-plugin check-agent-plugin-links \
         record-agui-trace check-agui-trace check-agui-trace-release
 
 # Re-vendor the ext-apps builder skills from the pinned tag and rewrite NOTICE.
@@ -54,6 +54,12 @@ agent-plugin-keep-pin:
 # another. Exit 0 = in sync, 1 = drift or non-conformance.
 check-agent-plugin:
 	uv run python scripts/build_agent_plugin.py --check
+
+# Build each package into its own directory and check its Markdown links THERE, one
+# package at a time (#1384). A link that resolves in the repository but escapes the
+# installed package fails. Offline; writes nothing under agent-plugin/.
+check-agent-plugin-links:
+	uv run python scripts/build_agent_plugin.py --check-links
 
 # --- CAO Dojo AG-UI trace (#1116) --------------------------------------------
 # See examples/ag-ui/cao-dojo/README.md, "Recorded trace and drift checks".

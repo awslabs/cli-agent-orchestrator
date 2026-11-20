@@ -34,6 +34,7 @@ from cli_agent_orchestrator.utils.atomic_file import (
     _lock_path_for,
     locked_atomic_delete,
     locked_atomic_rewrite,
+    locked_atomic_rewrite_or_delete,
     locked_atomic_write,
     strict_target_lock,
     unlocked_atomic_write,
@@ -865,6 +866,26 @@ def test_delete_is_idempotent_when_must_exist_is_false(tmp_path: Path) -> None:
 
     locked_atomic_delete(target, must_exist=False)  # no raise
 
+    assert not target.exists()
+
+
+def test_rewrite_or_delete_decides_from_the_locked_read(tmp_path: Path) -> None:
+    target = tmp_path / "AGENTS.md"
+    target.write_text("managed\n", encoding="utf-8")
+    seen: list[str] = []
+
+    locked_atomic_rewrite_or_delete(
+        target,
+        lambda existing: seen.append(existing) or "",
+        lambda rewritten: not rewritten.strip(),
+    )
+    locked_atomic_rewrite_or_delete(
+        target,
+        lambda existing: seen.append(existing) or "",
+        lambda rewritten: not rewritten.strip(),
+    )
+
+    assert seen == ["managed\n"]
     assert not target.exists()
 
 

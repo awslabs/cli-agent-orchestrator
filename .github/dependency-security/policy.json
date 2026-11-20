@@ -1,0 +1,87 @@
+{
+  "schema": 1,
+  "_comment": "Read only by scripts/dependency_security.py. Lists what the build MUST have recorded and what Trivy MUST have parsed; editing it changes what the gate trusts, so review it like the gate itself.",
+  "expected_outputs": [
+    {
+      "project": "web",
+      "config": "web",
+      "lockfile": "web/package-lock.json",
+      "output_dir": "src/cli_agent_orchestrator/web_ui"
+    },
+    {
+      "project": "cao_mcp_apps",
+      "config": "agent",
+      "lockfile": "cao_mcp_apps/package-lock.json",
+      "output_dir": "src/cli_agent_orchestrator/ext_apps/apps_static"
+    },
+    {
+      "project": "cao_mcp_apps",
+      "config": "dashboard",
+      "lockfile": "cao_mcp_apps/package-lock.json",
+      "output_dir": "src/cli_agent_orchestrator/ext_apps/apps_static"
+    },
+    {
+      "project": "cao_mcp_apps",
+      "config": "event-stream",
+      "lockfile": "cao_mcp_apps/package-lock.json",
+      "output_dir": "src/cli_agent_orchestrator/ext_apps/apps_static"
+    },
+    {
+      "project": "cao_mcp_apps",
+      "config": "graph",
+      "lockfile": "cao_mcp_apps/package-lock.json",
+      "output_dir": "src/cli_agent_orchestrator/ext_apps/apps_static"
+    },
+    {
+      "project": "docusaurus",
+      "config": "client",
+      "lockfile": "docusaurus/package-lock.json",
+      "output_dir": null
+    },
+    {
+      "project": "docusaurus",
+      "config": "server",
+      "lockfile": "docusaurus/package-lock.json",
+      "output_dir": null
+    }
+  ],
+  "sentinels": {
+    "web/package-lock.json": [
+      "react"
+    ],
+    "cao_mcp_apps/package-lock.json": [
+      "react",
+      "sigma"
+    ],
+    "docusaurus/package-lock.json": [
+      "react",
+      "@docusaurus/core"
+    ],
+    "uv.lock": [
+      "fastapi"
+    ],
+    "tui/Cargo.lock": [
+      "serde",
+      "ratatui"
+    ]
+  },
+  "html_writers": {
+    "docusaurus/package-lock.json": [
+      "remark-*",
+      "rehype-*",
+      "@mdx-js/*",
+      "mdast-*",
+      "hast-*",
+      "micromark*",
+      "unified",
+      "unist-*",
+      "vfile*",
+      "estree-util-*",
+      "prismjs",
+      "prism-react-renderer",
+      "@docusaurus/mdx-loader",
+      "*react-helmet-async",
+      "@docusaurus/react-loadable"
+    ]
+  }
+}

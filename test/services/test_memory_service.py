@@ -378,10 +378,10 @@ class TestGetContextRespectsBudget:
 
         if context:
             # Should contain cao-memory tags
-            assert "<cao-memory>" in context
+            assert "<cao-memory " in context
             assert "</cao-memory>" in context
             # Content between tags should be under budget
-            inner = context.split("<cao-memory>")[1].split("</cao-memory>")[0]
+            inner = context.split(">", 1)[1].split("</cao-memory>")[0]
             assert len(inner) <= 600  # some overhead for tags/headers is OK
 
 

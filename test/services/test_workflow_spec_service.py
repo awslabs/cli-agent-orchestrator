@@ -22,6 +22,7 @@ import pytest
 from cli_agent_orchestrator.clients.database import _migrate_workflow_index
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.services import workflow_spec_service as svc
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 _GOOD_SPEC = """\
 name: {name}
@@ -278,7 +279,7 @@ class TestIndexUpsertAndList:
         before = [r.model_dump(exclude={"indexed_at"}) for r in svc.list_workflows(str(spec_dir))]
 
         # Drop the derived table entirely.
-        with sqlite3.connect(str(isolated_db)) as conn:
+        with closing_transaction(sqlite3.connect(str(isolated_db))) as conn:
             conn.execute("DROP TABLE workflow_index")
             conn.commit()
         _migrate_workflow_index()  # recreate empty
@@ -464,7 +465,7 @@ class TestScriptTierGetWorkflow:
         outside = tmp_path / "outside.py"
         outside.write_text("def main():\n    pass\n")
 
-        with sqlite3.connect(str(isolated_db)) as conn:
+        with closing_transaction(sqlite3.connect(str(isolated_db))) as conn:
             conn.execute(
                 "INSERT INTO workflow_index "
                 "(name, source_path, mode, step_count, description, indexed_at) "

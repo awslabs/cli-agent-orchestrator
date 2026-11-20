@@ -15,6 +15,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.schema import CreateTable
 
 from cli_agent_orchestrator.clients import database as db_mod
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 
 def _base_schema_db(path):
@@ -32,7 +33,7 @@ def _base_schema_db(path):
             conn.exec_driver_sql(base_ddl)
     finally:
         engine.dispose()
-    with sqlite3.connect(str(path)) as conn:
+    with closing_transaction(sqlite3.connect(str(path))) as conn:
         conn.executemany(
             "INSERT INTO terminals (id, tmux_session, tmux_window, provider, agent_profile, "
             "deferred_init_failure) VALUES (?, ?, ?, ?, ?, ?)",
@@ -67,7 +68,7 @@ def base_schema_home(tmp_path, monkeypatch):
 
 
 def _column(path):
-    with sqlite3.connect(str(path)) as conn:
+    with closing_transaction(sqlite3.connect(str(path))) as conn:
         rows = conn.execute("PRAGMA table_info(terminals)").fetchall()
     return [r for r in rows if r[1] == "identity_verified"]
 

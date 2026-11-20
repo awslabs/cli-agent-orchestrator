@@ -509,6 +509,13 @@ def launch(
             body["env_vars"] = forwarded_env
         if server_delivers_message:
             body["initial_message"] = message
+        else:
+            # This launch has no CAO-delivered first message: non-headless
+            # launches attach instead, and a no-message headless launch has no
+            # task to deliver. Ask the server to use the provider's start-prompt
+            # seam for memory. Other create callers default to the first-message
+            # route because the request field itself defaults to false.
+            body["inject_memory_at_start"] = True
         if body:
             post_kwargs["json"] = body
 
