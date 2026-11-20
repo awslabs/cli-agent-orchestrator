@@ -1943,8 +1943,8 @@ async def lifespan(app: FastAPI):
     backend = get_backend()
     if isinstance(backend, HerdrBackend):
 
-        def deliver_inbox(terminal_id: str) -> None:
-            inbox_service.deliver_pending(terminal_id, registry=registry)
+        def deliver_inbox(terminal_id: str, source: str = "herdr") -> int:
+            return inbox_service.deliver_pending(terminal_id, registry=registry, source=source)
 
         svc = HerdrInboxService(
             herdr_session=backend.herdr_session,
@@ -10415,7 +10415,7 @@ async def create_inbox_message_endpoint(
         )
     )
 
-    def _log_outcome(task: "asyncio.Task[None]") -> None:
+    def _log_outcome(task: "asyncio.Task[int]") -> None:
         if not task.cancelled() and task.exception() is not None:
             logger.warning(
                 f"Immediate delivery attempt failed for {receiver_id}: {task.exception()}"
