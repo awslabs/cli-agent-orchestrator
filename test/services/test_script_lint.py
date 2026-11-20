@@ -14,13 +14,16 @@ explicit fixtures in ``TestStepReceiverShapeTotality`` instead. A safety net
 aimed at a different failure mode is not a safety net for this one.
 """
 
+import ast
+import re
 import time
+from pathlib import Path
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from cli_agent_orchestrator.constants import SCRIPT_LINT_MAX_SOURCE_CHARS
+from cli_agent_orchestrator.constants import SCRIPT_LINT_MAX_SOURCE_CHARS, WORKFLOW_NAME_RE
 from cli_agent_orchestrator.models.workflow import LintFinding, ScriptValidationResult
 from cli_agent_orchestrator.services.script_lint import lint_script
 
@@ -475,6 +478,51 @@ class TestLiteralStepIdRule:
 
         assert _findings_by_rule(result, "invalid-step-id") == []
         assert result.status == "pass"
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+# (file, name of the step-id helper its fan-out example defines)
+_FANOUT_EXAMPLES = [
+    ("skills/cao-workflow/SKILL.md", "summary_step_id"),
+    ("src/cli_agent_orchestrator/skills/cao-workflow/SKILL.md", "summary_step_id"),
+    ("docs/workflows.md", "step_id_for"),
+]
+
+
+def _fanout_example(relpath: str) -> str:
+    text = (_REPO_ROOT / relpath).read_text(encoding="utf-8")
+    blocks = re.findall(r"```python\n(.*?)```", text, re.S)
+    matches = [b for b in blocks if "ThreadPoolExecutor" in b and "def summarize" in b]
+    assert len(matches) == 1, relpath
+    return matches[0]
+
+
+class TestShippedFanOutExamples:
+    """The fan-out example agents copy must pass the same gate as their script (#1396)."""
+
+    @pytest.mark.parametrize("relpath,helper", _FANOUT_EXAMPLES)
+    def test_example_passes_the_lint_gate(self, relpath, helper):
+        result = lint_script(_fanout_example(relpath), "example.py")
+
+        assert result.errors == []
+        assert _findings_by_rule(result, "invalid-step-id") == []
+
+    @pytest.mark.parametrize("relpath,helper", _FANOUT_EXAMPLES)
+    def test_example_step_ids_are_valid_and_distinct(self, relpath, helper):
+        tree = ast.parse(_fanout_example(relpath))
+        func = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == helper)
+        namespace: dict = {}
+        exec(
+            compile(ast.Module(body=[func], type_ignores=[]), relpath, "exec"),
+            {"re": re, "hashlib": __import__("hashlib")},
+            namespace,
+        )
+        names = ["notes.txt", "a b", "a.b", "a_b", "report (final).md", "x" * 200, "é.txt"]
+
+        ids = [namespace[helper](name) for name in names]
+
+        assert all(re.fullmatch(WORKFLOW_NAME_RE, i) for i in ids), ids
+        assert len(set(ids)) == len(ids)
 
 
 class TestMissingRecoveryPolicyRule:
