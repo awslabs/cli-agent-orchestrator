@@ -97,6 +97,29 @@ PYPI_TIMEOUT_S = 30
 # Files copied into every package alongside its generated manifest.
 SHARED_FILES = ["LICENSE"]
 
+# Marketplace catalogs (#1409). The Agent Plugins specification defines one
+# manifest per plugin and no marketplace format, so each client that can install
+# from a repository reads its own catalog file at the repo root. Both are written
+# from the same ``PACKAGES`` list that writes the per-package manifests, so a
+# catalog cannot name a package that does not exist or disagree with it.
+MARKETPLACE_NAME = "cli-agent-orchestrator"
+MARKETPLACE_OWNER = "awslabs"
+MARKETPLACE_DESCRIPTION = (
+    "CLI Agent Orchestrator (CAO) Agent Plugins: drive multi-agent sessions, "
+    "contribute to CAO, and author AG-UI and Agent Plugins packages."
+)
+MARKETPLACE_DISPLAY_NAME = "CLI Agent Orchestrator"
+# Catalog locations relative to the directory that holds ``agent-plugin/``, so a
+# build redirected at another ``PACKAGES_DIR`` writes its catalogs beside it and
+# never into the real checkout.
+CLAUDE_MARKETPLACE_REL = Path(".claude-plugin") / "marketplace.json"
+CODEX_MARKETPLACE_REL = Path(".agents") / "plugins" / "marketplace.json"
+# Codex documents ``policy.installation`` values AVAILABLE, INSTALLED_BY_DEFAULT
+# and NOT_AVAILABLE, and ``policy.authentication`` as install-time or first-use.
+# AVAILABLE lists the plugin without installing it unasked. These packages call
+# no authenticated service, so the documented example value is used.
+CODEX_POLICY = {"installation": "AVAILABLE", "authentication": "ON_INSTALL"}
+
 
 @dataclass(frozen=True)
 class PackageConfig:
@@ -125,6 +148,9 @@ class PackageConfig:
     """
 
     extra_manifest: Dict[str, object] = field(default_factory=dict)
+
+    category: str = "Developer Tools"
+    """Catalog category shown by marketplace clients (#1409)."""
 
 
 OPERATOR = PackageConfig(
@@ -293,6 +319,76 @@ def render_claude_code_manifest(config: PackageConfig, version: str) -> str:
         "description": config.description,
     }
     return json.dumps(manifest, indent=2) + "\n"
+
+
+def render_claude_marketplace(version: str) -> str:
+    """Render ``.claude-plugin/marketplace.json`` for Claude Code, deterministically."""
+    catalog = {
+        "name": MARKETPLACE_NAME,
+        "owner": {"name": MARKETPLACE_OWNER},
+        "metadata": {"description": MARKETPLACE_DESCRIPTION, "version": version},
+        "plugins": [
+            {
+                "name": config.name,
+                "source": f"./agent-plugin/{config.name}",
+                "description": config.description,
+                "version": version,
+                "category": config.category,
+            }
+            for config in PACKAGES
+        ],
+    }
+    return json.dumps(catalog, indent=2) + "\n"
+
+
+def render_codex_marketplace(version: str) -> str:
+    """Render ``.agents/plugins/marketplace.json`` for Codex, deterministically.
+
+    ``version`` is accepted for symmetry with the Claude renderer; Codex reads a
+    plugin's version from the plugin's own manifest, not from the catalog.
+    """
+    catalog = {
+        "name": MARKETPLACE_NAME,
+        "interface": {"displayName": MARKETPLACE_DISPLAY_NAME},
+        "plugins": [
+            {
+                "name": config.name,
+                "source": {"source": "local", "path": f"./agent-plugin/{config.name}"},
+                "policy": dict(CODEX_POLICY),
+                "category": config.category,
+            }
+            for config in PACKAGES
+        ],
+    }
+    return json.dumps(catalog, indent=2) + "\n"
+
+
+def catalog_targets(version: str) -> Dict[Path, str]:
+    """Every marketplace catalog and its expected bytes."""
+    root = PACKAGES_DIR.parent
+    return {
+        root / CLAUDE_MARKETPLACE_REL: render_claude_marketplace(version),
+        root / CODEX_MARKETPLACE_REL: render_codex_marketplace(version),
+    }
+
+
+def write_catalogs(version: str) -> None:
+    for path, text in catalog_targets(version).items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        print(f"  wrote {path.relative_to(PACKAGES_DIR.parent)}")
+
+
+def check_catalogs(version: str) -> List[str]:
+    """Problems with the committed catalogs; empty means they match the packages."""
+    problems: List[str] = []
+    for path, expected in catalog_targets(version).items():
+        rel = path.relative_to(PACKAGES_DIR.parent)
+        if not path.is_file():
+            problems.append(f"MISSING {rel}")
+        elif path.read_text(encoding="utf-8") != expected:
+            problems.append(f"CONTENT DIFFERS in {rel}")
+    return problems
 
 
 def render_manifest(config: PackageConfig, version: str) -> str:
@@ -993,6 +1089,7 @@ def run_build(
     for config in PACKAGES:
         build_package(config, version, PACKAGES_DIR)
         print(f"  built agent-plugin/{config.name}/ ({len(config.skills)} skill(s))")
+    write_catalogs(version)
     print(f"Built {len(PACKAGES)} agent plugin package(s) at version {version}")
     return 0
 
@@ -1016,6 +1113,7 @@ def _build_at_committed_pin() -> int:
     for config in PACKAGES:
         build_package(config, version, PACKAGES_DIR)
         print(f"  built agent-plugin/{config.name}/ ({len(config.skills)} skill(s))")
+    write_catalogs(version)
     print(
         f"Built {len(PACKAGES)} agent plugin package(s) at the committed version "
         f"{version} (pyproject.toml is at {package_version()}; the pin was not moved)"
@@ -1067,6 +1165,10 @@ def run_check(*, require_current_pin: bool = False) -> int:
                 all_problems[config.name] = check_package(config, version, scratch)
             except Exception as exc:  # keep going: the other package still gets checked
                 all_problems[config.name] = [f"check raised: {exc}"]
+
+    catalog_problems = check_catalogs(version)
+    if catalog_problems:
+        all_problems["marketplace catalogs"] = catalog_problems
 
     ordering = pin_ordering_problems(version, current_version)
     if ordering:
