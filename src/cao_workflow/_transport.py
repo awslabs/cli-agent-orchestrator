@@ -5,8 +5,8 @@ key and the shared step core).
 
 stdlib ``urllib`` only, no third-party HTTP client, no connection pooling, no
 retry. The socket timeout carries a fixed slack over the caller's/base
-timeout so the shim's own socket never races the server's legitimate
-long-poll response.
+timeout. Opt-in user waits add their cumulative cap to that budget, or use
+an unlimited socket timeout when the caller leaves user waiting uncapped.
 """
 
 from __future__ import annotations
@@ -37,7 +37,10 @@ def _post(url: str, body: dict, timeout: "float | None" = None) -> _Response:
     ``ShimTransportError``.
     """
     base_timeout = timeout if timeout is not None else _BASE_TIMEOUT_DEFAULT
-    socket_timeout = base_timeout + _TRANSPORT_SLACK
+    socket_timeout: float | None = base_timeout + _TRANSPORT_SLACK
+    if body.get("timeout_excludes_waiting"):
+        max_waiting = body.get("max_waiting")
+        socket_timeout = None if max_waiting is None else socket_timeout + max_waiting
     data = json.dumps(body).encode("utf-8")
     request = Request(
         url,

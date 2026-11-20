@@ -94,7 +94,7 @@ _TIMEOUT_PRECISION = 6
 
 @dataclass(frozen=True)
 class StepCallFields:
-    """The execution-affecting inputs to one agent step — ten hashed components (BR-1).
+    """The execution-affecting inputs to one agent step — ten base components plus the opt-in waiting policy (BR-1).
 
     NEVER PERSISTED. It exists only to be hashed; the *hash* is persisted, the fields are not.
     This is the type's most load-bearing property and it is a security property, not an

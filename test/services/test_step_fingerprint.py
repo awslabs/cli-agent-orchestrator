@@ -142,10 +142,12 @@ def test_field_list_includes_waiting_policy_and_excludes_non_execution_fields():
 
     It also carries BR-6's second clause — the module exposes no parameter accepting a
     terminal id — and INV-5: ``provider``/``agent``/``prompt`` (the legacy three-field scheme)
-    remain a strict subset of the ten, so no caller loses coverage.
+    remain a strict subset of the execution fields, so no caller loses coverage.
 
     The waiting policy extends the preimage only when opted in. Default-policy
     calls still match previously recorded fingerprints.
+    This test deliberately fails when a field is added. New components must
+    preserve the default-policy preimage or introduce a new scheme prefix.
     """
     assert tuple(f.name for f in dataclass_fields(StepCallFields)) == (
         "provider",

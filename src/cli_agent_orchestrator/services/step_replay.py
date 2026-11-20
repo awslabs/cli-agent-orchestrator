@@ -18,7 +18,7 @@ code by renumbering seven rules is not a trade this module makes.
 
 THE ORDER OF THE TEN RULES IS THE CONTRACT, NOT A PRESENTATION OF IT (BR-1). First match
 wins, and reordering them changes behaviour with NO SIGNAL — the same class of silent break as
-reordering ``step_fingerprint.compute``'s ten components. Three orderings are load-bearing, and
+reordering ``step_fingerprint.compute``'s components. Three orderings are load-bearing, and
 each will look like a tidying opportunity to a later reader:
 
 * **Rule 1 admits ``rerun_authorized``, and rule 2 guards on ``running`` EXACTLY — never on
@@ -162,7 +162,7 @@ class ReplayDecision:
       English to recover a value that already exists as a closed enum (BR-8/TD-3).
 
     THERE IS DELIBERATELY NO ``diverged_fields`` (BR-7/TD-3, ruled at this unit's Q1).
-    ``step_fingerprint.compute`` returns ONE digest over ten components and only the digest is
+    ``step_fingerprint.compute`` returns ONE digest over the call components and only the digest is
     persisted, so nothing can populate a per-field list; an always-empty one reads as "no
     fields diverged" when the truth is "we cannot tell" — the opposite conclusion. This is the
     same field, by name, that ``workflow-errors`` deleted from both exception types on

@@ -653,7 +653,14 @@ class RunStepRequest(BaseModel):
         default=True,
         description="Delete the created terminal after the step (ignored when reusing)",
     )
-    timeout: float = Field(default=600.0, description="Max seconds to wait for completion", gt=0)
+    timeout: float = Field(
+        default=600.0,
+        description=(
+            "Completion budget in seconds; excludes user-answer waiting when "
+            "timeout_excludes_waiting is true"
+        ),
+        gt=0,
+    )
     working_directory: Optional[str] = Field(
         default=None, description="Working directory for a freshly created terminal"
     )
@@ -837,7 +844,11 @@ class RunStepRequest(BaseModel):
     delegation_message: Optional[str] = Field(default=None, min_length=1)
     orchestration_type: Optional[Literal["handoff"]] = None
     timeout_excludes_waiting: bool = Field(
-        default=False, description="Pause the completion timeout while awaiting a user answer"
+        default=False,
+        description=(
+            "Pause the completion timeout while awaiting a user answer; "
+            "waiting is unlimited unless max_waiting is set"
+        ),
     )
     max_waiting: Optional[float] = Field(
         default=None,
@@ -5881,10 +5892,11 @@ async def _record_job_state(job_id: Optional[str], state: str, **fields: Any) ->
         "Failure contract: a non-2xx body is a structured object "
         "`{message, kind, terminal_id}`. **`kind` is authoritative** — "
         '`kind="error"` means the worker CRASHED (terminal reached ERROR), '
-        '`kind="timeout"` means it RAN LONG, and `kind="provider_error"` means '
+        '`kind="timeout"` means the completion budget or cumulative user-wait cap '
+        'was reached, and `kind="provider_error"` means '
         "the provider refused in band (the CLI exited cleanly with an error "
         "payload sitting where the answer belongs). The HTTP status mirrors "
-        "`kind` (502 = crashed or provider refusal, 504 = ran long) for "
+        "`kind` (502 = crashed or provider refusal, 504 = completion or waiting timeout) for "
         "transport-layer consumers, but a caller MUST branch on `kind`, not the "
         "status code. `terminal_id` names the live terminal (read it as a field; "
         "never regex-scrape `message`)."
@@ -5916,7 +5928,7 @@ async def run_step(
       "terminal_id": str|None}``.
     - ``kind`` is the AUTHORITATIVE discriminator. ``kind="error"`` => the worker
       CRASHED (the terminal reached ``TerminalStatus.ERROR``); ``kind="timeout"``
-      => the worker RAN LONG (readiness/completion wait elapsed);
+      => the readiness, completion, or cumulative user-wait budget elapsed;
       ``kind="provider_error"`` => the provider refused in band (issue #638: a
       model/API error printed where the model's answer belongs). The HTTP status
       is derived FROM ``kind`` (``error``/``provider_error`` -> 502 Bad Gateway,
