@@ -20,12 +20,15 @@ own herdr session) and never touches a developer's live server.
 
 Enable with::
 
-    CAO_TEST_REAL_HOME=1 CAO_HERDR_LIVE=1 [CAO_HERDR_LIVE_PROFILE=worker-sonnet] \\
+    CAO_TEST_REAL_HOME=1 CAO_HERDR_LIVE=1 \\
+    CAO_HERDR_LIVE_PROFILE=<profile> CAO_HERDR_LIVE_PROVIDER=<provider> \\
         uv run pytest test/backends/test_herdr_live_smoke.py
 
-``CAO_TEST_REAL_HOME=1`` is required because the harness decides HOME isolation
-at import; without it the agent profile resolves inside an empty isolated home
-and the test skips.
+The profile and provider have no default: a profile that falls back to the
+default provider may not be herdr-detectable, and the smoke would then report a
+false regression (herdr sends no event for an agent it does not recognise).
+``CAO_TEST_REAL_HOME=1`` keeps the whole run under the real HOME so the agent
+CLI stays logged in.
 """
 
 from __future__ import annotations
@@ -44,11 +47,13 @@ from pathlib import Path
 import pytest
 import requests
 
+from cli_agent_orchestrator.services import herdr_inbox_service as his
+
 pytestmark = [
-    # Real HOME: the worker needs the agent CLI's real login, and the profile
-    # store lives under the real ~/.aws. The suite isolates HOME by default
-    # (test/conftest.py), so without this the agent is logged out and the
-    # profile is absent. CAO_HOME_DIR stays redirected, so the live DB is safe.
+    # Real HOME at RUN time: the worker needs the agent CLI's real login. The
+    # marker does not affect import-time paths (test/conftest.py:81-82), so the
+    # profile store path is resolved inside the fixture, at run time.
+    # CAO_HOME_DIR stays redirected, so the live DB is safe.
     pytest.mark.real_home,
     # The pytest process runs under real HOME (above) so MEMORY_BASE_DIR
     # resolves there; acknowledge it explicitly. This test does no memory I/O in
@@ -60,10 +65,21 @@ pytestmark = [
         reason="live herdr smoke is opt-in; set CAO_HERDR_LIVE=1 with a real agent available",
     ),
     pytest.mark.skipif(shutil.which("herdr") is None, reason="herdr binary not installed"),
+    # No personal defaults: the profile must name a herdr-detectable agent and
+    # the provider must be sent explicitly, or the server's kiro_cli fallback
+    # can produce a worker herdr cannot see (false "#1378 regression").
+    pytest.mark.skipif(
+        not os.environ.get("CAO_HERDR_LIVE_PROFILE"),
+        reason="set CAO_HERDR_LIVE_PROFILE to a profile backed by a herdr-detectable agent",
+    ),
+    pytest.mark.skipif(
+        not os.environ.get("CAO_HERDR_LIVE_PROVIDER"),
+        reason="set CAO_HERDR_LIVE_PROVIDER (e.g. claude_code) so the worker is not the kiro_cli default",
+    ),
 ]
 
-_PROFILE = os.environ.get("CAO_HERDR_LIVE_PROFILE", "worker-sonnet")
-_REAL_CAO_HOME = Path.home() / ".aws" / "cli-agent-orchestrator"
+_PROFILE = os.environ.get("CAO_HERDR_LIVE_PROFILE", "")
+_PROVIDER = os.environ.get("CAO_HERDR_LIVE_PROVIDER", "")
 # Reconcile eligibility is INBOX_RECONCILE_INTERVAL + grace (~60s); the event
 # path must deliver well inside that. The trigger tag is the real proof, not the
 # timing, but bound the wait so a dead event path fails fast rather than hanging.
@@ -98,13 +114,16 @@ def herdr_server(tmp_path: Path):
     ``CAO_HOME_DIR`` and the herdr session so nothing touches the developer's
     live server (the hazard called out in the herdr testing notes).
     """
-    if not (_REAL_CAO_HOME / "agent-store" / f"{_PROFILE}.md").exists():
-        pytest.skip(f"agent profile {_PROFILE!r} not found in {_REAL_CAO_HOME}/agent-store")
+    # Run-time resolution: under the real_home marker, import-time constants
+    # still point at the fake home. No existence precheck — the server reads
+    # provider folders, extra folders and built-in profiles too, so only its
+    # own "Agent profile not found" answer decides (mapped to a skip below).
+    real_cao_home = Path.home() / ".aws" / "cli-agent-orchestrator"
 
     cao_home = tmp_path / "cao-home"
     cao_home.mkdir(parents=True)
     for sub in ("agent-store", "agent-context"):
-        src = _REAL_CAO_HOME / sub
+        src = real_cao_home / sub
         if src.is_dir():
             shutil.copytree(src, cao_home / sub)
 
@@ -122,6 +141,9 @@ def herdr_server(tmp_path: Path):
             # path is never exercised (and the delivered line carries no trigger).
             "CAO_EAGER_INBOX_DELIVERY": "false",
             "OTEL_SDK_DISABLED": "true",
+            # _delivered_line reads an INFO record; a WARNING/ERROR level from
+            # the developer's shell would hide it and fake a delivery failure.
+            "CAO_LOG_LEVEL": "INFO",
             "PYTHONUNBUFFERED": "1",
         }
     )
@@ -175,10 +197,19 @@ def test_inbox_message_delivers_via_the_event_path_not_reconcile(herdr_server):
     end-to-end — the exact behaviour #1378 broke silently."""
     url, cao_home, _ = herdr_server
 
-    resp = requests.post(f"{url}/sessions", params={"agent_profile": _PROFILE}, timeout=120)
+    resp = requests.post(
+        f"{url}/sessions",
+        params={"agent_profile": _PROFILE, "provider": _PROVIDER},
+        timeout=120,
+    )
     if resp.status_code >= 500 and any(
         m in resp.text.lower()
-        for m in ("initialization timed out", "not installed", "command not found")
+        for m in (
+            "initialization timed out",
+            "not installed",
+            "command not found",
+            "agent profile not found",
+        )
     ):
         pytest.skip(f"agent profile {_PROFILE!r} not usable on this host: {resp.text[:200]}")
     assert resp.status_code in (
@@ -201,6 +232,13 @@ def test_inbox_message_delivers_via_the_event_path_not_reconcile(herdr_server):
         time.sleep(1.0)
     else:
         pytest.skip("worker never reached a ready state within 90s; agent too slow to boot here")
+
+    # The registration reconnect runs the settled-pane sweep, and for a pane
+    # that is already idle it arms a settle-retry loop that tags deliveries
+    # herdr-settle WITHOUT a live event (and while that loop runs, the arm from
+    # a real event is dropped). Let that loop lapse before the task starts, so
+    # a herdr-settle delivery below can only come from an event-armed loop.
+    time.sleep((his._SETTLE_RETRY_TICKS + 2) * his._SETTLE_RETRY_INTERVAL)
 
     # Give the warm worker a task so it is busy, then queue an inbox message
     # while it is still working — the case that only the event path delivers
@@ -257,6 +295,7 @@ def test_inbox_message_delivers_via_the_event_path_not_reconcile(herdr_server):
             f"a #1378 regression). Line:\n{line}"
         )
     assert "trigger: herdr-event" in line or "trigger: herdr-settle" in line, (
-        "message was delivered, but NOT via the herdr event path — it fell back "
-        f"to the reconciliation sweep, which is the #1378 regression. Line:\n{line}"
+        "message was delivered, but NOT via the herdr event path — a delivery "
+        "carrying any other trigger means the event path did not fire, which is "
+        f"the #1378 regression class. Line:\n{line}"
     )
