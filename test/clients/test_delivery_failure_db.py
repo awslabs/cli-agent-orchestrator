@@ -30,6 +30,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.models.delegation import DelegationEdge, EdgeSource, EdgeState
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 
 @pytest.fixture
@@ -65,7 +66,7 @@ _LEGACY_INBOX_DDL = (
 
 
 def _columns(path, table):
-    with sqlite3.connect(path) as conn:
+    with closing_transaction(sqlite3.connect(path)) as conn:
         return [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
 
 
@@ -73,7 +74,7 @@ class TestMigration:
     """Design "Migration Plan": PRAGMA-gated, additive, idempotent."""
 
     def _legacy(self, path):
-        with sqlite3.connect(path) as conn:
+        with closing_transaction(sqlite3.connect(path)) as conn:
             conn.execute(_LEGACY_EDGES_DDL)
             conn.execute(_LEGACY_INBOX_DDL)
             conn.execute(
@@ -100,7 +101,7 @@ class TestMigration:
         inbox_cols = _columns(path, "inbox")
         assert inbox_cols.count("delivery_attempts") == 1
         assert inbox_cols.count("last_error") == 1
-        with sqlite3.connect(path) as conn:
+        with closing_transaction(sqlite3.connect(path)) as conn:
             inbox_row = conn.execute("SELECT delivery_attempts, last_error FROM inbox").fetchone()
             edge_row = conn.execute(
                 "SELECT state, reply_message_id FROM delegation_edges"
@@ -112,7 +113,7 @@ class TestMigration:
         # Arrange: a DB written by this version, with values in the new columns.
         path = tmp_path / "current.db"
         self._legacy(path)
-        with sqlite3.connect(path) as conn:
+        with closing_transaction(sqlite3.connect(path)) as conn:
             conn.execute("ALTER TABLE delegation_edges ADD COLUMN reply_message_id INTEGER")
             conn.execute(
                 "ALTER TABLE inbox ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0"
@@ -128,7 +129,7 @@ class TestMigration:
 
         # Assert
         assert (_columns(path, "inbox"), _columns(path, "delegation_edges")) == before
-        with sqlite3.connect(path) as conn:
+        with closing_transaction(sqlite3.connect(path)) as conn:
             inbox_row = conn.execute("SELECT delivery_attempts, last_error FROM inbox").fetchone()
             edge_row = conn.execute("SELECT reply_message_id FROM delegation_edges").fetchone()
         assert inbox_row == (2, "lost read")
@@ -140,7 +141,7 @@ class TestMigration:
         # Arrange: a crash between the two inbox ALTERs left one of them applied.
         path = tmp_path / "partial.db"
         self._legacy(path)
-        with sqlite3.connect(path) as conn:
+        with closing_transaction(sqlite3.connect(path)) as conn:
             conn.execute(
                 "ALTER TABLE inbox ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0"
             )
@@ -165,14 +166,14 @@ class TestMigration:
         database._migrate_delivery_failure_columns()
 
         # Assert
-        with sqlite3.connect(path) as conn:
+        with closing_transaction(sqlite3.connect(path)) as conn:
             tables = conn.execute("SELECT name FROM sqlite_master").fetchall()
         assert tables == []
 
     def test_a_table_that_exists_is_migrated_when_the_other_does_not(self, tmp_path, monkeypatch):
         # Arrange
         path = tmp_path / "edges_only.db"
-        with sqlite3.connect(path) as conn:
+        with closing_transaction(sqlite3.connect(path)) as conn:
             conn.execute(_LEGACY_EDGES_DDL)
         monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
 
@@ -181,7 +182,7 @@ class TestMigration:
 
         # Assert
         assert "reply_message_id" in _columns(path, "delegation_edges")
-        with sqlite3.connect(path) as conn:
+        with closing_transaction(sqlite3.connect(path)) as conn:
             names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master")]
         assert "inbox" not in names, "the migration must not create a missing table"
 
