@@ -13,6 +13,7 @@ import pytest
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.terminal_service import (
     _memory_injected_terminals,
+    _memory_start_prompt,
     inject_memory_context,
 )
 
@@ -120,6 +121,36 @@ class TestInjectMemoryContextFunction:
         assert "term-cleanup" not in _memory_injected_terminals
 
 
+class TestInteractiveStartPrompt:
+    """Interactive prompt providers use the launch-time memory seam."""
+
+    def setup_method(self):
+        _memory_injected_terminals.clear()
+
+    @patch(
+        "cli_agent_orchestrator.services.settings_service.is_memory_enabled",
+        return_value=False,
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.memory_context_for_terminal")
+    def test_kill_switch_skips_start_memory(self, mock_context, _mock_enabled):
+        assert _memory_start_prompt("skills", "term-off") == "skills"
+        mock_context.assert_not_called()
+        assert "term-off" not in _memory_injected_terminals
+
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
+    @patch("cli_agent_orchestrator.services.terminal_service.memory_context_for_terminal")
+    def test_context_manager_preserves_task_aware_first_message(
+        self, mock_context, mock_service_cls
+    ):
+        mock_service = mock_service_cls.return_value
+        mock_service._get_terminal_context.return_value = {"session_name": "cao-session"}
+        mock_service._find_context_manager_terminal.return_value = {"id": "manager"}
+
+        assert _memory_start_prompt("skills", "term-curated") == "skills"
+        mock_context.assert_not_called()
+        assert "term-curated" not in _memory_injected_terminals
+
+
 class TestClaudeCodeInjection:
     """U8.4: Claude Code first message contains <cao-memory> block."""
 
@@ -132,6 +163,25 @@ class TestClaudeCodeInjection:
         mock_svc_cls.return_value.get_curated_memory_context.return_value = SAMPLE_MEMORY_CONTEXT
 
         injected = inject_memory_context(ORIGINAL_MESSAGE, "term-claude-001")
+
+        assert "<cao-memory>" in injected
+        assert "</cao-memory>" in injected
+        assert ORIGINAL_MESSAGE in injected
+        assert injected.index("<cao-memory>") < injected.index(ORIGINAL_MESSAGE)
+
+
+class TestCodexInjection:
+    """U8.4: Codex first message contains <cao-memory> block."""
+
+    def setup_method(self):
+        _memory_injected_terminals.clear()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
+    def test_codex_injection(self, mock_svc_cls):
+        """First message to Codex terminal should include <cao-memory> block."""
+        mock_svc_cls.return_value.get_curated_memory_context.return_value = SAMPLE_MEMORY_CONTEXT
+
+        injected = inject_memory_context(ORIGINAL_MESSAGE, "term-codex-001")
 
         assert "<cao-memory>" in injected
         assert "</cao-memory>" in injected
@@ -211,7 +261,7 @@ class TestConfigFilesNotMutated:
 
         context = self._store_and_get_context(tmp_path)
 
-        assert "<cao-memory>" in context
+        assert "<cao-memory " in context
         assert claude_md.read_text() == original
 
     def test_agents_md_not_mutated(self, tmp_path: Path):
@@ -223,7 +273,7 @@ class TestConfigFilesNotMutated:
 
         context = self._store_and_get_context(tmp_path)
 
-        assert "<cao-memory>" in context
+        assert "<cao-memory " in context
         assert agents_md.read_text() == original
 
     def test_kiro_steering_not_mutated(self, tmp_path: Path):
@@ -236,7 +286,7 @@ class TestConfigFilesNotMutated:
 
         context = self._store_and_get_context(tmp_path)
 
-        assert "<cao-memory>" in context
+        assert "<cao-memory " in context
         assert steering_md.read_text() == original
 
 
@@ -267,7 +317,7 @@ class TestMemoryContextGeneration:
         svc._get_terminal_context = lambda terminal_id: ctx
         context = svc.get_memory_context_for_terminal("term-001")
 
-        assert "<cao-memory>" in context
+        assert "<cao-memory " in context
         assert "</cao-memory>" in context
         assert "type-hints" in context
 

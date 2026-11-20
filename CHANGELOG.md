@@ -38,6 +38,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses unmarked access to a real-home memory directory and relocates memory
   for live-provider test runs.
 - **FIFO output readers continue working when a busy server has allocated a descriptor above 1023** (#1350).
+- **Provider memory file writes now default off** (#1335). CAO delivers each terminal's
+  memory without writing it into project files that can be committed. Interactive
+  `cao launch` sessions using a runtime start-prompt provider — Claude Code, Codex,
+  Kimi CLI, Antigravity CLI, OMP, Grok CLI, MiniMax Code, or Qwen Code — receive it in that
+  prompt; orchestrated terminals retain task-aware first-message delivery. Set
+  `memory.injection.write_project_files=true` to opt back into the legacy provider-file
+  behavior. With `memory.enabled=false`, CAO does not inspect or clean up those files.
+
+- **Memory injection no longer leaves stale provider context or drops a scope behind one
+  long note** (#1329). Claude Code, Codex and Kiro provider files receive UTC-stamped
+  blocks, including an explicit empty block when no memories are selected. A launch whose
+  selected memory body is unchanged preserves the provider file byte-for-byte, including
+  its prior stamp, so tracked files do not gain stamp-only diffs. The v1 builder clips an
+  oversized first note, continues to later notes that fit, and follows recorded project
+  `cwd_hash` aliases. `memory.injection.clear_on_empty` and
+  `memory.injection.v1_fixes` both default to `true`; setting either to `false` restores
+  its legacy behavior.
 - **Docs: the retrospector profile, the `store_lesson` description, the self-learning guides and the `cao-learning` skill no longer say lessons reach future sessions or can be recalled by a curator or supervisor, or that they are injected into new sessions** (#1335, #1329).
   A lesson is found only by the owning agent's `memory_recall` or a promoted `## Learned Patterns` block.
   A supervisor's recall returns only lessons under its own profile, so it tells the worker to recall.
