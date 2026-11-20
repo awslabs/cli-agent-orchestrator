@@ -2,7 +2,8 @@
 
 `cao remote` stores local registrations for experimental Remote CAO boxes and
 checks laptop and remote prerequisites. It never creates cloud resources,
-starts a session, or changes a registered box during a check.
+or changes a registered box during a check. The SSH stage uses the user's SSH
+configuration, which can open SSM sessions (up to three during a full check).
 
 ```bash
 cao remote add dev-box \
@@ -25,4 +26,4 @@ It checks only: installed command versions; the selected AWS profile and
 identity; EC2 and SSM status; local SSH key/config presence; and, after those
 prerequisites pass, SSH connectivity and the box's version/health endpoint.
 Its AWS and SSH calls are read-only. It does not run `aws sso login`,
-`ssh-keygen`, `aws ssm start-session`, or any remote setup command.
+`ssh-keygen`, or any remote setup command directly.

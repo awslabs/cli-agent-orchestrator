@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import configparser
+import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -33,15 +34,43 @@ def _version(result: RunResult) -> str:
     )
 
 
-def _has_access_key(profile: str, aws_dir: Path) -> bool:
-    parser = configparser.RawConfigParser()
-    for filename in (aws_dir / "credentials", aws_dir / "config"):
+def _has_access_key(profile: str, aws_dir: Path) -> tuple[bool, Path | None]:
+    filenames = (
+        Path(os.environ.get("AWS_SHARED_CREDENTIALS_FILE", aws_dir / "credentials")),
+        Path(os.environ.get("AWS_CONFIG_FILE", aws_dir / "config")),
+    )
+    for filename in filenames:
+        parser = configparser.RawConfigParser()
         try:
             parser.read(filename, encoding="utf-8")
         except OSError:
             continue
-    sections = (profile, f"profile {profile}")
-    return any(parser.has_option(section, "aws_access_key_id") for section in sections)
+        except configparser.Error:
+            return False, filename
+        sections = (profile, f"profile {profile}")
+        if any(parser.has_option(section, "aws_access_key_id") for section in sections):
+            return True, None
+    return False, None
+
+
+def _ssh_options(result: RunResult) -> dict[str, list[str]]:
+    options: dict[str, list[str]] = {}
+    if not _ok(result):
+        return options
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition(" ")
+        if separator:
+            options.setdefault(key.lower(), []).append(value)
+    return options
+
+
+def _identity_path(value: str, home: Path) -> Path:
+    return home / value[2:] if value.startswith("~/") else Path(value)
+
+
+def _tmux_supported(result: RunResult) -> bool:
+    match = re.fullmatch(r"tmux (?:next-)?(\d+)\.(\d+)[a-z]*", _version(result))
+    return _ok(result) and match is not None and tuple(map(int, match.groups())) >= (3, 3)
 
 
 def check_box(
@@ -90,12 +119,16 @@ def check_box(
             box.aws_profile if exists else f"run aws configure sso --profile {box.aws_profile}",
         )
     )
-    has_key = _has_access_key(box.aws_profile, home / ".aws")
+    has_key, invalid_aws_file = _has_access_key(box.aws_profile, home / ".aws")
     checks.append(
         Check(
-            "FIX" if has_key else "OK",
+            "FIX" if has_key or invalid_aws_file else "OK",
             "aws-credentials",
-            "has aws_access_key_id" if has_key else "no long-lived keys",
+            (
+                f"repair {invalid_aws_file}"
+                if invalid_aws_file
+                else "has aws_access_key_id" if has_key else "no long-lived keys"
+            ),
         )
     )
     login = runner.run(["aws", "sts", "get-caller-identity", "--profile", box.aws_profile])
@@ -152,31 +185,22 @@ def check_box(
     checks.append(
         Check("OK" if online else "FIX", "ssm", "Online" if online else "SSM must be Online")
     )
-    key = home / ".ssh" / f"cao-{box.name}_ed25519"
-    config = home / ".ssh" / "config"
-    key_exists = key.exists()
+    ssh_options = _ssh_options(runner.run(["ssh", "-G", f"cao-{box.name}"]))
+    identity_files = [_identity_path(value, home) for value in ssh_options.get("identityfile", [])]
+    key_exists = any(path.exists() for path in identity_files)
     checks.append(
         Check(
             "OK" if key_exists else "FIX",
             "ssh-key",
-            "present" if key_exists else f"create {key.name}",
+            "present" if key_exists else "add an IdentityFile for the box",
         )
     )
-    try:
-        configured = (
-            re.search(
-                rf"(?m)^Host\s+cao-{re.escape(box.name)}(?:\s|$)",
-                config.read_text(encoding="utf-8"),
-            )
-            is not None
-        )
-    except OSError:
-        configured = False
+    configured = ssh_options.get("hostname") == [box.instance_id]
     checks.append(
         Check(
             "OK" if configured else "FIX",
             "ssh-config",
-            "managed host exists" if configured else f"add Host cao-{box.name}",
+            "resolves to the box instance" if configured else f"configure Host cao-{box.name}",
         )
     )
     prerequisites = all(check.status == "OK" for check in checks)
@@ -200,8 +224,9 @@ def check_box(
         checks.append(Check("SKIP", "cao-server /health", "needs SSH first"))
         return checks
     if box.mode == "herdr":
+        # herdr is in the box user's ~/.local/bin, which only a login shell puts on PATH.
         remote_herdr = runner.run(
-            ["ssh", "-o", "BatchMode=yes", f"cao-{box.name}", "herdr", "--version"]
+            ["ssh", "-o", "BatchMode=yes", f"cao-{box.name}", "bash -lc 'herdr --version'"]
         )
         matching = _ok(remote_herdr) and _version(remote_herdr) == _version(laptop_herdr)
         checks.append(
@@ -213,7 +238,7 @@ def check_box(
         )
     else:
         tmux = runner.run(["ssh", "-o", "BatchMode=yes", f"cao-{box.name}", "tmux", "-V"])
-        supported = _ok(tmux) and re.search(r"tmux 3\.(?:[3-9]|\d{2,})", _version(tmux)) is not None
+        supported = _tmux_supported(tmux)
         checks.append(
             Check(
                 "OK" if supported else "FIX",

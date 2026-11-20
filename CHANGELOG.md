@@ -1,9 +1,5 @@
 # Changelog
 
-## Unreleased
-
-- Add experimental `cao remote` local box registry and read-only prerequisite checks.
-
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
@@ -28,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider's post-turn flush-wait, offloaded off the event loop and stopping as soon as the
   message lands.
 
+- Add experimental `cao remote` local box registry and read-only prerequisite checks.
 - **Memory inspection and fixture hygiene are safer by default** (#1329).
   This resolves #861 Q3: CLI list/show and REST list/show no longer increment
   `access_count` unless `memory.non_accessing_inspection=false`; MCP recall

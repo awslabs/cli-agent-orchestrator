@@ -14,6 +14,7 @@ from cli_agent_orchestrator.constants import CAO_HOME_DIR
 NAME_RE = re.compile(r"^[a-z0-9-]{1,32}$")
 INSTANCE_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
 REGION_RE = re.compile(r"^[a-z]{2}(?:-gov)?-[a-z]+-\d+$")
+USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 
 class RemoteConfigError(ValueError):
@@ -38,10 +39,14 @@ class RemoteBox:
             raise RemoteConfigError("region must look like us-east-1")
         if not self.aws_profile:
             raise RemoteConfigError("profile must not be empty")
+        if any(character.isspace() or ord(character) < 32 for character in self.aws_profile):
+            raise RemoteConfigError("profile must not contain control characters or whitespace")
         if self.mode not in {"herdr", "tmux"}:
             raise RemoteConfigError("mode must be herdr or tmux")
         if not self.user:
             object.__setattr__(self, "user", f"cao-{self.mode}")
+        elif not USER_RE.fullmatch(self.user):
+            raise RemoteConfigError("user must match [a-z_][a-z0-9_-]{0,31}")
 
 
 def registry_dir() -> Path:
@@ -92,11 +97,13 @@ def load(name: str) -> RemoteBox:
     target = path_for(name)
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise TypeError("a registration must be a JSON object")
         data["aws_profile"] = data.pop("profile")
         return RemoteBox(**data)
     except FileNotFoundError as exc:
         raise RemoteConfigError(f"remote box '{name}' is not registered") from exc
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (KeyError, OSError, TypeError, ValueError) as exc:
         raise RemoteConfigError(f"remote box '{name}' has invalid configuration") from exc
 
 
