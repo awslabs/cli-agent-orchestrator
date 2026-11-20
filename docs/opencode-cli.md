@@ -302,7 +302,7 @@ it from the agent's profile rather than denying it here. Reinstalling an agent w
 longer declares `mcpServers` withdraws CAO's grants for it, and drops the
 `agent.<agent_id>` entry entirely only when nothing but those grants was in it.
 
-`CAO_TERMINAL_ID` is **not** written to `opencode.json`. OpenCode spawns MCP subprocesses that inherit the tmux window's environment, so the terminal ID propagates naturally — the same mechanism Kiro uses.
+`CAO_TERMINAL_ID` is **not** written to `opencode.json`. OpenCode spawns MCP subprocesses that inherit the tmux window's environment, so the terminal ID propagates naturally — the same mechanism Kiro uses. That includes a value a profile or an agent plugin declares in a server's `env`: `cao install` drops it and logs a warning, for both providers (#1062). OpenCode applies an entry's `environment` on top of the inherited one, so a declared value would otherwise start the server under another terminal's identity, and the CAO MCP gates authorize on it. Every other `env` value is written as declared.
 
 ## End-to-End Testing
 

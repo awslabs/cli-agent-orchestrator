@@ -71,6 +71,7 @@ from cli_agent_orchestrator.providers.base import (
 from cli_agent_orchestrator.providers.qwen_output import QwenOutput
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.mcp_resolution import forward_terminal_identity
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -300,7 +301,9 @@ class QwenCliProvider(BaseProvider):
         ``_tmp_paths`` and removed on cleanup) so concurrent terminals never
         race on a shared config. ``CAO_TERMINAL_ID`` is forwarded into each
         server's ``env`` so cao-mcp-server can resolve the current terminal for
-        handoff / assign.
+        handoff / assign -- through the shared helper, so a profile that tried
+        to pin one is LOGGED rather than silently replaced, and every provider's
+        identity write has one shape (#1062).
         """
         servers: dict = {}
         for server_name, server_config in mcp_servers.items():
@@ -310,10 +313,9 @@ class QwenCliProvider(BaseProvider):
                 cfg = server_config.model_dump(exclude_none=True)
             entry = {key: value for key, value in cfg.items() if value is not None}
             entry["args"] = cfg.get("args") or []
-            env = dict(cfg.get("env") or {})
-            env["CAO_TERMINAL_ID"] = self.terminal_id
-            entry["env"] = env
-            servers[server_name] = entry
+            servers[server_name] = forward_terminal_identity(
+                entry, self.terminal_id, server_name=server_name
+            )
 
         fd, path_str = tempfile.mkstemp(prefix="cao_qwen_mcp_", suffix=".json")
         path = Path(path_str)
