@@ -1600,7 +1600,15 @@ class TestReplayDuringInitializationBehaviour:
         mock_tmux.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
-        mock_get_terminal.return_value = dict(_PRIOR_ROW, id="test1234")
+        replay_observed_row = asyncio.Event()
+        replay_created = False
+
+        def get_row(terminal_id):
+            if replay_created:
+                replay_observed_row.set()
+            return dict(_PRIOR_ROW, id=terminal_id)
+
+        mock_get_terminal.side_effect = get_row
 
         committed = asyncio.Event()
         release_init = asyncio.Event()
@@ -1623,17 +1631,26 @@ class TestReplayDuringInitializationBehaviour:
         original = asyncio.ensure_future(
             create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
         )
-        await asyncio.wait_for(committed.wait(), timeout=2)
+        await asyncio.wait_for(committed.wait(), timeout=30)
 
         replay = asyncio.ensure_future(
             create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
         )
-        await asyncio.sleep(0.1)
+        replay_created = True
+        await asyncio.wait_for(replay_observed_row.wait(), timeout=30)
         replay_returned_early = replay.done()
 
         release_init.set()
-        await asyncio.wait_for(original, timeout=2)
-        result = await asyncio.wait_for(replay, timeout=2)
+        try:
+            async with asyncio.timeout(30):
+                await original
+        except TimeoutError:
+            pytest.fail("original create did not finish within 30 seconds")
+        try:
+            async with asyncio.timeout(30):
+                result = await replay
+        except TimeoutError:
+            pytest.fail("replay create did not finish within 30 seconds")
 
         assert not replay_returned_early, "replay returned while the provider was initializing"
         assert result.id == "test1234"
@@ -1673,7 +1690,15 @@ class TestReplayDuringInitializationBehaviour:
         mock_tmux.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
-        mock_get_terminal.return_value = dict(_PRIOR_ROW, id="test1234")
+        replay_observed_row = asyncio.Event()
+        replay_created = False
+
+        def get_row(terminal_id):
+            if replay_created:
+                replay_observed_row.set()
+            return dict(_PRIOR_ROW, id=terminal_id)
+
+        mock_get_terminal.side_effect = get_row
 
         committed = asyncio.Event()
         release_init = asyncio.Event()
@@ -1694,20 +1719,34 @@ class TestReplayDuringInitializationBehaviour:
         original = asyncio.ensure_future(
             create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
         )
-        await asyncio.wait_for(committed.wait(), timeout=2)
+        await asyncio.wait_for(committed.wait(), timeout=30)
         replay = asyncio.ensure_future(
             create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
         )
-        await asyncio.sleep(0.1)
+        replay_created = True
+        await asyncio.wait_for(replay_observed_row.wait(), timeout=30)
         assert not replay.done()
 
         release_init.set()
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(original, timeout=2)
+        try:
+            async with asyncio.timeout(30):
+                with pytest.raises(
+                    TimeoutError,
+                    match="Antigravity CLI initialization timed out after 180.0 seconds",
+                ):
+                    await original
+        except TimeoutError:
+            pytest.fail("original create did not finish within 30 seconds")
         # The replay gets the original's failure as its own distinct error, and
         # no second provider is started for the key.
-        with pytest.raises(terminal_service.IdempotentCreateFailed, match="timed out after 180"):
-            await asyncio.wait_for(replay, timeout=2)
+        try:
+            async with asyncio.timeout(30):
+                with pytest.raises(
+                    terminal_service.IdempotentCreateFailed, match="timed out after 180"
+                ):
+                    await replay
+        except TimeoutError:
+            pytest.fail("replay create did not finish within 30 seconds")
         mock_provider_manager.create_provider.assert_called_once()
 
     @pytest.mark.asyncio

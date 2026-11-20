@@ -102,12 +102,13 @@ a single-project dependency update does not clear findings in other graphs.
 
 ## CI
 
-Three jobs in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) cover this
+Four jobs in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) cover this
 package:
 
 - **CAO MCP Apps** — install → typecheck → unit tests with coverage → `build:all`
-  → JIT scan → bundle-size budget → HTTP-only guard → backend coverage →
-  **coverage ratchet**.
+  → JIT scan → bundle-size budget → HTTP-only guard.
+- **Coverage ratchet** — reads the Unit Tests (3.12) coverage report and the
+  frontend coverage summary.
 - **CAO MCP Apps E2E (Playwright)** — installs Chromium and runs the E2E specs.
 - **Dependency Security** — audits all locked graphs, including development
   dependencies and unfixed advisories, and independently verifies the installed

@@ -24,6 +24,7 @@ from test.e2e.conftest import (
     get_terminal_status,
 )
 
+import psutil
 import pytest
 import requests
 
@@ -188,6 +189,24 @@ def _run_skill_injection_test(provider: str, agent_profile: str):
             )
             payload = Path(match.group(1)).read_text(encoding="utf-8")
             source = f"OMP context file ({match.group(1)})"
+        elif provider == "qwen_cli":
+            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+            resp.raise_for_status()
+            target = f"{actual_session}:{resp.json()['name']}"
+            pid = subprocess.check_output(
+                ["tmux", "display-message", "-p", "-t", target, "#{pane_pid}"], text=True
+            ).strip()
+            root = psutil.Process(int(pid))
+            payload = ""
+            for process in [root] + root.children(recursive=True):
+                try:
+                    argv = process.cmdline()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+                if "--append-system-prompt" in argv:
+                    payload = argv[argv.index("--append-system-prompt") + 1]
+                    break
+            source = "live Qwen --append-system-prompt argument"
         elif provider == "grok_cli":
             # Grok's rules payload is larger than the configured tmux
             # scrollback in a 220-column e2e pane.  Read the running process
@@ -309,3 +328,12 @@ class TestSkillApi:
         resp = requests.get(f"{API_BASE_URL}/skills/../../../etc/passwd")
         # FastAPI will either return 400 (our validation) or 404 (path routing)
         assert resp.status_code in (400, 404, 422)
+
+
+@pytest.mark.e2e
+class TestQwenCliSkills:
+    """E2E skill injection tests for the Qwen Code provider."""
+
+    def test_skill_catalog_injected(self, require_qwen_cli):
+        """Qwen Code terminal command contains the injected skill catalog."""
+        _run_skill_injection_test(provider="qwen_cli", agent_profile="developer")
