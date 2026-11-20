@@ -85,7 +85,7 @@ def _delivered_line(home: Path, terminal_id: str) -> str | None:
     for log in sorted(logs.glob("cao_*.log")):
         with contextlib.suppress(OSError):
             for line in log.read_text(errors="replace").splitlines():
-                if f"Delivered" in line and terminal_id in line:
+                if "Delivered" in line and terminal_id in line:
                     return line
     return None
 
@@ -118,7 +118,9 @@ def herdr_server(tmp_path: Path):
             "CAO_API_PORT": str(port),
             "CAO_TERMINAL_BACKEND": "herdr",
             "CAO_HERDR_SESSION": session,
-            "CAO_A2A_DISABLED": "true",
+            # The immediate POST path must not deliver mid-turn, or the event
+            # path is never exercised (and the delivered line carries no trigger).
+            "CAO_EAGER_INBOX_DELIVERY": "false",
             "OTEL_SDK_DISABLED": "true",
             "PYTHONUNBUFFERED": "1",
         }
@@ -176,7 +178,7 @@ def test_inbox_message_delivers_via_the_event_path_not_reconcile(herdr_server):
     resp = requests.post(f"{url}/sessions", params={"agent_profile": _PROFILE}, timeout=120)
     if resp.status_code >= 500 and any(
         m in resp.text.lower()
-        for m in ("initialization timed out", "not installed", "not found", "command not found")
+        for m in ("initialization timed out", "not installed", "command not found")
     ):
         pytest.skip(f"agent profile {_PROFILE!r} not usable on this host: {resp.text[:200]}")
     assert resp.status_code in (
@@ -211,6 +213,22 @@ def test_inbox_message_delivers_via_the_event_path_not_reconcile(herdr_server):
         },
         timeout=30,
     )
+    # Wait until the worker has actually entered its turn before queuing. POST
+    # /input returns right after dispatch, and on herdr the status read can keep
+    # reporting the previous turn's COMPLETED for a while; an inbox message
+    # posted in that window is delivered by the immediate POST path (no trigger
+    # tag), and the event path is never exercised.
+    busy_end = time.monotonic() + 30.0
+    while time.monotonic() < busy_end:
+        st = requests.get(f"{url}/terminals/{terminal_id}", timeout=10)
+        if st.status_code == 200 and st.json().get("status") == "processing":
+            break
+        time.sleep(0.5)
+    else:
+        pytest.skip(
+            "worker never reported processing after the task dispatch; "
+            "cannot stage the busy-delivery case this smoke exists to measure"
+        )
     requests.post(
         f"{url}/terminals/{terminal_id}/inbox/messages",
         params={"message": "SMOKE-INBOX: reply with exactly ACK-SMOKE.", "sender_id": "smoke"},
@@ -232,6 +250,12 @@ def test_inbox_message_delivers_via_the_event_path_not_reconcile(herdr_server):
         "inbox message was never delivered within the deadline — event-driven "
         "delivery is broken (it would otherwise fall to the 30s reconcile sweep)"
     )
+    if "trigger:" not in line:
+        pytest.skip(
+            "the immediate POST-path delivery landed before the worker entered "
+            "its turn, so the event path was never exercised (setup race, not "
+            f"a #1378 regression). Line:\n{line}"
+        )
     assert "trigger: herdr-event" in line or "trigger: herdr-settle" in line, (
         "message was delivered, but NOT via the herdr event path — it fell back "
         f"to the reconciliation sweep, which is the #1378 regression. Line:\n{line}"
