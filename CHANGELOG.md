@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message lands.
 
 - Add experimental `cao remote` local box registry and read-only prerequisite checks.
+- **Workflow scripts with an f-string `step_id` whose own text breaks the step id rule are refused** (#1396).
+  A `step_id` must be 1-64 characters from `[A-Za-z0-9_-]`. `step_id=f"review:{name}"` used to pass
+  validation and then get a 422 from `POST /terminals/run-step` on every call, since no value of
+  `name` can remove the colon. The lint gate now flags it, so `workflow validate`, workflow create and
+  update, and `cao workflow run` all refuse such a script before any step starts. A stored workflow
+  written that way needs its ids changed. The fan-out example in the `cao-workflow` skill and in
+  `docs/workflows.md` used this shape and now builds a valid id from each file name.
 - **Memory inspection and fixture hygiene are safer by default** (#1329).
   This resolves #861 Q3: CLI list/show and REST list/show no longer increment
   `access_count` unless `memory.non_accessing_inspection=false`; MCP recall
@@ -39,6 +46,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses unmarked access to a real-home memory directory and relocates memory
   for live-provider test runs.
 - **FIFO output readers continue working when a busy server has allocated a descriptor above 1023** (#1350).
+- **Provider memory file writes now default off** (#1335). CAO delivers each terminal's
+  memory without writing it into project files that can be committed. Interactive
+  `cao launch` sessions using a runtime start-prompt provider — Claude Code, Codex,
+  Kimi CLI, Antigravity CLI, OMP, Grok CLI, MiniMax Code, or Qwen Code — receive it in that
+  prompt; orchestrated terminals retain task-aware first-message delivery. Set
+  `memory.injection.write_project_files=true` to opt back into the legacy provider-file
+  behavior. With `memory.enabled=false`, CAO does not inspect or clean up those files.
+
+- **Memory injection no longer leaves stale provider context or drops a scope behind one
+  long note** (#1329). Claude Code, Codex and Kiro provider files receive UTC-stamped
+  blocks, including an explicit empty block when no memories are selected. A launch whose
+  selected memory body is unchanged preserves the provider file byte-for-byte, including
+  its prior stamp, so tracked files do not gain stamp-only diffs. The v1 builder clips an
+  oversized first note, continues to later notes that fit, and follows recorded project
+  `cwd_hash` aliases. `memory.injection.clear_on_empty` and
+  `memory.injection.v1_fixes` both default to `true`; setting either to `false` restores
+  its legacy behavior.
 - **Docs: the retrospector profile, the `store_lesson` description, the self-learning guides and the `cao-learning` skill no longer say lessons reach future sessions or can be recalled by a curator or supervisor, or that they are injected into new sessions** (#1335, #1329).
   A lesson is found only by the owning agent's `memory_recall` or a promoted `## Learned Patterns` block.
   A supervisor's recall returns only lessons under its own profile, so it tells the worker to recall.

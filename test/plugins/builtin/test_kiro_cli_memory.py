@@ -1,5 +1,7 @@
 """Tests for the Kiro CLI memory-injection plugin."""
 
+import json
+import re
 import threading
 from pathlib import Path
 
@@ -12,6 +14,15 @@ from cli_agent_orchestrator.plugins.builtin.kiro_cli_memory import (
     KiroCliMemoryPlugin,
 )
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
+
+
+@pytest.fixture(autouse=True)
+def _enable_project_file_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory."
+        "memory_injection_write_project_files_enabled",
+        lambda: True,
+    )
 
 
 def _event(provider: str = "kiro_cli", terminal_id: str = "t1") -> PostCreateTerminalEvent:
@@ -85,8 +96,39 @@ async def test_writes_steering_file_on_post_create_terminal(
     target = tmp_path / STEERING_SUBDIR / MEMORY_FILENAME
     assert target.exists()
     content = target.read_text(encoding="utf-8")
-    assert "<cao-memory>" in content
+    assert "<cao-memory " in content
     assert "stan prefers pytest" in content
+    assert re.search(r'<cao-memory generated="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z">', content)
+
+
+@pytest.mark.asyncio
+async def test_same_memory_body_twice_does_not_call_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _install_metadata_and_cwd(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.MemoryService",
+        lambda: type(
+            "F",
+            (),
+            {"get_memory_context_for_terminal": lambda self, t: "<cao-memory>SAME</cao-memory>"},
+        )(),
+    )
+
+    plugin = KiroCliMemoryPlugin()
+    await plugin.on_post_create_terminal(_event())
+    target = tmp_path / STEERING_SUBDIR / MEMORY_FILENAME
+    original = target.read_bytes()
+    writes: list[Path] = []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.locked_atomic_rewrite",
+        lambda path, compute: writes.append(path),
+    )
+
+    await plugin.on_post_create_terminal(_event())
+
+    assert writes == []
+    assert target.read_bytes() == original
 
 
 @pytest.mark.asyncio
@@ -98,7 +140,10 @@ async def test_overwrites_previous_memory_file(
     target_dir = tmp_path / STEERING_SUBDIR
     target_dir.mkdir(parents=True)
     target = target_dir / MEMORY_FILENAME
-    target.write_text("stale memory from a prior run\n", encoding="utf-8")
+    target.write_text(
+        '<cao-memory generated="2000-01-01T00:00:00Z">stale</cao-memory>\n',
+        encoding="utf-8",
+    )
 
     _install_metadata_and_cwd(monkeypatch, tmp_path)
 
@@ -117,6 +162,8 @@ async def test_overwrites_previous_memory_file(
     content = target.read_text(encoding="utf-8")
     assert "fresh" in content
     assert "stale" not in content
+    assert "2000-01-01T00:00:00Z" not in content
+    assert re.search(r'<cao-memory generated="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z">', content)
 
 
 @pytest.mark.asyncio
@@ -164,6 +211,58 @@ async def test_skips_write_when_memory_context_empty(
     await plugin.on_post_create_terminal(_event())
 
     assert not (tmp_path / STEERING_SUBDIR / MEMORY_FILENAME).exists()
+
+
+@pytest.mark.asyncio
+async def test_empty_context_replaces_stale_file_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / STEERING_SUBDIR / MEMORY_FILENAME
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        '<cao-memory generated="2000-01-01T00:00:00Z">STALE</cao-memory>\n',
+        encoding="utf-8",
+    )
+    _install_metadata_and_cwd(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.MemoryService",
+        lambda: type("F", (), {"get_memory_context_for_terminal": lambda self, t: ""})(),
+    )
+
+    await KiroCliMemoryPlugin().on_post_create_terminal(_event())
+
+    content = target.read_text(encoding="utf-8")
+    assert "STALE" not in content
+    assert "2000-01-01T00:00:00Z" not in content
+    assert "<!-- no memories selected -->" in content
+    assert re.search(r'<cao-memory generated="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z">', content)
+
+
+@pytest.mark.asyncio
+async def test_clear_on_empty_false_preserves_stale_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cli_agent_orchestrator.services import settings_service
+
+    target = tmp_path / STEERING_SUBDIR / MEMORY_FILENAME
+    target.parent.mkdir(parents=True)
+    original = "<cao-memory>STALE</cao-memory>\n"
+    target.write_text(original, encoding="utf-8")
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps({"memory": {"injection": {"clear_on_empty": False}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings_service, "SETTINGS_FILE", settings_path)
+    _install_metadata_and_cwd(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.MemoryService",
+        lambda: type("F", (), {"get_memory_context_for_terminal": lambda self, t: ""})(),
+    )
+
+    await KiroCliMemoryPlugin().on_post_create_terminal(_event())
+
+    assert target.read_text(encoding="utf-8") == original
 
 
 @pytest.mark.asyncio
@@ -397,7 +496,7 @@ async def test_steering_write_is_atomic_no_tmp_left_behind(
 
     target = tmp_path / STEERING_SUBDIR / MEMORY_FILENAME
     assert target.exists()
-    assert "<cao-memory>X</cao-memory>" in target.read_text(encoding="utf-8")
+    assert ">X</cao-memory>" in target.read_text(encoding="utf-8")
     leftovers = [p for p in target.parent.iterdir() if p.suffix == ".tmp"]
     assert leftovers == []
 
