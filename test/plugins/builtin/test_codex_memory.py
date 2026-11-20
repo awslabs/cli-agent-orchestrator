@@ -1,5 +1,7 @@
 """Tests for the Codex CLI memory-injection plugin."""
 
+import json
+import re
 import threading
 from pathlib import Path
 
@@ -11,6 +13,15 @@ from cli_agent_orchestrator.plugins.builtin.codex_memory import (
     END_MARKER,
     CodexMemoryPlugin,
 )
+
+
+@pytest.fixture(autouse=True)
+def _enable_project_file_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.codex_memory."
+        "memory_injection_write_project_files_enabled",
+        lambda: True,
+    )
 
 
 def _event(provider: str = "codex", terminal_id: str = "t1") -> PostCreateTerminalEvent:
@@ -81,6 +92,47 @@ async def test_writes_memory_block_on_post_create_terminal(
     assert BEGIN_MARKER in content
     assert END_MARKER in content
     assert "stan prefers pytest" in content
+    assert re.search(r'<cao-memory generated="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z">', content)
+
+
+@pytest.mark.asyncio
+async def test_same_memory_body_twice_does_not_call_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.codex_memory.get_terminal_metadata",
+        lambda terminal_id: {
+            "tmux_session": "cao-test-session",
+            "tmux_window": "developer-abcd",
+            "id": terminal_id,
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.codex_memory.get_backend",
+        lambda: type(
+            "FakeBackend", (), {"get_pane_working_directory": lambda self, s, w: str(tmp_path)}
+        )(),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.codex_memory.MemoryService",
+        lambda: type(
+            "F",
+            (),
+            {"get_memory_context_for_terminal": lambda self, t: "<cao-memory>SAME</cao-memory>"},
+        )(),
+    )
+
+    plugin = CodexMemoryPlugin()
+    await plugin.on_post_create_terminal(_event())
+    target = tmp_path / "AGENTS.md"
+    original = target.read_bytes()
+    writes: list[tuple[Path, str]] = []
+    monkeypatch.setattr(plugin, "_write_block", lambda path, block: writes.append((path, block)))
+
+    await plugin.on_post_create_terminal(_event())
+
+    assert writes == []
+    assert target.read_bytes() == original
 
 
 @pytest.mark.asyncio
@@ -92,7 +144,8 @@ async def test_replaces_existing_memory_block_on_rerun(
     target = tmp_path / "AGENTS.md"
     target.write_text(
         "# Project Notes\n\nHand-written content.\n"
-        f"{BEGIN_MARKER}\n<cao-memory>OLD</cao-memory>\n{END_MARKER}\n",
+        f'{BEGIN_MARKER}\n<cao-memory generated="2000-01-01T00:00:00Z">'
+        f"OLD</cao-memory>\n{END_MARKER}\n",
         encoding="utf-8",
     )
 
@@ -124,8 +177,9 @@ async def test_replaces_existing_memory_block_on_rerun(
     await plugin.on_post_create_terminal(_event())
 
     content = target.read_text(encoding="utf-8")
-    assert "<cao-memory>NEW</cao-memory>" in content
-    assert "<cao-memory>OLD</cao-memory>" not in content
+    assert ">NEW</cao-memory>" in content
+    assert "2000-01-01T00:00:00Z" not in content
+    assert re.search(r'<cao-memory generated="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z">', content)
     assert "Hand-written content." in content, "prior user content must be preserved"
     assert content.count(BEGIN_MARKER) == 1
     assert content.count(END_MARKER) == 1
@@ -161,6 +215,85 @@ async def test_skips_write_when_memory_context_empty(
 
     assert not (tmp_path / "AGENTS.md").exists()
     assert list(tmp_path.iterdir()) == [], "empty context must leave the cwd untouched"
+
+
+@pytest.mark.asyncio
+async def test_empty_context_replaces_stale_block_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "AGENTS.md"
+    target.write_text(
+        "# Project Notes\n"
+        f'{BEGIN_MARKER}\n<cao-memory generated="2000-01-01T00:00:00Z">'
+        f"STALE</cao-memory>\n{END_MARKER}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.codex_memory.get_terminal_metadata",
+        lambda terminal_id: {
+            "tmux_session": "cao-test-session",
+            "tmux_window": "developer-abcd",
+            "id": terminal_id,
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.codex_memory.get_backend",
+        lambda: type(
+            "FakeBackend", (), {"get_pane_working_directory": lambda self, s, w: str(tmp_path)}
+        )(),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.codex_memory.MemoryService",
+        lambda: type("F", (), {"get_memory_context_for_terminal": lambda self, t: ""})(),
+    )
+
+    await CodexMemoryPlugin().on_post_create_terminal(_event())
+
+    content = target.read_text(encoding="utf-8")
+    assert "STALE" not in content
+    assert "2000-01-01T00:00:00Z" not in content
+    assert "<!-- no memories selected -->" in content
+    assert re.search(r'<cao-memory generated="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z">', content)
+    assert "# Project Notes" in content
+
+
+@pytest.mark.asyncio
+async def test_clear_on_empty_false_preserves_stale_block(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cli_agent_orchestrator.services import settings_service
+
+    target = tmp_path / "AGENTS.md"
+    original = f"{BEGIN_MARKER}\n<cao-memory>STALE</cao-memory>\n{END_MARKER}\n"
+    target.write_text(original, encoding="utf-8")
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps({"memory": {"injection": {"clear_on_empty": False}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings_service, "SETTINGS_FILE", settings_path)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.codex_memory.get_terminal_metadata",
+        lambda terminal_id: {
+            "tmux_session": "cao-test-session",
+            "tmux_window": "developer-abcd",
+            "id": terminal_id,
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.codex_memory.get_backend",
+        lambda: type(
+            "FakeBackend", (), {"get_pane_working_directory": lambda self, s, w: str(tmp_path)}
+        )(),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.codex_memory.MemoryService",
+        lambda: type("F", (), {"get_memory_context_for_terminal": lambda self, t: ""})(),
+    )
+
+    await CodexMemoryPlugin().on_post_create_terminal(_event())
+
+    assert target.read_text(encoding="utf-8") == original
 
 
 @pytest.mark.asyncio

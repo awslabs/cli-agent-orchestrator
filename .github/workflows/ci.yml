@@ -109,6 +109,11 @@ jobs:
       - name: Check CAO agent plugin packages
         run: make check-agent-plugin
 
+      # Per built package, not the source tree (#1384): a link that resolves in the
+      # repository but escapes the installed package fails here.
+      - name: Check links inside each built agent plugin package
+        run: make check-agent-plugin-links
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
@@ -731,7 +736,8 @@ jobs:
     name: AG-UI operator dashboard
     runs-on: ubuntu-latest
     # Playwright's pinned image (the @playwright/test version the job uses): the browsers
-    # and their system libraries are already in it, so no apt install runs here.
+    # and their system libraries are already in it. The only apt use is the cold-cache
+    # tmux build below; with a warm cache no apt runs in this job.
     container: mcr.microsoft.com/playwright:v1.65.0-noble@sha256:9beb546099e11f52d62e505537914870e01a67e0e6b00ae41da4775324e73dbe
     # Bounds a hung e2e: the job normally takes a few minutes.
     timeout-minutes: 15
@@ -743,14 +749,31 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The keyless e2e drives real mock_cli terminals, which need tmux. The Playwright
-      # image does not ship it, so the step below installs it (bounded, see its comment).
+      # image does not ship it, so a statically linked tmux is built once from the
+      # upstream release tarball (SHA-256 pinned in scripts/build_tmux.sh) and cached.
+      # The key carries the container image digest and the build script, so a new image
+      # or a new tmux version rebuilds (test_ci_tmux_cache.py fails if the digest here
+      # drifts from the job's container). A warm cache runs no apt.
+      - name: Restore cached tmux
+        id: tmux-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /opt/tmux-cache
+          key: tmux-${{ runner.arch }}-sha256-9beb546099e11f52d62e505537914870e01a67e0e6b00ae41da4775324e73dbe-${{ hashFiles('scripts/build_tmux.sh') }}
+
+      - name: Build tmux (cold cache only)
+        if: steps.tmux-cache.outputs.cache-hit != 'true'
+        # apt runs as root (the image has no sudo), bounded inside the script by
+        # retries and a short per-request timeout; this step has its own time bound.
+        timeout-minutes: 10
+        working-directory: .
+        run: scripts/build_tmux.sh /opt/tmux-cache
+
       - name: Install tmux
-        # apt runs as root (the image has no sudo), with retries and a short per-request
-        # timeout; the step has its own time bound, so a stalled mirror fails fast.
-        timeout-minutes: 5
+        timeout-minutes: 2
         run: |
-          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
-          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y --no-install-recommends tmux
+          install -m 0755 /opt/tmux-cache/tmux /usr/local/bin/tmux
+          tmux -V
 
       - name: Install uv
         timeout-minutes: 10

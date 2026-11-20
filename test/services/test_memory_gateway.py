@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import requests
+from sqlalchemy.exc import OperationalError
 
 from cli_agent_orchestrator.models.memory import Memory
 from cli_agent_orchestrator.services import memory_gateway
@@ -38,6 +39,24 @@ def test_remote_memory_is_opt_in(monkeypatch):
 def test_remote_memory_url_normalized(monkeypatch):
     monkeypatch.setenv("CAO_MEMORY_API_URL", "http://cao-supervisor:9889/")
     assert memory_gateway.remote_memory_url() == "http://cao-supervisor:9889"
+
+
+def test_remote_context_propagates_local_terminal_lookup_failure(monkeypatch):
+    from cli_agent_orchestrator.clients import database
+
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner:9889")
+
+    def locked_session():
+        raise OperationalError("SELECT terminals", {}, Exception("database is locked"))
+
+    monkeypatch.setattr(database, "SessionLocal", locked_session)
+    post = Mock()
+    monkeypatch.setattr(memory_gateway, "_post", post)
+
+    with pytest.raises(RuntimeError, match="Could not get terminal context"):
+        memory_gateway.memory_context_for_terminal("worker")
+
+    post.assert_not_called()
 
 
 @pytest.mark.asyncio

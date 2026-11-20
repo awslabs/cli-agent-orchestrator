@@ -169,7 +169,11 @@ def simulate(
         ctx = dict(context)
         for n in needs:
             ctx[f"needs.{n}.result"] = results[n]
-        evaluate = Evaluator(ctx, {"always": True, "success": needs_ok, "failure": False})
+        evaluate = Evaluator(
+            ctx,
+            # Nothing is cancelled in this simulation: it models a run that completes.
+            {"always": True, "success": needs_ok, "failure": False, "cancelled": False},
+        )
         if evaluate(condition):
             results[name] = (outcome or {}).get(name, "success")
         else:
