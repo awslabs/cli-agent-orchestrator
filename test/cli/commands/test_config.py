@@ -105,6 +105,18 @@ class TestConfigSet:
         on_disk = json.loads(_isolated_settings["settings"].read_text())
         assert on_disk["terminal"]["backend"] == "herdr"
 
+    def test_set_herdr_auto_start_false_round_trips(self, runner, _isolated_settings):
+        result = runner.invoke(config, ["set", "terminal.herdr_auto_start", "false"])
+        assert result.exit_code == 0
+        assert (
+            json.loads(_isolated_settings["settings"].read_text())["terminal"]["herdr_auto_start"]
+            is False
+        )
+
+        get_result = runner.invoke(config, ["get", "terminal.herdr_auto_start"])
+        assert get_result.exit_code == 0
+        assert json.loads(get_result.output) is False
+
     def test_set_persists_coerced_int(self, runner, _isolated_settings):
         result = runner.invoke(config, ["set", "server.mcp_request_timeout", "99"])
         assert result.exit_code == 0

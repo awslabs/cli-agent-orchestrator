@@ -53,6 +53,16 @@ class TestPrecedence:
         monkeypatch.setenv("CAO_TERMINAL_BACKEND", "tmux")
         assert ConfigService.get("terminal.backend") == "tmux"
 
+    def test_herdr_auto_start_env_var_beats_file_value(self, _isolated_settings, monkeypatch):
+        _isolated_settings["settings"].write_text(
+            json.dumps({"terminal": {"herdr_auto_start": True}})
+        )
+        monkeypatch.setenv("CAO_HERDR_AUTO_START", "false")
+        assert ConfigService.get("terminal.herdr_auto_start") is False
+
+    def test_herdr_auto_start_defaults_to_true(self):
+        assert ConfigService.get("terminal.herdr_auto_start") is True
+
     def test_cli_override_beats_env_var(self, _isolated_settings, monkeypatch):
         monkeypatch.setenv("CAO_TERMINAL_BACKEND", "herdr")
         assert ConfigService.get("terminal.backend", override="tmux") == "tmux"
