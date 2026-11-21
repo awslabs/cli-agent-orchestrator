@@ -380,7 +380,9 @@ Merge semantics are frozen and deterministic:
 - `CAO_TERMINAL_ID` is **not** injected per server. Kimi Code's stdio MCP
   children inherit the parent environment, so the launch line exports it once
   for every server, including user-level ones. An explicit `env` block on a
-  profile server is preserved verbatim, including an explicit `CAO_TERMINAL_ID`.
+  profile server is preserved, with one exception: a declared `CAO_TERMINAL_ID`
+  is replaced with the launching terminal's own id and logged (#1062), because
+  the CAO MCP gates authorize on it.
 
 ### MCP Timeouts — milliseconds
 

@@ -1,0 +1,56 @@
+{
+  "name": "cli-agent-orchestrator",
+  "interface": {
+    "displayName": "CLI Agent Orchestrator"
+  },
+  "plugins": [
+    {
+      "name": "cao",
+      "source": {
+        "source": "local",
+        "path": "./agent-plugin/cao"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    },
+    {
+      "name": "cao-contributor",
+      "source": {
+        "source": "local",
+        "path": "./agent-plugin/cao-contributor"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    },
+    {
+      "name": "cao-agent-plugin-lifecycle",
+      "source": {
+        "source": "local",
+        "path": "./agent-plugin/cao-agent-plugin-lifecycle"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    },
+    {
+      "name": "cao-ag-ui-builder",
+      "source": {
+        "source": "local",
+        "path": "./agent-plugin/cao-ag-ui-builder"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

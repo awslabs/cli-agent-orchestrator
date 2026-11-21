@@ -672,17 +672,18 @@ snapshots, S3, KMS and Bedrock usage. This sample quotes no prices: check
 the EC2, EBS and Bedrock pricing pages for Sydney. Set a budget alarm
 before you start.
 
-To remove everything, first get the user's OK to terminate the instance, then
-terminate it:
+To remove everything, note that terminating the instance deletes its root volume
+and everything on it. While the box is still running, have the user download what
+they want to keep. Then get the user's OK to terminate the instance, and terminate it:
 
 ```bash
 aws ec2 terminate-instances --region ap-southeast-2 --instance-ids <instance-id>
 aws ec2 wait instance-terminated --region ap-southeast-2 --instance-ids <instance-id>
 ```
 
-Before deleting data, show the user the exact data volume id, every snapshot
-id with its date, the backup bucket, and the KMS key id. The user downloads
-what they want to keep. Get a separate explicit OK to delete that data, then:
+Before deleting the remaining data, show the user the exact data volume id, every
+snapshot id with its date, the backup bucket, and the KMS key id. Get a separate
+explicit OK to delete that data, then:
 
 ```bash
 aws ec2 delete-volume --region ap-southeast-2 --volume-id <data-volume-id>      # it survives termination
