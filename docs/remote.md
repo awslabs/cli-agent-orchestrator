@@ -58,6 +58,7 @@ Replace every `<...>` placeholder with your own value:
 You need:
 - the AWS CLI v2, and the `session-manager-plugin` program;
 - `ssh`;
+- `jq`;
 - herdr. Its version must match the one on the box.
 - an AWS login that can create the resources in step 2 and call `ssm:StartSession` on the instance.
 
@@ -143,7 +144,7 @@ Skip this if you don't want S3 backups. The box still keeps 14 local copies.
 
 The backups hold message text, so treat the bucket like the box. Do this in order:
 
-1. **Make a KMS key.** The key policy must also allow the instance role (see the `BackupKey` statement in the [IAM notes](../examples/remote/ec2/iam/README.md)).
+1. **Make a KMS key.** With the default key policy, the role's `BackupKey` statement is sufficient. If you write your own key policy, keep the statement that enables IAM policies (see the `BackupKey` statement in the [IAM notes](../examples/remote/ec2/iam/README.md)).
 
    ```bash
    aws kms create-key --profile <profile> --region <region> --description "CAO box backups" \
@@ -162,6 +163,8 @@ The backups hold message text, so treat the bucket like the box. Do this in orde
      '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms","KMSMasterKeyID":"<backup-key-arn>"}}]}'
    aws s3api put-bucket-policy --profile <profile> --bucket <backup-bucket> --policy file://backup-bucket-policy.json
    ```
+
+   In `us-east-1`, omit `--create-bucket-configuration LocationConstraint=<region>`.
 
 3. **Check it.** This should print `Enabled`:
 
@@ -212,7 +215,7 @@ Write the settings file, `/opt/cao-box-src/box-settings.env`, one `KEY=VALUE` pe
 
 ```text
 BOX_USER=cao-herdr
-BOX_UID=1001
+BOX_UID=2001
 BOX_HOME=/home/cao-herdr
 DATA_MOUNT=/home/cao-herdr
 DATA_VOLUME_ID=<data-volume-id>
@@ -221,9 +224,17 @@ HERDR_SHA256=<sha256 of herdr-linux-aarch64>
 CAO_REF=<the CAO commit or tag to install>
 BACKUP_S3_URI=s3://<backup-bucket>/cao-box/        # optional
 BACKUP_KMS_KEY_ARN=<backup-key-arn>                # optional
+AWS_CLI_VERSION=<version>
+AWS_CLI_SHA256=<sha256>
+SAM_VERSION=<version>
+SAM_SHA256=<sha256>
+YAZI_SHA256=<sha256>
+HELIX_SHA256=<sha256>
+UV_VERSION=<version>
+UV_SHA256=<sha256>
 ```
 
-- `BOX_UID` is a number from 1000 to 59999, and you never change it. The Ubuntu image's own user has 1000, so 1001 is a good pick.
+- `BOX_UID` is a number from 1000 to 59999, and you never change it. Pick a higher unused uid, such as 2001. Make sure that `getent passwd <uid>` prints nothing.
 - `DATA_MOUNT` equal to `BOX_HOME` mounts the data volume as the home itself.
 - The file must be root's, not group- or world-writable, and outside the home. `bootstrap.sh` refuses anything else.
 
@@ -249,7 +260,7 @@ Never copy a private key to the box.
 
 ### 4. Connect: SSH inside SSM
 
-Paste this into `~/.ssh/config` on the laptop. It's [`ssh/config.snippet`](../examples/remote/ec2/ssh/config.snippet) with the box user filled in:
+Put this above any `Host *` block in `~/.ssh/config` on the laptop. It's [`ssh/config.snippet`](../examples/remote/ec2/ssh/config.snippet) with the box user filled in:
 
 ```text
 Host cao-box
@@ -262,9 +273,19 @@ Host cao-box
   ServerAliveCountMax 4
 ```
 
-The snippet also has a `cao-box-dash` entry for the dashboard (step 6). Copy it too.
+Add the dashboard entry too:
 
-**Check:** `ssh cao-box true` exits 0.
+```text
+Host cao-box-dash
+  HostName <instance-id>
+  User cao-herdr
+  IdentityFile ~/.ssh/cao-box_ed25519
+  ProxyCommand sh -c "aws ssm start-session --profile <profile> --region <region> --target %h --document-name AWS-StartSSHSession --parameters 'portNumber=%p'"
+  LocalForward 19889 127.0.0.1:9889
+  ExitOnForwardFailure yes
+```
+
+**Check:** `ssh cao-box true` exits 0, and `ssh -G cao-box | grep -i '^forwardagent'` prints `forwardagent no`.
 
 The first time, ssh asks you to accept the host key. To check it instead of trusting it blindly, read the box's key through Run Command (`cat /etc/ssh/ssh_host_ed25519_key.pub`) and compare.
 
@@ -278,7 +299,11 @@ systemctl start cao-server.service     # waits for herdr's socket
 systemctl start cao-backup.timer
 ```
 
-**Check:** on the laptop, `ssh cao-box curl -fsS http://127.0.0.1:9889/health` answers.
+**Check:** on the laptop, wait for the server to listen:
+
+```bash
+ssh cao-box 'for i in $(seq 1 30); do curl -fsS http://127.0.0.1:9889/health && break; sleep 1; done'
+```
 
 Then log in to the agent CLIs **on the box**, as `cao-herdr`. Don't copy login files from your laptop:
 - Claude Code on Bedrock uses the instance role. See [`config/claude-settings.box.json.example`](../examples/remote/ec2/config/claude-settings.box.json.example).
@@ -323,7 +348,7 @@ Now start an agent on the box with `cao launch`, from an SSH shell or a herdr pa
 
 **After a reboot, or a stop and start.** The units come back by themselves, and the session name stays the same. Panes and agents don't come back, so relaunch them.
 - Remove old session records first: `cao shutdown --session <name>`.
-- To check the box: `ssh cao-box 'bash -lc /usr/local/lib/cao-box/box-resume.sh'`. It ends with `All up.`
+- To check the box: `ssh cao-box 'bash -lc /usr/local/lib/cao-box/box-resume.sh'`. It prints `All up.`
 
 **Upgrade CAO.** As root, run `bootstrap.sh` again with a new `CAO_REF`, then `systemctl restart cao-server`.
 
@@ -342,12 +367,12 @@ aws ec2 stop-instances --profile <profile> --region <region> --instance-ids <ins
 aws ec2 start-instances --profile <profile> --region <region> --instance-ids <instance-id>
 ```
 
-**Take it down.** Get an OK before you terminate the instance, and a separate OK before you delete any data (the data volume, the snapshots, the bucket, the KMS key). The data volume survives termination on purpose. The sample's [teardown section](../examples/remote/ec2/README.md#teardown-and-cost) has the commands. Then remove the `cao-box` and `cao-box-dash` entries from `~/.ssh/config`, run `ssh-keygen -R cao-box`, and run `herdr machine remove cao-box`.
+**Take it down.** Get an OK before you terminate the instance, and a separate OK before you delete any data (the data volume, the snapshots, the bucket, the KMS key). The data volume survives termination on purpose. The sample's [teardown section](../examples/remote/ec2/README.md#teardown-and-cost) has the commands. Then remove the `cao-box` and `cao-box-dash` entries from `~/.ssh/config`, run `ssh-keygen -R <instance-id>`, and run `herdr machine remove cao-box`.
 
 ## Security in short
 
 - **No inbound port.** SSH runs inside SSM. Session Manager doesn't record what you type inside an SSH session, so it isn't an audit trail.
-- **Laptop credentials stay on the laptop.** The SSH block has `ForwardAgent no` and sends no environment.
+- **Laptop credentials stay on the laptop.** The SSH block has `ForwardAgent no` (check it with `ssh -G`) and adds no `SendEnv`.
 - **Run Command is root.** Anyone with `ssm:SendCommand` on the instance can run anything on it as root. Give it to your admin profile only, scoped to this instance.
 - **The instance role is the limit on what an agent can do in your account.** Every agent on the box can use it. The sample's role allows the SSM agent's actions, Bedrock on named profiles, and one backup prefix with one KMS key. It allows nothing for IAM, EC2, Secrets Manager or Parameter Store.
 - **A login stored on the box can be read by any agent.** That includes `gh auth login` and `codex login`. Claude Code with Bedrock through the role stores no secret.
