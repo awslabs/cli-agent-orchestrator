@@ -60,6 +60,13 @@ _COMMANDS: tuple[tuple[str, str, str, str, bool], ...] = (
         True,
     ),
     ("profile", _PKG + "profile", "profile", "Manage agent profiles.", False),
+    (
+        "remote",
+        _PKG + "remote",
+        "remote",
+        "Check experimental Remote CAO laptop prerequisites.",
+        False,
+    ),
     ("schedule", _PKG + "schedule", "schedule", "Manage scheduled agent flows.", False),
     ("session", _PKG + "session", "session", "Manage CAO sessions.", False),
     (

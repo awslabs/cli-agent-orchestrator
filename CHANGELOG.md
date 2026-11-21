@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider's post-turn flush-wait, offloaded off the event loop and stopping as soon as the
   message lands.
 
+- Add experimental `cao remote` local box registry and read-only prerequisite checks.
 - **Workflow scripts with an f-string `step_id` whose own text breaks the step id rule are refused** (#1396).
   A `step_id` must be 1-64 characters from `[A-Za-z0-9_-]`. `step_id=f"review:{name}"` used to pass
   validation and then get a 422 from `POST /terminals/run-step` on every call, since no value of
