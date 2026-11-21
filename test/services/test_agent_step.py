@@ -1088,6 +1088,62 @@ class TestPromptDeliveryVerification:
         m_out.assert_not_called()
 
 
+class TestUserWaitingTimeout:
+    @staticmethod
+    def _wait(samples, *, timeout_excludes_waiting=False, max_waiting=None):
+        from cli_agent_orchestrator.services.agent_step import _wait_for_completion
+
+        now = 0.0
+
+        def get_status(_terminal_id):
+            nonlocal now
+            now, status = next(samples)
+            return status
+
+        with (
+            patch(f"{_MODULE}.time") as clock,
+            patch(f"{_MODULE}.status_monitor.get_status", side_effect=get_status),
+            patch(f"{_MODULE}._COMPLETION_POLL_INTERVAL", 0),
+        ):
+            clock.monotonic.side_effect = lambda: now
+            return asyncio.run(
+                _wait_for_completion(
+                    "worker",
+                    timeout=5,
+                    timeout_excludes_waiting=timeout_excludes_waiting,
+                    max_waiting=max_waiting,
+                )
+            )
+
+    def test_long_wait_is_excluded_only_when_enabled(self):
+        samples = [
+            (0, TerminalStatus.PROCESSING),
+            (1, TerminalStatus.WAITING_USER_ANSWER),
+            (7, TerminalStatus.WAITING_USER_ANSWER),
+            (8, TerminalStatus.PROCESSING),
+            (9, TerminalStatus.COMPLETED),
+        ]
+
+        assert self._wait(iter(samples), timeout_excludes_waiting=True) == 7
+        with pytest.raises(StepExecutionError, match="did not complete within 5s") as error:
+            self._wait(iter(samples))
+        assert error.value.kind == "timeout"
+
+    def test_waiting_cap_is_cumulative_across_prompts(self):
+        samples = iter(
+            [
+                (0, TerminalStatus.PROCESSING),
+                (2, TerminalStatus.WAITING_USER_ANSWER),
+                (3, TerminalStatus.PROCESSING),
+                (5, TerminalStatus.WAITING_USER_ANSWER),
+            ]
+        )
+
+        with pytest.raises(StepExecutionError, match="user-wait limit of 4s") as error:
+            self._wait(samples, timeout_excludes_waiting=True, max_waiting=4)
+        assert error.value.kind == "timeout"
+
+
 class TestInterruptibleCancel:
     """#409b: an in-flight completion wait is interruptible via cancel_event, so a
     hung step (never settling) becomes cancellable rather than boundary-only."""

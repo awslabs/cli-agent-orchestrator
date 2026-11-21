@@ -155,6 +155,7 @@ def _execute_step(
         # would hand the author a DEAD terminal_id labelled live. A KeyError
         # is the honest failure.
         replayed=data["replayed"],
+        waited_seconds=data.get("waited_seconds"),
     )
 
 

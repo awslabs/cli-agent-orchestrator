@@ -174,7 +174,9 @@ async def _wait_for_completion(
     cancel_event: Optional["asyncio.Event"] = None,
     *,
     prompt: Optional[str] = None,
-) -> None:
+    timeout_excludes_waiting: bool = False,
+    max_waiting: Optional[float] = None,
+) -> float:
     """Wait for a post-input step to settle, polling ``status_monitor`` (issue #409).
 
     Called strictly AFTER the prompt has been sent, so IDLE here can never be the
@@ -215,12 +217,18 @@ async def _wait_for_completion(
     in-flight — possibly hung — step becomes cancellable instead of being observed
     only at the next step boundary.
 
+    Returns the total seconds attributed to ``WAITING_USER_ANSWER`` by polling.
+    With ``timeout_excludes_waiting`` those seconds have their own optional
+    cumulative limit, ``max_waiting``, and are excluded from ``timeout``.
+
     Raises:
         StepExecutionError(kind="error"): the terminal reached ``ERROR``.
         StepExecutionError(kind="timeout"): no completion signal within ``timeout``.
         StepCancelledError: ``cancel_event`` fired while waiting.
     """
-    deadline = time.monotonic() + timeout
+    last_poll = time.monotonic()
+    deadline = last_poll + timeout
+    waited_seconds = 0.0
     observed_working = False
     consecutive_idle = 0
     redeliveries = 0
@@ -238,6 +246,20 @@ async def _wait_for_completion(
         # Off the event loop — get_status() can shell out to a real tmux capture-pane
         # subprocess (status_monitor.py's stale-PROCESSING fallback) or a herdr CLI call.
         current = await asyncio.to_thread(status_monitor.get_status, terminal_id)
+        now = time.monotonic()
+        # Attribute each interval to the status observed at its end.
+        if current == TerminalStatus.WAITING_USER_ANSWER:
+            elapsed = now - last_poll
+            waited_seconds += elapsed
+            if timeout_excludes_waiting:
+                deadline += elapsed
+            if max_waiting is not None and waited_seconds >= max_waiting:
+                raise StepExecutionError(
+                    f"step on terminal {terminal_id} reached its user-wait limit of {max_waiting}s",
+                    kind="timeout",
+                    terminal_id=terminal_id,
+                )
+        last_poll = now
         if current == TerminalStatus.ERROR:
             raise StepExecutionError(
                 f"terminal {terminal_id} reached ERROR status",
@@ -245,7 +267,7 @@ async def _wait_for_completion(
                 terminal_id=terminal_id,
             )
         if current == TerminalStatus.COMPLETED:
-            return
+            return waited_seconds
         if current == TerminalStatus.IDLE:
             # Post-input IDLE only counts once the agent has actually started
             # working — otherwise the idle-before-processing window right after
@@ -259,7 +281,7 @@ async def _wait_for_completion(
                         terminal_id,
                         consecutive_idle,
                     )
-                    return
+                    return waited_seconds
         elif current in _WORKING_STATES:
             observed_working = True
             consecutive_idle = 0
@@ -459,6 +481,9 @@ async def run_agent_step(
     delegating_terminal_id: Optional[str] = None,
     caller_ceiling: Optional[list[str]] = None,
     keep_on_success: Optional[Callable[[str], bool]] = None,
+    *,
+    timeout_excludes_waiting: bool = False,
+    max_waiting: Optional[float] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -655,7 +680,7 @@ async def run_agent_step(
     # itself (BR-1a/BR-5), which is CORRECT and must not be "fixed": the resolution block
     # above is inside ``if created_here:``, so on a reuse call those fields describe a
     # terminal this call did not make and the implementation discards them. The tuple is never
-    # shortened — ten components on both paths.
+    # shortened on the reuse path.
     #
     # The digest is NEVER logged, echoed or put in an exception (SR-7).
     call_fingerprint = compute(
@@ -674,6 +699,8 @@ async def run_agent_step(
             use_worktree=use_worktree,
             reused_terminal=not created_here,
             timeout=timeout,
+            timeout_excludes_waiting=timeout_excludes_waiting,
+            max_waiting=max_waiting,
         )
     )
 
@@ -830,7 +857,14 @@ async def run_agent_step(
     # Filed separately; gating it means threading dispatch_input's boundary
     # through run_agent_step.
     try:
-        await _wait_for_completion(terminal_id, timeout, cancel_event, prompt=prompt)
+        waited_seconds = await _wait_for_completion(
+            terminal_id,
+            timeout,
+            cancel_event,
+            prompt=prompt,
+            timeout_excludes_waiting=timeout_excludes_waiting,
+            max_waiting=max_waiting,
+        )
     except StepCancelledError:
         # A cancellation is NOT a run-failure. Tear down a terminal this call
         # created (best-effort — never let cleanup mask the cancellation), then
@@ -939,6 +973,7 @@ async def run_agent_step(
         last_message=last_message,
         status=TerminalStatus.COMPLETED,
         torn_down=torn_down,
+        waited_seconds=waited_seconds,
     )
 
 

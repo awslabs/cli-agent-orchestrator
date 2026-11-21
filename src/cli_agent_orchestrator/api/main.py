@@ -664,7 +664,14 @@ class RunStepRequest(BaseModel):
         default=True,
         description="Delete the created terminal after the step (ignored when reusing)",
     )
-    timeout: float = Field(default=600.0, description="Max seconds to wait for completion", gt=0)
+    timeout: float = Field(
+        default=600.0,
+        description=(
+            "Completion budget in seconds; excludes user-answer waiting when "
+            "timeout_excludes_waiting is true"
+        ),
+        gt=0,
+    )
     working_directory: Optional[str] = Field(
         default=None, description="Working directory for a freshly created terminal"
     )
@@ -847,6 +854,25 @@ class RunStepRequest(BaseModel):
 
     delegation_message: Optional[str] = Field(default=None, min_length=1)
     orchestration_type: Optional[Literal["handoff"]] = None
+    timeout_excludes_waiting: bool = Field(
+        default=False,
+        description=(
+            "Pause the completion timeout while awaiting a user answer; "
+            "waiting is unlimited unless max_waiting is set"
+        ),
+    )
+    max_waiting: Optional[float] = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        description="Maximum total seconds awaiting user answers when timeout_excludes_waiting is true",
+    )
+
+    @model_validator(mode="after")
+    def validate_waiting_timeout(self) -> "RunStepRequest":
+        if self.max_waiting is not None and not self.timeout_excludes_waiting:
+            raise ValueError("max_waiting requires timeout_excludes_waiting")
+        return self
 
     @model_validator(mode="after")
     def validate_delegation(self) -> "RunStepRequest":
@@ -903,6 +929,10 @@ class RunStepResponse(BaseModel):
             "worker: one sentence saying whether it was kept and why, including any "
             "kept agent torn down to stay within the per-session cap. Absent otherwise."
         ),
+    )
+    waited_seconds: Optional[float] = Field(
+        default=None,
+        description="Seconds observed awaiting user answers when timeout_excludes_waiting is true",
     )
 
 
@@ -6196,18 +6226,18 @@ async def _record_job_state(job_id: Optional[str], state: str, **fields: Any) ->
 @app.post(
     TERMINALS_RUN_STEP_ROUTE,
     response_model=RunStepResponse,
-    # The two #1225 keep fields are the only Optional ones, so this keeps every
-    # response body without a keep byte-identical to the one before #1225.
+    # Omit keep and wait metadata when their options do not apply.
     response_model_exclude_none=True,
     summary="Run one agent step (shared substrate)",
     description=(
         "Failure contract: a non-2xx body is a structured object "
         "`{message, kind, terminal_id}`. **`kind` is authoritative** — "
         '`kind="error"` means the worker CRASHED (terminal reached ERROR), '
-        '`kind="timeout"` means it RAN LONG, and `kind="provider_error"` means '
+        '`kind="timeout"` means the completion budget or cumulative user-wait cap '
+        'was reached, and `kind="provider_error"` means '
         "the provider refused in band (the CLI exited cleanly with an error "
         "payload sitting where the answer belongs). The HTTP status mirrors "
-        "`kind` (502 = crashed or provider refusal, 504 = ran long) for "
+        "`kind` (502 = crashed or provider refusal, 504 = completion or waiting timeout) for "
         "transport-layer consumers, but a caller MUST branch on `kind`, not the "
         "status code. `terminal_id` names the live terminal (read it as a field; "
         "never regex-scrape `message`)."
@@ -6239,7 +6269,7 @@ async def run_step(
       "terminal_id": str|None}``.
     - ``kind`` is the AUTHORITATIVE discriminator. ``kind="error"`` => the worker
       CRASHED (the terminal reached ``TerminalStatus.ERROR``); ``kind="timeout"``
-      => the worker RAN LONG (readiness/completion wait elapsed);
+      => the readiness, completion, or cumulative user-wait budget elapsed;
       ``kind="provider_error"`` => the provider refused in band (issue #638: a
       model/API error printed where the model's answer belongs). The HTTP status
       is derived FROM ``kind`` (``error``/``provider_error`` -> 502 Bad Gateway,
@@ -6310,6 +6340,7 @@ async def run_step(
         last_message: Optional[str] = None,
         response_status: Optional[str] = None,
         error_kind: Optional[str] = None,
+        waited_seconds: Optional[float] = None,
     ) -> None:
         # ``last_message`` is the step's own text result and defaults to None because
         # every FAILURE arm below has none to give: the step never produced one. Only
@@ -6320,7 +6351,9 @@ async def run_step(
         if on_step_settled is None:
             return
         try:
-            on_step_settled(terminal_id, error, last_message, response_status, error_kind)
+            on_step_settled(
+                terminal_id, error, last_message, response_status, error_kind, waited_seconds
+            )
         except Exception:  # noqa: BLE001 — step bookkeeping is best-effort; never fail the step
             logger.warning("run_step: script step completion bookkeeping failed", exc_info=True)
 
@@ -6442,6 +6475,8 @@ async def run_step(
                     # hardcoded so it stays correct if that ever changes.
                     reused_terminal=body.reuse_terminal_id is not None,
                     timeout=body.timeout,
+                    timeout_excludes_waiting=body.timeout_excludes_waiting,
+                    max_waiting=body.max_waiting,
                 )
             ),
         )
@@ -6514,6 +6549,9 @@ async def run_step(
                     last_message=envelope.last_message,
                     status=envelope.status,
                     replayed=True,
+                    waited_seconds=(
+                        envelope.waited_seconds if body.timeout_excludes_waiting else None
+                    ),
                 )
             if decision.verdict is step_replay.ReplayVerdict.DIVERGED:
                 # FR-3's surfacing. NO fingerprint travels with it, and none can be
@@ -6597,6 +6635,8 @@ async def run_step(
             reuse_terminal_id=body.reuse_terminal_id,
             teardown=body.teardown,
             timeout=body.timeout,
+            timeout_excludes_waiting=body.timeout_excludes_waiting,
+            max_waiting=body.max_waiting,
             # BR-10: the ALREADY-RESOLVED directory rides the existing parameter, so
             # ``run_agent_step``'s own ``working_directory is None and caller_id is
             # not None`` guard simply does not fire and the resolution never runs
@@ -6628,7 +6668,14 @@ async def run_step(
         response_status = (
             result.status.value if hasattr(result.status, "value") else str(result.status)
         )
-        _settle_step(result.terminal_id, None, result.last_message, response_status)
+        waited_seconds = result.waited_seconds if body.timeout_excludes_waiting else None
+        _settle_step(
+            result.terminal_id,
+            None,
+            result.last_message,
+            response_status,
+            waited_seconds=waited_seconds,
+        )
         keep_outcome = keep_outcomes[0] if keep_outcomes else keep_service.NOT_APPLICABLE
         _schedule_elastic_terminal_ended(
             background_tasks,
@@ -6650,6 +6697,7 @@ async def run_step(
             status=response_status,
             # False for a kept worker: it was not torn down (#1203 / #1225).
             torn_down=result.torn_down,
+            waited_seconds=waited_seconds,
             kept_until=keep_outcome.kept_until if keep_outcome.kept else None,
             keep_note=keep_outcome.note,
         )

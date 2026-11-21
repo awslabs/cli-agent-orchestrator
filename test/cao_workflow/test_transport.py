@@ -11,6 +11,9 @@ import io
 import json
 from urllib.error import HTTPError
 
+import pytest
+
+import cao_workflow
 from cao_workflow._transport import _TRANSPORT_SLACK, _post
 
 
@@ -30,6 +33,51 @@ class _FakeCM:
 
     def getcode(self):
         return self._status
+
+
+@pytest.mark.parametrize("surface", ["step", "run_step"])
+@pytest.mark.parametrize("timeout", [None, 100.0])
+@pytest.mark.parametrize("cap", [None, 400.0])
+@pytest.mark.parametrize("replayed", [False, True])
+def test_user_wait_budget_and_result_reach_script(monkeypatch, surface, timeout, cap, replayed):
+    for key, value in {
+        "CAO_WORKFLOW_RUN_ID": "run-1",
+        "CAO_WORKFLOW_GENERATION": "1",
+        "CAO_API_BASE_URL": "http://localhost:9889",
+    }.items():
+        monkeypatch.setenv(key, value)
+    captured = {}
+
+    def fake_urlopen(request, timeout=None):
+        captured["timeout"] = timeout
+        captured["body"] = json.loads(request.data)
+        return _FakeCM(
+            200,
+            json.dumps(
+                dict(
+                    terminal_id="t1",
+                    last_message="done",
+                    status="completed",
+                    replayed=replayed,
+                    waited_seconds=300.0,
+                )
+            ).encode(),
+        )
+
+    monkeypatch.setattr("cao_workflow._transport.urlopen", fake_urlopen)
+    options = dict(timeout=timeout, timeout_excludes_waiting=True, max_waiting=cap)
+    if surface == "step":
+        options["recovery"] = "idempotent"
+    handle = getattr(cao_workflow, surface)("codex", "developer", "task", **options)
+
+    expected = (
+        None if cap is None else (600.0 if timeout is None else timeout) + cap + _TRANSPORT_SLACK
+    )
+    assert captured["timeout"] == expected
+    assert captured["body"]["timeout_excludes_waiting"] is True
+    assert captured["body"]["max_waiting"] == cap
+    assert handle.waited_seconds == 300.0
+    assert handle.replayed is replayed
 
 
 def test_socket_timeout_includes_transport_slack(monkeypatch):

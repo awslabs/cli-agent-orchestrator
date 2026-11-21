@@ -246,7 +246,7 @@ def _seed_step(
 
 
 def _route_fingerprint(body: dict, *, effective_working_directory: Optional[str] = None) -> str:
-    """The fingerprint the route must compute for ``body`` — the ten components.
+    """The fingerprint the route must compute for ``body``.
 
     Assembled here from the request rather than read out of the route, so a change
     to the route's field list breaks the REPLAY tests loudly instead of silently
@@ -268,6 +268,8 @@ def _route_fingerprint(body: dict, *, effective_working_directory: Optional[str]
             use_worktree=body.get("use_worktree", False),
             reused_terminal=body.get("reuse_terminal_id") is not None,
             timeout=body.get("timeout", 600.0),
+            timeout_excludes_waiting=body.get("timeout_excludes_waiting", False),
+            max_waiting=body.get("max_waiting"),
         )
     )
 
@@ -1483,7 +1485,10 @@ class TestCompatibility:
 # PR #628 review, P1 — replay exposes the original response status, not journal state.
 # ---------------------------------------------------------------------------
 class TestReplayPreservesOriginalResponseStatus:
-    def test_unvalidated_completion_replays_the_live_completed_status(self, client):
+    @pytest.mark.parametrize("timeout_excludes_waiting", [False, True])
+    def test_unvalidated_completion_replays_the_live_completed_status(
+        self, client, timeout_excludes_waiting
+    ):
         """A schema-invalid structured output is a journal-quality distinction, not a changed
         run-step response: live and replay must both answer ``completed`` while the durable
         row remains ``completed_unvalidated`` for the YAML-tier-compatible state machine."""
@@ -1491,6 +1496,8 @@ class TestReplayPreservesOriginalResponseStatus:
 
         run_id = "run-unvalidated-status"
         body = _body(env_vars=_env(run_id))
+        if timeout_excludes_waiting:
+            body.update(timeout_excludes_waiting=True, max_waiting=30)
         _register_run(run_id)
         record_step_output(
             run_id,
@@ -1507,7 +1514,7 @@ class TestReplayPreservesOriginalResponseStatus:
             callback = kwargs["on_step_terminal_ready"]
             assert callback is not None
             callback("fresh-terminal", _route_fingerprint(body))
-            return _ok_result()
+            return _ok_result().model_copy(update={"waited_seconds": 12.5})
 
         with patch(_RUN_STEP, new=AsyncMock(side_effect=_run_with_terminal_ready)):
             live = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
@@ -1517,6 +1524,11 @@ class TestReplayPreservesOriginalResponseStatus:
         assert replay.status_code == 200
         assert live.json()["status"] == "completed"
         assert replay.json()["status"] == live.json()["status"]
+        for response in (live, replay):
+            if timeout_excludes_waiting:
+                assert response.json()["waited_seconds"] == 12.5
+            else:
+                assert "waited_seconds" not in response.json()
         row = workflow_journal.get_step(run_id, "s1")
         assert row is not None
         assert row.state == "completed_unvalidated"

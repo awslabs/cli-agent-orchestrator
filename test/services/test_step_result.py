@@ -223,6 +223,11 @@ def test_round_trip() -> None:
     assert parsed.redacted is False
 
 
+def test_waited_seconds_survives_envelope_round_trip() -> None:
+    envelope = build_envelope("done", "completed", "term-7", waited_seconds=12.5)
+    assert parse_envelope(serialise_envelope(envelope)) == envelope
+
+
 def test_round_trip_preserves_flags() -> None:
     """BR-4/INV-5: the self-reported lossiness survives persistence, or FR-12 loses it."""
     env = build_envelope("a" * (BOUND + 1) + _FAKE_AWS_KEY, "FAILED", "term-9")
