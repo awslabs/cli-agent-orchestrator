@@ -206,9 +206,12 @@ allowedTools:
   - "@builtin"
   - fs_read
   - "@cao-ops"
+  - "@cao-ops-mcp-server"
 ---
 Synthetic agent proving the fail-closed rule's escape hatch: naming @cao-ops in
-allowedTools is how an operator authorises a plugin-provided MCP server.
+allowedTools is how an operator authorises a plugin-provided MCP server. The
+second entry is the grant the operations server's own gate asks a CAO terminal
+for (#1062): it reads the fixed selector, not the key the server is declared under.
 MD
 hdr ""
 hdr "[3b] cao install dogfood-optin --provider kiro_cli    (escape hatch: opt in by naming it)"
@@ -222,12 +225,18 @@ mcp = d.get("mcpServers", {})
 assert "cao-ops" in mcp, "cao-ops not delivered into the opt-in profile"
 allowed = d.get("allowedTools", [])
 assert "@cao-ops" in allowed, f"@cao-ops NOT granted to a profile that named it: {allowed!r}"
+# #1062: inside a CAO terminal the operations server gates every tool on the fixed
+# selector @cao-ops-mcp-server, whatever key the server is declared under. The
+# operator's entry must survive into the emitted list, because launch records the
+# same resolved list and the gate reads that record.
+assert "@cao-ops-mcp-server" in allowed, f"the operations gate's grant was dropped: {allowed!r}"
 assert "x-cao-pre-expanded" not in json.dumps(d), "x-cao-pre-expanded marker leaked into provider config"
 PY
 OPTIN_ALLOWED="$("${PY[@]}" -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1])).get("allowedTools")))' "$OPTIN_JSON")"
-ok "profile frontmatter declared: allowedTools: [\"@builtin\", fs_read, \"@cao-ops\"]"
+ok "profile frontmatter declared: allowedTools: [\"@builtin\", fs_read, \"@cao-ops\", \"@cao-ops-mcp-server\"]"
 ok "allowedTools = $OPTIN_ALLOWED"
 ok "  -> @cao-ops GRANTED: the operator named it, so the grant honours that"
+ok "  -> @cao-ops-mcp-server kept: the grant the operations gate reads in a CAO terminal"
 pass "the escape hatch works: naming the server is how an operator opts in"
 
 # ── step 4: install for OpenCode + Finding 2 (isolated) ──────────────────────
@@ -304,6 +313,9 @@ assert "cao-ops" not in d.get("mcpServers", {}), "cao-ops still present in the o
 allowed = d.get("allowedTools", [])
 assert "@cao-ops" in allowed, (
     f"removal deleted the operator's own allowedTools entry: {allowed!r}"
+)
+assert "@cao-ops-mcp-server" in allowed, (
+    f"removal deleted the operator's own operations-gate grant: {allowed!r}"
 )
 PY
 ok "Kiro (opt-in): cao-ops ABSENT; the operator's own \"@cao-ops\" entry PRESERVED"

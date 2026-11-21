@@ -17,7 +17,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE, SKILLS_DIR
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    drop_declared_terminal_identity,
+    resolve_cao_mcp_command,
+)
 from cli_agent_orchestrator.utils.path_validation import flatten_path_separators
 
 logger = logging.getLogger(__name__)
@@ -157,7 +160,7 @@ def write_config(data: Dict[str, Any]) -> None:
     )
 
 
-def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
+def translate_mcp_server_config(cao_config: Dict[str, Any], *, name: str = "") -> Dict[str, Any]:
     """Translate a CAO mcpServer entry to OpenCode's ``mcp`` format.
 
     CAO profiles store MCP servers in Claude/Q CLI format::
@@ -172,7 +175,8 @@ def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
     - ``type`` → always ``"local"`` (OpenCode's only supported subprocess type)
     - ``command`` (str) + ``args`` (list) → ``command`` (list, combined)
     - ``"enabled": true`` added
-    - ``env`` → ``environment`` (OpenCode's key for process env vars)
+    - ``env`` → ``environment`` (OpenCode's key for process env vars), minus a
+      declared terminal identity (below)
     - ``cwd`` → ``cwd`` (OpenCode ``McpLocalConfig.cwd``; agent-plugin servers
       default to their ``PLUGIN_ROOT``)
 
@@ -184,7 +188,18 @@ def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
     the workspace directory" rule never applies to those. A profile-declared
     ``cwd`` is passed through as the author wrote it — ``AgentProfile.mcpServers``
     is ``Dict[str, Any]``, so CAO does not own that value.
+
+    The terminal identity is the one ``env`` value that is not carried. This runs
+    at install time, before any terminal exists, and OpenCode applies an entry's
+    ``environment`` over the pane environment its MCP children otherwise inherit,
+    so a declared value would replace the real id for every terminal that uses
+    the entry (#1062). ``drop_declared_terminal_identity`` removes and logs it;
+    ``name`` is the entry's key, used only for that log line. The install path
+    has already dropped it once (``mcp_delivery.apply_plugin_mcp_servers``); it
+    is repeated here because this function is the last thing between any caller
+    and ``opencode.json``.
     """
+    cao_config = drop_declared_terminal_identity(cao_config, server_name=name)
     # Resolve the bundled cao-mcp-server console script to a PATH-independent
     # invocation before flattening into OpenCode's command list.
     # persisted=True: OpenCode reads this from opencode.json at launch, so prefer

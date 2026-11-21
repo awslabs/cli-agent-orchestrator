@@ -9,8 +9,8 @@ Design:
 - Maintains a pane_id → terminal_id map for managed panes
 - Subscribes to pane.agent_status_changed per managed pane, validated against a
   fresh snapshot: herdr ≥0.9 accepts a broadcast pane.updated subscription but
-  never emits the event, and rejects (and then RESETS the connection on) any
-  subscription naming a pane it does not know
+  no longer emits it on agent-status transitions, and rejects (and then RESETS
+  the connection on) any subscription naming a pane it does not know
 - herdr allows exactly ONE events.subscribe per connection (a second resets the
   connection, measured on 0.7.5 and again on 0.9.5), so a pane registered after
   connect is picked up by an intentional reconnect, not an incremental call
@@ -29,6 +29,8 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from typing import Callable, Dict, Optional, Set
+
+from cli_agent_orchestrator.services.inbox_service import DELIVERY_DEFERRED
 
 logger = logging.getLogger(__name__)
 
@@ -1092,8 +1094,8 @@ class HerdrInboxService:
                 self._working_since.pop(terminal_id, None)
                 # A pane already settled at connect time has the same flush-wait
                 # gap as a live event, and no event will follow, so carry it too
-                # — but only if the immediate attempt didn't already land.
-                if self._deliver(terminal_id, source="settled-sweep") == 0:
+                # — but only if queued messages are deferred by the readiness gate.
+                if self._deliver(terminal_id, source="settled-sweep") == DELIVERY_DEFERRED:
                     self._arm_settle_retries(terminal_id)
                 delivered += 1
             self._note_activity(terminal_id, pane.get("agent_status"))
@@ -1153,9 +1155,9 @@ class HerdrInboxService:
 
         The subscription set is:
         - pane.agent_status_changed PER MANAGED PANE. herdr ≥0.9 (protocol 22)
-          accepts a broadcast pane.updated subscription but never emits the
-          event, so the per-pane form is the only one that actually delivers
-          agent-status transitions there. pane_id is required by the schema.
+          accepts a broadcast pane.updated subscription but no longer emits it
+          on agent-status transitions, so the per-pane form is the only one
+          that actually delivers them. pane_id is required by the schema.
         - a broadcast pane.updated, kept for older herdr versions (≤0.8) that
           emit it with agent_status in the payload. Duplicate signals are
           harmless: _deliver is idempotent and _record_agent_status dedupes.
@@ -1408,13 +1410,11 @@ class HerdrInboxService:
         if status in ("idle", "done"):
             # Clear working timestamp
             self._working_since.pop(terminal_id, None)
-            # Trigger delivery now; only arm the flush-wait re-check if nothing
-            # landed. This single event is the only agent-status signal herdr
-            # sends for the transition, so if the provider isn't ready yet
-            # (delivered 0) the retry loop carries it; if it already delivered,
-            # arming would just fire one redundant attempt (matches the loop's
-            # own > 0 stop rule).
-            if self._deliver(terminal_id, source="herdr-event") == 0:
+            # Trigger delivery now; only arm the flush-wait re-check when
+            # queued messages are deferred by the readiness gate. Herdr sends
+            # only one agent-status event for this transition, so the retry
+            # loop carries pending messages until the provider is ready.
+            if self._deliver(terminal_id, source="herdr-event") == DELIVERY_DEFERRED:
                 self._arm_settle_retries(terminal_id)
 
         elif status == "working":
@@ -1804,7 +1804,7 @@ class HerdrInboxService:
         self._settle_tasks.clear()
 
     def _deliver(self, terminal_id: str, source: str = "herdr") -> int:
-        """Check and deliver pending messages for a terminal; return the count.
+        """Deliver pending messages; pass through the three-state delivery result.
 
         ``source`` names the trigger (herdr-event, herdr-settle, settled-sweep,
         kiro-supplement) so a delivery in the logs can be told apart from the
