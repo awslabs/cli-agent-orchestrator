@@ -69,3 +69,6 @@ All up. Next, by hand:
   - relaunch your agents with `cao launch ...` (add --resume-session-id to
     continue a Claude conversation), and wait until each is idle before typing.
 TXT
+if [ "$attach_mode" != "tmux" ]; then
+  echo "  - herdr keeps the old layout in ~/.config/herdr/sessions/${session}/restore-archive/."
+fi

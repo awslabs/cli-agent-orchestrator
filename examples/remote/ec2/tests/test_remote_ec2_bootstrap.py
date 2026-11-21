@@ -270,9 +270,56 @@ def test_documented_settings_example_uses_the_fixed_box_user_and_home() -> None:
     agent_setup = (SAMPLE_DIR / "AGENT-SETUP.md").read_text(encoding="utf-8")
     for text in (readme, agent_setup):
         assert "BOX_USER=cao-herdr" in text
-        assert "BOX_UID=1001" in text
+        assert "BOX_UID=2001" in text
         assert "BOX_HOME=/home/cao-herdr" in text
         assert "DATA_MOUNT=/home/cao-herdr" in text
+
+
+def test_reviewed_docs_describe_the_current_restore_and_tmux_behavior() -> None:
+    readme = (SAMPLE_DIR / "README.md").read_text(encoding="utf-8")
+    agent_setup = (SAMPLE_DIR / "AGENT-SETUP.md").read_text(encoding="utf-8")
+    snippet = (SAMPLE_DIR / "ssh" / "config.snippet").read_text(encoding="utf-8")
+
+    assert "sudo install -D -m 0644 /dev/stdin /etc/cao-box/box.env" in readme
+    assert "<instance-id> ssh-ed25519 <base64>" in readme
+    assert "Starts them, unless `--no-start`" in readme
+    assert "User cao-tmux" in readme
+    assert "cao-tmux.service" in readme
+    assert "BOX_SSH_PUBLIC_KEY=ssh-ed25519" in agent_setup
+    assert "bootstrap.sh only enables the units" not in agent_setup
+    assert "User cao-herdr" in snippet
+
+
+def test_a_crlf_ssh_key_in_a_settings_file_is_accepted(sandbox) -> None:
+    root = make_root(sandbox.root)
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+    kit = sandbox.root / "kit" / "box-settings.env"
+    lines = [
+        *settings_lines(),
+        "BOX_SSH_PUBLIC_KEY=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey",
+    ]
+    kit.parent.mkdir(parents=True)
+    kit.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+    kit.chmod(0o600)
+
+    result = sandbox.run("bootstrap.sh", "--root", str(root), "--settings", str(kit))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    authorized_keys = root / "home" / "cao-herdr" / ".ssh" / "authorized_keys"
+    assert authorized_keys.read_text(encoding="utf-8").endswith("IFakeKey\n")
+
+
+def test_an_unusable_ed25519_host_key_does_not_fail_a_completed_run(sandbox) -> None:
+    root = make_root(sandbox.root)
+    seed_volume_box_env(root)
+    host_key = root / "etc" / "ssh" / "ssh_host_ed25519_key.pub"
+    host_key.parent.mkdir(parents=True)
+    host_key.write_text("ssh-rsa AAAA-not-an-ed25519-key\n", encoding="utf-8")
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **VOLUME_SETTINGS)
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_data_mount_never_allows_home(sandbox) -> None:

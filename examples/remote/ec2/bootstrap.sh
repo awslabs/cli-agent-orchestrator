@@ -196,7 +196,7 @@ read_settings() {
     n=$((n + 1))
     if [[ "$line" =~ ^BOX_SSH_PUBLIC_KEY=(.*)$ ]]; then
       key="BOX_SSH_PUBLIC_KEY"
-      value="${BASH_REMATCH[1]}"
+      value="${BASH_REMATCH[1]%$'\r'}"
       [[ -n "$value" ]] || die "${file} line ${n}: BOX_SSH_PUBLIC_KEY must be one OpenSSH public key line"
     else
     line="${line%%#*}"
@@ -270,16 +270,13 @@ fi
 if [ -n "$BOX_SSH_PUBLIC_KEY" ]; then
   [[ "$BOX_SSH_PUBLIC_KEY" != *$'\n'* && "$BOX_SSH_PUBLIC_KEY" != *"PRIVATE KEY"* ]] \
     || die "BOX_SSH_PUBLIC_KEY must be one public key line, never a private key"
-  read -r ssh_key_type ssh_key_data ssh_key_comment <<< "$BOX_SSH_PUBLIC_KEY"
+  read -r ssh_key_type ssh_key_data _ <<< "$BOX_SSH_PUBLIC_KEY"
   case "$ssh_key_type" in
     ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-rsa|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) ;;
     *) die "BOX_SSH_PUBLIC_KEY has an unsupported OpenSSH key type" ;;
   esac
   [[ "$ssh_key_data" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] \
     || die "BOX_SSH_PUBLIC_KEY must contain base64 key data"
-  [ -n "$ssh_key_comment" ] || :
-  [[ "$BOX_SSH_PUBLIC_KEY" != *" "* || "$BOX_SSH_PUBLIC_KEY" == "$ssh_key_type $ssh_key_data"* ]] \
-    || die "BOX_SSH_PUBLIC_KEY must not have an options prefix"
 fi
 INSTALL_DOCKER="${INSTALL_DOCKER:-no}"
 case "$INSTALL_DOCKER" in yes|no) ;; *) die "INSTALL_DOCKER is yes or no" ;; esac
@@ -745,7 +742,7 @@ else
 fi
 
 # ------------------------------------------------------- 6. session name
-step "6. session name (cao-<instance-id>), kept on the data volume"
+step "6. session name (cao-<instance-id>)"
 etc_env="${ETC_DIR}/box.env"
 vol_env="${STATE_DIR}/box.env"
 STOP_DIR="${ROOT:-/}"
@@ -804,7 +801,11 @@ elif [ -e "$etc_env" ]; then
 elif ! system_step; then
   log "--root: no box.env to copy; the first real run writes it (IMDS is never called under --root)"
 elif [ "$DRY_RUN" -eq 1 ]; then
-  printf '[dry-run] would read the instance id from IMDSv2 and write %s and %s:\n' "$vol_env" "$etc_env"
+  if [ "$use_vol" -eq 1 ]; then
+    printf '[dry-run] would read the instance id from IMDSv2 and write %s and %s:\n' "$vol_env" "$etc_env"
+  else
+    printf '[dry-run] would read the instance id from IMDSv2 and write %s:\n' "$etc_env"
+  fi
   printf '[dry-run]   CAO_BOX_SESSION=cao-<instance-id>\n[dry-run]   CAO_HERDR_SESSION=cao-<instance-id>\n'
 else
   session_now="$("$HERE/bin/box-session-name.sh")"
@@ -976,12 +977,14 @@ Next steps (you run these; see README.md):
      gh auth login.
   2. Check: systemctl is-active herdr-cao.service cao-server.service cao-backup.timer
      (with --no-start, start herdr-cao then cao-server, and the backup timer).
-  4. On the laptop: herdr machine add <ssh-host> --remote-session <session> --label cao-box
+  3. On the laptop: herdr machine add <ssh-host> --remote-session <session> --label cao-box
      (answer No if it offers to stop the remote server)
 EOF
 fi
 host_key_file="${ROOT}/etc/ssh/ssh_host_ed25519_key.pub"
 if [ -r "$host_key_file" ]; then
   host_key="$(awk '$1 == "ssh-ed25519" && $2 ~ /^[A-Za-z0-9+/]+={0,2}$/ { print $1 " " $2; exit }' "$host_key_file")"
-  [ -n "$host_key" ] && printf 'HOST KEY: %s\n' "$host_key"
+  if [ -n "$host_key" ]; then
+    printf 'HOST KEY: %s\n' "$host_key"
+  fi
 fi

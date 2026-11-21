@@ -566,9 +566,10 @@ sources it, and refuses any name that isn't one of its settings:
 sudo install -m 0600 /dev/null /opt/cao-box-src/box-settings.env
 sudo tee /opt/cao-box-src/box-settings.env > /dev/null <<'EOF'
 BOX_USER=cao-herdr
-BOX_UID=1001
+BOX_UID=2001
 BOX_HOME=/home/cao-herdr
 DATA_MOUNT=/home/cao-herdr
+BOX_SSH_PUBLIC_KEY=ssh-ed25519 <base64-from-your-public-key> <optional-comment>
 DATA_VOLUME_ID=<vol-id>
 HERDR_VERSION=<herdr-version>
 HERDR_SHA256=<sha256>
@@ -621,22 +622,17 @@ sudo bash bootstrap.sh --settings /opt/cao-box-src/box-settings.env --format-new
 
 ```bash
 findmnt -no SOURCE,TARGET /home/cao-herdr                      # the data volume, at the box home
-id cao-herdr                                                   # uid=1001 gid=1001
+id cao-herdr                                                   # uid=2001 gid=2001
 cat /etc/cao-box/box.env                                       # two non-secret lines: the session, cao-<instance-id>
 systemctl is-enabled herdr-cao.service cao-server.service cao-backup.timer   # enabled x3
 ```
 
-`bootstrap.sh` only enables the units; it never starts them (its header). On later runs, leave
+`bootstrap.sh` starts the units unless `--no-start` is set. On later runs, leave
 `--format-new-volume` off.
 
-**5e. The user's SSH key for the box user** (README quick start, step 6). Add the laptop's
-**public** key to the box user's `~/.ssh/authorized_keys`, mode 0600, owned by the box user.
-Do it as the box user, so root never writes in the home:
-
-```bash
-sudo -u cao-herdr sh -c 'install -d -m 0700 "$1/.ssh" && cat >> "$1/.ssh/authorized_keys" && chmod 0600 "$1/.ssh/authorized_keys"' \
-  sh /home/cao-herdr < <file-with-the-public-key>
-```
+**5e. The user's SSH key for the box user** (README quick start, step 6).
+`bootstrap.sh` installs `BOX_SSH_PUBLIC_KEY` as the box user, with `~/.ssh`
+mode 0700 and `authorized_keys` mode 0600, without duplicating the key.
 
 **Check:** `sudo -u cao-herdr stat -c '%U %a' /home/cao-herdr/.ssh/authorized_keys` prints `cao-herdr 600`, and the
 file has the one public key line (a public key is not a secret, but don't paste private keys
@@ -644,13 +640,11 @@ anywhere).
 
 ## 6. Start the services and connect herdr
 
-**6a. Start the units, then check `/health`** (README quick start, step 8). From the admin shell:
+**6a. Check the units and `/health`** (README quick start, step 8). From the admin shell:
 the box user has no sudo, and shouldn't.
 
 ```bash
-sudo systemctl start herdr-cao.service
-sudo systemctl start cao-server.service     # waits for herdr's socket; fails if it never appears
-sudo systemctl start cao-backup.timer       # bootstrap only enables it; a reboot would start it too
+systemctl is-active herdr-cao.service cao-server.service cao-backup.timer
 for i in $(seq 1 30); do curl -fsS http://127.0.0.1:9889/health && break; sleep 1; done
 ```
 
@@ -987,7 +981,7 @@ restore"; [`iam/README.md`](iam/README.md)).
 | `BOX_UID must be a number from 1000 to 59999` | A macOS uid (for example 501) or another one below 1000. | Pick a uid from 1000 to 59999 and keep it for every rebuild (`bootstrap.sh` step 0). |
 | A dry run stops with `... is blank. To format it as ext4, re-run with --format-new-volume` | The data volume is new and blank, and the flag is missing. | Add `--format-new-volume` to the first dry run and the first real run only (step 5d). |
 | `curl /health` fails right after `systemctl start` | cao-server takes a few seconds to listen after systemd says it started. | Use the retry loop from step 6a. If it never answers: `journalctl -u cao-server -b`. |
-| `box-resume.sh` says `FAIL cao-backup.timer is active` | `bootstrap.sh` only enables the timer; it starts at the next boot. | `sudo systemctl start cao-backup.timer` (step 6a). |
+| `box-resume.sh` says `FAIL cao-backup.timer is active` | The timer did not start or was stopped after bootstrap. | `sudo systemctl start cao-backup.timer`. |
 | `cao: command not found` or `uv: command not found` | `~/.local/bin` isn't on the login shell's `PATH`. | Step 8a. |
 | An agent's launch times out, and its pane shows "do you trust this folder?" | Claude Code's trust prompt, on a folder not yet trusted on this box. | Pre-trust the folder (step 8c), then remove the session and relaunch. |
 | A launch fails on a box with no Codex | The profile is pinned to a Codex model, and `--provider` doesn't override that. | Pick a Claude Code profile, or adapt one (step 8d). |

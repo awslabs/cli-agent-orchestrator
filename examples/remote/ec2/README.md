@@ -192,7 +192,7 @@ cd /opt/cao-box-src/cli-agent-orchestrator/examples/remote/ec2
 sudo install -m 0600 /dev/null /opt/cao-box-src/box-settings.env
 sudo tee /opt/cao-box-src/box-settings.env > /dev/null <<'EOF'
 BOX_USER=cao-herdr
-BOX_UID=1001                  # 1000-59999 (a macOS uid such as 501 is refused); pick one and never change it
+BOX_UID=2001                  # 1000-59999 (a macOS uid such as 501 is refused); pick one and never change it
 BOX_HOME=/home/cao-herdr
 DATA_MOUNT=/home/cao-herdr
 BOX_SSH_PUBLIC_KEY=ssh-ed25519 <base64-from-your-public-key> <optional-comment>
@@ -225,7 +225,9 @@ refuses to run for real if any `BOX_TEST_*` variable is set (those are hooks
 for its dry-run tests).
 
 At the end, it prints `HOST KEY: ssh-ed25519 AAAA…`, with the host-key comment
-stripped. Pin that public line in the laptop's `known_hosts` before connecting.
+stripped. Before connecting, add `<instance-id> ssh-ed25519 <base64>` to the
+laptop's `known_hosts`, using the instance id from the SSH entry and the printed
+key.
 
 The data-volume step formats **only** a disk that matches `DATA_VOLUME_ID`'s
 NVMe serial, is a whole disk, isn't the root disk, has no partitions, holders
@@ -248,7 +250,7 @@ instead, omit the herdr pins and set these settings:
 
 ```text
 ATTACH_MODE=tmux
-BOX_UID=1001
+BOX_UID=2001
 # BOX_USER=cao-tmux and BOX_HOME=/home/cao-tmux are the tmux defaults.
 ```
 
@@ -263,6 +265,15 @@ owns tmux's normal per-user socket in its own cgroup, so restarting
 ssh -t cao-box tmux attach
 ```
 
+In both `cao-box` entries in [`ssh/config.snippet`](ssh/config.snippet), change
+`User cao-herdr` to `User cao-tmux` before using tmux mode. Select the attach
+mode before the first run; change modes by building a new box.
+
+For tmux mode, step 7's `ssh cao-box true` then proves the `cao-tmux` login.
+In step 8, check `cao-tmux.service cao-server.service cao-backup.timer` and
+run `sudo -u cao-tmux -i /usr/local/lib/cao-box/box-resume.sh`; do not use
+`herdr-cao.service` or the herdr machine command.
+
 ### 7. Connect the laptop
 
 Add [`ssh/config.snippet`](ssh/config.snippet) to the laptop's
@@ -274,10 +285,11 @@ herdr machine add cao-box --remote-session cao-<instance-id> --label cao-box
 ```
 
 **If `herdr machine add` offers to stop the remote server, answer No** (that's
-the default). The session name is in `/etc/cao-box/box.env` on the box (and
-a copy on the data volume, see [Backups and restore](#backups-and-restore)).
+the default). The session name is in `/etc/cao-box/box.env` on the box. When
+`DATA_MOUNT` differs from `BOX_HOME`, a root-only copy is also on the data
+volume (see [Backups and restore](#backups-and-restore)).
 
-### 8. Start the services, log in, check
+### 8. Check the services, log in
 
 From your admin shell (the Session Manager shell; `cao-herdr` has no sudo, and
 shouldn't):
@@ -502,10 +514,10 @@ flags. herdr's own `session-snapshots/` are kept. That herdr then comes up
 empty is an assumption that phase 0 checks.
 
 The session name is `cao-<instance-id>`. It's read once from the instance
-metadata (IMDSv2) at bootstrap and kept in `.cao-box/box.env` on the data
-volume, with a copy in `/etc/cao-box/box.env` for the units. It's never
-recomputed, so it doesn't drift, and it survives stop and start and a
-whole-box restore.
+metadata (IMDSv2) at bootstrap and kept in `/etc/cao-box/box.env` for the
+units. When `DATA_MOUNT` differs from `BOX_HOME`, a root-only
+`.cao-box/box.env` copy on the data volume also preserves it. It's never
+recomputed, so it doesn't drift.
 
 ### Editing
 
@@ -535,10 +547,9 @@ uid and gid `BOX_UID`, and mounts the data volume at that home
 (`DATA_MOUNT=/home/cao-herdr`). It never mounts at `/home`, which would hide
 Ubuntu's `ubuntu` home.
 
-**Why a fixed user name?** Each attach mode gets one name: this sample uses
-`cao-herdr`, while `cao-tmux` and `cao-herdr-core` are reserved for their
-future tmux and herdr-core paths. The same commands therefore work on every
-box. If kits, prompts or memory hold absolute laptop paths, set
+**Why a fixed user name?** Each attach mode gets one name: herdr uses
+`cao-herdr` and tmux uses `cao-tmux`. The same commands therefore work on
+every box in that mode. If kits, prompts or memory hold absolute laptop paths, set
 `BOX_HOME=/Users/<you>` and `DATA_MOUNT=/Users/<you>` instead.
 
 - **Why not a symlink?** `/Users/<you> -> /home/cao-herdr` lets literal paths
@@ -592,15 +603,23 @@ sudo /usr/local/lib/cao-box/restore.sh --live /home/cao-herdr/backups/cao/cao-<s
 
 **Whole-box restore:**
 1. Make a volume from a snapshot and attach it to a fresh instance.
-2. Run `bootstrap.sh` with the same settings, the same `BOX_UID` and the new
+2. If `DATA_MOUNT` is `BOX_HOME` (the default and the `/Users/<you>` layout),
+   find the old session name in the laptop's herdr machine entry (the step 7
+   mismatch error also shows it), then as root write it before bootstrap:
+   ```bash
+   sudo install -D -m 0644 /dev/stdin /etc/cao-box/box.env <<'EOF'
+   CAO_BOX_SESSION=cao-<old-instance-id>
+   CAO_HERDR_SESSION=cao-<old-instance-id>
+   EOF
+   ```
+3. Run `bootstrap.sh` with the same settings, the same `BOX_UID` and the new
    `DATA_VOLUME_ID`, without `--format-new-volume`.
-3. It finds the filesystem and mounts it, checks the home belongs to
-   `BOX_UID`, and reads `.cao-box/box.env` from the volume. The folder must
-   be root's, and the file must be exactly the two session lines with equal
-   values. It then writes those two lines afresh into `/etc/cao-box/box.env`.
-   So the session name stays the old one, and it matches CAO's `settings.json`
-   and the laptop's saved machine. It stops if `settings.json` and `box.env`
-   disagree.
+4. With a separate `DATA_MOUNT`, it finds the filesystem and mounts it, checks
+   the home belongs to `BOX_UID`, and reads `.cao-box/box.env` from the volume.
+   The folder must be root's, and the file must be exactly the two session
+   lines with equal values. In either layout the old session name matches CAO's
+   `settings.json` and the laptop's saved machine. It stops if `settings.json`
+   and `box.env` disagree.
 
 ## Checking it works
 
@@ -740,7 +759,7 @@ Then remove the `cao-box` entries from the laptop's `~/.ssh/config`, run
 
 | File | What it does |
 |---|---|
-| [`bootstrap.sh`](bootstrap.sh) | Sets up the box. Idempotent, with `--dry-run`. Ubuntu 24.04 arm64 only. Formats only a verified blank data volume, and only with `--format-new-volume`. Checks every download's sha256. Enables units but never starts them. |
+| [`bootstrap.sh`](bootstrap.sh) | Sets up the box. Idempotent, with `--dry-run`. Ubuntu 24.04 arm64 only. Formats only a verified blank data volume, and only with `--format-new-volume`. Checks every download's sha256. Starts them, unless `--no-start` is set. |
 | [`backup.sh`](backup.sh), [`restore.sh`](restore.sh) | Nightly backup; a restore drill (as the box user) and a live restore (root only). |
 | [`bin/box-session-name.sh`](bin/box-session-name.sh) | Prints `cao-<instance-id>` from IMDSv2. |
 | [`bin/herdr-start.sh`](bin/herdr-start.sh), [`bin/herdr-clean-layout.sh`](bin/herdr-clean-layout.sh) | Start herdr with the minimal environment, after moving the saved layout aside. |

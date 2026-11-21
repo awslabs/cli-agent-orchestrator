@@ -15,6 +15,7 @@ Environment=HOME=@BOX_HOME@
 Environment=USER=@BOX_USER@
 Environment=PATH=@BOX_HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/tmux new-session -d -s box-keepalive
+ExecStartPost=/usr/bin/tmux set-option -s exit-empty off
 # An explicit stop intentionally kills the server and its agent sessions.
 ExecStop=/usr/bin/tmux kill-server
 

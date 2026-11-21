@@ -484,6 +484,7 @@ def test_tmux_unit_uses_a_separate_standard_socket_server() -> None:
     unit = (SAMPLE_DIR / "systemd" / "cao-tmux.service").read_text(encoding="utf-8")
     assert "Type=forking" in unit
     assert "ExecStart=/usr/bin/tmux new-session -d -s box-keepalive" in unit
+    assert "ExecStartPost=/usr/bin/tmux set-option -s exit-empty off" in unit
     assert "ExecStop=/usr/bin/tmux kill-server" in unit
     assert "KillMode=none" not in unit
     assert "\nPrivateTmp=" not in unit
