@@ -844,8 +844,13 @@ class TestKimiCliProviderBuildCommand:
         assert config["test-server"]["env"]["CAO_TERMINAL_ID"] == "abc123"
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load):
-        """Test that existing CAO_TERMINAL_ID in env is not overwritten."""
+    def test_build_command_mcp_overrides_a_profile_declared_terminal_id(self, mock_load):
+        """A profile does not get to declare the identity the gates authorize on.
+
+        Inverted for #1062: this asserted that a declared value was kept, which
+        let a profile choose its own authorization posture on both CAO MCP
+        surfaces. See ``test/providers/test_terminal_identity_forwarding.py``.
+        """
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
@@ -867,8 +872,7 @@ class TestKimiCliProviderBuildCommand:
         mcp_json = parts[1].strip().strip("'")
         config = json.loads(mcp_json)
 
-        # Should keep the existing value, not override
-        assert config["test-server"]["env"]["CAO_TERMINAL_ID"] == "existing-id"
+        assert config["test-server"]["env"]["CAO_TERMINAL_ID"] == "new-id"
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     def test_build_command_mcp_tool_timeout(self, mock_load, tmp_path):

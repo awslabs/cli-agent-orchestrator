@@ -589,17 +589,21 @@ jobs:
       # GITHUB_REF_NAME is the branch (`main`) — it would produce
       # "repin packages to main". `pyproject.toml` is what the build itself pins from, so
       # it is the version the commit actually delivers.
+      #
+      # The build also rewrites the two marketplace catalogs (`.claude-plugin/` and
+      # `.agents/plugins/`), which carry the pinned version, so both are diffed and added
+      # here. Naming only `agent-plugin/` would leave a catalog stale on `main` (#1409).
       - name: Commit the regenerated packages if they changed
         run: |
           set -euo pipefail
-          if git diff --quiet -- agent-plugin/; then
-            echo "agent-plugin/ already matches the published release; nothing to commit"
+          if git diff --quiet -- agent-plugin/ .claude-plugin/ .agents/plugins/; then
+            echo "agent-plugin/ and the marketplace catalogs already match the published release; nothing to commit"
             exit 0
           fi
           version="$(uv run python -c 'import sys; sys.path.insert(0, "scripts"); import build_agent_plugin as b; print(b.package_version())')"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add agent-plugin/
+          git add agent-plugin/ .claude-plugin/ .agents/plugins/
           git commit -m "chore(agent-plugin): repin packages to v${version}"
           git push origin HEAD:main
 

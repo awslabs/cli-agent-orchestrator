@@ -602,6 +602,42 @@ failing CI on any drift.
 > The name `cao-contributor` and the packaged name of the event-plugin authoring
 > skill are provisional, pending maintainer decision **M4**.
 
+## Install from the marketplace
+
+The repository root carries a marketplace catalog for each client that can add a
+repository as a marketplace, so the four packages above install without
+cloning anything or enabling `CAO_AGENT_PLUGINS_ENABLED`:
+
+```sh
+# Claude Code
+/plugin marketplace add awslabs/cli-agent-orchestrator
+/plugin install cao@cli-agent-orchestrator
+
+# Codex
+codex plugin marketplace add awslabs/cli-agent-orchestrator
+codex plugin add cao@cli-agent-orchestrator
+```
+
+The same commands work from a shell as `claude plugin marketplace add ...` and
+`claude plugin install ...`. Verified against Claude Code 2.1.328 and Codex CLI
+0.170.0, from a local checkout.
+
+The catalogs are `.claude-plugin/marketplace.json` (Claude Code) and
+`.agents/plugins/marketplace.json` (Codex). The Agent Plugins specification
+defines one manifest per plugin and no marketplace format, so each client's own
+file is needed. `scripts/build_agent_plugin.py` writes both from the same package
+list that writes the per-package manifests, and `make check-agent-plugin` fails
+when either is stale.
+
+**The catalog follows `main`**, not a release tag. A marketplace added from
+`awslabs/cli-agent-orchestrator` receives `main`'s skills, including
+`cao-ag-ui-builder`, which can describe behavior that has not been released.
+Package versions say what was last pinned, not what `main` contains.
+
+`cao plugin add` remains the route that works across every CAO provider: it
+installs a package into CAO's own skill store and provider configs, which a
+client-specific marketplace does not do.
+
 ## Trying it in a client
 
 Two routes reach a client, and they are worth keeping apart. **Through CAO** —
@@ -648,8 +684,23 @@ An operator opts in by naming the server in the profile's `allowedTools`:
 allowedTools:
   - "@builtin"
   - fs_read
-  - "@cao-ops"     # or a matching glob, or "*" — then it is granted
+  - "@cao-ops"              # or a matching glob, or "*" — then it is granted
+  - "@cao-ops-mcp-server"   # what the operations server's own gate asks for
 ```
+
+**That agent runs in a CAO terminal, so it needs both entries** (#1062). They
+answer two different checks. `@cao-ops` names the server by the key it is
+declared under, which is how CAO and the provider decide whether the agent may
+see its tools. `@cao-ops-mcp-server` is the grant the operations server itself
+requires of a bound terminal on every tool except `decisions_off`; that gate
+reads the fixed selector, not the key, so `@cao-ops` alone is refused with
+`the calling terminal's allowed tools do not include '@cao-ops-mcp-server'`. `"*"`
+covers both. A glob that covers both names, such as `"@cao-ops*"`, satisfies the
+gate and CAO's own server selection, but CAO passes the entry to the provider as
+written, so the two explicit entries are the form to rely on. See
+[Tool Restrictions](tool-restrictions.md#cao-ops-mcp-server-gates-the-operations-control-plane-separately).
+A client that runs the plugin **outside** CAO has no `CAO_TERMINAL_ID`, is an
+operator context, and needs neither.
 
 The accepted cost is that a freshly installed plugin's tools are inert until
 named. That is visible, because the operator just ran the install; the widening it
@@ -733,8 +784,10 @@ What each step asserts, and why it is the load-bearing one:
    `x-cao-pre-expanded` marker leaked. The profile names no `allowedTools`, so
    `@cao-ops` is **absent** from the resolved list — the fail-closed rule below,
    asserted where it takes effect. A second install (step 3b) of a profile that
-   *does* declare `allowedTools: ["@builtin", fs_read, "@cao-ops"]` gets the
-   grant, so the recording proves both halves of the rule rather than one.
+   *does* declare `allowedTools: ["@builtin", fs_read, "@cao-ops", "@cao-ops-mcp-server"]`
+   gets the grant, so the recording proves both halves of the rule rather than
+   one. The second entry is the one the operations server's gate reads in a CAO
+   terminal (#1062); the step asserts that it survives into the emitted list.
 4. **`cao install … --provider opencode_cli`** — `opencode.json` gets a real
    boolean `"enabled": true`; and installing over a user's own same-named entry
    **preserves it and emits a finding** rather than clobbering it.

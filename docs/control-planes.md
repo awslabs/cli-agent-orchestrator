@@ -139,6 +139,12 @@ For Claude Code, add this stdio server to `.mcp.json`:
 }
 ```
 
+This is the operator setup: the client runs outside CAO, the server sees no
+`CAO_TERMINAL_ID`, and no grant is needed. A `cao-ops-mcp-server` process that
+does see `CAO_TERMINAL_ID` (one started inside a CAO terminal) is gated on that
+terminal's allowlist and needs `@cao-ops-mcp-server`; see
+[Tool Restrictions](tool-restrictions.md#cao-ops-mcp-server-gates-the-operations-control-plane-separately).
+
 For other MCP clients, configure the equivalent stdio command:
 
 ```bash

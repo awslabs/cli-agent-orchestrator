@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add the Qwen Code (`qwen_cli`) provider with profile, skill, MCP and model support.
 
+- **`cao memory show` finds an existing key when recall ranks by BM25** (#1329).
 - **herdr backend: event-driven inbox delivery works again on herdr 0.9.x (protocol 22)**.
   herdr ≥0.9 acks a broadcast `pane.updated` subscription but never emits the event, so every
   inbox delivery silently fell back to the 30s reconciliation sweep (measured 51s/83s
@@ -24,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider's post-turn flush-wait, offloaded off the event loop and stopping as soon as the
   message lands.
 
+- **Workflow scripts with an f-string `step_id` whose own text breaks the step id rule are refused** (#1396).
+  A `step_id` must be 1-64 characters from `[A-Za-z0-9_-]`. `step_id=f"review:{name}"` used to pass
+  validation and then get a 422 from `POST /terminals/run-step` on every call, since no value of
+  `name` can remove the colon. The lint gate now flags it, so `workflow validate`, workflow create and
+  update, and `cao workflow run` all refuse such a script before any step starts. A stored workflow
+  written that way needs its ids changed. The fan-out example in the `cao-workflow` skill and in
+  `docs/workflows.md` used this shape and now builds a valid id from each file name.
 - **Memory inspection and fixture hygiene are safer by default** (#1329).
   This resolves #861 Q3: CLI list/show and REST list/show no longer increment
   `access_count` unless `memory.non_accessing_inspection=false`; MCP recall
@@ -1727,6 +1735,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently, so `limit=500` keeps working rather than becoming a 422.
 
 ### Security
+
+- **`cao-ops-mcp-server` is gated on the caller's `tools:` allowlist** (#1062). #972 gated every
+  `cao-mcp-server` tool on that allowlist and recorded the operations control plane as knowingly
+  ungated. The gap: `CAO_TERMINAL_ID` is forwarded into **every** server in a profile's
+  `mcpServers` map, so a bound terminal whose profile listed `cao-ops-mcp-server` reached all
+  18 ops tools — `launch_session`, `install_profile`, `shutdown_session`, `send_session_message`,
+  the session/terminal readers and the seven `decisions_*` controls — with its allowlist
+  unconsulted, and could lift an operator's `cao decisions off` by setting a point back to `shadow`
+  or `on`. Every ops tool now requires the new `@cao-ops-mcp-server` grant (or `*`, or a glob
+  covering it), which `@cao-mcp-server` does **not** imply. Two deliberate carve-outs:
+  `decisions_off` stays reachable without the grant, because an argument-free off-only kill switch
+  that needs a grant is not a fail-safe; and lifting a halt is refused for any bound terminal even
+  *with* the grant, so it takes an operator context — `cao decisions set` on the CLI, or an MCP host
+  running the operations server with no `CAO_TERMINAL_ID`. That refusal is enforced inside the
+  mutation: `set_point` takes the exclusive egress lock, re-reads the halt marker under it, refuses a
+  bound caller before writing anything, and removes the marker only if it observed it under that
+  lock — so a halt an operator publishes beside a call in flight survives. `decisions_off` does
+  **not** wait for that lock to publish its marker (the shared side is held for the whole of an
+  outstanding decision request, and a kill switch that waits on one is not a kill switch), which is
+  exactly why the removal is conditional rather than the publication locked. An operator setter that
+  finds the lock busy proceeds with a logged warning, because the CLI must not lose the only way to
+  lift a halt; a bound caller is refused instead. The middleware refuses early
+  only to say so sooner. An operator MCP host, with
+  no `CAO_TERMINAL_ID`, is unchanged on both counts. A caller that claims an identity CAO cannot
+  resolve — including an explicitly empty `CAO_TERMINAL_ID` — is refused rather than treated as an
+  operator, and a `CAO_TERMINAL_ID` that a profile or an agent plugin declares in a server's `env`
+  is no longer written into a provider's MCP configuration. The providers that write it at launch
+  inject the launching terminal's own id, overriding (and logging) a pinned one. Three have no id
+  to inject and drop
+  (and log) a pinned one instead, so the server takes the id of the terminal that launches it:
+  antigravity, because its config file is shared across that terminal's siblings (#940), and Kiro
+  CLI and OpenCode, because `cao install` writes theirs (`~/.kiro/agents/<agent>.json`,
+  `opencode.json`) before any terminal exists. Those two carried a pinned value verbatim until
+  review of this change; a file installed earlier keeps it until the next `cao install` of that
+  agent. A bound terminal that pulls the `decisions_off` kill switch is now named in a WARNING on
+  the operations server's log, since the call needs no grant and only an operator can undo it. The
+  launching CAO's coordinates (`CAO_API_HOST`/`CAO_API_PORT`/`CAO_HOME_DIR`, #1075/#1089) are now
+  gated on the same shape predicate as the identity: both are injected only into an entry that
+  launches the bundled server (bare script, absolute path, `.exe`, module entrypoint, or the script
+  named in a `uvx` entry's args), the entry's name in `mcpServers` is no longer trusted for either,
+  and an entry merely named `cao-mcp-server` that launches something else gains nothing and is
+  logged. The gate is #972's own middleware, moved to `security/mcp_tool_gate.py` and installed on
+  both surfaces, and the `@server` spelling rule is now
+  `tool_mapping.mcp_reference_covers` — the same matcher the provider layer uses — so a documented
+  glob grant such as `@cao-*` authorizes here what it already authorized there.
+  **How this slipped through:** the surface was recorded as ungated on purpose. #972's own guard
+  declared it in `UNGATED_SURFACES` with the reason and the shape of the risk written out, and the
+  suite stayed green because the declaration was the assertion. The follow-up had no owner and no
+  issue until #1062. `UNGATED_SURFACES` is now empty, and both surfaces are enumerated by
+  introspection in the per-tool coverage test, so a new ops tool is gated by default rather than by
+  someone remembering.
+  **Who holds the grant.** The #772 rule is unchanged: a profile with no explicit `allowedTools:`
+  (and no `--allowed-tools` at launch) still gets `@<server>` appended for each server it declares,
+  so a role-default profile (developer, `supervisor`, `reviewer`) that declares the server under the
+  key `cao-ops-mcp-server` holds the grant and reaches every ops tool, short of lifting a halt. Only
+  an explicit `allowedTools:` withholds it (the Kiro `tools:` field does not); to declare the server
+  and withhold the control plane, pin `allowedTools:` without the grant. The gate reads the fixed
+  selector, not the key the server is declared under.
+  **Migration:** inside a CAO terminal, (1) a profile that lists `cao-ops-mcp-server` in
+  `mcpServers` and pins an explicit `allowedTools:` must add `@cao-ops-mcp-server` to it; (2) a
+  profile that reaches the server under **another key** must name `@cao-ops-mcp-server` as well.
+  This includes the operator agent-plugin delivered through `cao install`, whose server key is
+  `cao-ops`: `allowedTools: [..., "@cao-ops"]` becomes `[..., "@cao-ops", "@cao-ops-mcp-server"]`,
+  and `@cao-ops` alone is now refused on every tool except `decisions_off`
+  (`docs/agent-plugins.md`). A role-default profile that declares the server itself under another
+  key is refused the same way, because the entry appended for it is `@<that key>`. (3) Review
+  any profile that lists both servers and already grants a glob: `@cao-*` and `@*` cover
+  `@cao-ops-mcp-server`, so such a profile holds the control plane as well as delegation, not
+  delegation alone. Name `@cao-mcp-server` instead of the glob to withhold it. Profiles
+  granting `*`, and operator MCP hosts outside CAO (no `CAO_TERMINAL_ID`, which is how a client runs
+  the agent plugin itself), need no change.
 
 - **Vault `secret_gate: "warn"` no longer forwards raw secret matches to a model** (#644 AC10).
   Under `warn` a secret-bearing note is still indexed and recallable, but every match is replaced by

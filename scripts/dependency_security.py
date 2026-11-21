@@ -610,6 +610,44 @@ def scan(
 
 #: Lockfiles under these prefixes ship nothing and are always ``toolchain``.
 NO_SHIP_PREFIXES = ("examples/",)
+#: Named exceptions to NO_SHIP_PREFIXES: example lockfiles whose code is deployed, so their
+#: runtime (non-dev) packages are shipped. Owner ruling on #1400: the decision-model-host
+#: CDK app is a deployable stack, so what it installs at deploy time runs in an account.
+SHIPPED_EXAMPLES = {
+    "examples/decision-model-host/aws/cdk/package-lock.json": (
+        "deployable CDK app: its runtime dependencies run in the deployed stack"
+    ),
+}
+
+
+def ships_nothing(lockfile: str) -> bool:
+    """A lockfile under NO_SHIP_PREFIXES that is not a named SHIPPED_EXAMPLES exception."""
+    return lockfile.startswith(NO_SHIP_PREFIXES) and lockfile not in SHIPPED_EXAMPLES
+
+
+def npm_runtime_packages(root: Path, lockfile: str) -> set[tuple[str, str]]:
+    """Non-dev packages of an npm lockfile (v2/v3 ``packages`` map, ``"dev": true`` skipped)."""
+    try:
+        packages = json.loads((root / lockfile).read_text(encoding="utf-8")).get("packages")
+    except (OSError, ValueError) as exc:
+        raise ShippedSetError(f"{lockfile}: unreadable: {exc}") from exc
+    if not isinstance(packages, dict):
+        raise ShippedSetError(f"{lockfile}: no lockfile v2/v3 'packages' map")
+    pairs = set()
+    for key, entry in packages.items():
+        if not key or not isinstance(entry, dict) or entry.get("dev") or entry.get("link"):
+            continue
+        if entry.get("version"):
+            folder = key.rsplit("node_modules/", 1)[-1]
+            pairs.add((folder, entry["version"]))
+            # An npm alias ("helper": "npm:@scope/real-helper@1.0.0") sits in the folder
+            # "helper" but Trivy reports the real name, so record both.
+            real = entry.get("name")
+            if isinstance(real, str) and real and real != folder:
+                pairs.add((real, entry["version"]))
+    return pairs
+
+
 IGNORE_MAX_DAYS = 14
 EXIT_PASSED, EXIT_BLOCKED, EXIT_ERROR = 0, 1, 2
 PRODUCER_TIMEOUT = 300
@@ -1020,6 +1058,13 @@ def _producers(root: Path, policy: dict | None = None) -> dict[str, tuple[str, o
         "web/package-lock.json": ("bundled-packages.json", bundled("web")),
         "cao_mcp_apps/package-lock.json": ("bundled-packages.json", bundled("cao_mcp_apps")),
         "docusaurus/package-lock.json": ("bundled-packages.json", docusaurus),
+        **{
+            lockfile: (
+                "package-lock.json non-dev packages",
+                lambda lockfile=lockfile: npm_runtime_packages(root, lockfile),
+            )
+            for lockfile in SHIPPED_EXAMPLES
+        },
     }
 
 
@@ -1037,7 +1082,7 @@ def collect_shipped_sets(
     sets: dict[str, dict] = {}
     for path in inputs:
         key = path.as_posix()
-        if key.startswith(NO_SHIP_PREFIXES):
+        if ships_nothing(key):
             continue
         if key not in producers:
             raise ShippedSetError(
@@ -1065,7 +1110,7 @@ def validate_shipped_sets(document: object, inputs: list[Path]) -> dict[str, dic
         raise ShippedSetError("shipped-set.json: 'sets' is not an object")
     for path in inputs:
         key = path.as_posix()
-        if key.startswith(NO_SHIP_PREFIXES):
+        if ships_nothing(key):
             continue
         entry = sets.get(key)
         if not isinstance(entry, dict) or not isinstance(entry.get("producer"), str):
@@ -1338,7 +1383,7 @@ def classify_findings(
         record = dict(finding)
         ecosystem = ecosystems.get(path, "")
         name = _canonical(ecosystem, finding["package"])
-        if path.startswith(NO_SHIP_PREFIXES):
+        if ships_nothing(path):
             record["classification"], record["reason"] = "toolchain", "ships nothing (examples/)"
         elif path not in members:
             record["classification"] = "shipped"

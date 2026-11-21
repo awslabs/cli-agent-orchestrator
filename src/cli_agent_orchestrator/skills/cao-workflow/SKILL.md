@@ -346,6 +346,12 @@ explicit, stable `step_id`**. The sequential `call-N` counter fallback is race-f
 deterministic across runs under concurrent scheduling — so resume would replay the wrong
 results. Iterate over `sorted()` inputs so the mapping from item → step_id is stable.
 
+A `step_id` must be 1-64 characters from `[A-Za-z0-9_-]`; anything else gets a 422 from
+`run-step`. `validate` checks only the literal text of an f-string id, so every value you
+format into it must obey the rule too. File names carry `.` and often spaces, so build the id
+from a slug plus a digest of the name, as the worked example below does. Do not use the list
+index: if the inputs change between a halt and a resume, the same id points at a different item.
+
 Default `max_workers=2` for `claude_code` (measured: 4 starved the heaviest lens). Expose it as
 a tunable input; higher values are fine when steps are light.
 
@@ -410,7 +416,9 @@ file, per-unit fault tolerance, and results written to disk:
 
 ```python
 """summarize_dir — fan out a summary step over every file in target_dir."""
+import hashlib
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 from cao_workflow import step, emit_output, get_inputs, ShimError, ShimHTTPError
@@ -432,6 +440,15 @@ files = sorted(
 )
 
 
+def summary_step_id(filename: str) -> str:
+    # A step_id allows only [A-Za-z0-9_-], up to 64 characters, and a file name
+    # like "notes.txt" breaks that. Slug the name and always add a digest, so two
+    # names that slug alike ("a b" and "a.b") still get different ids.
+    slug = re.sub(r"[^A-Za-z0-9_-]", "_", filename)[:40]
+    digest = hashlib.sha256(filename.encode("utf-8")).hexdigest()[:12]
+    return f"summarize-{slug}-{digest}"
+
+
 def summarize(filename: str):
     path = os.path.join(target_dir, filename)
     try:
@@ -441,7 +458,7 @@ def summarize(filename: str):
             provider="claude_code",          # headless (R5)
             agent="reviewer",
             prompt=f"Summarize the file at {path} in 3 bullet points. Return the summary only.",
-            step_id=f"summarize:{filename}",
+            step_id=summary_step_id(filename),
             # DECLARED, not defaulted. This step reads a file and returns text — it writes
             # nothing and charges nothing — so "re-running it has the same effect as running
             # it once" is an honest claim about THIS step. If it sent mail or filed a ticket,
