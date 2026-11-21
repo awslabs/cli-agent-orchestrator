@@ -1485,10 +1485,12 @@ class TestHerdrInboxServiceSettleRetries:
     re-delivery that closes that gap.
     """
 
-    @pytest.mark.parametrize("result", [0, DELIVERY_DEFERRED, 1])
+    @pytest.mark.parametrize(
+        "result, should_arm", [(0, False), (DELIVERY_DEFERRED, True), (1, False)]
+    )
     @pytest.mark.parametrize("source", ["herdr-event", "settled-sweep"])
     @pytest.mark.parametrize("status", ["idle", "done"])
-    def test_only_deferred_delivery_arms_retries(self, result, source, status):
+    def test_only_deferred_delivery_arms_retries(self, result, should_arm, source, status):
         callback = MagicMock(return_value=result)
         service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
         service._pane_to_terminal = {"w1:p1": "tid1"}
@@ -1507,7 +1509,7 @@ class TestHerdrInboxServiceSettleRetries:
                 else:
                     await service._deliver_settled_panes()
                 callback.assert_called_once_with("tid1", source)
-                if result == DELIVERY_DEFERRED:
+                if should_arm:
                     arm.assert_called_once_with("tid1")
                 else:
                     arm.assert_not_called()
@@ -1559,7 +1561,7 @@ class TestHerdrInboxServiceSettleRetries:
         def callback(tid, source):
             ticks["n"] += 1
             # Not ready on the first tick, delivers on the second.
-            return 1 if ticks["n"] >= 2 else 0
+            return 1 if ticks["n"] >= 2 else DELIVERY_DEFERRED
 
         service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
         service._terminal_to_pane = {"tid1": "w1:p1"}
