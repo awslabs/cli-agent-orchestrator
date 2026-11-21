@@ -33,6 +33,9 @@ class DelegationEdge(BaseModel):
     state: EdgeState
     reason: EdgeReason
     message_id: Optional[int] = None
+    # Inbox id of a reply from the worker that is stored but not yet delivered
+    # (reply-delivery-failure D1). The edge stays OPEN while this is set.
+    reply_message_id: Optional[int] = None
     created_at: datetime
     delivered_at: Optional[datetime] = None
     closed_at: Optional[datetime] = None

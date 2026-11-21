@@ -41,6 +41,7 @@ from cli_agent_orchestrator.constants import (
     DECISION_RESPONSE_HEADER,
     DEFAULT_PROVIDER,
     DISCOVERY_TOOL_MARKER,
+    INBOX_DELIVERY_OUTCOME_WAIT,
 )
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
@@ -71,6 +72,16 @@ logger = logging.getLogger(__name__)
 def _mcp_timeout() -> float:
     """Get MCP request timeout from server settings."""
     return float(get_server_settings()["mcp_request_timeout"])
+
+
+def _inbox_post_timeout() -> float:
+    """HTTP timeout for an inbox POST, which waits for its delivery outcome.
+
+    The POST can hold for INBOX_DELIVERY_OUTCOME_WAIT before it answers
+    (reply-delivery-failure D5), so the client must wait longer than that, or
+    a message that may still arrive would read to the sender as an error.
+    """
+    return max(_mcp_timeout(), INBOX_DELIVERY_OUTCOME_WAIT + 10)
 
 
 def _auth_headers() -> Dict[str, str]:
@@ -1635,7 +1646,8 @@ def _send_to_inbox(receiver_id: str, message: str, expect_reply: bool = False) -
         message: Message content
 
     Returns:
-        Dict with message details
+        The POST's answer: message details plus ``success``, ``delivery`` and
+        ``error`` (see ``create_inbox_message_endpoint``).
 
     Raises:
         ValueError: If CAO_TERMINAL_ID not set
@@ -1672,7 +1684,7 @@ def _send_to_inbox(receiver_id: str, message: str, expect_reply: bool = False) -
         f"{base_url}/terminals/{receiver_id}/inbox/messages",
         params=params,
         headers=_inbox_headers(base_url),
-        timeout=_mcp_timeout(),
+        timeout=_inbox_post_timeout(),
     )
     if response.status_code == 404 and callback_url and base_url != callback_url:
         # Receiver unknown on this node but a cross-node supervisor is
@@ -1682,7 +1694,7 @@ def _send_to_inbox(receiver_id: str, message: str, expect_reply: bool = False) -
             f"{callback_url}/terminals/{receiver_id}/inbox/messages",
             params=params,
             headers=_inbox_headers(callback_url),
-            timeout=_mcp_timeout(),
+            timeout=_inbox_post_timeout(),
         )
     response.raise_for_status()
     data: Dict[str, Any] = response.json()

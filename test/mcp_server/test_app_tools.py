@@ -223,17 +223,15 @@ def test_create_session_gesture_timeout_follows_provider_init_timeout() -> None:
 
 
 def test_non_creating_gestures_stay_on_the_ordinary_mcp_timeout() -> None:
-    """Only the create is widened (issue #710).
+    """Only the create and send_message are widened (issue #710, F6).
 
-    ``send_message`` and ``interrupt`` are answered immediately, so they keep the
-    flat ``mcp_request_timeout`` scalar -- widening those would only delay
-    reporting a wedged server.
+    ``interrupt`` is answered immediately, so it keeps the flat
+    ``mcp_request_timeout`` scalar -- widening it would only delay reporting a
+    wedged server. ``send_message`` now waits for its delivery outcome; see
+    ``test_operator_send_message_waits_past_the_outcome_bound``.
     """
 
-    for kind, payload in (
-        ("send_message", {"terminal_id": "abcd1234", "message": "hi"}),
-        ("interrupt", {"terminal_id": "abcd1234"}),
-    ):
+    for kind, payload in (("interrupt", {"terminal_id": "abcd1234"}),):
         calls: List[Dict[str, Any]] = []
         with (
             patch.object(app_tools.requests, "post", _capture_post(calls)),
@@ -704,3 +702,61 @@ def test_submit_command_forwards_bearer_when_token_present(
     result = app_tools._submit_command_impl("create_session", {"agent_profile": "dev"})
     assert result["success"] is True
     assert captured["headers"] == {"Authorization": "Bearer local-machine-token"}
+
+
+def _post_answering(body: Dict[str, Any], recorder: List[Dict[str, Any]]):
+    def _fake_post(url: str, params=None, headers=None, timeout=None):
+        recorder.append({"url": url, "params": params, "timeout": timeout})
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = dict(body)
+        return resp
+
+    return _fake_post
+
+
+@pytest.mark.parametrize("mcp_timeout", [30, 1000], ids=["mcp-shorter", "mcp-longer"])
+def test_operator_send_message_waits_past_the_outcome_bound(mcp_timeout) -> None:
+    """F6: the inbox POST can wait INBOX_DELIVERY_OUTCOME_WAIT for its outcome."""
+    from cli_agent_orchestrator.constants import INBOX_DELIVERY_OUTCOME_WAIT
+
+    calls: List[Dict[str, Any]] = []
+    with (
+        patch.object(
+            app_tools.requests,
+            "post",
+            _post_answering({"success": True, "delivery": "delivered"}, calls),
+        ),
+        patch(
+            "cli_agent_orchestrator.utils.orchestration.get_server_settings",
+            return_value={"provider_init_timeout": 60, "mcp_request_timeout": mcp_timeout},
+        ),
+    ):
+        app_tools._submit_command_impl("send_message", {"terminal_id": "abcd1234", "message": "hi"})
+    timeout = calls[0]["timeout"]
+    read_timeout = timeout[-1] if isinstance(timeout, tuple) else timeout
+    assert read_timeout >= INBOX_DELIVERY_OUTCOME_WAIT + 10
+    assert read_timeout >= mcp_timeout
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"success": True, "message_id": 7, "delivery": "delivered", "error": None},
+        {"success": True, "message_id": 7, "delivery": "queued", "error": None},
+        {"success": False, "message_id": 7, "delivery": "failed", "error": "lost read"},
+        {"success": False, "message_id": 7, "delivery": "uncertain", "error": "lost send"},
+    ],
+    ids=["delivered", "queued", "failed", "uncertain"],
+)
+def test_operator_send_message_carries_the_post_outcome(body: Dict[str, Any]) -> None:
+    """F6: the result says what the POST said, success false included."""
+    calls: List[Dict[str, Any]] = []
+    with patch.object(app_tools.requests, "post", _post_answering(body, calls)):
+        result = app_tools._submit_command_impl(
+            "send_message", {"terminal_id": "abcd1234", "message": "hi"}
+        )
+    assert result["success"] is body["success"]
+    assert result["delivery"] == body["delivery"]
+    assert result["error"] == body["error"]
+    assert result["kind"] == "send_message"
