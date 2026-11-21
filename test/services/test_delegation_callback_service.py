@@ -770,6 +770,41 @@ class TestSystemNoticeMark:
         assert _inbox(S) == [], "S is not told that its notice to W failed"
 
 
+class TestDeferredInitNoticeMark:
+    """The notice a worker's failed deferred init queues for its caller is a CAO notice too."""
+
+    def _notify(self, text="Worker wwww0003 failed to initialize: trust prompt"):
+        from cli_agent_orchestrator.services import terminal_service as real_terminal_service
+
+        real_terminal_service._notify_caller_of_deferred_failure(
+            W, text, registry=None, delete_worker=False
+        )
+
+    def test_the_notice_is_stored_marked(self, live):
+        self._notify()
+
+        (notice,) = _inbox(S)
+        assert (notice.sender_id, notice.message.startswith("Worker wwww0003")) == (W, True)
+        assert notice.is_system_notice is True
+
+    def test_a_notice_that_fails_for_good_gets_the_worker_no_failure_notice(self, live):
+        from cli_agent_orchestrator.constants import INBOX_MAX_DELIVERY_ATTEMPTS
+
+        self._notify()
+        (notice,) = _inbox(S)
+        live.paste.dispatch_input.side_effect = [
+            _not_sent(f"lost terminal.read on attempt {n}")
+            for n in range(1, INBOX_MAX_DELIVERY_ATTEMPTS + 1)
+        ]
+
+        for _ in range(INBOX_MAX_DELIVERY_ATTEMPTS):
+            _attempt(S)
+
+        assert [m.status.value for m in _inbox(S) if m.id == notice.id] == ["failed"]
+        assert _failure_notices(W) == []
+        assert _inbox(W) == [], "the worker did not write that notice, and is told nothing"
+
+
 class TestQueuedFailureNotices:
     """The same spec requirement through the real deliver_pending, with no edges involved.
 

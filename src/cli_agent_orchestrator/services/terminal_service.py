@@ -3825,7 +3825,14 @@ def _notify_caller_of_deferred_failure(
 
     if caller_id:
         try:
-            create_inbox_message(sender_id=terminal_id, receiver_id=caller_id, message=message)
+            # A notice CAO wrote: marked, so its own failure is not reported
+            # back to the worker, which did not write it.
+            create_inbox_message(
+                sender_id=terminal_id,
+                receiver_id=caller_id,
+                message=message,
+                is_system_notice=True,
+            )
         except Exception as exc:  # noqa: BLE001 — best-effort
             logger.warning(
                 "Deferred-init failure notify: could not enqueue inbox message to "
