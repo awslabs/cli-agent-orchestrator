@@ -182,8 +182,9 @@ class InboxService:
     ) -> int:
         """Deliver pending message(s) to a ready terminal. Use num_messages=0 for all.
 
-        Return 0 when nothing is pending, DELIVERY_DEFERRED when queued messages
-        are blocked by the readiness gate, or the positive delivered count.
+        Return the positive delivered count, or 0 if empty or permanently failed.
+        Return DELIVERY_DEFERRED when the readiness gate blocks queued messages
+        or a refused send re-queues a message to PENDING with none delivered.
 
         Status comes from the StatusMonitor (the event-driven source of truth).
         Delivery normally happens on IDLE/COMPLETED; providers that accept input
@@ -232,10 +233,11 @@ class InboxService:
         after_dispatch: Callable[[], None] = lambda: None,
         source: Optional[str] = None,
     ) -> int:
-        """Return 0 if empty, DELIVERY_DEFERRED if gated, or the delivered count.
+        """Return 0 if empty or failed, DELIVERY_DEFERRED if deferred, or the delivered count.
 
         DELIVERY_DEFERRED means messages are queued but the readiness gate is
-        still closed. A positive count records messages handed to the pane.
+        still closed, or a refused send re-queues a message to PENDING with none
+        delivered. A positive count records messages handed to the pane.
         """
         limit = num_messages if num_messages > 0 else 100
         messages = get_pending_messages(terminal_id, limit=limit)
@@ -245,6 +247,7 @@ class InboxService:
         status = status_monitor.get_status(terminal_id)
         eager = False
         delivered_count = 0
+        requeued_pending = False
         if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
             # Not ready on the normal path. Eager delivery (#251) lets providers
             # that accept input mid-turn receive messages while PROCESSING or
@@ -403,6 +406,7 @@ class InboxService:
                         )
                 self._arm_message_edges(terminal_id, batch)
             except TerminalNotFoundError as e:
+                requeued_pending = True
                 # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
                 # for this window). Treat as transient: reset to PENDING so the
                 # reconcile sweep retries rather than marking FAILED. These were
@@ -434,6 +438,7 @@ class InboxService:
                     TerminalInputBlockedReason.WAITING_USER_ANSWER,
                     TerminalInputBlockedReason.IDENTITY_PENDING,
                 ):
+                    requeued_pending = True
                     for message in batch:
                         update_message_status(message.id, MessageStatus.PENDING)
                     logger.warning(
@@ -459,6 +464,8 @@ class InboxService:
                     update_message_status(message.id, MessageStatus.FAILED)
                 self._close_message_edges(terminal_id, batch, _short_reason(e), registry)
 
+        if delivered_count == 0 and requeued_pending:
+            return DELIVERY_DEFERRED
         return delivered_count
 
     def deliver_pending_in_background(
