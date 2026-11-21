@@ -4,10 +4,8 @@ from wake_rules import decide
 
 NOW = '2026-11-09T12:00:00+00:00'
 
-WATCH = {'identities': {'ours': ['your-login']}}
-
 def report(author='your-login', events=None, **fields):
-    return {'polled_at': NOW, 'watch': WATCH, 'items': [{'kind': 'pr', 'number': 102, 'author': author,
+    return {'polled_at': NOW, 'items': [{'kind': 'pr', 'number': 1263, 'author': author,
         'fields': {'state': 'OPEN', 'ci': 'SUCCESS', 'ci_failing': [], 'ci_pending': 0,
                    'reviewDecision': 'REVIEW_REQUIRED', **fields}, 'events': events or []}]}
 
@@ -64,11 +62,11 @@ def test_unknown_author_cannot_be_ours():
 
 @pytest.mark.parametrize('author,state,expected', [('your-login','OPEN','WAKE'),('other','OPEN','DIGEST'),('your-login','CLOSED','DIGEST')])
 def test_new_pr(author,state,expected):
-    assert mode({'watch':WATCH,'unwatched_open_prs':[{'number':7,'author':author,'state':state}]}) == expected
+    assert mode({'unwatched_open_prs':[{'number':7,'author':author,'state':state}]}) == expected
 
 @pytest.mark.parametrize('event,expected', [(field('head','abcd'),'WAKE'),(field('ci','FAILURE'),'DIGEST'),(field('mergeState','BEHIND'),'DIGEST'),(field('state','CLOSED'),'WAKE'),(field('merged',True),'WAKE'),({'kind':'comment','author':'other','at':'2026-11-08T12:00Z'},'WAKE'),({'kind':'comment','author':'your-login','at':'2026-11-08T12:00Z'},'QUIET'),({'kind':'review','author':'other','at':'2026-11-07T12:00Z'},'DIGEST')])
 def test_reviewed(event,expected):
-    d=report('other',[event]); d['reviewer_ledger']={'prs':{'102':{'last_reviewed_at':'2026-11-08T00:00Z'}}}
+    d=report('other',[event]); d['reviewer_ledger']={'prs':{'1263':{'last_reviewed_at':'2026-11-08T00:00Z'}}}
     assert mode(d)==expected
 
 @pytest.mark.parametrize('hours,expected', [(23,'QUIET'),(24,'QUIET'),(25,'WAKE')])
@@ -86,22 +84,64 @@ def test_empty_and_delivered_digest():
 @pytest.mark.parametrize('names,expected', [(['known'],'DIGEST'),(['known','new'],'WAKE')])
 def test_known_checks(names,expected):
     d=report(events=[field('ci','FAILURE'),field('ci_failing',names)],ci='FAILURE',ci_failing=names)
-    d['watch']={**WATCH,'known_ci_failures':{'102':['known']}}
+    d['watch']={'known_ci_failures':{'1263':['known']}}
     assert mode(d)==expected
 
 def test_prose_does_not_suppress_failure():
     d=report(events=[field('ci','FAILURE')],ci='FAILURE',ci_failing=['Security Scan'])
-    d['watch']={**WATCH,'known_ci_failures':{'CVE-example':'Security Scan already reported'}}
+    d['watch']={'known_ci_failures':{'CVE-example':'Security Scan already reported'}}
     assert mode(d)=='WAKE'
 
 def test_known_checks_scoped_to_pr():
-    d=report(events=[field('ci_failing',['known'])],ci_failing=['known']);d['watch']={**WATCH,'known_ci_failures':{'99':['known']}}
+    d=report(events=[field('ci_failing',['known'])],ci_failing=['known']);d['watch']={'known_ci_failures':{'99':['known']}}
     assert mode(d)=='WAKE'
 
 def test_issue_and_new_issue_digest():
     d=report(events=[{'kind':'comment','author':'other'}]);d['items'][0]['kind']='issue'
     assert mode(d)=='DIGEST'
     assert mode({'new_issues':[{'number':8}]})=='DIGEST'
+
+def test_opted_in_issue_comment_wakes():
+    d=report(events=[{'kind':'comment','author':'maintainer-login'}]);d['items'][0]['kind']='issue'
+    d['watch']={'issues':{'1263':{'wake_on_comment':True}}}
+    assert mode(d)=='WAKE'
+    assert any('watched issue comment' in reason for reason in decide(d)['reasons'])
+
+def test_opted_in_issue_own_comment_is_quiet():
+    d=report(events=[{'kind':'comment','author':'your-login'}]);d['items'][0]['kind']='issue'
+    d['watch']={'issues':{'1263':{'wake_on_comment':True}}}
+    assert mode(d)!='WAKE'
+
+def test_unflagged_issue_comment_is_digest():
+    d=report(events=[{'kind':'comment','author':'maintainer-login'}]);d['items'][0]['kind']='issue'
+    assert mode(d)=='DIGEST'
+
+def test_opted_in_issue_field_change_is_digest():
+    d=report(events=[field('state','CLOSED')]);d['items'][0]['kind']='issue'
+    d['watch']={'issues':{'1263':{'wake_on_comment':True}}}
+    assert mode(d)=='DIGEST'
+
+@pytest.mark.parametrize('name,new', [('state','MERGED'),('merged',True),('head','abcd1234')])
+def test_opted_in_other_pr_change_wakes(name, new):
+    d=report('other-author',[field(name,new)])
+    d['watch']={'prs':{'1263':{'wake_on_change':True}}}
+    assert mode(d)=='WAKE'
+    assert any('watched PR change' in reason for reason in decide(d)['reasons'])
+
+@pytest.mark.parametrize('name,new', [('state','MERGED'),('head','abcd1234')])
+def test_unflagged_other_pr_change_does_not_wake(name, new):
+    assert mode(report('other-author',[field(name,new)]))!='WAKE'
+
+@pytest.mark.parametrize('event', [field('ci','FAILURE'),field('reviewDecision','APPROVED'),{'kind':'comment','author':'other'}])
+def test_opted_in_other_pr_other_events_stay_digest(event):
+    d=report('other-author',[event])
+    d['watch']={'prs':{'1263':{'wake_on_change':True}}}
+    assert mode(d)=='DIGEST'
+
+def test_wake_on_change_is_per_pr():
+    d=report('other-author',[field('state','MERGED')])
+    d['watch']={'prs':{'9999':{'wake_on_change':True}}}
+    assert mode(d)!='WAKE'
 
 def test_ours_only_quiet():
     assert mode(report(events=[{'kind':'comment','author':'your-login'}]))=='QUIET'
@@ -112,18 +152,14 @@ def test_approval_with_a_p3_and_a_reviewed_head():
     d=report(events=[approval],reviewDecision='APPROVED');assert mode(d)=='WAKE'
     assert any('1 P3' in e.get('body','') for e in d['items'][0]['events'])
     d=report('other-author',[field('head','c0de0002')]);assert mode(d)=='DIGEST'
-    d['reviewer_ledger']={'prs':{'102':{}}};assert mode(d)=='WAKE'
-
-def test_no_identities_means_nothing_is_ours():
-    d=report(events=[{'kind':'comment','author':'your-login'}]);d['watch']={}
-    assert mode(d)=='DIGEST'
+    d['reviewer_ledger']={'prs':{'1263':{}}};assert mode(d)=='WAKE'
 
 def test_pure():
     d=report(events=[field('ci','ERROR')]);before=copy.deepcopy(d);decide(d);assert d==before
 
 @pytest.mark.parametrize('reported,expected', [(True,'DIGEST'),(False,'WAKE')])
 def test_structured_known_reported(reported,expected):
-    d=report(events=[field('ci_failing',['unit'])],ci_failing=['unit']);d['watch']={**WATCH,'known_ci_failures':{'102':{'checks':['unit'],'reported':reported}}}
+    d=report(events=[field('ci_failing',['unit'])],ci_failing=['unit']);d['watch']={'known_ci_failures':{'1263':{'checks':['unit'],'reported':reported}}}
     assert mode(d)==expected
 
 def test_oldest_digest():
@@ -131,7 +167,7 @@ def test_oldest_digest():
     assert decide(d)['reasons']==['digest']
 
 def test_reviewed_closed_feedback_digest():
-    d=report('other',[{'kind':'comment','author':'other'}],state='CLOSED');d['reviewer_ledger']={'prs':{'102':{}}}
+    d=report('other',[{'kind':'comment','author':'other'}],state='CLOSED');d['reviewer_ledger']={'prs':{'1263':{}}}
     assert mode(d)=='DIGEST'
 
 def test_issue_field_does_not_wake():
@@ -144,9 +180,9 @@ def test_unknown_self_activity_flag():
     assert mode(report(events=[{'kind':'comment','ours':True}]))=='QUIET'
 
 def test_reviewed_unknown_timestamp_conservative():
-    d=report('other',[{'kind':'comment','author':'other'}]);d['reviewer_ledger']={'prs':{'102':{'last_reviewed_at':'2026-11-08T00:00Z'}}}
+    d=report('other',[{'kind':'comment','author':'other'}]);d['reviewer_ledger']={'prs':{'1263':{'last_reviewed_at':'2026-11-08T00:00Z'}}}
     assert mode(d)=='WAKE'
 
 def test_reviewed_at_cutoff_is_not_new():
-    d=report('other',[{'kind':'comment','author':'other','at':'2026-11-08T00:00Z'}]);d['reviewer_ledger']={'prs':{'102':{'last_reviewed_at':'2026-11-08T00:00Z'}}}
+    d=report('other',[{'kind':'comment','author':'other','at':'2026-11-08T00:00Z'}]);d['reviewer_ledger']={'prs':{'1263':{'last_reviewed_at':'2026-11-08T00:00Z'}}}
     assert mode(d)=='DIGEST'

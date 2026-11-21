@@ -2,8 +2,8 @@
 import copy
 import json
 import os
-import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -13,7 +13,7 @@ import pytest
 
 from conftest import BIN, KIT, base_env, run
 from test_automerge_gate import ARM, DENY, expect, gate, pr, review
-from test_check_mandate import REPO, URL, act, check, doc
+from test_check_mandate import REPO, URL, act, doc
 
 
 def git(work, env, *args, optional=False):
@@ -29,6 +29,8 @@ def destination_repo():
     with tempfile.TemporaryDirectory(prefix="destination-", dir=os.environ.get("TMPDIR")) as root:
         root = Path(root)
         env = base_env(root, GIT_CONFIG_NOSYSTEM="1", TMPDIR=str(root))
+        (root / "state").mkdir()  # an ALLOW needs this host's writer lease
+        (root / "state" / "WRITER").write_text(f"host={socket.gethostname()} since=2026-11-13T00:00:00Z\n")
         work, good, evil = root / "work", root / "good.git", root / "evil.git"
         work.mkdir()
         for bare in (good, evil):
@@ -136,7 +138,7 @@ def test_delta_legacy_remote_denies_real_push(destination_repo, kind, want):
     good = good.rename(work / want)
     git(work, env, "config", "remote.origin.url", want)
     legacy = work / ".git" / kind
-    legacy.mkdir()
+    legacy.mkdir(exist_ok=True)  # newer git creates .git/branches on init
     content = (f"URL: {evil.as_uri()}\nPush: refs/heads/*:refs/heads/*\n"
                if kind == "remotes" else f"{evil.as_uri()}\n")
     (legacy / want).write_text(content)
@@ -153,14 +155,15 @@ def test_delta_legacy_remote_denies_real_push(destination_repo, kind, want):
         assert git(work, env, "ls-remote", evil.as_uri(), "refs/heads/fix").split()[0] == old
         assert git(work, env, "ls-remote", good.as_uri(), "refs/heads/fix").split()[0] == old
         assert result.returncode == 1
-        assert result.stdout.startswith("DENY push_url_invalid")
+        # no "/" in the authorised URL refuses first (git would read .git/remotes/<name>)
+        assert result.stdout.startswith("DENY push_url_unbound")
         return
     git(work, env, "push", want, f"{new}:refs/heads/fix")
     redirected = "/" not in want
     assert git(work, env, "ls-remote", evil.as_uri(), "refs/heads/fix").split()[0] == (new if redirected else old)
     assert git(work, env, "ls-remote", good.as_uri(), "refs/heads/fix").split()[0] == (old if redirected else new)
     assert result.returncode == 1
-    assert result.stdout.startswith("DENY push_url_invalid")
+    assert result.stdout.startswith("DENY push_url_unbound" if redirected else "DENY push_url_invalid")
 
 
 @pytest.mark.parametrize("dest", ["goodrepo", "host:repo", "../goodrepo"])
@@ -212,7 +215,7 @@ def test_delta_unsafe_destination_denies(tmp_path, char, field):
     data = act(doc(push_urls={REPO: want}))
     extra = dict(push_dest=URL if field == "push_urls" else unsafe, push_url=want, fetch_url=want,
                  url_rewrites="", remote_config="")
-    assert check_destination(data, REPO, extra) == (
+    assert check_destination(data, REPO, extra).split(" ", 1)[0] == (
         "push_url_invalid" if field == "push_urls" else "push_dest_invalid")
 
 
@@ -241,30 +244,8 @@ def test_delta_unsafe_push_urls_refuse_go_add(tmp_path, char):
     assert not (tmp_path / "state/go.jsonl").exists()
 
 
-@pytest.mark.parametrize("field", ["author", "base"])
-def test_delta_conductor_null_scope_denies(tmp_path, field):
-    text = (KIT / "conductor-playbook.md").read_text().split("## 5. Reviewer plan approval", 1)[1]
-    variable = "A" if field == "author" else "B"
-    code = re.search(rf"{variable}=\$\(python3 -c '([^']+)'", text).group(1)
-    scope = {"author": {"login": "your-login"}, "baseRefName": "main"}
-    if field == "author":
-        scope["author"]["login"] = None
-    else:
-        scope["baseRefName"] = None
-    path = tmp_path / "scope.json"
-    path.write_text(json.dumps(scope))
-    result = subprocess.run([sys.executable, "-I", "-c", code, str(path)],
-                            env=base_env(tmp_path), capture_output=True, text=True)
-    assert result.returncode == 0
-    assert result.stdout == "\n"
-    rc, out = check(tmp_path, doc(), holder="conductor", action="approve_review_plan",
-                    **{field: result.stdout.strip()})
-    assert rc == 1
-    assert out.startswith("DENY missing_pr_scope")
-
-
 def test_delta_arm_ignores_revoked_cap(tmp_path):
-    data = json.loads((KIT / "mandates.json").read_text())
+    data = json.loads((KIT / "mandates.example.json").read_text())
     arm = next(m for m in data["mandates"] if m["action"] == "arm_automerge")
     arm["conditions"]["max_changed_lines"] = 800
     revoked = copy.deepcopy(arm)
@@ -278,7 +259,7 @@ def test_delta_arm_ignores_revoked_cap(tmp_path):
 @pytest.mark.parametrize("inactive", [dict(revoked=True), dict(revoked=None),
                                       dict(holder="conductor"), dict(granted_by="conductor")])
 def test_delta_inactive_invalid_cap_denies_update(tmp_path, inactive):
-    data = json.loads((KIT / "mandates.json").read_text())
+    data = json.loads((KIT / "mandates.example.json").read_text())
     arm = next(m for m in data["mandates"] if m["action"] == "arm_automerge")
     arm.update(inactive)
     arm["conditions"]["max_changed_lines"] = None

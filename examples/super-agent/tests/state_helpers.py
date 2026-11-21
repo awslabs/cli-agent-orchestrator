@@ -9,7 +9,7 @@ import hashlib
 import importlib.util
 import json
 
-from conftest import BIN, KIT, base_env, ledger, run, write_json  # noqa: F401
+from conftest import BIN, KIT, KIT_MANDATES, base_env, ledger, run, write_json  # noqa: F401
 from test_automerge_gate import (ARM, DENY, MAINTAINER_CLEAN, HEAD, HOLD, clear_item, expect, gate, pr,  # noqa: F401
                                  review)
 from test_check_mandate import GO_ARGS, act, doc, go_row, recheck, revoke_row  # noqa: F401
@@ -107,7 +107,7 @@ APPROVAL = {"kind": "approval", "at": "2026-11-09T10:00:00+00:00", "plan_id": "p
 
 
 def pv():
-    return json.loads((KIT / "mandates.json").read_text())["policy_version"]
+    return json.loads(KIT_MANDATES.read_text())["policy_version"]
 
 
 def complete_proof(ns):

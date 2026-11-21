@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Clear a hold-on-findings hold by reading, bound to the exact text. Offline.
+"""Clear a 01c hold by reading, bound to the exact text. Offline.
 
 Why: the keyword scan flags clean structured approvals ("APPROVE (0 P1, 0 P2, 0 P3) ...
 Findings: None.") as findings, and only a newer non-merge commit clears a persisted hold, but
@@ -10,7 +10,7 @@ may mark ONE item (one review or comment, one exact body) as not holding.
       FILE is a paginated reviews / issue-comments / review-comments file; writes the item's
       canonical body (CRLF -> LF, trailing newlines dropped) to F and prints BODY <sha256>.
       Both the shepherd and the conductor read and hash that same file.
-  holds.py clear --repo OWNER/NAME --pr-author LOGIN --base BRANCH --pr N --item KIND:ID
+  holds.py clear --repo OWNER/NAME --pr-author "$A" --base "$B" --pr N --item KIND:ID
                  --body-file F --reason "<one line>" --go-id WID
       Appends {pr, item_id, body_sha256, reason, go_id, cleared_at} to the "_cleared" list in
       state/holds.json. --repo, --pr-author and --base are the verified target PR's (the same
@@ -22,8 +22,8 @@ may mark ONE item (one review or comment, one exact body) as not holding.
           user's decline relayed by the conductor; there is no clear path for them here. A
           prose mention ("The previous P3 is fixed.", "0 P1, 0 P2, 0 P3") is clearable;
         - mandates.json has an unrevoked, user-granted clear_hold mandate for the shepherd;
-        - the full check_mandate.decide() decision (the same function every other action uses)
-          prints ALLOW for holder shepherd, action clear_hold, this repo, author and base,
+        - the full check_mandate.decide() decision (the same function every other action uses,
+          F2) prints ALLOW for holder shepherd, action clear_hold, this repo, author and base,
           with --go-id WID: not paused; the mandate's scope (repo, author, base) covers the
           target, so a conductor GO can't widen the user's standing scope; and state/go.jsonl's
           latest record for WID was written by the conductor (writer_role "conductor") and is an
@@ -46,7 +46,6 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 KIT = os.path.dirname(HERE)
@@ -84,6 +83,15 @@ def state_dir():
 
 def refuse(reason):
     print(f"REFUSED {reason}")
+    if reason.startswith("go_missing"):
+        hint = ("no GO record with the requested id in the GO ledger (go_ledger.py has only add, "
+                "revoke and next-id): read that file, or have the conductor record the GO with "
+                "go_ledger.py add")
+    elif reason.startswith("go_mismatch:"):
+        hint = f"the GO does not match {reason.split(':', 2)[1]}; request a matching GO"
+    else:
+        hint = f"resolve {reason.split()[0]}, then retry holds.py clear"
+    print(f"hint: {hint}", file=sys.stderr)
     return 1
 
 
@@ -106,8 +114,12 @@ def cmd_body(a):
     if not isinstance(hits[0].get("body"), str):  # a null body is not an empty one
         return error(f"item {a.item} has no string body")
     text = GATE.normalise_body(hits[0]["body"])
-    with open(a.out, "w", encoding="utf-8", newline="") as fh:
-        fh.write(text)
+    try:
+        with SS.writer_locked_for_output(a.out):
+            with open(a.out, "w", encoding="utf-8", newline="") as fh:
+                fh.write(text)
+    except SS.NotWriter as exc:
+        return error(str(exc))
     print(f"BODY {hashlib.sha256(text.encode('utf-8')).hexdigest()}")
     return 0
 
@@ -117,13 +129,15 @@ def latest_go(rows, wid):
     return hits[-1] if hits else None
 
 
+@SS.writer_section
 def write_cleared(path, row):
     """Append one _cleared row to holds.json under its lock, with an atomic replace. The file is
     read with the same validator the gate uses (SS.StateCorrupt) and the result is validated
     before the write (SS.RowRefused); either way nothing is written."""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    SS.require_writer()
     with open(path + ".lock", "a") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
+        SS.require_writer()  # Revalidate after waiting for the state lock.
         holds = GATE.read_holds(path)
         holds.setdefault(GATE.CLEARED, []).append(row)
         SS.check_holds_write(path, holds)
@@ -159,7 +173,7 @@ def cmd_clear(a):
         with open(a.mandates) as fh:
             doc = json.load(fh)
         records = CM.load_go(a.go_file or os.path.join(state_dir(), "go.jsonl"))
-    except SS.StateCorrupt as exc:  # state_corrupt:go.jsonl:<line>:<why>
+    except (SS.StateCorrupt, SS.NotWriter) as exc:  # state_corrupt:go.jsonl:<line>:<why>
         return refuse(str(exc))
     except (OSError, ValueError) as exc:
         return refuse(f"unreadable_input:{type(exc).__name__}")
@@ -173,7 +187,7 @@ def cmd_clear(a):
     go = latest_go(records, a.go_id)
     if go is None:
         return refuse(f"go_missing:{a.go_id}")
-    # The full decision, the same function every other action runs (pause, scope, revocation,
+    # F2: the full decision, the same function every other action runs (pause, scope, revocation,
     # policy_version, the GO's writer role, repo, PR, body and expiry). A clear binds an item and
     # its body, not a head, so the GO's own head stands in for the expected and remote head.
     head = go.get("head")
@@ -186,10 +200,8 @@ def cmd_clear(a):
 
     path = a.holds or os.path.join(state_dir(), "holds.json")
     try:
-        write_cleared(path, {"pr": a.pr, "item_id": a.item, "body_sha256": sha, "reason": reason,
-                             "go_id": a.go_id,
-                             "cleared_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
-    except SS.StateCorrupt as exc:  # a corrupt holds.json, or a row the gate would reject
+        write_cleared(path, GATE.cleared_row(a.pr, a.item, sha, reason, a.go_id))
+    except (SS.StateCorrupt, SS.NotWriter) as exc:  # a corrupt holds.json, or a row the gate would reject
         return refuse(str(exc))
     except (OSError, ValueError) as exc:
         return refuse(f"holds_file:{type(exc).__name__}")
@@ -198,7 +210,7 @@ def cmd_clear(a):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Clear a hold-on-findings hold by reading (conductor GO required).")
+    ap = argparse.ArgumentParser(description="Clear a 01c hold by reading (conductor GO required).")
     sub = ap.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("body")
     b.add_argument("--from", dest="src", required=True)

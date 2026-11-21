@@ -24,8 +24,9 @@ second publisher can double-post.
   outbox.py owner-gone KEY --generation G --evidence EVIDENCE_FILE
                              reconcile step 1: the caller ran exactly
                                curl -s -o /dev/null -w '%{url_effective} %{http_code}' \
-                                 http://localhost:9889/terminals/<owner> > EVIDENCE_FILE
-                             and the file reads `http://localhost:9889/terminals/<owner> 404` for
+                                 API/terminals/<owner> > EVIDENCE_FILE
+                             (API = cao_api in workplace.json) and the file reads
+                             `API/terminals/<owner> 404` for
                              the owner of generation G. Appends the proof, with its time, to
                              <key>.pending. exit 0 OWNER_GONE <key> generation=G at=<T> | 1 REFUSED
   outbox.py now              print the UTC time (microseconds): taken right BEFORE the search
@@ -62,6 +63,7 @@ rename. The body is normalised (CRLF -> LF, trailing newlines dropped) so the ke
 the read-back compares a posted body with its file. Errors (bad key, corrupt outbox) exit 2.
 State dir: $SUPER_AGENT_STATE_DIR, else <kit>/state.
 """
+from contextlib import ExitStack
 import argparse
 import fcntl
 import hashlib
@@ -96,7 +98,6 @@ def _state_schema():
 
 
 SS = _state_schema()
-CAO_API = SS.CAO_API
 
 
 def pending_state(key):
@@ -221,15 +222,50 @@ def sent_row(key):
 
 
 class locked:
+    def __init__(self, readonly=False):
+        self.readonly = readonly
+        self.fd = None
+        self.stack = ExitStack()
+
     def __enter__(self):
-        os.makedirs(os.path.join(state_dir(), "outbox"), exist_ok=True)
-        self.fd = os.open(os.path.join(state_dir(), "outbox.lock"), os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        if self.readonly:
+            try:
+                self.fd = os.open(os.path.join(state_dir(), "outbox.lock"), os.O_RDONLY)
+            except FileNotFoundError:
+                return self
+            fcntl.flock(self.fd, fcntl.LOCK_SH)
+            return self
+        try:
+            self.stack.enter_context(SS.writer_locked())
+            SS.require_writer()
+            try:
+                os.mkdir(os.path.join(state_dir(), "outbox"))
+            except FileExistsError:
+                if not os.path.isdir(os.path.join(state_dir(), "outbox")):
+                    raise
+            self.fd = os.open(os.path.join(state_dir(), "outbox.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+            try:
+                SS.require_writer()  # Revalidate after waiting for the state lock.
+            except SS.NotWriter:
+                os.close(self.fd)
+                self.fd = None
+                raise
+        except BaseException:
+            if self.fd is not None:
+                os.close(self.fd)
+                self.fd = None
+            self.stack.close()
+            raise
         return self
 
     def __exit__(self, *exc):
-        fcntl.flock(self.fd, fcntl.LOCK_UN)
-        os.close(self.fd)
+        try:
+            if self.fd is not None:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+                os.close(self.fd)
+        finally:
+            self.stack.close()
         return False
 
 
@@ -450,12 +486,12 @@ def main(argv=None):
 
     try:
         if a.cmd == "check":
-            with locked():
+            with locked(readonly=True):
                 word, row = status(a.key)
                 if word == "PENDING":
                     try:
                         row, _ = pending_state(a.key)
-                    except SS.StateCorrupt as exc:  # PENDING kept: the reservation still blocks
+                    except (SS.StateCorrupt, SS.NotWriter) as exc:  # PENDING kept: the reservation still blocks
                         print(f"PENDING {a.key} {exc} (the reservation file is damaged: nobody may "
                               f"post or release this key until the conductor repairs it by hand)")
                         return PENDING_EXIT
@@ -525,7 +561,7 @@ def main(argv=None):
                     return 1
                 try:
                     gen = pending_state(a.key)[0]["generation"]
-                except SS.StateCorrupt as exc:  # PENDING kept
+                except (SS.StateCorrupt, SS.NotWriter) as exc:  # PENDING kept
                     print(f"REFUSED {a.key} {exc}: nothing changed (the reservation stays PENDING)")
                     return 1
                 if a.generation is not None and a.generation != gen:
@@ -544,7 +580,7 @@ def main(argv=None):
                     return 1
                 try:
                     proof, why = prove_gone(a.key, a.generation, a.evidence)
-                except SS.StateCorrupt as exc:  # PENDING kept
+                except (SS.StateCorrupt, SS.NotWriter) as exc:  # PENDING kept
                     proof, why = None, str(exc)
                 if proof is None:
                     print(f"REFUSED {a.key} {why}: the owner may still post; nothing changed")
@@ -567,7 +603,7 @@ def main(argv=None):
                 return 1
             try:
                 how, evidence = owner_release(a.key, a.token, a)
-            except SS.StateCorrupt as exc:  # PENDING kept
+            except (SS.StateCorrupt, SS.NotWriter) as exc:  # PENDING kept
                 how, evidence = None, str(exc)
             if how is None:
                 print(f"REFUSED {a.key} {evidence}: the owner may still post; nothing changed")

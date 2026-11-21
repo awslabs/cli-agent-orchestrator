@@ -88,7 +88,7 @@ CLEAN_BODIES = {"", "lgtm", "looks good", "looks good to me", "approved", "appro
 # severity-tagged item at the start of a line ("1. **P3:", "- P2 —", "P1:", "nit:"); (c) a
 # Findings/Issues heading followed by a list item before the next heading. Any other mention of a
 # tag ("The previous P3 is fixed.", "0 P1, 0 P2, 0 P3") still holds, but a conductor GO can clear it.
-NONZERO_COUNT = re.compile(r"(?<![\w.])0*[1-9][0-9]*[ \t]*(?:x[ \t]*)?(?:P[0-3]s?|nits?)\b"
+NONZERO_COUNT = re.compile(r"(?<![\w.#])0*[1-9][0-9]*[ \t]*(?:x[ \t]*)?(?:P[0-3]s?|nits?)\b"
                            r"|\bP[0-3][ \t]*[:=][ \t]*0*[1-9][0-9]*(?![\w.])", re.IGNORECASE)
 LINE_TAG = re.compile(r"^[ \t>]*(?:(?:[-*+]|[0-9]+[.)])[ \t]+)?[*_`\[(]*"
                       r"(?:P[0-3]|(?P<nit>nits?))(?![A-Za-z0-9])(?P<close>[*_`\])]*)[ \t]*(?P<rest>.*)$",
@@ -194,6 +194,14 @@ def cleared_set(holds, number):
     """{(item_key, body_sha256)} cleared for this PR. holds comes from SS.load_holds: every
     _cleared row is complete (pr, item_id, body_sha256, reason, go_id, cleared_at)."""
     return {(r["item_id"], r["body_sha256"]) for r in holds.get(CLEARED, []) if r["pr"] == str(number)}
+
+
+def cleared_row(pr, item_id, body_sha256, reason, go_id, cleared_at=None):
+    """One _cleared record, the shape SS.CLEARED validates. Every writer of a holds file builds
+    its rows here (bin/holds.py today), so the format can't fork."""
+    return {"pr": str(pr), "item_id": item_id, "body_sha256": body_sha256, "reason": reason,
+            "go_id": go_id,
+            "cleared_at": cleared_at or datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
 
 def is_cleared(kind, item, cleared):
@@ -612,11 +620,13 @@ def read_holds(path):
     return SS.load_holds(path)
 
 
+@SS.writer_section
 def write_hold(path, number, change):
     """Apply a hold change under an exclusive lock, with an atomic replace."""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    SS.require_writer()
     with open(path + ".lock", "a") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
+        SS.require_writer()  # Revalidate after waiting for the state lock.
         holds = read_holds(path)
         if change[0] == "set":
             rec = dict(change[1])
@@ -662,15 +672,27 @@ def main(argv=None):
         holds = read_holds(holds_path)
         word, detail, change = decide(a.action, pr, reviews, commits, issue_comments,
                                       review_comments, required_docs, ids, limits, holds)
+        if word in ("ARM", "UPDATE_BRANCH"):
+            SS.require_writer()
         if change is not None:
             write_hold(holds_path, pr["number"], change)
-    except SS.StateCorrupt as exc:  # state_corrupt:holds.json:<row>:<why> (or row_refused:...)
+    except (SS.StateCorrupt, SS.NotWriter) as exc:  # state_corrupt:holds.json:<row>:<why> (or row_refused:...)
         word, detail = "DENY", str(exc)
     except BadInput as exc:
         word, detail = "DENY", f"malformed_input {exc}"
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
         word, detail = "DENY", f"unreadable_input:{type(exc).__name__}"
     print(f"{word} {detail}".rstrip())
+    if word == "WAIT" and detail.startswith("failed:"):
+        hint = f"the required check {detail.split()[0][7:]} failed; inspect it, fix or retry it, then re-check"
+    elif word == "WAIT":
+        hint = f"wait for {detail.split()[0]}, then re-run automerge_gate.py"
+    elif word == "HOLD_FINDINGS":
+        hint = "inspect the recorded finding, resolve it, then clear the hold with its required GO"
+    else:
+        hint = f"resolve {detail.split()[0]}, then re-run automerge_gate.py"
+    if word in ("DENY", "WAIT", "HOLD_FINDINGS"):
+        print(f"hint: {hint}", file=sys.stderr)
     return EXIT[word]
 
 

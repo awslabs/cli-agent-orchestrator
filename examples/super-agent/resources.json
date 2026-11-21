@@ -3,7 +3,6 @@
  "stop": {"pressure_level_gte": 4, "free_memory_pct_lt": 15, "disk_free_gib_lt": 20, "live_terminals_gte": 7},
  "throttle": {"pressure_level_gte": 2, "free_memory_pct_lt": 30, "swap_used_gib_gt": 16, "disk_free_gib_lt": 40, "load_per_cpu_gt": 1.2, "live_terminals_gte": 4},
  "heavy": {"stale_hours": 3, "lock_timeout_s": 10},
- "cao_url": "http://localhost:9889",
  "disk_path": "/System/Volumes/Data",
  "probe_timeouts": {"sysctl": 5, "memory_pressure": 20}
 }

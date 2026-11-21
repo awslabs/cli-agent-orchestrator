@@ -8,11 +8,14 @@ RETRY_DELAY="${RETRY_DELAY:-30}"
 LOOP_OWNER="${CAO_TERMINAL_ID:-unknown}"
 ROOT=$("$PYTHON" "$SCRIPT_DIR/config.py") || { echo 'WAKE none :: configuration_error'; exit 2; }
 cd -- "$ROOT" || { echo 'WAKE none :: watch_dir_error'; exit 2; }
-mkdir -p state reports || exit 2
+writer_check() {
+  "$PYTHON" "$SCRIPT_DIR/config.py" --check-writer || { echo 'WAKE none :: not_writer'; exit 2; }
+}
+writer_check
+mkdir -p reports || exit 2
 LOCK=state/tick_loop.lock
-mkdir "$LOCK" 2>/dev/null || { echo 'WAKE none :: another_loop_running'; exit 3; }
-echo $$ > "$LOCK/pid"
-trap 'rm -f -- "${LOCK:?}/pid"; rmdir -- "${LOCK:?}"' EXIT
+"$PYTHON" "$SCRIPT_DIR/config.py" --loop-lock "$$" || exit $?
+trap '"$PYTHON" "$SCRIPT_DIR/config.py" --loop-unlock "$$" >/dev/null 2>&1' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -30,15 +33,14 @@ filter() {
   REASON="${POLICY#WAKE }"
 }
 emit_wake() {
-  local ARG="${1:-}"
-  echo "WAKE $FILTER_REPORT $ARG :: $REASON"
+  echo "WAKE $FILTER_REPORT ${1:-} :: $REASON"
   # Retire only after emitting the handover; a crash earlier preserves the queue and the wake
   # journal, so the next start replays this WAKE (at most one repeat).
-  "$PYTHON" "$SCRIPT_DIR/digest_store.py" --delivered "$FILTER_REPORT" "${ARG#*=}" || exit 2
+  "$PYTHON" "$SCRIPT_DIR/digest_store.py" --delivered "$FILTER_REPORT" "${1:+${1#*=}}" || exit 2
   exit 0
 }
 replay() {
-  # An undelivered WAKE from an interrupted run is emitted before any new poll.
+  # An undelivered WAKE from an interrupted run is emitted before any new poll (F11).
   local RESULT
   RESULT=$("$PYTHON" "$SCRIPT_DIR/digest_store.py" --replay) || { echo "WAKE none :: replay_error"; exit 2; }
   IFS=$'\t' read -r MODE FILTER_REPORT REASON <<< "$RESULT"
@@ -46,11 +48,13 @@ replay() {
 }
 while true; do
   replay
+  writer_check
   T=$(ts); R1="reports/tick-$T.json"
   "$PYTHON" "$SCRIPT_DIR/poll.py" > "$R1" 2>"reports/tick-$T.stderr"
   ERR=$(error_count "$R1")
   if [ "$ERR" != 0 ]; then
     sleep "$RETRY_DELAY"
+    writer_check
     R2="reports/tick-$T-retry.json"
     "$PYTHON" "$SCRIPT_DIR/poll.py" > "$R2" 2>>"reports/tick-$T.stderr"
     ERR2=$(error_count "$R2")
@@ -63,13 +67,15 @@ while true; do
     fi
     if [ "$M2" = WAKE ]; then emit_wake "partial=$F1"; fi
     if [ "$ERR2" != 0 ]; then
-      echo "- $(date -u '+%Y-%m-%d %H:%M') UTC tick (loop $LOOP_OWNER): poll errors twice ($ERR/$ERR2), see $R1 $R2" >> log.md
+      writer_check
+      echo "- $(date -u '+%Y-%m-%d %H:%M') UTC tick (loop $LOOP_OWNER): poll errors twice ($ERR/$ERR2), see $R1 $R2" | "$PYTHON" "$SCRIPT_DIR/config.py" --append-log || exit 2
       REASON="poll_errors=$ERR/$ERR2"; emit_wake "partial=$F1"
     fi
   else
     filter "$R1"
     if [ "$MODE" = WAKE ]; then emit_wake; fi
   fi
-  echo "- $(date -u '+%Y-%m-%d %H:%M') UTC tick (loop $LOOP_OWNER): $MODE ($FILTER_REPORT)" >> log.md
+  writer_check
+  echo "- $(date -u '+%Y-%m-%d %H:%M') UTC tick (loop $LOOP_OWNER): $MODE ($FILTER_REPORT)" | "$PYTHON" "$SCRIPT_DIR/config.py" --append-log || exit 2
   sleep "$INTERVAL"
 done

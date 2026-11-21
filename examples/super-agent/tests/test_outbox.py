@@ -195,7 +195,7 @@ def test_sent_appends_jsonl_history(tmp_path):
 
 def test_history_row_alone_counts_as_used(tmp_path):
     k = key(tmp_path)
-    (tmp_path / "state").mkdir()
+    (tmp_path / "state").mkdir(exist_ok=True)
     (tmp_path / "state" / "outbox.jsonl").write_text(json.dumps(
         {"key": k, "url": "old", "recorded_at": "2026-11-08T12:00:00+00:00", "generation": 1}) + "\n")
     assert ob(tmp_path, "check", k).returncode == 1
@@ -216,7 +216,7 @@ def test_sent_requires_url(tmp_path):
 
 
 def test_corrupt_outbox_line_fails_closed(tmp_path):
-    (tmp_path / "state").mkdir()
+    (tmp_path / "state").mkdir(exist_ok=True)
     (tmp_path / "state" / "outbox.jsonl").write_text("{broken\n")
     assert ob(tmp_path, "check", key(tmp_path)).returncode == 2
     assert reserve(tmp_path, key(tmp_path)).returncode == 2
@@ -752,7 +752,7 @@ def test_sweep_malformed_line_after_a_valid_proof_refuses(tmp_path):
 def test_sweep_non_object_history_row_fails_closed(tmp_path, line):
     """outbox.jsonl rows are objects; anything else might be this key's record."""
     k = key(tmp_path)
-    (tmp_path / "state").mkdir()
+    (tmp_path / "state").mkdir(exist_ok=True)
     (tmp_path / "state" / "outbox.jsonl").write_text(line + "\n")
     r = ob(tmp_path, "check", k)
     assert (r.returncode, r.stdout.strip()) == (2, "ERROR state_corrupt:outbox.jsonl:1:row:not_object"), r.stdout

@@ -10,7 +10,8 @@ control, not an OS boundary: every agent runs as the same user and could write t
   go_ledger.py add --writer-role conductor --id WID --action A --head SHA --policy-version V --granted-by WHO
                    (--pr N | --branch B | both) [--repo OWNER/NAME] [--new-head SHA]
                    [--body-file F | --body-sha256 HEX] [--item KIND:ID]
-                   [--expires-in MINUTES] [--relayed-by CONDUCTOR_ID]      -> ADDED <wid> (0)
+                   [--expires-in MINUTES] [--relayed-by CONDUCTOR_ID]
+                   [--run-id N]  (any rerun_* action: required, the run it reruns) -> ADDED <wid> (0)
   go_ledger.py revoke --writer-role conductor --id WID --by WHO   -> REVOKED <wid> (0)
   go_ledger.py next-id (--pr N | --branch B) --action A --head SHA [--pending F]
                                                           -> <N>-<action>-<head8>-<k> (0)
@@ -91,12 +92,13 @@ def ledger():
     return os.path.join(sd, "go.jsonl")
 
 
+@SS.writer_section
 def append(row):
     """Append one row under the lock with SS.append_row, after the same validation every reader
     runs: the existing ledger must be valid (else SS.StateCorrupt) and the new row must be a valid
     grant with an id not used before, or the one revocation of an earlier grant (else
     SS.RowRefused, e.g. row_refused:go.jsonl:<n>:id:duplicate). Either way nothing is written."""
-    os.makedirs(os.path.dirname(ledger()), exist_ok=True)
+    SS.require_writer()
     with open(ledger() + ".lock", "a") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
         SS.append_row(ledger(), row, SS.check_go_file_append)
@@ -157,6 +159,7 @@ def main(argv=None):
     a_.add_argument("--expires-in", type=int, default=120, help="minutes, 1-1440")
     a_.add_argument("--relayed-by", help="one-offs (--granted-by user): the conductor's id")
     a_.add_argument("--item", help="clear_hold only: the review or comment, e.g. review:123")
+    a_.add_argument("--run-id", help="rerun_* actions only (and required for them): the run id")
     g = a_.add_mutually_exclusive_group()
     g.add_argument("--body-file")
     g.add_argument("--body-sha256")
@@ -178,6 +181,7 @@ def main(argv=None):
                 or (a.branch is not None and not BRANCH_RE.fullmatch(a.branch)) \
                 or not SS.ACTION_RE.fullmatch(a.action) or not SHA_RE.fullmatch(a.head):
             print("ERROR bad --pr (digits) or --branch, --action or --head (40 lowercase hex)")
+            print("hint: supply a numeric PR or valid branch, action, and 40-character lowercase head", file=sys.stderr)
             return 2
         target = a.pr if a.pr is not None else a.branch.replace("/", ".")
         try:
@@ -205,7 +209,7 @@ def main(argv=None):
     if a.cmd == "revoke":
         try:
             append({"id": a.id, "revoked": True, "by": a.by, "at": at, **signed})
-        except SS.StateCorrupt as exc:  # a corrupt ledger, or no such grant: nothing written
+        except (SS.StateCorrupt, SS.NotWriter) as exc:  # a corrupt ledger, or no such grant: nothing written
             print(f"ERROR {exc}")
             return 2
         print(f"REVOKED {a.id}")
@@ -234,6 +238,13 @@ def main(argv=None):
     elif a.new_head is not None:
         print("ERROR --new-head is for push actions only")
         return 2
+    if a.action.startswith("rerun_"):
+        if a.run_id is None or not SS.RUN_ID_RE.fullmatch(a.run_id):
+            print("ERROR a rerun_* GO needs --run-id (1-20 digits)")
+            return 2
+    elif a.run_id is not None:
+        print("ERROR --run-id is for rerun_* actions only")
+        return 2
     if not 1 <= a.expires_in <= 1440:
         print("ERROR --expires-in must be 1-1440 minutes")
         return 2
@@ -261,6 +272,8 @@ def main(argv=None):
            "revoked": False, **signed}
     if a.relayed_by is not None:
         row["relayed_by"] = a.relayed_by
+    if a.run_id is not None:
+        row["run_id"] = a.run_id
     if a.item is not None:
         if not re.fullmatch(r"(review|issue_comment|review_comment):[0-9]+", a.item):
             print("ERROR bad item")
@@ -268,7 +281,7 @@ def main(argv=None):
         row["item"] = a.item
     try:
         append(row)
-    except SS.StateCorrupt as exc:  # a corrupt ledger, or a row the readers would reject
+    except (SS.StateCorrupt, SS.NotWriter) as exc:  # a corrupt ledger, or a row the readers would reject
         print(f"ERROR {exc}")
         return 2
     print(f"ADDED {a.id}")

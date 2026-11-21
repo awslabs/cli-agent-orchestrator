@@ -10,7 +10,7 @@ import subprocess
 
 import pytest
 
-from conftest import BIN, KIT, base_env, ledger
+from conftest import BIN, KIT, KIT_MANDATES, base_env, ledger
 
 TEMPLATE = KIT / "templates" / "publisher.md"
 BRANCH, PR = "fix/x", "101"
@@ -56,9 +56,10 @@ def kit_copy(tmp_path, url):
     """bin/ and mandates.json of the kit under test, authorising `url` for the repo."""
     dest = tmp_path / "kit"
     shutil.copytree(BIN, dest / "bin", ignore=shutil.ignore_patterns("__pycache__"))
-    doc = json.loads((BIN.parent / "mandates.json").read_text())
+    doc = json.loads(KIT_MANDATES.read_text())
     doc["push_urls"] = {"your-org/your-repo": url}
     (dest / "mandates.json").write_text(json.dumps(doc))
+    shutil.copy2(BIN.parent / "workplace.json", dest / "workplace.json")  # the copy is its own workplace
     return dest / "bin"
 
 
@@ -82,7 +83,7 @@ def remote_head(tmp_path, remote):
 
 
 def go(tmp_path, old, new):
-    pv = json.loads((BIN.parent / "mandates.json").read_text())["policy_version"]
+    pv = json.loads(KIT_MANDATES.read_text())["policy_version"]
     r = ledger("add", "--id", "w-push", "--action", "ff_fix_push", "--pr", PR,
             "--branch", BRANCH, "--head", old, "--new-head", new, "--policy-version", pv,
             "--granted-by", "conductor test GO", env=base_env(tmp_path))
@@ -110,7 +111,8 @@ def values(repo, pv):
     return {"worktree": str(repo["wt"]), "branch": BRANCH, "new": repo["b"], "old": repo["a"],
             "pr": PR, "push_action": "ff_fix_push", "policy_version": pv, "go_push": "--go-id w-push",
             "scope_file": str(repo["wt"].parent / "scope.json"),
-            "push_url": repo["remote"].as_uri(), "_bin": str(repo["bin"])}
+            "push_url": repo["remote"].as_uri(), "login": "your-login", "repo": "your-org/your-repo",
+            "repo_url": "https://github.com/your-org/your-repo.git", "_bin": str(repo["bin"])}
 
 
 def test_template_push_never_names_a_bare_branch():
@@ -135,7 +137,7 @@ def test_template_reads_and_pushes_the_verified_url_never_origin():
 
 
 def test_real_kit_authorises_exactly_the_cao_url():
-    doc = json.loads((BIN.parent / "mandates.json").read_text())
+    doc = json.loads(KIT_MANDATES.read_text())
     assert doc["push_urls"] == {"your-org/your-repo":
                                 "https://github.com/your-org/your-repo.git"}
 
@@ -257,7 +259,7 @@ def test_f1_trailing_dot_git_is_normalised(tmp_path, repo):
 def test_flows_c_and_d_through_the_template_with_the_bound_destination(tmp_path, repo):
     """(c) OBSERVE without a GO -> conductor GO -> ALLOW -> exact push of B -> B read back;
     (d) a later pause after a GO -> exit 4 PAUSED before the push, the remote stays put."""
-    pv = json.loads((BIN.parent / "mandates.json").read_text())["policy_version"]
+    pv = json.loads(KIT_MANDATES.read_text())["policy_version"]
     v = values(repo, pv)
     v["go_push"] = ""
     r = step(tmp_path, "4", v)

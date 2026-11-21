@@ -3,7 +3,7 @@
 
 Usage:
   check_mandate.py --holder shepherd --action ff_fix_push --pr-author "$A" --base "$B"
-                   [--repo your-org/your-repo] [--mandates PATH]
+                   [--repo OWNER/NAME] [--mandates PATH]   (--repo defaults to the one push_urls repository)
                    [--expect-policy-version V]
                    [--expect-head SHA --remote-head SHA]     (the caller runs ls-remote and
                                                               passes its value; this stays offline)
@@ -12,6 +12,7 @@ Usage:
                    [--push-dest URL --push-url "$PU" --fetch-url "$FU" --url-rewrites "$RW" --remote-config "$RC"]
                                                              (push actions: the destination)
                    [--go-id WID (--pr N | --branch B) [--body-file F]] [--go-file PATH]
+                   [--run-id N]  (any rerun_* action with a GO: required; the GO binds it)
 
 The pre-write re-check: publishers and armers run it IMMEDIATELY before each push, post or
 arm command, with every option, and abort (STATUS: blocked) on anything but ALLOW:
@@ -37,7 +38,7 @@ arm command, with every option, and abort (STATUS: blocked) on anything but ALLO
                                   must include all remote sections; URL-named remotes are refused.
   - observe mode, no GO        -> OBSERVE (not ALLOW: do not write)
   - GO missing or not matching -> DENY go_missing / go_mismatch:<field>
-GO records live in state/go.jsonl (bin/go_ledger.py add). Every row is validated by
+The conductor alone writes GO records (go_ledger.py, writer role "conductor"). Every row is validated by
 bin/state_schema.py (grant or revoke row types): any invalid row, or a revocation of a GO that was
 never granted, makes the whole ledger corrupt -> DENY state_corrupt:go.jsonl:<line>:<why>.
 In observe mode a matching GO turns
@@ -115,11 +116,19 @@ def check_destination(doc, repo, extra):
     want = urls.get(repo) if isinstance(urls, dict) else None
     if not isinstance(want, str) or not want.strip():
         return f"push_url_unbound:{repo} (no mandates.json push_urls entry)"
+    if "/" not in want:
+        # `git push <X>` with no "/" in X also reads .git/remotes/<X> and .git/branches/<X>, which
+        # neither `remote get-url` nor `config --get-regexp` shows.
+        return f"push_url_unbound:{repo} (authorised URL has no '/', so git would read .git/remotes/<name>)"
+    # Only https:// and file:// destinations, with no space or control character. A schemeless
+    # or scp-style value lets git pick a transport (or a legacy .git/remotes or .git/branches
+    # file) the observed URLs don't show.
     if not re.match(r"(?:https|file)://", want, re.IGNORECASE) or re.search(r"[\s\x00-\x1f\x7f-\x9f]", want):
-        return "push_url_invalid"
+        return "push_url_invalid (the authorised URL must be https:// or file://, with no space or control character)"
     dest, rewrites = extra.get("push_dest"), extra.get("url_rewrites")
-    if isinstance(dest, str) and (not re.match(r"(?:https|file)://", dest, re.IGNORECASE) or re.search(r"[\s\x00-\x1f\x7f-\x9f]", dest)):
-        return "push_dest_invalid"
+    if isinstance(dest, str) and (not re.match(r"(?:https|file)://", dest, re.IGNORECASE)
+                                  or re.search(r"[\s\x00-\x1f\x7f-\x9f]", dest)):
+        return "push_dest_invalid (want https:// or file://, with no space or control character)"
     observed = {"push_url": extra.get("push_url"), "fetch_url": extra.get("fetch_url")}
     if dest is None or rewrites is None or None in observed.values():
         return "push_dest_needs:--push-dest, --push-url, --fetch-url and --url-rewrites"
@@ -176,6 +185,9 @@ def check_extra(doc, action, extra, repo=None):
             return f"local_head_moved:new_head={new[:8]} local={loc[:8]}"
     if br is not None and not BRANCH_RE.fullmatch(br):
         return "bad_branch"
+    run_id = extra.get("run_id")
+    if run_id is not None and not SS.RUN_ID_RE.fullmatch(run_id):
+        return "bad_run_id (want 1-20 digits)"
     if is_push(action) and pre_write:
         return check_destination(doc, repo, extra)
     return None
@@ -188,6 +200,8 @@ def check_go(doc, action, extra, records, repo, now):
         return "go_needs:--pr or --branch, and --expect-head", None
     # records come from SS.load_go: every row is a valid grant or revocation (else the whole
     # ledger is state_corrupt and nothing gets here), so no damaged row can be skipped.
+    if action.startswith("rerun_") and extra.get("run_id") is None:
+        return "go_needs:--run-id (a rerun GO binds its run)", None
     rows = [r for r in records if r["id"] == wid]
     if not rows:
         return f"go_missing:{wid}", None
@@ -198,7 +212,7 @@ def check_go(doc, action, extra, records, repo, now):
             "pr": None if extra.get("pr") is None else str(extra["pr"]),
             "branch": extra.get("branch"), "head": extra["expect_head"],
             "new_head": extra.get("new_head"), "body_sha256": extra.get("body_sha256"),
-            "policy_version": doc.get("policy_version")}
+            "policy_version": doc.get("policy_version"), "run_id": extra.get("run_id")}
     for field, value in want.items():
         got = go.get(field)
         got = str(got) if field == "pr" and got is not None else got
@@ -212,8 +226,13 @@ def check_go(doc, action, extra, records, repo, now):
 
 def is_oneoff(go):
     """A user one-off: granted_by exactly "user". The row is a validated SS.GO_GRANT, so a user
-    grant always names the conductor that relayed it (relayed_by, a non-blank string)."""
+    grant always names the verified approval transport (relayed_by, a non-blank string)."""
     return go is not None and go["granted_by"] == "user"
+
+
+# A GitHub login (workplace.LOGIN_RE), optionally in a bot form: "name[bot]" (REST) or "app/name" (gh).
+# Anything else, "" or an unfilled "{login}" from a template included, can't be a PR's author.
+PR_AUTHOR_RE = re.compile(r"^(?:app/)?[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$")
 
 
 def decide(doc, holder, action, pr_author, base, repo, extra=None, go_records=(), now=None):
@@ -225,6 +244,8 @@ def decide(doc, holder, action, pr_author, base, repo, extra=None, go_records=()
     forbidden = doc.get("forbidden_without_user")  # missing or null would forbid nothing
     if not isinstance(forbidden, list) or not all(isinstance(x, str) and x for x in forbidden):
         return "DENY", "malformed_mandates:forbidden_without_user"
+    if not isinstance(pr_author, str) or not PR_AUTHOR_RE.match(pr_author):
+        return "DENY", "bad_pr_author"  # before any mandate is matched, a "*" scope included
     if doc.get("paused") is not False:
         return "PAUSED", ""
     if not isinstance(pr_author, str) or not pr_author.strip() \
@@ -248,13 +269,18 @@ def decide(doc, holder, action, pr_author, base, repo, extra=None, go_records=()
     for m in candidates:
         reason = _mismatch(m, holder, pr_author, base, repo)
         if reason is None:
+            tier = m.get("tier")  # required: a missing tier must not read as tier 1 (fail closed)
+            if type(tier) is not int or tier not in (1, 2):
+                return "DENY", f"malformed_mandates:tier:{m.get('id')}"
+            cond = m.get("conditions", {})
+            go_always = cond.get("go_always_required", False) if isinstance(cond, dict) else None
+            if not isinstance(go_always, bool):
+                return "DENY", f"malformed_mandates:conditions:{m.get('id')}"
+            if tier == 2 and go is None:
+                return "OBSERVE", m["id"]
             if holder == "conductor":
                 return "ALLOW", m["id"]
             mode = doc.get("shepherd_mode")
-            cond = m.get("conditions", {})  # absent: no conditions; null or a non-object: refused
-            go_always = cond.get("go_always_required", False) if isinstance(cond, dict) else None
-            if not isinstance(go_always, bool):  # "true" or a non-object would read as "no GO needed"
-                return "DENY", f"malformed_mandates:conditions:{m.get('id')}"
             if go_always and go is None:
                 return "OBSERVE", m["id"]  # e.g. clear_hold: the conductor's GO, even in act mode
             if mode == "observe":
@@ -318,6 +344,7 @@ def main(argv=None):
     ap.add_argument("--branch")
     ap.add_argument("--new-head")
     ap.add_argument("--local-head")
+    ap.add_argument("--run-id", help="any rerun_* action: the run the GO is bound to")
     ap.add_argument("--push-dest", help="push actions: the URL the push and ls-remote use")
     for f in ("--push-url", "--fetch-url"):  # repeated flags are joined: more than one URL refuses
         ap.add_argument(f, action="append", help="push actions: git remote get-url output")
@@ -331,11 +358,13 @@ def main(argv=None):
     extra = {"expect_policy_version": a.expect_policy_version, "expect_head": a.expect_head,
              "remote_head": a.remote_head, "go_id": a.go_id, "pr": a.pr, "body_sha256": None,
              "branch": a.branch, "new_head": a.new_head, "local_head": a.local_head,
-             "push_dest": a.push_dest, **joined}
+             "push_dest": a.push_dest, "run_id": a.run_id, **joined}
     try:
         with open(a.mandates) as fh:
             doc = json.load(fh)
         repo = a.repo if a.repo is not None else mandate_repo(doc)
+        if not isinstance(doc, dict) or doc.get("policy_version") is None:  # absent or null
+            raise ValueError("policy_version_missing")
         if a.body_file:
             with open(a.body_file, "rb") as fh:
                 extra["body_sha256"] = hashlib.sha256(fh.read()).hexdigest()
@@ -345,8 +374,33 @@ def main(argv=None):
     except (OSError, ValueError) as exc:
         word, detail = "DENY", f"unreadable_input:{type(exc).__name__}"
     else:
-        word, detail = decide(doc, a.holder, a.action, a.pr_author, a.base, repo, extra, go_records)
+        word, detail = decide(doc, a.holder, a.action, a.pr_author, a.base, repo, extra,
+                              go_records)
+    if word == "ALLOW":
+        try:
+            SS.require_writer()
+        except (SS.NotWriter, OSError) as exc:
+            word, detail = "DENY", str(exc) if isinstance(exc, SS.NotWriter) else "not_writer lease_io_error"
     print(f"{word} {detail}".rstrip())
+    if word == "DENY":
+        if detail.startswith("forbidden_without_user:"):
+            action = detail.split(":", 1)[1]
+            hint = (f"needs the user's one-off OK for {action}; ask the user, have the "
+                    f"conductor record the one-off GO with go_ledger.py add --granted-by user "
+                    f"--relayed-by <conductor> ..., then retry with that GO id")
+        elif detail.startswith("go_missing"):
+            hint = (f"no GO record with id {a.go_id or '<go-id>'} in state/go.jsonl (go_ledger.py has "
+                    f"only add, revoke and next-id): read that file, or have the conductor record "
+                    f"the GO with go_ledger.py add")
+        elif detail.startswith("go_mismatch:"):
+            hint = f"GO id {a.go_id or '<go-id>'} does not match {detail.split(':', 2)[1]}; issue a matching GO"
+        elif detail.startswith("policy_changed"):
+            hint = "the policy version changed; obtain a new GO under the current policy"
+        elif detail.startswith("head_moved"):
+            hint = "the remote head moved; re-read it and obtain a GO bound to that head"
+        else:
+            hint = f"resolve mandate condition {detail.split()[0]}, then re-run check_mandate.py"
+        print(f"hint: {hint}", file=sys.stderr)
     return EXIT[word]
 
 

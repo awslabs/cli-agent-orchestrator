@@ -1,12 +1,15 @@
 """Contract checks on the profiles, playbooks and templates."""
+import json
 import re
+import subprocess
 
 import pytest
 
-from conftest import KIT
+from conftest import KIT, KIT_MANDATES
 
-TOP = "top -l 1 -o mem -n 5 -stats pid,command,mem"
-DOCS = sorted([*(KIT / "agents").glob("*.md"), *(KIT / "templates").glob("*.md"),
+# Profiles are templates ({{KIT}} is rendered at install); the playbooks use the KIT symbol.
+TOP = {"profile": "python3 {{KIT}}/bin/top_mem.py", "playbook": "python3 KIT/bin/top_mem.py"}
+DOCS = sorted([*(KIT / "agents").glob("*.md.tmpl"), *(KIT / "templates").glob("*.md"),
                KIT / "conductor-playbook.md", KIT / "shepherd-playbook.md", KIT / "README.md"])
 
 
@@ -31,13 +34,15 @@ def test_no_rss_memory_holder_command(doc):
     assert "ps -axo rss" not in doc.read_text()
 
 
-@pytest.mark.parametrize("rel", ["agents/cao_conductor.md", "agents/pr_shepherd.md",
+@pytest.mark.parametrize("rel", ["agents/cao_conductor.md.tmpl", "agents/pr_shepherd.md.tmpl",
                                  "conductor-playbook.md", "shepherd-playbook.md"])
 def test_top_memory_holder_command_present(rel):
-    assert TOP in text(rel)
+    assert TOP["profile" if rel.startswith("agents/") else "playbook"] in text(rel)
 
 
-# recovery never starts the loop; setup = recovery -> remap -> one guarded start
+# finding 8: recovery never starts the loop; setup = recovery -> remap -> loop guard.
+# Item 8 drift fix: the conductor's tick_supervisor.sh owns the loop (2026-11-14), so setup starts
+# no loop, and the remap comes from the previous owner the conductor names, not a fixed id.
 def test_shepherd_recovery_never_starts_the_loop():
     rec = section(text("shepherd-playbook.md"), "## 9. Restart recovery")
     assert "tick_loop.sh" not in rec and not re.search(r"\bStart the loop\b", rec)
@@ -46,18 +51,21 @@ def test_shepherd_recovery_never_starts_the_loop():
 def test_shepherd_setup_order():
     setup = section(text("shepherd-playbook.md"), "## 1. Setup")
     i_rec, i_map = setup.index("Restart recovery"), setup.index("remap_owners.py")
-    i_guard, i_start = setup.index("pgrep -fl tick_loop.sh"), setup.index("bash PB/tick_loop.sh")
-    assert i_rec < i_map < i_guard < i_start
-    assert setup.count("bash PB/tick_loop.sh") == 1 and "--from <old owner id>" in setup
-    assert "skip to step 3" in setup  # the remap only applies when taking over an older watcher
+    i_guard = setup.index(r"pgrep -fl 'tick_[l]oop\.sh'")
+    assert i_rec < i_map < i_guard
+    assert "bash PB/tick_loop.sh" not in setup and "you never start the loop" in setup
+    assert "tick_supervisor.sh" in setup and "SHEPHERD BLOCKED another tick loop is running" in setup
+    assert "--from <previous owner id>" in setup
+    wake = section(text("shepherd-playbook.md"), "## 2. On each wake")
+    assert "bash PB/tick_loop.sh" not in wake and "Don't start or restart the loop" in wake
 
 
 # no trust-on-first-use; the checker and the user own baselines
 def test_no_first_use_baseline():
-    for rel in ("conductor-playbook.md", "agents/cao_conductor.md"):
+    for rel in ("conductor-playbook.md", "agents/cao_conductor.md.tmpl"):
         t = " ".join(text(rel).split())
         assert "The first time, record the hashes" not in t
-        assert "plan_hash_check.py" in t and "never record a baseline yourself" in t.lower()
+        assert "approve_review_plan" not in t  # the reviewer and its plan approvals are gone
 
 
 # every outside write is immediately preceded by the full pre-write check
@@ -109,21 +117,10 @@ def test_no_release_by_label(doc):
     assert not re.search(r"--release-heavy \{?label\}?", doc.read_text())
 
 
-# the reviewer takes the heavy slot and reports to its creator
-def test_reviewer_copy_takes_the_heavy_slot():
-    t = text("agents/cao_pr_reviewer.md")
-    assert "<old owner id>" not in t and "leaving `receiver_id` out" in t
-    run = section(t, "## Running a review")
-    for s in ("resource_gate.py`", "--acquire-heavy pr-review-<N>", "--refresh-heavy <token>",
-              "--release-heavy <token>", "every outcome", "No retry loop", "RESOURCES"):
-        assert s in run, s
-    assert "Every 45 minutes" in t and "one existing exception" in t
-
-
 # line limits
 def test_profile_body_line_limits():
-    assert body_lines("agents/cao_conductor.md") <= 150
-    assert body_lines("agents/pr_shepherd.md") <= 120
+    assert body_lines("agents/cao_conductor.md.tmpl") <= 150
+    assert body_lines("agents/pr_shepherd.md.tmpl") <= 120
 
 
 # clear-by-reading needs the conductor's GO; real findings have no clear path
@@ -143,11 +140,12 @@ import subprocess  # noqa: E402
 import sys  # noqa: E402
 from functools import lru_cache  # noqa: E402
 
-CMD_DOCS = DOCS + [KIT / "mandates.json"]
+CMD_DOCS = DOCS + [KIT_MANDATES]
 SCRIPTS = {p.name for p in (KIT / "bin").glob("*.py")}
 SUBCOMMANDS = {"outbox.py": {"key", "check", "reserve", "sent", "failed", "find-post", "owner-gone", "now"},
                "holds.py": {"body", "clear"}, "go_ledger.py": {"add", "revoke", "next-id"},
-               "state_schema.py": {"check", "append-plan-row"}}
+               "state_schema.py": {"check", "append-plan-row"},
+               "writer_lease.py": {"show", "claim", "release"}}
 
 
 @lru_cache(maxsize=None)
@@ -214,19 +212,18 @@ def test_doc_commands_exist(doc):
 
 
 def test_mandates_name_the_real_outbox_commands():
-    t = text("mandates.json")
+    t = KIT_MANDATES.read_text()
     assert "outbox.py record" not in t and "outbox.py sent <key> --url <url>" in t
 
 
 def test_readme_matches_the_mandates():
     t = " ".join(text("README.md").split())
     assert "says `UPDATE_BRANCH`" in t and "| M5 |" in t and "| M6 |" in t
-    assert "| M8 | shepherd |" in t and "holds.py clear" in t
-    assert "one existing exception" in t and "reviewer's 45-minute review cycle" in t
+    assert "| M8 | 2 | shepherd |" in t and "holds.py clear" in t
+    assert "reviewer's 45-minute review cycle" not in t and "There is no M7" in t
     assert "The only poll is" not in t
-    ids = {m["id"].split("-")[0] for m in __import__("json").loads(text("mandates.json"))["mandates"]}
-    for mid in ids:
-        assert f"| {mid} |" in t, mid
+    for m in __import__("json").loads(KIT_MANDATES.read_text())["mandates"]:
+        assert f"| {m['id'].split('-')[0]} | {m['tier']} |" in t, m["id"]
 
 
 # --- no reduced publisher path; one-offs are GO records checked in full ---
@@ -272,7 +269,7 @@ def test_required_contexts_recipe_captures_status():
 def test_reconcile_proves_the_owner_gone():
     t = text("templates/publisher.md")
     rec = t[t.index("RECONCILE ("):t.index("RE-RUN (")]
-    curl = "curl -s -o /dev/null -w '%{url_effective} %{http_code}' http://localhost:9889/terminals/{owner}"
+    curl = "curl -s -o /dev/null -w '%{url_effective} %{http_code}' {cao_api}/terminals/{owner}"
     assert curl in rec and "outbox.py owner-gone {key} --generation {generation} --evidence {gone_file}" in rec
     assert rec.index(curl) < rec.index("outbox.py owner-gone") < rec.index("outbox.py failed")
     assert '--owner-terminal "$CAO_TERMINAL_ID"' in t and "--token <T>" in t
@@ -292,7 +289,7 @@ def test_reconcile_searches_only_after_the_owner_gone_proof():
     failed = [ln for ln in st if "outbox.py failed" in ln]
     assert len(failed) == 1 and all(o in failed[0] for o in (
         "--owner-gone --generation {generation} --search-file {search_file}",
-        '--search-fetched-at "$(cat {fetched_file})"', "--body-file {body_file} --login your-login"))
+        '--search-fetched-at "$(cat {fetched_file})"', "--body-file {body_file} --login {login}"))
     # the owner's own release after a failed post searches (R4-R5) only after its post returned
     assert "run RECONCILE R4-R5 (the search only" in t
 
@@ -300,13 +297,13 @@ def test_reconcile_searches_only_after_the_owner_gone_proof():
 # --- the push goes to the verified URL, never to a remote name ---
 
 def test_no_doc_pushes_or_reads_heads_through_origin():
-    for doc in DOCS + [KIT / "mandates.json"]:
+    for doc in DOCS + [KIT_MANDATES]:
         t = doc.read_text()
         assert not re.search(r"git (?:-C \S+ )?push origin\b", t), doc.name
         assert "push exactly git push origin" not in t, doc.name
     t = text("templates/publisher.md")
     assert "ls-remote origin" not in t and "ls-remote {push_url} refs/heads/{branch}" in t
-    assert "exactly `https://github.com/your-org/your-repo.git`" in t
+    assert "exactly `{repo_url}`" in t
 
 
 
@@ -316,11 +313,11 @@ def test_only_the_conductor_writes_the_go_ledger():
     cp = " ".join(text("conductor-playbook.md").split())
     assert cp.count("go_ledger.py add --writer-role conductor") >= 3       # WOULD, clear_hold, one-off
     assert "go_ledger.py revoke --writer-role conductor" in cp and "Record the GO yourself first" in cp
-    assert "go_ledger.py add --writer-role conductor" in " ".join(text("agents/cao_conductor.md").split())
-    assert "Never write go.jsonl" in text("agents/pr_shepherd.md")
+    assert "go_ledger.py add --writer-role conductor" in " ".join(text("agents/cao_conductor.md.tmpl").split())
+    assert "Never write go.jsonl" in text("agents/pr_shepherd.md.tmpl")
     sp = text("shepherd-playbook.md")
     assert "never write `go.jsonl`" in sp and not re.search(r"go_ledger\.py (add|revoke)", sp)
-    for doc in DOCS + [KIT / "mandates.json"]:  # every command line names the conductor as writer
+    for doc in DOCS + [KIT_MANDATES]:  # every command line names the conductor as writer
         for m in re.finditer(r"go_ledger\.py (add|revoke) (--[^\n`]*)", doc.read_text()):
             assert m.group(2).startswith("--writer-role conductor"), (doc.name, m.group(0)[:100])
     assert "discipline control, not an operating-system boundary" in text("README.md")
@@ -335,7 +332,7 @@ def test_readme_limits_state_files():
                "always fails closed", "hand repair by the conductor after it inspects the file"):
         assert s_ in t, s_
     cp = " ".join(text("conductor-playbook.md").split())
-    assert cp.count("state_schema.py append-plan-row --row") == 2 and "state_schema.py check" in cp
+    assert "state_schema.py check" in cp
 
 
 # --- the old <N>-<action>-<head8> recipe is gone everywhere; next-id replaces it ---
@@ -357,8 +354,119 @@ def test_docs_build_every_would_id_with_next_id():
     assert sp.count("go_ledger.py next-id --pr <N> --action") == 2  # §4 clear_hold and §5 WOULD
     assert "`<N>-<action>-<head8>-<k>`" in sp and "with a new id from `go_ledger.py next-id`, never the old one" in sp
     assert "go_ledger.py next-id --pr <N> --action <a> --head <sha>" in flat(KIT / "conductor-playbook.md")
-    for rel in ("README.md", "agents/cao_conductor.md", "agents/pr_shepherd.md",
+    for rel in ("README.md", "agents/cao_conductor.md.tmpl", "agents/pr_shepherd.md.tmpl",
                 "templates/publisher.md", "templates/automerge-armer.md"):
         assert "next-id" in flat(KIT / rel), rel
     assert "<N>-<action>-<head8>-<k>" in flat(KIT / "README.md")
 
+
+
+@pytest.mark.parametrize('rel',['conductor-playbook.md','shepherd-playbook.md','agents/cao_conductor.md.tmpl','agents/pr_shepherd.md.tmpl'])
+def test_lease_guidance_pinned(rel):
+    doc=text(rel)
+    for expected in ('writer_lease.py show','At setup and on every wake','this host: yes',
+                     'socket.gethostname()', 'BLOCKED not_writer', 'operator/conductor-only',
+                     'never claim or force', 'claim, release or --force'):
+        assert expected in doc,expected
+
+
+@pytest.mark.parametrize('rel',['conductor-playbook.md','shepherd-playbook.md'])
+def test_handwritten_state_is_fenced(rel):
+    doc=text(rel)
+    for expected in ('state_write.py', '--append', 'shepherd-prs.json','shepherd-pending.json',
+                     'shepherd-workers.json', 'hold-findings.json', 'watch.json.pre-shepherd-',
+                     'mandates.json.bak-', 'PB/log.md', 'reader host can acquire'):
+        assert expected in doc
+    assert 'cp PB/watch.json' not in doc and 'cp KIT/mandates.json' not in doc
+
+
+def test_publisher_rerun_check_binds_the_run_id():
+    """A rerun GO binds its run, so step 15's check passes --run-id, and the conductor's GO row says so."""
+    (step,) = [line for line in text("templates/publisher.md").splitlines() if line.startswith("15. ")]
+    assert '--remote-head "$R" --run-id {run_id} {go_rerun}' in step
+    cp = text("conductor-playbook.md")
+    assert "a `rerun_failed_outage` GO needs `--run-id`" in cp
+
+
+def test_conductor_oneoff_row_takes_its_own_fresh_id():
+    """The one-off row itself names next-id; the WOULD row saying it too must not hide its loss."""
+    (row,) = [line for line in text("conductor-playbook.md").splitlines()
+              if line.startswith("| The user OKs one such action once")]
+    assert "Take a fresh `<wid>` from `python3 KIT/bin/go_ledger.py next-id --pr <N> --action <a> --head <sha>`" in row
+
+
+def test_publisher_go_post_always_needs_a_go_and_act_mode_push_and_rerun_take_none():
+    """M2 is tier 2, so a reply needs the conductor's GO even in act mode; a push or re-run doesn't."""
+    flat_pub = " ".join(text("templates/publisher.md").split())
+    assert "with nothing in act mode" not in flat_pub
+    assert ("In act mode `{go_post}` still needs `--go-id <wid>` (M2 is tier 2), and `{go_push}` and "
+            "`{go_rerun}` are empty.") in flat_pub
+
+
+def test_publisher_readback_uses_the_body_equals_helper():
+    (step,) = [line for line in text("templates/publisher.md").splitlines() if line.startswith("13. ")]
+    assert step.startswith("13. python3 $K/body_equals.py {readback_file} {body_file}  -> expect BODY-OK")
+    assert "python3 -c" not in step
+
+
+def test_publisher_rerun_reads_the_runs_head_and_branch_before_rerunning():
+    (step,) = [line for line in text("templates/publisher.md").splitlines() if line.startswith("14. ")]
+    assert "--json status,conclusion,headSha,event,headBranch" in step
+    assert "the run's headSha must equal {run_head}" in step and "STATUS: blocked" in step
+
+
+def test_the_would_and_the_go_reply_carry_the_run_id_a_rerun_go_binds():
+    spb = flat(KIT / "shepherd-playbook.md")
+    assert "body_sha256=<shasum -a 256 of the body | null> run_id=<the run a rerun_* re-runs | null>" in spb
+    cpb = flat(KIT / "conductor-playbook.md")
+    assert "body_sha256=<hex or null> run_id=<id or null> policy_version=<v> expires_in=<minutes>`" in cpb
+
+
+def test_tier1_is_described_as_checked_scope_plus_written_judgment():
+    """Tier 1 isn't 'a script can check every condition': M1's competing-PR check and M3's log reading are judgment."""
+    readme = flat(KIT / "README.md")
+    about = json.loads(KIT_MANDATES.read_text())["about"]
+    for t in (readme, about):
+        assert "can check every condition" not in t
+        assert "checks the scope, heads, pins and caps" in t and "the shepherd's judgment" in t
+
+
+def run_step14(tmp_path, pr_branch, run_line):
+    """Run publisher step 14 as written, with a fake gh that answers the PR view and the run view."""
+    (step,) = [line for line in text("templates/publisher.md").splitlines() if line.startswith("14. ")]
+    cmd = step[len("14. "):].split("  -> expect", 1)[0]
+    for k, v in {"{pr}": "101", "{repo}": "your-org/your-repo", "{run_id}": "12345678901",
+                 "{run_head}": "a" * 40}.items():
+        cmd = cmd.replace(k, v)
+    fake = tmp_path / "bin"
+    fake.mkdir(parents=True)
+    (fake / "gh").write_text("#!/bin/bash\n"
+                             f'case "$1 $2" in "pr view") echo {pr_branch!r};; "run view") echo {run_line!r};; esac\n')
+    (fake / "gh").chmod(0o755)
+    return subprocess.run(["bash", "-c", cmd], env={"PATH": f"{fake}:/usr/bin:/bin"},
+                          capture_output=True, text=True, timeout=20)
+
+
+def test_publisher_step14_takes_the_branch_from_the_pr_and_refuses_another_run(tmp_path):
+    (step,) = [line for line in text("templates/publisher.md").splitlines() if line.startswith("14. ")]
+    assert "gh pr view {pr} -R {repo} --json headRefName --jq .headRefName" in step
+    head = "a" * 40
+    ok = run_step14(tmp_path / "ok", "feat/x", f"completed failure {head} feat/x pull_request")
+    assert ok.returncode == 0 and ok.stdout.startswith("RUN-OK ")
+    for name, line in (("branch", f"completed failure {head} main push"),
+                       ("prefix", f"completed failure {head} feat/x-other pull_request"),
+                       ("head", f"completed failure {'b' * 40} feat/x pull_request"),
+                       ("success", f"completed success {head} feat/x pull_request")):
+        bad = run_step14(tmp_path / name, "feat/x", line)
+        assert bad.returncode == 1 and bad.stdout.startswith("RUN-WRONG "), name
+
+
+def test_a_new_ok_in_the_conductor_playbook_carries_its_tier():
+    cpb = flat(KIT / "conductor-playbook.md")
+    assert "**New OK:** a new mandate with `granted_by: \"user\"`, `granted_at`, a `source`, a `tier` (1, or 2" in cpb
+
+
+def test_the_watcher_readme_describes_the_write_ahead_order():
+    t = flat(KIT / "pr-watch" / "README.md")
+    assert "(fsync'd) **before** the first delivery attempt" in t
+    assert "repeats that WAKE at most once" in t

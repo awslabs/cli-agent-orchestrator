@@ -43,7 +43,7 @@ def test_hold_field_fails_closed(tmp_path, field, how):
 @pytest.mark.parametrize("bad,why", [({"pr12": {}}, "pr12:row_type:unknown"), ({"_cleared": {}}, "_cleared:_cleared:type"),
                                      ({"101": {"items": []}}, "101:sha:missing")])
 def test_holds_document_shapes_fail_closed(tmp_path, bad, why):
-    (tmp_path / "state").mkdir()
+    (tmp_path / "state").mkdir(exist_ok=True)
     write_json(tmp_path / "state" / "holds.json", bad)
     out = expect(gate(tmp_path, pr(), [review()]), DENY, "DENY")
     assert out.startswith(f"DENY state_corrupt:holds.json:{why}"), out

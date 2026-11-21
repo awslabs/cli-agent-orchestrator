@@ -1,8 +1,13 @@
+import importlib.util
 import json
 
 import pytest
 
-from conftest import base_env, run, write_json, ledger
+from conftest import BIN, TESTS, base_env, run, write_json, ledger, KIT_MANDATES
+
+_GATE_SPEC = importlib.util.spec_from_file_location("automerge_gate_under_test", BIN / "automerge_gate.py")
+GATE_MODULE = importlib.util.module_from_spec(_GATE_SPEC)
+_GATE_SPEC.loader.exec_module(GATE_MODULE)
 
 HEAD = "a" * 40
 OLD = "b" * 40
@@ -362,13 +367,13 @@ def test_unreadable_mandates_file_denies(tmp_path):
 
 
 def test_mandate_without_scope_for_the_action_denies(tmp_path):
-    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "conditions": {}}]}
+    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "revoked": False, "granted_by": "user", "holder": "shepherd", "conditions": {}}]}
     out = expect(gate(tmp_path, pr(), [review()], mandates=m), DENY, "DENY")
     assert "no mandate scope" in out
 
 
 def test_mandate_scope_author_must_match(tmp_path):
-    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "conditions": {},
+    m = {"mandates": [{"id": "M6", "action": "arm_automerge", "revoked": False, "granted_by": "user", "holder": "shepherd", "conditions": {},
                        "scope": dict(SCOPE, pr_author="someone")}]}
     expect(gate(tmp_path, pr(), [review()], mandates=m), DENY, "DENY")
 
@@ -564,7 +569,7 @@ def test_different_but_older_non_merge_commit_keeps_the_hold(tmp_path):
 
 
 def test_hold_for_another_pr_does_not_block(tmp_path):
-    (tmp_path / "state").mkdir()
+    (tmp_path / "state").mkdir(exist_ok=True)
     write_json(tmp_path / "state" / "holds.json",
                {"102": {"sha": HEAD, "date": "2026-11-08T09:30:00Z", "head": HEAD, "detail": "x",
                          "recorded_at": "2026-11-08T10:00:00+00:00",
@@ -577,7 +582,7 @@ def test_hold_for_another_pr_does_not_block(tmp_path):
                                       ('{"101": "yes"}', "state_corrupt:holds.json:101:row:not_object"),
                                       ('{"101": {"sha": "x"}}', "state_corrupt:holds.json:101:sha:format")])
 def test_corrupt_holds_file_denies(tmp_path, text, why):
-    (tmp_path / "state").mkdir()
+    (tmp_path / "state").mkdir(exist_ok=True)
     (tmp_path / "state" / "holds.json").write_text(text)
     out = expect(gate(tmp_path, pr(), [review()]), DENY, "DENY")
     assert out.startswith(f"DENY {why}"), out
@@ -896,8 +901,7 @@ REAL_P3 = "APPROVE (0 P1, 0 P2, 1 P3)\n\nFindings:\n- P3: rename `_claim` to `_c
 
 
 def policy_version():
-    from conftest import KIT
-    return json.loads((KIT / "mandates.json").read_text())["policy_version"]
+    return json.loads(KIT_MANDATES.read_text())["policy_version"]
 
 
 def clear_item(tmp_path, body, item="review:1001", go=True, pr_no="101"):
@@ -985,14 +989,14 @@ def cleared_row(body, **over):
 
 
 def test_gate_ignores_a_hand_written_clear_on_a_real_finding(tmp_path):
-    (tmp_path / "state").mkdir()
+    (tmp_path / "state").mkdir(exist_ok=True)
     write_json(tmp_path / "state" / "holds.json", {"_cleared": [cleared_row(REAL_P3)]})
     expect(gate(tmp_path, pr(), [review(body=REAL_P3)]), HOLD, "HOLD")
 
 
 def test_gate_refuses_a_clear_without_go_id(tmp_path):
     """Pre-brief-14 such a row was skipped (HOLD); now the whole holds.json is corrupt (DENY)."""
-    (tmp_path / "state").mkdir()
+    (tmp_path / "state").mkdir(exist_ok=True)
     row = cleared_row(MAINTAINER_CLEAN)
     del row["go_id"]
     write_json(tmp_path / "state" / "holds.json", {"_cleared": [row]})
@@ -1001,7 +1005,7 @@ def test_gate_refuses_a_clear_without_go_id(tmp_path):
 
 
 def test_malformed_cleared_list_denies(tmp_path):
-    (tmp_path / "state").mkdir()
+    (tmp_path / "state").mkdir(exist_ok=True)
     write_json(tmp_path / "state" / "holds.json", {"_cleared": {"x": 1}})
     out = expect(gate(tmp_path, pr(), [review()]), DENY, "DENY")
     assert "_cleared" in out
@@ -1020,6 +1024,29 @@ def test_real_findings_classifier_through_holds(tmp_path, body, real):
     else:
         assert r.returncode == 0 and r.stdout.startswith("CLEARED #101 review:1001 body="), r.stdout
         expect(gate(tmp_path, pr(), [review(body=body)]), ARM, "ARM")
+
+
+HASH_REFERENCE = (TESTS / "fixtures" / "clear-hash-reference.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("body,real", [
+    ("APPROVE\n\nThe fix text is in my #101 P3-1.", False),
+    ("APPROVE\n\nThe fix text is in my #101 P3.", False),
+    ("APPROVE\n\nSee (#1329 P1b) for context.", False),
+    (HASH_REFERENCE, False),
+    ("APPROVE\n\n1 P3", True),
+    ("APPROVE\n\n2 P3s", True),
+    ("APPROVE\n\n3 nits", True),
+    ("APPROVE\n\nP2: 1 P2", True),
+    ("APPROVE\n\n0 P1, 1 P2", True),
+])
+def test_nonzero_count_hash_references_and_findings(tmp_path, body, real):
+    assert GATE_MODULE.real_findings(body) is real
+    r = clear_item(tmp_path, body)
+    if real:
+        assert r.returncode == 1 and r.stdout.startswith("REFUSED real_findings"), r.stdout
+    else:
+        assert r.returncode == 0 and r.stdout.startswith("CLEARED #101 review:1001 body="), r.stdout
 
 
 def test_forged_clear_never_releases_a_persisted_real_finding(tmp_path):
@@ -1114,7 +1141,7 @@ def test_d1_persisted_real_flag_is_not_trusted_after_an_edit(tmp_path):
 
 def test_d1_persisted_real_true_on_a_clean_body_is_recomputed(tmp_path):
     import hashlib
-    (tmp_path / "state").mkdir()
+    (tmp_path / "state").mkdir(exist_ok=True)
     sha = hashlib.sha256(PROBE_09.encode()).hexdigest()
     write_json(tmp_path / "state" / "holds.json", {"101": {
         "sha": HEAD, "date": "2026-11-08T09:30:00Z", "head": HEAD, "detail": "old",

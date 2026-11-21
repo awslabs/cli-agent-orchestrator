@@ -10,12 +10,12 @@ import pytest
 from conftest import BIN, KIT, base_env, run
 from test_automerge_gate import ESCALATE, expect, gate, pr, review
 from test_check_mandate import H1, REPO, URL, act, doc
-from test_outbox import BODY, body_file, f4_release, key, reserve
+from test_outbox import BODY, f4_release, key, reserve
 
 
 @pytest.mark.parametrize("position", ["stock", 0, 1])
 def test_review_revoked_limit_cannot_widen(tmp_path, position):
-    data = json.loads((KIT / "mandates.json").read_text())
+    data = json.loads((KIT / "mandates.example.json").read_text())
     active = next(m for m in data["mandates"] if m["action"] == "arm_automerge")
     revoked = copy.deepcopy(active)
     revoked.update(id="revoked-wide", revoked=True)
@@ -29,7 +29,7 @@ def test_review_revoked_limit_cannot_widen(tmp_path, position):
 
 @pytest.mark.parametrize("order", [False, True])
 def test_review_smallest_active_limit(tmp_path, order):
-    data = json.loads((KIT / "mandates.json").read_text())
+    data = json.loads((KIT / "mandates.example.json").read_text())
     active = next(m for m in data["mandates"] if m["action"] == "arm_automerge")
     small = copy.deepcopy(active)
     small["id"] = "small-cap"
@@ -43,7 +43,7 @@ def test_review_smallest_active_limit(tmp_path, order):
                                           ("revoked", True)])
 def test_review_inactive_scope_ignored(tmp_path, field, value):
     import automerge_gate
-    data = json.loads((KIT / "mandates.json").read_text())
+    data = json.loads((KIT / "mandates.example.json").read_text())
     active = next(m for m in data["mandates"] if m["action"] == "arm_automerge")
     invalid = copy.deepcopy(active)
     invalid[field] = value
@@ -69,7 +69,9 @@ def test_review_missing_scope_is_deny(tmp_path, action, missing):
     i = args.index(missing)
     del args[i:i + 2]
     result = run("check_mandate.py", *args, env=base_env(tmp_path))
-    assert result.returncode == 1 and result.stdout.startswith("DENY missing_pr_scope")
+    # A missing author is refused even earlier, as not a GitHub login.
+    want = "DENY bad_pr_author" if missing == "--pr-author" else "DENY missing_pr_scope"
+    assert result.returncode == 1 and result.stdout.startswith(want)
 
 
 def test_review_casefold_login_finds_existing_post(tmp_path):
@@ -107,18 +109,27 @@ def test_review_url_remote_section_refused(tmp_path, name):
 
 @pytest.mark.parametrize("login,word", [("alice", "ALLOW"), ("colleague", "DENY wrong_author")])
 def test_review_readme_setup_then_template_allows(tmp_path, login, word):
-    """Run the shipped setup substitution, then a template check with fake GitHub reads."""
+    """Run the README's setup block on a copy, then a template check with fake GitHub reads."""
     import re
+    import socket
     kit = tmp_path / "kit"
-    shutil.copytree(KIT, kit, ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(KIT, kit, ignore=shutil.ignore_patterns("__pycache__", "state", "work", "reviews",
+                                                            "workplace.local.json", "mandates.json"))
     readme = (kit / "README.md").read_text()
-    start = readme.index("   grep -rl")
-    end = readme.index("   cp pr-watch", start)
+    start = readme.index("   printf '{\"github_login\"")
+    end = readme.index("   python3 bin/workplace.py show", start)
     setup = readme[start:end].replace("OWNER/REPO", "acme/widgets").replace("LOGIN", "alice")
-    result = subprocess.run(["/bin/bash", "-c", setup], cwd=kit,
-                            env=base_env(tmp_path), capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
+    env = base_env(tmp_path, SUPER_AGENT_STATE_DIR=kit / "state")
+    del env["CAO_WORKPLACE_CONFIG"]  # the setup writes the kit's own workplace.local.json
+    result = subprocess.run(["/bin/bash", "-c", setup], cwd=kit, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (kit / "state" / "WRITER").read_text().startswith(f"host={socket.gethostname()} ")
+    shown = subprocess.run([sys.executable, "-I", str(kit / "bin/workplace.py"), "show"], env=env,
+                           capture_output=True, text=True)
+    assert shown.returncode == 0 and "LOGIN=alice" in shown.stdout and "REPO=acme/widgets" in shown.stdout
     data = json.loads((kit / "mandates.json").read_text())
+    assert data["push_urls"] == {"acme/widgets": "https://github.com/acme/widgets.git"}
+    assert all(m["scope"]["pr_author"] == "alice" for m in data["mandates"])
     data["shepherd_mode"] = "act"
     (kit / "mandates.json").write_text(json.dumps(data))
     fake = tmp_path / "fake-bin"
@@ -128,27 +139,26 @@ def test_review_readme_setup_then_template_allows(tmp_path, login, word):
     (fake / "git").write_text("#!/bin/sh\nprintf '%s\\n' '" + H1 + "'\n")
     for file in fake.iterdir():
         file.chmod(0o755)
+    # Step 15 (a tier-1 re-run): its check reads the PR's live author and base from the scope file.
     template = next(line for line in (kit / "templates/publisher.md").read_text().splitlines()
-                    if line.startswith("8. ")).split("  -> ")[0]
-    template = template[template.find("gh pr view") if "gh pr view" in template
-                        else template.index("R=$(git"):]
-    replacements = {"pr": "101", "post_head": H1, "policy_version": data["policy_version"],
-                    "body_file": str(body_file(tmp_path)), "go_post": "",
-                    "scope_file": str(tmp_path / "scope.json")}
+                    if line.startswith("15. ")).split("  -> ")[0][len("15. "):]
+    replacements = {"pr": "101", "run_head": H1, "policy_version": data["policy_version"],
+                    "repo": "acme/widgets", "repo_url": "https://github.com/acme/widgets.git",
+                    "go_rerun": "", "run_id": "12345678901", "scope_file": str(tmp_path / "scope.json")}
     template = re.sub(r"\{([^{}]+)\}", lambda m: replacements[m.group(1)], template)
-    env = base_env(tmp_path, PATH=str(fake) + ":/usr/bin:/bin")
+    run_env = dict(env, PATH=str(fake) + ":/usr/bin:/bin")
     result = subprocess.run(["/bin/bash", "-c", "K=" + str(kit / "bin") + "; " + template],
-                            cwd=tmp_path, env=env, capture_output=True, text=True)
+                            cwd=tmp_path, env=run_env, capture_output=True, text=True)
     assert result.returncode == (0 if word == "ALLOW" else 1), result.stdout + result.stderr
     assert result.stdout.startswith(word), result.stdout + result.stderr
     result = subprocess.run([sys.executable, "-I", str(kit / "bin/go_ledger.py"), "add",
                              "--writer-role", "conductor", "--id", "setup-go", "--action", "factual_fix_reply",
                              "--pr", "101", "--head", H1, "--policy-version", data["policy_version"],
                              "--granted-by", "conductor"],
-                            env=base_env(tmp_path, CAO_TERMINAL_ID="test-conductor"),
+                            env=dict(env, CAO_TERMINAL_ID="test-conductor"),
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    row = json.loads((tmp_path / "state/go.jsonl").read_text())
+    row = json.loads((kit / "state/go.jsonl").read_text())
     assert row["repo"] == "acme/widgets"
 
 
@@ -173,7 +183,7 @@ def test_review_every_existing_pr_check_uses_live_scope_file(rel):
     checks = [line for line in lines if re.match(r"\d+\.", line) and "check_mandate.py --holder" in line]
     for line in checks:
         if "--action open_pr" in line:
-            assert "--pr-author your-login --base main" in line
+            assert "--pr-author {login} --base main" in line
             continue
         assert "gh pr view {pr}" in line
         assert "--json author,baseRefName > {scope_file}" in line

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """Pure wake policy. JSON (stdin or path) -> WAKE reasons / DIGEST lines / QUIET.
 
-Optional report keys: watch (its "identities" names our logins), reviewer_ledger, digest_pending. No file reads in
-classify/decide; callers supply context. Unknown authors are never guessed.
+Optional report keys: watch, reviewer_ledger, digest_pending. No file reads in
+classify/decide beyond config.login() (the operator's login, read once per process);
+callers supply the rest. Unknown authors are never guessed.
 """
 import json
 import sys
 from datetime import datetime, timezone
+from config import login
 
 BAD = {'FAILURE', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE', 'ERROR'}
 FEEDBACK = {'review', 'comment', 'thread_comment'}
 ACTIONS = {'github-actions', 'github-actions[bot]'}
 STATE = {'state', 'merged', 'draft'}
+WATCHED_CHANGE = {'state', 'merged', 'head'}
 
 
 def timestamp(value):
@@ -29,12 +32,6 @@ def last_review_at(meta):
     return max((x for x in dates if x), default=None)
 
 
-def ours(watch):
-    """Our own GitHub logins, from watch.json "identities": {"ours": [...]}. Empty means none."""
-    found = (watch.get('identities') or {}).get('ours') or []
-    return {x for x in found if isinstance(x, str) and x}
-
-
 def known_checks(watch, number):
     """Only explicit per-PR already-reported check names can suppress a failure.
 
@@ -50,15 +47,14 @@ def known_checks(watch, number):
 def classify(item, event, watch, reviewed):
     """Return (wake boolean, explanation), or (False, None) for own activity."""
     f = item.get('fields', {})
-    us = ours(watch)
-    own = item.get('author', f.get('author')) in us
+    own = item.get('author', f.get('author')) == login()
     open_pr = item.get('kind') == 'pr' and f.get('state') == 'OPEN'
     meta = reviewed.get(str(item['number']))
     is_reviewed = meta is not None and item.get('kind') == 'pr'
     kind = event.get('kind')
     if kind in FEEDBACK:
         author = event.get('author')
-        if author in us or (not author and event.get('ours')):
+        if author == login() or (not author and event.get('ours')):
             return False, None
         ci_comment = kind in {'comment', 'thread_comment'} and author in ACTIONS
         if open_pr and own and not ci_comment:
@@ -68,11 +64,16 @@ def classify(item, event, watch, reviewed):
             at = timestamp(event.get('at'))
             if cutoff is None or at is None or at > cutoff:
                 return True, 'reviewed feedback'
+        if item.get('kind') == 'issue' and (watch.get('issues', {}).get(str(item['number'])) or {}).get('wake_on_comment'):
+            return True, 'watched issue comment'
         return False, 'CI comment' if ci_comment else 'activity outside wake scope'
     if kind != 'field':
         return False, 'activity outside wake scope'
     name, new = event.get('field'), event.get('new')
     if item.get('kind') == 'pr':
+        # Opt-in for a watched PR that is not ours (e.g. a maintainer PR we depend on).
+        if name in WATCHED_CHANGE and (watch.get('prs', {}).get(str(item['number'])) or {}).get('wake_on_change'):
+            return True, 'watched PR change'
         # Terminal transitions matter even though the current state is no longer OPEN.
         if own and name in STATE:
             return True, 'own state'
@@ -105,13 +106,12 @@ def classify(item, event, watch, reviewed):
 def decide(report):
     reasons, lines = [], []
     watch = report.get('watch', {})
-    us = ours(watch)
     reviewed = report.get('reviewer_ledger', {}).get('prs', {})
     for p in report.get('unwatched_open_prs', []):
         author = p.get('author')
         if isinstance(author, dict):
             author = author.get('login')
-        if author in us and p.get('state', 'OPEN') == 'OPEN':
+        if author == login() and p.get('state', 'OPEN') == 'OPEN':
             reasons.append(f"pr#{p['number']}:new own PR")
         else:
             lines.append(f"pr#{p['number']}:new PR outside wake scope")
@@ -121,7 +121,7 @@ def decide(report):
         label = f"{item['kind']}#{item['number']}"
         f = item.get('fields', {})
         if item.get('ready_to_merge_new'):
-            if item.get('kind') == 'pr' and item.get('author', f.get('author')) in us and f.get('state') == 'OPEN':
+            if item.get('kind') == 'pr' and item.get('author', f.get('author')) == login() and f.get('state') == 'OPEN':
                 reasons.append(f'{label}:ready_to_merge')
             else:
                 lines.append(f'{label}:ready_to_merge outside wake scope')

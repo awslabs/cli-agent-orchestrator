@@ -1,0 +1,258 @@
+"""tick_supervisor.sh never drops a WAKE: it is kept before delivery, retried, and delivered once."""
+import http.server
+import os
+import shutil
+import signal
+import subprocess
+import threading
+import time
+import urllib.parse
+
+import pytest
+
+from conftest import SOURCE
+
+WAKE = "WAKE reports/tick-x.json :: pr#9:new own PR"
+NOT_WRITER = "WAKE none :: not_writer"
+
+
+def stub_loop(line):
+    """A stand-in tick_loop.sh: counts its runs; the first run prints `line`, later runs are quiet."""
+    return f"""#!/bin/bash
+S="$(dirname -- "$0")/state"
+echo run >> "$S/stub_runs"
+if [ "$(wc -l < "$S/stub_runs")" -eq 1 ]; then echo '{line}'; fi
+exit 0
+"""
+
+
+class Inbox(http.server.BaseHTTPRequestHandler):
+    """Refuses the first `fail` POSTs with 503, then accepts and records each message."""
+    fail = 0
+    attempts = 0
+    received = []
+
+    def do_POST(self):
+        cls = type(self)
+        cls.attempts += 1
+        if cls.attempts <= cls.fail:
+            self.send_response(503)
+            self.end_headers()
+            return
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)
+        cls.received.append((self.path.split("?")[0], q["sender_id"][0], q["message"][0]))
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def inbox():
+    handler = type("TestInbox", (Inbox,), {"fail": 0, "attempts": 0, "received": []})
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield handler, f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+    server.server_close()
+
+
+def tree(tmp_path, line=WAKE):
+    pb = tmp_path / "wp" / "pr-watch"
+    (pb / "state").mkdir(parents=True)
+    shutil.copyfile(SOURCE / "tick_supervisor.sh", pb / "tick_supervisor.sh")
+    (pb / "tick_loop.sh").write_text(stub_loop(line))
+    return pb
+
+
+def env_for(api, cycles, tries, backoff=0):
+    return {"PATH": "/usr/bin:/bin", "SHEPHERD_ID": "aaaa1111", "SENDER_ID": "bbbb2222",
+            "CAO_API": api, "DELIVER_TRIES": str(tries), "DELIVER_BACKOFF": str(backoff),
+            "SUPERVISOR_CYCLES": str(cycles), "SUPERVISOR_SLEEP": "0", "SUPERVISOR_ERROR_SLEEP": "0"}
+
+
+def supervise(pb, api, cycles, tries):
+    return subprocess.run(["bash", str(pb / "tick_supervisor.sh")], env=env_for(api, cycles, tries),
+                          capture_output=True, text=True, timeout=60)
+
+
+def runs(pb):
+    f = pb / "state" / "stub_runs"
+    return len(f.read_text().splitlines()) if f.exists() else 0
+
+
+def messages(handler):
+    return [m for _, _, m in handler.received]
+
+
+def wait_for(predicate, timeout=20):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_a_failed_post_is_kept_and_arrives_exactly_once_on_a_later_cycle(tmp_path, inbox):
+    handler, api = inbox
+    handler.fail = 3  # cycle 1: both tries refused, the WAKE stays kept; cycle 2: one more refusal, then 2xx
+    pb = tree(tmp_path)
+    r = supervise(pb, api, cycles=3, tries=2)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert handler.attempts == 4
+    assert len(handler.received) == 1
+    path, sender, message = handler.received[0]
+    assert path == "/terminals/aaaa1111/inbox/messages" and sender == "bbbb2222"
+    assert message.startswith(WAKE + "  [from tick_supervisor")
+    assert not (pb / "state" / "tick_supervisor.pending").exists()
+    log = (pb / "state" / "tick_supervisor.log").read_text()
+    assert "kept WAKE in" in log and "delivered a kept WAKE" in log
+
+
+def test_no_new_loop_starts_while_a_wake_is_still_pending(tmp_path, inbox):
+    handler, api = inbox
+    handler.fail = 100
+    pb = tree(tmp_path)
+    r = supervise(pb, api, cycles=4, tries=2)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert handler.received == []
+    assert runs(pb) == 1  # the first loop printed the WAKE; no loop ran while it stayed undelivered
+    kept = (pb / "state" / "tick_supervisor.pending").read_text().splitlines()
+    assert len(kept) == 1 and kept[0].startswith(WAKE)
+
+
+def test_a_loop_does_not_start_before_wakes_kept_by_an_earlier_supervisor_are_delivered(tmp_path, inbox):
+    handler, api = inbox
+    handler.fail = 100
+    pb = tree(tmp_path)
+    (pb / "state" / "tick_supervisor.pending").write_text("WAKE reports/old.json :: pr#7:review\n")
+    r = supervise(pb, api, cycles=3, tries=1)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert runs(pb) == 0
+
+
+def test_kept_wakes_are_delivered_oldest_first_before_any_new_one(tmp_path, inbox):
+    handler, api = inbox
+    pb = tree(tmp_path)
+    (pb / "state" / "tick_supervisor.pending").write_text(
+        "WAKE reports/old1.json :: pr#7:review\nWAKE reports/old2.json :: pr#8:ci\n")
+    r = supervise(pb, api, cycles=2, tries=1)
+    assert r.returncode == 0, r.stdout + r.stderr
+    got = messages(handler)
+    assert got[:2] == ["WAKE reports/old1.json :: pr#7:review", "WAKE reports/old2.json :: pr#8:ci"]
+    assert len(got) == 3 and got[2].startswith(WAKE)
+    assert not (pb / "state" / "tick_supervisor.pending").exists()
+
+
+def test_a_first_try_success_posts_once_and_keeps_nothing(tmp_path, inbox):
+    handler, api = inbox
+    pb = tree(tmp_path)
+    r = supervise(pb, api, cycles=2, tries=4)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert handler.attempts == 1 and len(handler.received) == 1
+    assert not (pb / "state" / "tick_supervisor.pending").exists()
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGKILL])
+def test_a_stop_or_kill_during_the_retry_window_keeps_the_wake_for_exactly_one_later_delivery(tmp_path, inbox, sig):
+    handler, api = inbox
+    handler.fail = 10_000
+    pb = tree(tmp_path)
+    log = pb / "state" / "tick_supervisor.log"
+    proc = subprocess.Popen(["bash", str(pb / "tick_supervisor.sh")], env=env_for(api, 0, 4, backoff=2),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        assert wait_for(lambda: log.exists() and "deliver failed (attempt 1 of 4)" in log.read_text())
+        proc.send_signal(sig)
+        proc.wait(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    if sig == signal.SIGTERM:
+        assert proc.returncode == 0
+    kept = (pb / "state" / "tick_supervisor.pending").read_text().splitlines()
+    assert len(kept) == 1 and kept[0].startswith(WAKE)
+    handler.fail = 0
+    r = supervise(pb, api, cycles=2, tries=1)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert len(handler.received) == 1 and messages(handler)[0].startswith(WAKE)
+    assert not (pb / "state" / "tick_supervisor.pending").exists()
+
+
+def test_blank_lines_in_the_pending_file_are_skipped_never_posted(tmp_path, inbox):
+    handler, api = inbox
+    pb = tree(tmp_path)
+    (pb / "state" / "tick_supervisor.pending").write_text("\n  \nWAKE reports/old.json :: pr#7:review\n\n")
+    r = supervise(pb, api, cycles=2, tries=1)
+    assert r.returncode == 0, r.stdout + r.stderr
+    got = messages(handler)
+    assert "" not in got and all(m.strip() for m in got)
+    assert got[0] == "WAKE reports/old.json :: pr#7:review" and len(got) == 2
+
+
+def unusable(pb, r, handler):
+    assert r.returncode == 4, r.stdout + r.stderr
+    assert "STOP: pending file unusable" in r.stdout
+    assert "STOP: pending file unusable" in (pb / "state" / "tick_supervisor.log").read_text()
+    assert handler.attempts == 0 and runs(pb) == 0
+
+
+def test_a_pending_path_that_is_a_directory_stops_without_spinning(tmp_path, inbox):
+    handler, api = inbox
+    pb = tree(tmp_path)
+    (pb / "state" / "tick_supervisor.pending").mkdir()
+    unusable(pb, supervise(pb, api, cycles=3, tries=1), handler)
+    assert (pb / "state" / "tick_supervisor.pending").is_dir()
+
+
+def test_a_pending_path_that_is_a_symlink_stops(tmp_path, inbox):
+    handler, api = inbox
+    pb = tree(tmp_path)
+    target = tmp_path / "elsewhere.txt"
+    target.write_text("WAKE reports/old.json :: pr#7:review\n")
+    os.symlink(target, pb / "state" / "tick_supervisor.pending")
+    unusable(pb, supervise(pb, api, cycles=3, tries=1), handler)
+    assert (pb / "state" / "tick_supervisor.pending").is_symlink()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_an_unreadable_pending_file_stops_and_is_kept_as_it_is(tmp_path, inbox):
+    handler, api = inbox
+    pb = tree(tmp_path)
+    pending = pb / "state" / "tick_supervisor.pending"
+    pending.write_text("WAKE reports/old.json :: pr#7:review\n")
+    pending.chmod(0)
+    try:
+        unusable(pb, supervise(pb, api, cycles=3, tries=1), handler)
+    finally:
+        pending.chmod(0o600)
+    assert pending.read_text() == "WAKE reports/old.json :: pr#7:review\n"
+
+
+def test_not_writer_with_the_api_down_keeps_the_notice_and_says_so(tmp_path, inbox):
+    handler, api = inbox
+    handler.fail = 100
+    pb = tree(tmp_path, line=NOT_WRITER)
+    r = supervise(pb, api, cycles=0, tries=1)
+    assert r.returncode == 3, r.stdout + r.stderr
+    kept = (pb / "state" / "tick_supervisor.pending").read_text().splitlines()
+    assert len(kept) == 1 and kept[0].startswith(NOT_WRITER)
+    stopped = (pb / "state" / "tick_supervisor.stopped").read_text().splitlines()
+    assert len(stopped) == 1 and stopped[0].startswith("NOT_WRITER ")
+    assert "the notice waits in" in stopped[0]
+    assert "NOT_WRITER " in (pb / "state" / "tick_supervisor.log").read_text()
+    assert "NOT_WRITER " in r.stdout
+    assert not (pb / "state" / "tick_supervisor.pid").exists()
+
+
+def test_not_writer_with_the_api_up_tells_the_shepherd_and_records_the_stop(tmp_path, inbox):
+    handler, api = inbox
+    pb = tree(tmp_path, line=NOT_WRITER)
+    r = supervise(pb, api, cycles=0, tries=1)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert messages(handler)[0].startswith(NOT_WRITER)
+    assert "the shepherd was told" in (pb / "state" / "tick_supervisor.stopped").read_text()
+    assert not (pb / "state" / "tick_supervisor.pending").exists()

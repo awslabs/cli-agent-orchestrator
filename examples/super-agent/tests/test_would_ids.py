@@ -14,7 +14,7 @@ def mandates(version):
     d["mandates"].append({"id": "M6", "holder": "shepherd", "action": "arm_automerge",
                           "scope": {"repo": REPO, "pr_author": "your-login", "base": "main"},
                           "conditions": {}, "granted_by": "user", "granted_at": "2026-11-09",
-                          "source": "memory:test", "revoked": False})
+                          "source": "memory:test", "revoked": False, "tier": 1})
     return d
 
 
@@ -90,14 +90,14 @@ def test_next_id_is_per_prefix(tmp_path):
     assert next_id(tmp_path, pr="1260") == (0, "1260-arm_automerge-aaaaaaaa-1")
     assert next_id(tmp_path, action="update_branch") == (0, "101-update_branch-aaaaaaaa-1")
     # look-alike ids never count: a longer prefix, a zero or leading-zero k, a non-number
-    for wid in ("11259-arm_automerge-aaaaaaaa-9", PREFIX + "0", PREFIX + "09", PREFIX + "x9",
+    for wid in ("1101-arm_automerge-aaaaaaaa-9", PREFIX + "0", PREFIX + "09", PREFIX + "x9",
                 PREFIX + "9-1", "101-arm_automerge-aaaaaaaab-9"):
         assert grant(tmp_path, wid, "v1").returncode == 0, wid
     assert next_id(tmp_path) == (0, PREFIX + "6")
 
 
 def test_next_id_counts_pending_woulds(tmp_path):
-    (tmp_path / "state").mkdir()
+    (tmp_path / "state").mkdir(exist_ok=True)
     pend = tmp_path / "state" / "shepherd-pending.json"
     pend.write_text(json.dumps({PREFIX + "9": {"sent": True}, "list": [{"wid": PREFIX + "6"}]}))
     assert next_id(tmp_path) == (0, PREFIX + "10")  # a key counts

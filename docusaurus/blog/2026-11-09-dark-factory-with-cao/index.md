@@ -12,7 +12,7 @@ Well, I have to admit, it wasn't always like that. My agents running under CAO w
 {/* truncate */}
 
 :::tip TL;DR
-I can follow three, maybe five (after some really good coffee), agent sessions at once. Instead of talking to multiple agents and trying to memorise what they are busy with (it got even harder when those agents used the handoff function to assign jobs to other agents), I choose to talk to one conductor agent and let CAO run a PR shepherd and short-lived workers behind it. A Kiro Crew bot reviews other people's pull requests on its own (and I ask it to take extra care and be humble with my own PRs). That makes it a lot easier. The rules that matter are small scripts instead of prompts, and the kit starts in observe mode. Seven reviews said NOT-READY before one said READY, and it still runs as one OS user.
+I can follow three, maybe five (after some really good coffee), agent sessions at once. Instead of talking to multiple agents and trying to memorise what they are busy with (it got even harder when those agents used the handoff function to assign jobs to other agents), I choose to talk to one conductor agent and let CAO run a PR shepherd and short-lived workers behind it. A Kiro Crew bot reviews other people's pull requests on its own (and I ask it to take extra care and be humble with my own PRs). That makes it a lot easier. The rules that matter are small scripts instead of prompts, and the kit starts in observe mode. Seven reviews said NOT-READY before one said READY. The agents still run as one OS user, but publishing to GitHub now goes through a user of its own.
 
 :::
 
@@ -111,8 +111,8 @@ A rule in a prompt only works while the agent keeps choosing to follow it, and a
 
 | What is gated | What the script does |
 |---|---|
-| Every push, post and arm | Runs again right before the action. It stops the worker if I paused, if an OK was revoked or if the PR head moved. |
-| My permissions | Standing OKs are data records: who holds it, what action, what scope. Only the conductor edits them, and only on my words. |
+| Every push, post and arm | Runs again right before the action. It stops the worker if I paused, if an OK was revoked, if the PR head moved, or if the PR isn't one of mine. |
+| My permissions | Standing OKs are data records: who holds it, what action, what scope, and a tier. Only the conductor edits them, and only on my words. |
 | Auto-merge | Gated by a GitHub Action and the PR. It arms only when the approval covers the last commit, every required check is green, and the PR is 1,500 lines or fewer. GitHub does the merge. |
 | Text from outside | PR comments, CI logs and web pages are data. They rank last and can never grant a permission. |
 
@@ -174,17 +174,33 @@ Reviewers who hadn't written the kit kept finding real holes in it. The worst on
 
 They went over the kit read-only and reproduced each finding before reporting it. Over two days in November they returned seven NOT-READY verdicts, then READY. In all: 17 serious (P1) findings, 12 P2s and one P3.
 
-That one worked like this. Before pushing, the kit asked git where `origin` *fetches* from. But a push goes wherever the *push* URL points, and git lets those two differ. A reviewer pointed the push URL at a second scratch repository, and the push landed there. My kit had checked the wrong address and felt safe. The fix compares every push destination with the one URL in my standing OKs, and refuses anything else.
+The worst one worked like this. Before pushing, the kit asked git where `origin` *fetches* from. But a push goes wherever the *push* URL points, and git lets those two differ. A reviewer pointed the push URL at a second scratch repository, and the push landed there. My kit had checked the wrong address and felt safe. The fix compares every push destination with the one URL in my standing OKs, and refuses anything else.
 
-If you build guardrails for agents, have someone who didn't write them try to break them. The tests grew with the reviews: 138 kit tests at the first review, 1,291 at the last, plus 100 for the PR watch. I also run mutation tests, which break each gate condition on purpose and check that a test notices.
+If you build guardrails for agents, have someone who didn't write them try to break them. The tests grew with the reviews: 138 kit tests at the first review, 1,290 at the last, plus 101 for the PR watch. The sample in the repo has 1,935 now, plus 184. I also run mutation tests, which break each gate condition on purpose and check that a test notices.
 
 The last gate is GitHub itself. Every change to the main branch goes through a pull request, and no agent can skip that. Even if one of my gates has a hole, the PR still needs its approval and green checks before it merges, and a person still reads it.
 
+## What has improved since
+
+The kit kept changing after the reviews. Most of the changes move trust out of prompts and into places an agent can't talk its way past.
+
+- **Standing OKs have tiers.** Tier 1 is mechanical: a script checks the scope, heads, pins and caps, like a fast-forward push or an approved, green PR, and the rest is the shepherd's judgment, written in the OK's conditions. Tier 2 needs someone to read text, like the wording of a reply, so it needs a GO every time, even in act mode.
+- **Every refusal says why and what to do next.** A DENY or STOP line names the cause and the values, and in the gate scripts a hint line names the next step. The agents stopped guessing.
+- **One helper per procedure.** The change-set check after a merge of main, the check that a posted body equals its file, the leak check and the isolated test run are each one small script now, instead of a few lines of shell copied into every playbook. The playbooks shrank to the judgment calls, each with its reason.
+- **One leak check guards every public body.** Every reply, PR body and diff goes through the same script before it goes out. It reports the kind of hit and the line, never the text.
+- **The tick loop runs under a supervisor.** A loop started as an agent's background job died with that job, or lost its wake when the agent's turn ended. Now the conductor starts a small supervisor that keeps exactly one loop running and posts each wake to the shepherd's inbox, and keeps it on disk until it's delivered.
+- **Hooks watch every command.** Claude Code hooks look at every Bash command an agent runs. They still run in audit mode: they log what they would block, and block nothing. The first day's false alarms were triaged and fixed, and the alarms from real traffic are still being sorted before anything is enforced.
+- **Publishing goes through a user of its own.** Every push, post and arm is a ticket for a separate operating-system user, which measures the PR and checks the ticket itself before it writes. In my own setup, standing OKs of the mechanical kind go straight through, and a refusal names its cause.
+- **Everything else needs one tap on my phone.** For anything that isn't a mechanical OK, that user sends me a card with the exact action and text, and I tap Approve.
+- **A shadow audit came before the switch.** On every real run, the new path decided too. Each time it disagreed with the old one, that was a check to fix or a finding to write down. Then the new path took over.
+
+The publishing user, the phone approvals and the hooks need root on the machine to install, and their code isn't in the sample yet.
+
 ## What it can't do yet
 
-The kit is running in observe mode. The shepherd proposes; the conductor says GO.
+The kit in the sample runs in observe mode. The shepherd proposes; the conductor says GO.
 
-Every agent runs as the same operating-system user, so the permission and state checks only work if every agent runs them. They are not an operating-system boundary. A deliberately forged, well-formed record is out of scope. Accidental damage, like a cut-off line, fails closed.
+Every agent runs as the same operating-system user, so the permission and state checks only work if every agent runs them. They are not an operating-system boundary; the publishing user above is the first step past that. A deliberately forged, well-formed record is out of scope. Accidental damage, like a cut-off line, fails closed.
 
 The reviews modelled GitHub merges and message delivery rather than running them live. And the big calls stay with people. I decide every new pull request or issue, every security question, and anything outside my standing OKs. Releases stay the maintainers' call.
 
@@ -214,6 +230,8 @@ For the phone half: [herdr-remote](https://github.com/dcolinmorgan/herdr-remote)
 - **Worker / ephemeral agent:** a short-lived helper, sized to one job and deleted after.
 - **Gate:** a small script that returns an explicit answer, instead of a rule in a prompt.
 - **Standing OK:** a permission I granted, stored as a data record.
+- **Tier:** how a standing OK is checked. Tier 1's scope, heads, pins and caps are checked by a script; tier 2 needs a GO each time.
+- **Shadow mode:** a new path runs next to the old one and records what it would do; the old path still does the real work.
 - **P1 / P2 / P3:** finding severity, from serious to minor.
 - **Fast-forward push:** a push that adds commits on top without rewriting history.
 - **Arm auto-merge:** switch on GitHub's own auto-merge for a PR. GitHub does the merge.

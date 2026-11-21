@@ -17,3 +17,7 @@ pr-watch/log.md
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Your own workplace values and standing OKs.
+/workplace.local.json
+/mandates.json

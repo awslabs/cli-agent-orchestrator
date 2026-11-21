@@ -82,7 +82,7 @@ def test_revoke_before_its_grant_is_corrupt(tmp_path):
                                       ('{"id": "x"', "1:row:not_json"), ("NaN\n", "1:row:not_json"),
                                       ("[]\n", "1:row:not_object")])
 def test_go_ledger_damaged_lines(tmp_path, text, why):
-    (tmp_path / "state").mkdir()
+    (tmp_path / "state").mkdir(exist_ok=True)
     (tmp_path / "state" / "go.jsonl").write_text(json.dumps(go_row()) + "\n" + text)
     rc, out = recheck(tmp_path, act(doc()), *GO_ARGS)
     n, rest = why.split(":", 1)
@@ -90,7 +90,7 @@ def test_go_ledger_damaged_lines(tmp_path, text, why):
 
 
 def test_go_ledger_duplicate_field_is_corrupt(tmp_path):
-    (tmp_path / "state").mkdir()
+    (tmp_path / "state").mkdir(exist_ok=True)
     line = json.dumps(go_row())[:-1] + ', "revoked": true}'
     (tmp_path / "state" / "go.jsonl").write_text(line + "\n")
     assert recheck(tmp_path, act(doc()), *GO_ARGS) == (1, "DENY state_corrupt:go.jsonl:1:row:not_json")
@@ -172,7 +172,7 @@ def test_go_ledger_writer_refuses_rows_its_readers_reject(tmp_path):
 
 def test_go_ledger_writer_refuses_to_append_to_a_corrupt_ledger(tmp_path):
     env = base_env(tmp_path)
-    (tmp_path / "state").mkdir()
+    (tmp_path / "state").mkdir(exist_ok=True)
     led = tmp_path / "state" / "go.jsonl"
     led.write_text(json.dumps(revoke_row("w", by=None)) + "\n")
     before = led.read_text()
@@ -181,3 +181,70 @@ def test_go_ledger_writer_refuses_to_append_to_a_corrupt_ledger(tmp_path):
         r = ledger(cmd, *args, env=env)
         assert r.returncode == 2 and r.stdout.startswith("ERROR state_corrupt:go.jsonl:1:"), r.stdout
     assert led.read_text() == before
+
+
+# --- a rerun_failed_outage GO binds its run_id ---------------------------------------
+
+RUN = "12345678901"
+
+
+def rerun_go(tmp_path, wid, *extra):
+    return ledger("add", "--id", wid, "--action", "rerun_failed_outage", "--pr", "101",
+                  "--head", HEAD, "--policy-version", pv(), "--granted-by", "conductor GO", *extra,
+                  env=base_env(tmp_path))
+
+
+def rerun_check(tmp_path, wid, *extra):
+    r = run("check_mandate.py", "--holder", "shepherd", "--action", "rerun_failed_outage",
+            "--pr-author", "your-login", "--base", "main", "--go-id", wid, "--pr", "101",
+            "--expect-head", HEAD, "--remote-head", HEAD, "--expect-policy-version", pv(), *extra,
+            env=base_env(tmp_path))
+    return r.returncode, r.stdout.strip()
+
+
+def test_a_rerun_go_binds_exactly_its_run(tmp_path):
+    r = rerun_go(tmp_path, "w-rerun", "--run-id", RUN)
+    assert (r.returncode, r.stdout.strip()) == (0, "ADDED w-rerun")
+    assert jsonl_get(tmp_path / "state" / "go.jsonl", 1)["run_id"] == RUN
+    assert rerun_check(tmp_path, "w-rerun", "--run-id", RUN) == (0, "ALLOW M3-rerun-outage-ci go=w-rerun")
+    assert rerun_check(tmp_path, "w-rerun", "--run-id", "12345678902") == (
+        1, "DENY go_mismatch:run_id:w-rerun")
+    assert rerun_check(tmp_path, "w-rerun") == (1, "DENY go_needs:--run-id (a rerun GO binds its run)")
+    assert rerun_check(tmp_path, "w-rerun", "--run-id", "0") == (1, "DENY bad_run_id (want 1-20 digits)")
+
+
+def test_go_ledger_needs_run_id_for_a_rerun_and_only_for_a_rerun(tmp_path):
+    r = rerun_go(tmp_path, "w-rerun")
+    assert (r.returncode, r.stdout.strip()) == (2, "ERROR a rerun_* GO needs --run-id (1-20 digits)")
+    r = rerun_go(tmp_path, "w-rerun", "--run-id", "044")
+    assert r.returncode == 2
+    r = ledger("add", "--id", "w-arm", "--action", "arm_automerge", "--pr", "101", "--head", HEAD,
+               "--policy-version", pv(), "--granted-by", "conductor GO", "--run-id", RUN,
+               env=base_env(tmp_path))
+    assert (r.returncode, r.stdout.strip()) == (2, "ERROR --run-id is for rerun_* actions only")
+    assert not (tmp_path / "state" / "go.jsonl").exists()
+
+
+def test_an_older_rerun_row_without_run_id_still_loads_but_binds_no_run(tmp_path):
+    """Backwards compatible: run_id is optional in the schema, so the ledger stays readable; but
+    such a GO no longer allows a rerun, because the check needs the run it names."""
+    row = go_row(id="w-old", action="rerun_failed_outage", branch=None, new_head=None,
+                 head=HEAD, policy_version=pv())
+    (tmp_path / "state").mkdir(exist_ok=True)
+    (tmp_path / "state" / "go.jsonl").write_text(json.dumps(row) + "\n")
+    assert rerun_check(tmp_path, "w-old", "--run-id", RUN) == (1, "DENY go_mismatch:run_id:w-old")
+    assert rerun_go(tmp_path, "w-new", "--run-id", RUN).returncode == 0  # the ledger is valid
+
+
+@pytest.mark.parametrize("over,why", [
+    ({"run_id": RUN, "action": "arm_automerge"}, "run_id:not_a_rerun"),
+    ({"run_id": 12345678901}, "run_id:type"), ({"run_id": "0"}, "run_id:format"),
+    ({"run_id": None}, "run_id:null"),
+])
+def test_a_bad_run_id_in_a_grant_row_is_corrupt(tmp_path, over, why):
+    row = go_row(id="w", action="rerun_failed_outage", branch=None, new_head=None, policy_version=pv())
+    row.update(over)
+    (tmp_path / "state").mkdir(exist_ok=True)
+    (tmp_path / "state" / "go.jsonl").write_text(json.dumps(row) + "\n")
+    rc, out = rerun_check(tmp_path, "w", "--run-id", RUN)
+    assert rc == 1 and out.startswith(f"DENY state_corrupt:go.jsonl:1:{why}"), out

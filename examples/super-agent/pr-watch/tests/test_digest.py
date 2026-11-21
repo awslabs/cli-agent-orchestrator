@@ -4,7 +4,7 @@ from digest_store import process, delivered
 
 def setup(tmp_path):
     config={k:tmp_path/v for k,v in [('watch','watch.json'),('ledger','ledger.json'),('queue','queue.json'),('digest','digest.md')]}
-    config['watch'].write_text('{"identities":{"ours":["your-login"]}}');config['ledger'].write_text('{"prs":{}}')
+    config['watch'].write_text('{}');config['ledger'].write_text('{"prs":{}}')
     return config
 
 def test_queue_catchup_and_once(tmp_path):
@@ -36,3 +36,26 @@ def test_enriched_report_replays_pure_policy(tmp_path):
     r=tmp_path/'report.json';r.write_text(json.dumps({'polled_at':'2026-11-09T01:00Z','items':[{'kind':'pr','number':5,'author':'other','fields':{'state':'OPEN'},'events':[{'kind':'field','field':'head','new':'abcd'}]}]}))
     p=process(r,c);d=json.loads(Path(p['report']).read_text());assert decide(d)['mode']==p['mode']=='WAKE'
     assert decide(d)['reasons']==p['reasons']
+
+def test_enriched_report_keeps_opted_in_issue_wake_policy(tmp_path):
+    c=setup(tmp_path)
+    c['watch'].write_text(json.dumps({'issues': {'5': {'wake_on_comment': True}, '6': {}}}))
+    r=tmp_path/'report.json'
+    r.write_text(json.dumps({'polled_at':'2026-11-09T01:00Z','items':[{
+        'kind':'issue','number':5,'events':[{'kind':'comment','author':'other'}]}]}))
+    p=process(r,c)
+    saved=json.loads(Path(p['report']).read_text())
+    assert saved['watch']['issues']=={'5': {'wake_on_comment': True}}
+
+def test_enriched_report_keeps_opted_in_pr_change_policy(tmp_path):
+    from wake_rules import decide
+    c=setup(tmp_path)
+    c['watch'].write_text(json.dumps({'prs': {'7': {'wake_on_change': True, 'routing_note': 'x'}, '8': {'owner': 'y'}}}))
+    r=tmp_path/'report.json'
+    r.write_text(json.dumps({'polled_at':'2026-11-09T01:00Z','items':[{
+        'kind':'pr','number':7,'author':'other','fields':{'state':'MERGED'},
+        'events':[{'kind':'field','field':'state','new':'MERGED'}]}]}))
+    p=process(r,c)
+    saved=json.loads(Path(p['report']).read_text())
+    assert saved['watch']['prs']=={'7': {'wake_on_change': True}}
+    assert p['mode']=='WAKE' and decide(saved)['mode']=='WAKE'

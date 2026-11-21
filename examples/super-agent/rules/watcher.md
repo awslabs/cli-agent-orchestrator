@@ -1,7 +1,8 @@
 # Rule: the PR/issue watcher
 
 The watcher is the zero-token poll loop in `PB` (`KIT/pr-watch`). It reads GitHub and decides
-whether to wake the shepherd. The shepherd runs it; this file is the rule the shepherd follows.
+whether to wake the shepherd. The conductor's `tick_supervisor.sh` keeps it running; this file is
+the rule the shepherd follows.
 
 **Hard rules**
 - The loop never pushes, comments, reviews, labels, merges, closes or edits code. `poll.py`
@@ -14,8 +15,9 @@ whether to wake the shepherd. The shepherd runs it; this file is the rule the sh
 ## watch.json
 Copy `PB/watch.example.json` to `PB/watch.json` and edit it:
 - `repo`: `your-org/your-repo`.
-- `identities.ours`: your GitHub login(s). The loop and the auto-merge gate both read it; an
-  author not listed here is never treated as "ours".
+- `identities.ours`: your GitHub login, which `bin/remap_owners.py` fills from `github_login` in
+  `workplace.local.json`. The auto-merge gate reads it; the loop reads the same login from the
+  workplace config. An author that isn't yours is never treated as "ours".
 - `prs` and `issues`: what to watch, keyed by number, each with an `owner`
   (`{"session": ..., "terminal": ...}` or `null` for report-only).
 - `ignore_prs`: numbers the loop must skip (for example, merged PRs after the conductor acks).
@@ -23,7 +25,7 @@ Copy `PB/watch.example.json` to `PB/watch.json` and edit it:
   for a failure already reported once. Prose descriptions never suppress a failure.
 
 Your own open PRs that are not yet in `watch.json` show up as `unwatched_open_prs` on every
-poll (`gh pr list --author @me`). PRs in the reviewer's ledger (`KIT/reviews/ledger.json`) are
+poll (`gh pr list --author @me`). PRs in your review ledger (`KIT/reviews/ledger.json`, the PRs you reviewed) are
 watched for new commits and replies too.
 
 ## Each tick (the loop does this by itself)
@@ -33,8 +35,9 @@ watched for new commits and replies too.
    behind main) and for new commits, replies and state changes on PRs you reviewed. Everything
    else goes to the digest, which rides along with the next wake, or wakes once by itself when
    its oldest line is more than 24 hours old.
-3. On `WAKE`, the loop exits with `WAKE <report> [retry=<report2>] :: <reasons>`, and the
-   shepherd takes over (`shepherd-playbook.md` §2). Otherwise it logs one line and sleeps
+3. On `WAKE`, the loop exits with `WAKE <report> [retry=<report2>] :: <reasons>`;
+   `tick_supervisor.sh` posts that line to the shepherd's inbox, the shepherd takes over
+   (`shepherd-playbook.md` §2), and the supervisor starts the next loop. Otherwise it logs one line and sleeps
    (30 minutes by default; `INTERVAL` seconds).
 
 ## Partial polls

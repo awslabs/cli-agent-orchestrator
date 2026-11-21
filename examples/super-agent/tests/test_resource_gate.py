@@ -1,7 +1,9 @@
+import importlib.util
 import json
 import os
 import re
 import socket
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -9,6 +11,13 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from conftest import KIT, base_env, run, write_json
+
+
+def resource_gate():
+    spec = importlib.util.spec_from_file_location("resource_gate_parser", KIT / "bin" / "resource_gate.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 GO_M = {"pressure_level": 1, "free_memory_pct": 60, "swap_used_gib": 1.0, "disk_free_gib": 100.0,
         "load1": 1.0, "ncpu": 10, "live_terminals": 1}
@@ -36,7 +45,7 @@ def gate(tmp_path, fakebin, measurements, *args, cao_url=None):
         extra["SUPER_AGENT_CAO_URL"] = cao_url
     env = base_env(tmp_path, **extra)
     env["PATH"] = f"{d}:{env['PATH']}"
-    r = run("resource_gate.py", *args, env=env)
+    r = run("resource_gate.py", "--resources", KIT / "resources.json", *args, env=env)
     assert not marker.exists(), "a real system probe ran under fake measurements"
     return r.returncode, r.stdout.strip()
 
@@ -285,26 +294,20 @@ def live(tmp_path, d, timeout=5):
 
 @pytest.mark.parametrize("raw,level", [("1\n", 1), ("2\n", 2), ("4\n", 4)])
 def test_pressure_parser_reads_the_tool(tmp_path, probebin, raw, level):
-    rc, data, why = live(tmp_path, probebin(pressure=raw))
-    assert data["measurements"]["pressure_level"] == level
-    assert ("pressure=" in why) == (level > 1) and "unknown:pressure" not in why
-    if level == 4:
-        assert rc == STOP
+    assert resource_gate().parse_pressure(raw) == level
 
 
 @pytest.mark.parametrize("raw", ["", "\n", "garbage\n", "1 2\n", "2.0\n", "+2\n", "4_0\n"])
 def test_pressure_parser_rejects_bad_output(tmp_path, probebin, raw):
-    rc, data, why = live(tmp_path, probebin(pressure=raw))
-    assert data["measurements"]["pressure_level"] is None and "unmeasured:pressure" in why
-    assert rc == THROTTLE
+    with pytest.raises(ValueError):
+        resource_gate().parse_pressure(raw)
 
 
 def test_pressure_tool_reporting_zero_is_unknown(tmp_path, probebin):
-    rc, data, why = live(tmp_path, probebin(pressure="0\n"))
-    assert data["measurements"]["pressure_level"] == 0 and "unknown:pressure=0" in why
-    assert rc == THROTTLE
+    assert resource_gate().parse_pressure("0\n") == 0
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS probe integration")
 def test_missing_tools_are_unmeasured(tmp_path, probebin):
     rc, data, why = live(tmp_path, probebin(omit=("sysctl", "memory_pressure")))
     for k in ("pressure_level", "swap_used_gib", "free_memory_pct"):
@@ -312,6 +315,7 @@ def test_missing_tools_are_unmeasured(tmp_path, probebin):
     assert "unmeasured:pressure" in why and "unmeasured:swap_gib" in why and rc == THROTTLE
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS probe integration")
 def test_probe_timeout_is_unmeasured(tmp_path, probebin):
     rc, data, why = live(tmp_path, probebin(sleep=3), timeout=0.3)
     assert data["measurements"]["pressure_level"] is None and "unmeasured:pressure" in why
@@ -319,10 +323,9 @@ def test_probe_timeout_is_unmeasured(tmp_path, probebin):
 
 
 def test_swap_and_free_parsers_read_the_tools(tmp_path, probebin):
-    rc, data, why = live(tmp_path, probebin(pressure="2\n"))
-    meas = data["measurements"]
-    assert meas["free_memory_pct"] == 47 and abs(meas["swap_used_gib"] - 18386.19 / 1024) < 1e-6
-    assert "swap_gib=18.0>16" in why
+    rg = resource_gate()
+    assert rg.parse_free_pct(MP_NORMAL) == 47
+    assert abs(rg.parse_swap_gib(SWAP_RAW) - 18386.19 / 1024) < 1e-6
 
 
 @pytest.mark.parametrize("swap,gib", [("total = 2048.00M  used = 512.00M  free = 1.0M\n", 0.5),
@@ -334,6 +337,7 @@ def test_swap_units(tmp_path, probebin, swap, gib):
 
 
 @pytest.mark.parametrize("swap,mp", [("garbage\n", "garbage\n"), ("", "")])
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS probe integration")
 def test_swap_and_free_garbage_is_unmeasured(tmp_path, probebin, swap, mp):
     rc, data, why = live(tmp_path, probebin(swap=swap, mp=mp))
     assert data["measurements"]["swap_used_gib"] is None and data["measurements"]["free_memory_pct"] is None

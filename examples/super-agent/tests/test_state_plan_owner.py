@@ -1,4 +1,4 @@
-"""plan-approvals.jsonl (baseline and approval rows) and heavy/active/owner.json."""
+"""plan-approvals.jsonl (its strict schema; the review plans it guarded are gone) and heavy/active/owner.json."""
 import json
 import re
 
@@ -7,51 +7,17 @@ import pytest
 from state_helpers import *  # noqa: F401,F403
 
 
-BASELINE_WRONG = {"kind": 7, "workflow": 7, "file": 7, "sha256": 7, "verified_at": 7, "verified_by": 7,
-                  "evidence": 7}
-
-
-APPROVAL_WRONG = {"kind": 7, "at": 7, "plan_id": 7, "workflow": 7, "pr": [], "head": 7, "base": 7,
-                  "sha256": "x"}
-
-
-def plan_check(tmp_path, rows):
-    (tmp_path / "state").mkdir(exist_ok=True)
-    (tmp_path / "state" / "plan-approvals.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
-    f = tmp_path / WF
-    f.write_bytes(b"wf")
-    r = run("plan_hash_check.py", f, env=base_env(tmp_path))
-    return r.returncode, r.stdout.strip()
-
-
-def test_plan_ledger_control_matches(tmp_path):
-    assert plan_check(tmp_path, [BASELINE, APPROVAL, dict(APPROVAL, pr=None), dict(APPROVAL, pr="101")]) == (
-        0, f"MATCH {WF} {sha(b'wf')[:8]}")
-
-
-PLAN_CASES = ([("baseline-" + c[0], [c[1]], 1, c[2]) for c in variants(BASELINE, BASELINE_WRONG, discriminator="kind")]
-              + [("approval-" + c[0], [BASELINE, c[1]], 2, c[2])
-                 for c in variants(APPROVAL, APPROVAL_WRONG, nullable=("pr",), discriminator="kind")]
-              + [("approval-sha256-empty", [BASELINE, dict(APPROVAL, sha256={})], 2, "sha256:empty"),
-                 ("approval-sha256-bad-hex", [BASELINE, dict(APPROVAL, sha256={WF: "x"})], 2, "sha256:format"),
-                 ("approval-pr-zero", [BASELINE, dict(APPROVAL, pr=0)], 2, "pr:"),
-                 ("baseline-unknown_field", [dict(BASELINE, extra=1)], 1, "extra:unknown_field"),
-                 ("other-kind", [BASELINE, dict(APPROVAL, kind="note")], 2, "row_type:unknown")])
-
-
-@pytest.mark.parametrize("case", PLAN_CASES, ids=[c[0] for c in PLAN_CASES])
-def test_plan_ledger_row_field_fails_closed(tmp_path, case):
-    _, rows, line, why = case
-    rc, out = plan_check(tmp_path, rows)
-    assert rc == 1 and out.startswith(f"REFUSE corrupt_ledger state_corrupt:plan-approvals.jsonl:{line}:{why}"), out
-
-
-def test_kit_plan_ledger_is_valid_when_present():
-    led = KIT / "state" / "plan-approvals.jsonl"
-    if not led.exists():
-        pytest.skip("the example ships no plan ledger; you record your own baselines")
+def test_shipped_plan_ledger_is_valid(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    second = dict(BASELINE, workflow="branch-review-script-local-20261027",
+                  file="branch-review-script-local-20261027.py",
+                  sha256="1" * 64)
+    (state / "plan-approvals.jsonl").write_text(
+        json.dumps(BASELINE) + "\n" + json.dumps(second) + "\n")
     ss = load("state_schema")
-    assert all(r["kind"] in {"baseline", "approval"} for r in ss.load_plan_ledger(led))
+    rows = ss.load_plan_ledger(state / "plan-approvals.jsonl")
+    assert len(rows) == 2 and {r["kind"] for r in rows} == {"baseline"}
 
 
 OWNER_WRONG = {"label": 7, "token": 7, "acquired_at": "1", "refreshed_at": "1", "pid": "1"}

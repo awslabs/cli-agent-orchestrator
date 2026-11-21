@@ -12,7 +12,7 @@ its reservation makes the WHOLE file corrupt. The reader raises StateCorrupt, pr
 and the calling script fails closed by its own convention (DENY, REFUSED, ERROR, PENDING kept,
 REFUSE). There is no "skip this row" path. <file> is the path under the state dir (else the
 basename), <line> the 1-based line of a .jsonl file or the row's key in a JSON document
-(holds.json: "101", "_cleared[0]"; owner.json and the generation file: 1), and <why> is
+(holds.json: "1259", "_cleared[0]"; owner.json and the generation file: 1), and <why> is
 <field>:<problem>. Writers run the same validators before they write; a refused row raises
 RowRefused (row_refused:<file>:<line>:<why>) and nothing is written, so the kit never writes a
 row it would itself reject. Every .jsonl writer appends through append_row (one LF separator,
@@ -35,9 +35,9 @@ Files and row types (required fields; [optional]; "|null" = present, may be null
   go.jsonl               grant  : id action repo pr|null branch|null head new_head|null
                                   body_sha256|null policy_version granted_by at expires_at
                                   revoked=false writer_role=conductor writer_terminal
-                                  [relayed_by item]; pr or branch set; a *_push action has
-                                  new_head and branch, any other has new_head null; granted_by
-                                  "user" needs relayed_by
+                                  [relayed_by item run_id]; pr or branch set; a *_push
+                                  action has new_head and branch, any other has new_head null;
+                                  granted_by "user" needs relayed_by; run_id only on rerun_*
                          revoke : id revoked=true by at writer_role=conductor writer_terminal;
                                   id names a grant on an earlier line
   outbox.jsonl, outbox/<key>.sent
@@ -54,9 +54,16 @@ Files and row types (required fields; [optional]; "|null" = present, may be null
                          _cleared: list of pr item_id body_sha256 reason go_id cleared_at
   plan-approvals.jsonl   baseline: kind workflow file sha256 verified_at verified_by evidence
                          approval: kind at plan_id workflow pr|null head base sha256{file: hex}
-  heavy/active/owner.json  label token acquired_at refreshed_at pid
+  heavy/active/owner.json, heavy/active/owner-<n>.json (n = 2..8)
+                         one heavy-slot holder per file: label token acquired_at refreshed_at
+                         pid. owner.json is slot 1 (the single-slot file, unchanged), so an
+                         existing holder needs no migration. Tokens are unique across the
+                         holders; any other entry in heavy/active (except owner*.json.tmp) is
+                         file:unknown.
 Lock (*.lock), temp (*.tmp), backup (mandates.json.bak-*) and .failed-* files are never read.
 """
+import importlib.util
+from contextlib import contextmanager
 import argparse
 import fcntl
 import json
@@ -67,7 +74,47 @@ import sys
 from datetime import datetime, timezone
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CAO_API = "http://localhost:9889"
+def _writer_lease():
+    path = os.path.join(KIT, "bin", "writer_lease.py")
+    mod = sys.modules.get("kit_writer_lease")
+    if mod is None or getattr(mod, "__file__", None) != path:
+        spec = importlib.util.spec_from_file_location("kit_writer_lease", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["kit_writer_lease"] = mod
+        spec.loader.exec_module(mod)
+    return mod
+
+
+WL = _writer_lease()
+NotWriter = WL.NotWriter
+require_writer = WL.require_writer
+writer_locked = WL.writer_locked
+writer_section = WL.writer_section
+
+
+def workplace():
+    """bin/workplace.py (the per-install config), loaded by path so it works under python3 -I."""
+    path = os.path.join(KIT, "bin", "workplace.py")
+    mod = sys.modules.get("kit_workplace")
+    if mod is None or getattr(mod, "__file__", None) != path:
+        spec = importlib.util.spec_from_file_location("kit_workplace", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["kit_workplace"] = mod
+        spec.loader.exec_module(mod)
+    return mod
+
+
+def workplace_value(key, require=()):
+    """One value of the workplace config, or None when it can't be read. Callers fail closed on None."""
+    try:
+        return workplace().load(require=require)[key]
+    except (ValueError, OSError, ImportError, KeyError):  # WorkplaceConfigError is a ValueError
+        return None
+
+
+def cao_api():
+    """The CAO API base URL from the workplace config (cao_api), or None."""
+    return workplace_value("cao_api")
 
 SHA40 = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -78,6 +125,7 @@ REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 BRANCH_RE = re.compile(r"(?!-)(?!.*\.\.)[A-Za-z0-9_./-]{1,200}")
 ACTION_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 PR_RE = re.compile(r"[1-9][0-9]{0,9}")
+RUN_ID_RE = re.compile(r"[1-9][0-9]{0,19}")  # GitHub Actions run ids: 11 digits today
 ITEM_RE = re.compile(r"(review|issue_comment|review_comment):[0-9]+")
 # A held item GitHub returned without an id is saved as "<kind>:None"; it can never be cleared.
 HELD_ITEM_RE = re.compile(r"(review|issue_comment|review_comment):([0-9]+|None)")
@@ -110,6 +158,26 @@ class RowRefused(StateCorrupt):
 
 def state_dir():
     return os.environ.get("SUPER_AGENT_STATE_DIR") or os.path.join(KIT, "state")
+
+
+def require_writer_for_output(path):
+    """Scratch evidence is allowed on reader hosts; state output needs the fence."""
+    root = os.path.realpath(state_dir())
+    target = os.path.realpath(path)
+    if os.path.commonpath((root, target)) == root:
+        require_writer()
+
+
+@contextmanager
+def writer_locked_for_output(path):
+    require_writer_for_output(path)
+    root = os.path.realpath(state_dir())
+    target = os.path.realpath(path)
+    if os.path.commonpath((root, target)) == root:
+        with writer_locked():
+            yield
+    else:
+        yield
 
 
 def label(path):
@@ -271,6 +339,8 @@ def _grant_check(row):
             return "new_head:missing_for_push"
     elif row["new_head"] is not None:
         return "new_head:not_a_push"
+    if "run_id" in row and not row["action"].startswith("rerun_"):  # optional: older rows have no run_id
+        return "run_id:not_a_rerun"
     if row["granted_by"] == "user" and "relayed_by" not in row:
         return "relayed_by:missing_for_user"
     return None
@@ -283,7 +353,8 @@ GO_GRANT = Row("go_grant", {
     "new_head": nullable(pattern(SHA40)), "body_sha256": nullable(pattern(HEX64)),
     "policy_version": text(), "granted_by": text(), "at": iso, "expires_at": iso,
     "revoked": const(False), **SIGNED,
-}, optional={"relayed_by": text(), "item": pattern(ITEM_RE)}, check=_grant_check)
+}, optional={"relayed_by": text(), "item": pattern(ITEM_RE), "run_id": pattern(RUN_ID_RE)},
+   check=_grant_check)
 GO_REVOKE = Row("go_revoke", {"id": pattern(WID_RE), "revoked": const(True), "by": text(), "at": iso,
                               **SIGNED})
 
@@ -397,8 +468,9 @@ def jsonl_rows(path):
     return out
 
 
+@writer_section
 def append_row(path, row, check):
-    """The one append routine every .jsonl writer uses. Call it under the file's existing
+    """The one append routine every .jsonl writer uses (F9). Call it under the file's existing
     lock. check(path, row) validates the whole current file and the new row (raising
     StateCorrupt, or RowRefused for the row); on any error nothing is written. Then exactly one
     row is appended with exactly one LF between it and the last row, whichever valid ending the
@@ -409,6 +481,7 @@ def append_row(path, row, check):
     row:blank_line, so check() raises and the writer refuses cleanly before writing; the file is
     left byte-for-byte as it was, for the conductor to hand-repair (drop the blank line) and
     rerun, after which recovery works as normal. Readers accept both valid endings."""
+    require_writer()
     check(path, row)
     try:
         with open(path, "rb") as fh:
@@ -436,7 +509,7 @@ def json_doc(path):
 
 def go_row_problem(row, granted, revoked_ids):
     """Why this go.jsonl row is invalid after the grant ids in `granted` and the revoked ids in
-    `revoked_ids`, or None. Grant ids are unique: a second grant with a used id -- the same
+    `revoked_ids`, or None. Grant ids are unique (F8): a second grant with a used id -- the same
     bytes or not, revoked in between or not -- is corrupt, and so is a second revoke of one id,
     so a stale grant can never reappear after its revocation."""
     if not isinstance(row, dict):
@@ -496,8 +569,11 @@ def iso_ns(ns):
 
 
 def gone_evidence(owner):
-    """The only text that proves a terminal gone: what the template's exact curl writes."""
-    return f"{CAO_API}/terminals/{owner} 404"
+    """The only text that proves a terminal gone: what the template's exact curl writes.
+
+    None when the workplace config can't be read, which matches no evidence (fail closed)."""
+    api = cao_api()
+    return None if api is None else f"{api}/terminals/{owner} 404"
 
 
 def history_problem(row):
@@ -674,6 +750,7 @@ def check_holds_write(path, doc):
 
 
 # ---------- plan-approvals.jsonl ----------
+# Kept on purpose: its reader (the reviewer's plan check) is gone, but older installs still hold this file.
 
 def plan_row_problem(row):
     if not isinstance(row, dict):
@@ -700,9 +777,10 @@ def default_plan_ledger():
     return os.path.join(state_dir(), "plan-approvals.jsonl")
 
 
+@writer_section
 def append_plan_row(path, row):
     """Validate the file and the row, then append it under an exclusive lock."""
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    require_writer()
     with open(str(path) + ".lock", "a") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
         append_row(path, row, check_plan_append)
@@ -716,10 +794,67 @@ def check_plan_append(path, row):
         raise RowRefused(label(path), len(rows) + 1, why)
 
 
-# ---------- heavy/active/owner.json ----------
+# ---------- heavy/active/owner.json and owner-<n>.json ----------
+
+HEAVY_MAX_SLOTS = 8
+HEAVY_HOLDER_RE = re.compile(r"owner(?:-([2-8]))?\.json")
+HEAVY_TMP_RE = re.compile(r"owner(?:-[2-8])?\.json\.tmp")
+
+
+def heavy_holder_name(slot):
+    """Slot 1 is owner.json (the single-slot file); slot n >= 2 is owner-<n>.json."""
+    if isinstance(slot, bool) or not isinstance(slot, int) or not 1 <= slot <= HEAVY_MAX_SLOTS:
+        raise ValueError(f"heavy slot out of range: {slot!r}")
+    return "owner.json" if slot == 1 else f"owner-{slot}.json"
+
+
+def _heavy_entries(active):
+    """([(slot, name)], [unknown names]) of heavy/active in slot order. owner*.json.tmp (a write
+    cut short) is skipped; anything else that is not a regular holder file is unknown.
+    FileNotFoundError propagates (no marker)."""
+    holders, unknown = [], []
+    for name in sorted(os.listdir(active)):
+        if HEAVY_TMP_RE.fullmatch(name):
+            continue
+        m = HEAVY_HOLDER_RE.fullmatch(name)
+        path = os.path.join(active, name)
+        if m and os.path.isfile(path) and not os.path.islink(path):
+            holders.append((int(m.group(1) or 1), name))
+        else:
+            unknown.append(name)
+    return sorted(holders), unknown
+
+
+def heavy_holder_files(active):
+    """[(slot, name)] of the holder files in heavy/active. An unknown entry raises StateCorrupt
+    <its path>:1:file:unknown: it might be a holder, so nobody counts past it."""
+    holders, unknown = _heavy_entries(active)
+    if unknown:
+        raise StateCorrupt(label(os.path.join(active, unknown[0])), 1, "file:unknown")
+    return holders
+
+
+def load_heavy_holders(active):
+    """[(name, row)] of every holder in heavy/active, slot order, each row validated by
+    load_owner, tokens unique (else token:duplicate on the later file). A file removed between
+    the listing and the read is skipped (it was released). FileNotFoundError propagates when
+    heavy/active itself does not exist."""
+    out, seen = [], set()
+    for _, name in heavy_holder_files(active):
+        path = os.path.join(active, name)
+        try:
+            row = load_owner(path)
+        except FileNotFoundError:
+            continue
+        if row["token"] in seen:
+            raise StateCorrupt(label(path), 1, "token:duplicate")
+        seen.add(row["token"])
+        out.append((name, row))
+    return out
+
 
 def load_owner(path):
-    """The validated owner.json. FileNotFoundError propagates (a marker without its file)."""
+    """One validated holder file. FileNotFoundError propagates (a marker without its file)."""
     row = json_doc(path)
     why = HEAVY_OWNER.problem(row)
     if why:
@@ -731,6 +866,9 @@ def check_owner_write(path, row):
     why = HEAVY_OWNER.problem(row)
     if why:
         raise RowRefused(label(path), 1, why)
+    name = os.path.basename(path)
+    if not HEAVY_HOLDER_RE.fullmatch(name):
+        raise RowRefused(label(path), 1, "file:not_a_holder_name")
 
 
 # ---------- the whole state dir ----------
@@ -744,7 +882,7 @@ def check_all(sd):
         try:
             fn()
             out.append((name, None))
-        except StateCorrupt as exc:
+        except (StateCorrupt, NotWriter) as exc:
             out.append((name, exc))
         except OSError as exc:
             out.append((name, StateCorrupt(name, 0, f"file:{type(exc).__name__}")))
@@ -763,9 +901,23 @@ def check_all(sd):
             run(f"outbox/{f}", lambda p=p, key=key: load_sent(p, key))
         elif suffix == "generation":
             run(f"outbox/{f}", lambda p=p: load_generation(p))
-    owner = os.path.join(sd, "heavy", "active", "owner.json")
-    if os.path.exists(owner):
-        run("heavy/active/owner.json", lambda: load_owner(owner))
+    active = os.path.join(sd, "heavy", "active")
+    if os.path.isdir(active):
+        holders, unknown = _heavy_entries(active)
+        for name in unknown:
+            out.append((f"heavy/active/{name}", StateCorrupt(f"heavy/active/{name}", 1, "file:unknown")))
+        tokens = {}
+        for _, name in holders:
+            p = os.path.join(active, name)
+
+            def holder(p=p, name=name):
+                row = load_owner(p)
+                if row["token"] in tokens:
+                    raise StateCorrupt(label(p), 1, "token:duplicate")
+                tokens[row["token"]] = name
+            run(f"heavy/active/{name}", holder)
+    elif os.path.lexists(active):
+        out.append(("heavy/active", StateCorrupt("heavy/active", 1, "file:not_a_directory")))
     return out
 
 
@@ -795,7 +947,7 @@ def main(argv=None):
         return 2
     try:
         append_plan_row(path, row)
-    except StateCorrupt as exc:
+    except (StateCorrupt, NotWriter) as exc:
         print(f"ERROR {exc}")
         return 2
     except OSError as exc:

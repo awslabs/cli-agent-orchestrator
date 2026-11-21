@@ -1,6 +1,6 @@
 {
   "policy_version": "example-1",
-  "about": "Standing OKs from the user, as structured records. This is the example's starting set: replace your-org/your-repo and your-login with your own repo and GitHub login, and keep shepherd_mode observe until you trust the proposals. Only the conductor edits this file, and only on the user's explicit words; it mirrors every change to CAO memory and bumps policy_version. check_mandate.py reads it before every outside action.",
+  "about": "Standing OKs from the user, as structured records. This is the example's starting set: copy it to mandates.json, replace your-org/your-repo and your-login with your own repo and GitHub login, and keep shepherd_mode observe until you trust the proposals. Each record has a tier: tier 1 is mechanical (the script checks the scope, heads, pins and caps; the rest is the shepherd's judgment, written in the conditions), tier 2 needs the conductor's GO for each use, in act mode too, because it needs a reading of text. Only the conductor edits mandates.json, and only on the user's explicit words; it mirrors every change to CAO memory and bumps policy_version. check_mandate.py reads it before every outside action.",
   "shepherd_mode": "observe",
   "paused": false,
   "paused_by": null,
@@ -51,7 +51,8 @@
       "granted_by": "user",
       "granted_at": "<date you granted it>",
       "source": "the user's words to the conductor (quote them here)",
-      "revoked": false
+      "revoked": false,
+      "tier": 1
     },
     {
       "id": "M2-factual-fix-reply",
@@ -79,7 +80,8 @@
       "granted_by": "user",
       "granted_at": "<date you granted it>",
       "source": "the user's words to the conductor (quote them here)",
-      "revoked": false
+      "revoked": false,
+      "tier": 2
     },
     {
       "id": "M3-rerun-outage-ci",
@@ -105,7 +107,8 @@
       "granted_by": "user",
       "granted_at": "<date you granted it>",
       "source": "the user's words to the conductor (quote them here)",
-      "revoked": false
+      "revoked": false,
+      "tier": 1
     },
     {
       "id": "M4-main-merge-push",
@@ -135,7 +138,8 @@
       "granted_by": "user",
       "granted_at": "<date you granted it>",
       "source": "the user's words to the conductor (quote them here)",
-      "revoked": false
+      "revoked": false,
+      "tier": 1
     },
     {
       "id": "M5-update-branch",
@@ -162,7 +166,8 @@
       "granted_by": "user",
       "granted_at": "<date you granted it>",
       "source": "the user's words to the conductor (quote them here)",
-      "revoked": false
+      "revoked": false,
+      "tier": 1
     },
     {
       "id": "M6-arm-automerge",
@@ -196,43 +201,8 @@
       "granted_by": "user",
       "granted_at": "<date you granted it>",
       "source": "the user's words to the conductor (quote them here)",
-      "revoked": false
-    },
-    {
-      "id": "M7-approve-review-plan",
-      "holder": "conductor",
-      "action": "approve_review_plan",
-      "scope": {
-        "repo": "your-org/your-repo",
-        "pr_author": "*",
-        "base": "main"
-      },
-      "conditions": {
-        "what": "cao workflow approve <plan_id> for a plan the cao_pr_reviewer reported as refused.",
-        "workflows": [
-          "pr-review",
-          "branch-review"
-        ],
-        "requires": [
-          "the cao_pr_reviewer reported the refusal",
-          "inputs match the PR it reported: head_sha equals the PR's live head",
-          "follow-ups: base_sha is the last reviewed head and an ancestor of head, or the PR's mergeBaseOid after a rebase",
-          "bin/plan_hash_check.py ~/.aws/cli-agent-orchestrator/workflows/<both workflow>.py prints MATCH for both (the trusted baselines in state/plan-approvals.jsonl); a missing or changed baseline goes to the user, and the conductor never records a baseline itself"
-        ],
-        "never": [
-          "any other workflow or plan",
-          "approving on any mismatch",
-          "disabling enforcement"
-        ],
-        "tell_user": "after each approval"
-      },
-      "granted_by": "user",
-      "granted_at": "<date you granted it>",
-      "source": "the user's words to the conductor (quote them here)",
-      "revoked": true,
-      "revoked_by": "user",
-      "revoked_at": "<date>",
-      "revoked_source": "off by default in the example: the reviewer is optional. Set revoked to false only if you run cao_pr_reviewer and want the conductor to approve its two workflow plans."
+      "revoked": false,
+      "tier": 1
     },
     {
       "id": "M8-clear-hold",
@@ -260,7 +230,8 @@
       "granted_by": "user",
       "granted_at": "<date you granted it>",
       "source": "the user's words to the conductor (quote them here)",
-      "revoked": false
+      "revoked": false,
+      "tier": 2
     }
   ]
 }

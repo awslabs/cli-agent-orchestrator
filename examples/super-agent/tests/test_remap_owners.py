@@ -2,19 +2,19 @@ import json
 
 from conftest import base_env, run, write_json
 
-OLD, NEW = "a1b2c3d4", "5eedf00d"
+OLD, NEW = "c0ffee02", "5eedf00d"
 
 
 def watch():
     return {
         "repo": "your-org/your-repo",
-        "prs": {"101": {"owner": {"session": "cao-main", "terminal": OLD}, "issues": []},
+        "prs": {"101": {"owner": {"session": "cao-old-session", "terminal": OLD}, "issues": []},
                 "999": {"owner": {"session": "s", "terminal": "0b0e0b0e"}},
                 "998": {"owner": None},
                 "997": {"owner": {"session": None, "terminal": None}}},
-        "issues": {"810": {"owner": {"session": "cao-main", "terminal": OLD}},
+        "issues": {"810": {"owner": {"session": "cao-old-session", "terminal": OLD}},
                    "811": {"owner": {"session": "x", "terminal": OLD}}},
-        "our_pr_rules": {"scope": "add it with owner a1b2c3d4"},
+        "our_pr_rules": {"scope": "add it with owner c0ffee02"},
     }
 
 
@@ -23,7 +23,7 @@ def remap(tmp_path, doc, *extra):
     if isinstance(doc, str):
         p.write_text(doc)
     r = run("remap_owners.py", "--watch", p, "--from", OLD, "--to", NEW, "--session", "cao-super",
-            "--ours", "your-login", *extra, env=base_env(tmp_path))
+            *extra, env=base_env(tmp_path))
     return r, p
 
 
@@ -66,10 +66,15 @@ def test_bad_ids_refused(tmp_path):
     assert r.returncode == 2 and json.loads(p.read_text()) == watch()
 
 
-def test_missing_identities_without_ours_writes_nothing(tmp_path):
+def test_identities_follow_the_configured_login_and_fail_closed_when_unset(tmp_path):
+    local = tmp_path / "local.json"
+    local.write_text('{"github_login": "new-user"}')
     p = write_json(tmp_path / "watch.json", watch())
-    before = p.read_text()
-    r = run("remap_owners.py", "--watch", p, "--from", OLD, "--to", NEW, "--session", "cao-super",
-            env=base_env(tmp_path))
-    assert r.returncode == 2 and r.stdout.startswith("ERROR ValueError: watch.json has no identities")
-    assert p.read_text() == before
+    args = ("--watch", p, "--from", OLD, "--to", NEW, "--session", "cao-super")
+    r = run("remap_owners.py", *args, env=base_env(tmp_path, CAO_WORKPLACE_CONFIG=local))
+    assert r.returncode == 0 and json.loads(p.read_text())["identities"]["ours"] == ["new-user"]
+    local.write_text('{"github_login": null}')
+    p = write_json(tmp_path / "watch.json", watch())
+    before = p.read_bytes()
+    r = run("remap_owners.py", *args, env=base_env(tmp_path, CAO_WORKPLACE_CONFIG=local))
+    assert r.returncode == 2 and "workplace_login_unset" in r.stdout and p.read_bytes() == before

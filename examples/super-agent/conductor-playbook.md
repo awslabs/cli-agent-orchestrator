@@ -1,65 +1,81 @@
 # Conductor playbook
 
-The conductor's profile (`agents/cao_conductor.md`) says *what* to do. This file says *how*.
-Read the section you need when you need it. `KIT` = `${SUPER_AGENT_HOME:-$HOME/super-agent}`
-(your copy of this example), `PB` = `KIT/pr-watch`, `REPO` = your repo (`your-org/your-repo` in
-the shipped files), `API` = `http://localhost:9889` (the default `cao-server` address).
+The profile (`agents/cao_conductor.md.tmpl`) says *what* to do; this file keeps the judgment calls, each
+with its reason. Where a helper enforces a rule, run it: it refuses with the reason and the next step.
+Workers' exact commands live in `templates/`.
+`KIT` (your copy of this example), `PB` (`KIT/pr-watch`, the poll loop), `REPO` (`owner/name`),
+`REPO_URL` (`https://github.com/REPO.git`), `LOGIN` and `API` are this install's values
+(`python3 KIT/bin/workplace.py show`). Write them out in full in every command and brief: a worker
+has no other way to know them.
+
+## Writer lease
+At setup and on every wake, run `python3 KIT/bin/writer_lease.py show` before any state write or
+outward action: it must say `this host: yes` (the host exactly `socket.gethostname()`); missing,
+malformed or foreign means `STATUS: blocked`. Any `not_writer` (also `WAKE … not_writer`) is
+**BLOCKED not_writer**: report it and stop, write and restart nothing. Why: two writing hosts is the
+one failure nothing later can undo. Workers report to their creator, the shepherd to you, you to the
+operator. `claim`, `release` and `--force` are **operator/conductor-only**, and you use them only for
+an explicitly operator-authorized transfer or recovery, after draining the old host's writers.
+Agents and workers never claim or force to unblock themselves; the shepherd never runs claim, release or --force.
+
+### Agent-maintained state and logs
+Write `KIT/state/shepherd-prs.json`, `shepherd-pending.json`, `shepherd-workers.json`,
+`PB/state/hold-findings.json` and the `PB/state/watch.json.pre-shepherd-*` and `KIT/state/mandates.json.bak-*`
+backups only with `python3 KIT/bin/state_write.py --out <path> --from <file prepared in KIT/work/>`,
+and every `PB/log.md` entry with `--append` (stdin works:
+`printf '%s\n' '<entry>' | python3 KIT/bin/state_write.py --out PB/log.md --append`). It checks the
+lease, locks and replaces atomically; it never creates parent directories. A refusal is BLOCKED:
+never fall back to shell edits or `cp`, which skip the lease. GO, holds and outbox ledgers keep
+their own schema-aware tools. The heavy slot is host-local: a reader host can acquire,
+refresh and release its own slot without WRITER; never copy heavy markers during a transfer.
 
 ## 0. Resource rules (hard rule: "too many resources would lead the machine dead")
-- **Before every `create_ephemeral_agent` or `assign`, and before every review-plan approval,**
-  run `python3 KIT/bin/resource_gate.py` and branch on its exit code:
-  - **GO (0):** go ahead.
-  - **THROTTLE (3):** at most **one** new worker at a time, small tiers where they'll do, no
-    parallel suites, delete finished workers first, and defer non-urgent work (review plans,
-    cleanup).
-  - **STOP (1):** create nothing and start no suite; let running work finish. The shepherd tells
-    the conductor; the conductor tells the user **once**, with the top memory holders
-    (`top -l 1 -o mem -n 5 -stats pid,command,mem`; RSS misses compressed memory).
-- **Heavy jobs** (full suites, review-workflow runs, main-merge full suites): workers run
-  `resource_gate.py --acquire-heavy <label>` first, keep the printed `token=`, refresh with
-  `--refresh-heavy <token>` during long runs and `--release-heavy <token>` after, in every
-  outcome. On refusal (STOP, BUSY, STALE, LOCKED) they report `STATUS: waiting` and never retry
-  in a loop. `cao_pr_reviewer` takes the same slot before every workflow run or retry. A `REFUSED STALE` marker
-  (older than 3 h) goes to the conductor; nobody takes it over silently.
-- **Never kill or pause anything we didn't start.** Apps and security agents belong to the
-  user. Orphans we did start are listed to the conductor, which removes them by exact PID only
-  after checking them (args **and** `lsof -a -p PID`).
-- The shepherd records **one resource line per wake** in `pr-watch/log.md`.
-- **Disk:** review scratch is 1–22 GiB each, so clean up by exact path after every run.
+- **Before every `create_ephemeral_agent` or `assign`,** run `python3 KIT/bin/resource_gate.py` and
+  obey the verdict as your profile spells it out (GO 0, THROTTLE 3: one new worker at a time and
+  defer cleanup, STOP 1: create nothing). On STOP tell the user **once**, with
+  `python3 KIT/bin/top_mem.py` (macOS includes compressed memory; Linux shows RSS KiB).
+- **Heavy jobs** (full suites, main-merge full suites): `resource_gate.py --acquire-heavy <label>`
+  enforces the slots (`heavy.slots` on GO, one on THROTTLE, `REFUSED THROTTLE_CAP`) and says what
+  to do on each refusal; the templates carry the token lines. A refused worker reports
+  `STATUS: waiting`, never a retry loop. A `REFUSED STALE` holder comes to you; nobody takes it over silently.
+- **Never kill or pause anything we didn't start:** apps and security agents are the user's.
+  Orphans we started you remove by exact PID only after checking args **and** `lsof -a -p PID` (§7).
+- The shepherd logs **one resource line per wake** in `PB/log.md`. Big scratch (exports,
+  venvs, mutant copies) runs to gigabytes: clean it by exact path after every run.
 
 ## 1. Each turn, in order
-1. **A user message is in the batch?** Handle it first. Background work waits.
+1. **A user message in the batch comes first;** background work waits. Why: the user is the only
+   one who can't be queued.
 2. **Drain the inbox:** `curl -s "$API/terminals/$CAO_TERMINAL_ID/inbox/messages?status=pending&limit=100"`.
-   Read every `message` in full, group by PR or task, and decide on the batch together.
-   If an expected callback is overdue, check `GET $API/terminals/$CAO_TERMINAL_ID` for a status
-   stuck on `processing` (the inbox only delivers while idle).
-3. **Act** on the table below. Run the resource gate before creating, assigning or approving.
-4. **Hand off waits:** start a background shell job or leave it to the shepherd. Never sleep or
-   poll inside your own turn.
-5. **Report:** one consolidated update to the user if anything real happened, otherwise nothing.
+   Read every `message` in full, group by PR or task, decide on the batch together. If a callback
+   is overdue, check `GET $API/terminals/$CAO_TERMINAL_ID` for a status stuck on `processing`
+   (the inbox only delivers while idle).
+3. **Act** on §2. Run the resource gate before creating, assigning or approving.
+4. **Hand off waits** to a background shell job or the shepherd. Never sleep or poll in your own
+   turn: while you wait, the user can't reach you.
+5. **Report** one consolidated update if anything real happened; otherwise nothing.
 
 ## 2. Event → action
 | Message or event | Action |
 |---|---|
 | The user asks for work | Split it. Write a brief file. Gate. Dispatch a sized ephemeral (§3). Verify the result (§4). Ask before anything in `forbidden_without_user`. |
-| The user asks for a PR review | Ask `cao_pr_reviewer` to take it. Add the 👀 reaction through a small publisher (reactions API, never edit the body). |
-| Shepherd `WOULD <wid>: …` (observe mode) | `<wid>` is `<N>-<action>-<head8>-<k>`, a fresh id from `go_ledger.py next-id` for every request (a renewal after a policy bump, restart or expiry too); check its PR, action and head8 match the proposal. If `add` prints `row_refused:…:id:duplicate`, reply `NO <wid> id already used` and the shepherd sends a new WOULD. Verify the proposal (§4) against live state, including the head, the body's `shasum -a 256` and `policy_version`. Reply exactly `GO <wid> action=<a> pr=<N> branch=<name or null> head=<full sha> new_head=<full sha or null> body_sha256=<hex or null> policy_version=<v> expires_in=<minutes>` (your values, not copied unchecked; a push names the exact commit it may publish as `new_head`, checked with `git rev-parse`), or `NO <wid> <reason>`. **Record the GO yourself first** (only you write `state/go.jsonl`): `python3 KIT/bin/go_ledger.py add --writer-role conductor --id <wid> --action <a> --pr <N> --head <sha> --policy-version <v> --granted-by "conductor $CAO_TERMINAL_ID GO" --expires-in <minutes> [--branch <name> --new-head <sha>] [--body-sha256 <hex>]` (a push needs `--branch` and `--new-head`), then reply. Every worker re-checks the record right before its write. Log both "would" and the outcome in `PB/log.md`. |
-| Shepherd `HOLD-FINDINGS #N …` | FYI. The shepherd dispatches the fixer itself. Step in only if a finding is P1, security or design. Real findings stay held until a fix commit, or until you relay the user's decline. |
-| Shepherd `WOULD <wid>: clear_hold #N item=… body=<file>` | Read **the same body file** yourself and check `shasum -a 256` equals the WOULD. GO only if it truly lists no finding (e.g. "0 P1, 0 P2, 0 P3 … Findings: None."). A real finding is never cleared this way: `holds.py` refuses it. Record it yourself, `python3 KIT/bin/go_ledger.py add --writer-role conductor --id <wid> --action clear_hold --pr <N> --head <sha> --policy-version <v> --granted-by "conductor $CAO_TERMINAL_ID GO" --body-file <that file> --item <kind:id>`, then reply `GO <wid> action=clear_hold pr=<N> head=<sha> body_sha256=<hex> policy_version=<v>`; or `NO <wid> <reason>`. This GO is needed in act mode too. |
-| Shepherd `ESCALATE_SIZE #N lines=… cap=…` | Second look, not a block. Check that the approvals cover the whole change, and get an independent large review if none exists. Then `GO` the shepherd's `WOULD`, or ask the user. |
-| Shepherd escalation: P1, security or design | Dispatch a read-only architect or large/high reviewer. Ask the user one question if the choice is theirs. |
-| Shepherd FYI: an external PR or issue event | Route it to `cao_pr_reviewer` (one line, ids and URLs only) if it is review work; otherwise relay it in the next user update. |
+| Shepherd `WOULD <wid>: …` (observe mode) | `<wid>` is `<N>-<action>-<head8>-<k>`, a fresh id from `go_ledger.py next-id --pr <N> --action <a> --head <sha>` for every request (a renewal after a policy bump, restart or expiry too); check its PR, action and head8 match. On `row_refused:…:id:duplicate`, reply `NO <wid> id already used`; the shepherd sends a new WOULD. Verify the proposal (§4) against live state: the head, the body's `shasum -a 256`, `policy_version`; a push names the exact commit it may publish as `new_head` (check it with `git rev-parse`). **Record the GO yourself first** (only you write `state/go.jsonl`): `python3 KIT/bin/go_ledger.py add --writer-role conductor --id <wid> --action <a> --pr <N> --head <sha> --policy-version <v> --granted-by "conductor $CAO_TERMINAL_ID GO" --expires-in <minutes> [--branch <name> --new-head <sha>] [--body-sha256 <hex>] [--run-id <run>]` (a push needs `--branch` and `--new-head`; a `rerun_failed_outage` GO needs `--run-id`, the run it reruns, and binds it (so does any other `rerun_*` GO)), then reply exactly `GO <wid> action=<a> pr=<N> branch=<name or null> head=<full sha> new_head=<full sha or null> body_sha256=<hex or null> run_id=<id or null> policy_version=<v> expires_in=<minutes>` with your own checked values, or `NO <wid> <reason>`. Every worker re-checks the record right before its write. Log the WOULD and the outcome in `PB/log.md` (`state_write.py --append`). |
+| Shepherd `HOLD-FINDINGS #N …` | FYI; the shepherd dispatches the fixer. Step in only for P1, security or design. Real findings stay held until a fix commit, or until you relay the user's decline. |
+| Shepherd `WOULD <wid>: clear_hold #N item=… body=<file>` | Read **the same body file** yourself and check its `shasum -a 256` equals the WOULD. GO only if it truly lists no finding (e.g. "0 P1, 0 P2, 0 P3 … Findings: None."); a real finding is never cleared this way, and `holds.py` refuses it. Record `python3 KIT/bin/go_ledger.py add --writer-role conductor --id <wid> --action clear_hold --pr <N> --head <sha> --policy-version <v> --granted-by "conductor $CAO_TERMINAL_ID GO" --body-file <that file> --item <kind:id>`, then reply `GO <wid> action=clear_hold pr=<N> head=<sha> body_sha256=<hex> policy_version=<v>`, or `NO <wid> <reason>`. This GO is needed in act mode too. |
+| Shepherd `ESCALATE_SIZE #N lines=… cap=…` | A second look, not a block: check the approvals cover the whole change; get an independent large review if none exists. Then `GO` the WOULD, or ask the user. |
+| Shepherd escalation: P1, security or design | Dispatch a read-only architect or a large/high reviewer. Ask the user one question if the choice is theirs. |
 | Shepherd escalation: force-push, new PR, close, merge outside the gate, release, PR-body edit, flaky re-run | `forbidden_without_user` or uncovered: ask the user, one question. Releases are the maintainers' call. |
-| The user OKs one such action once (e.g. "open that PR") | A **one-off**, never a reduced path: relay `GO <wid> action=<a> pr=<N or null> branch=<name or null> head=<sha> new_head=<sha or null> body_sha256=<hex> policy_version=<v> expires_in=<minutes> granted_by=user` with the user's words, bound to exactly that action, target, content and a short expiry. Take a fresh `<wid>` from `python3 KIT/bin/go_ledger.py next-id --pr <N> --action <a> --head <sha>` (`--branch <name>` when there is no PR). You record it yourself before relaying, for the shepherd's publisher and your own alike: `go_ledger.py add --writer-role conductor … --granted-by user --relayed-by $CAO_TERMINAL_ID`. The publisher's full `check_mandate.py` then prints `ALLOW oneoff go=<wid>`. Withdrawn: `go_ledger.py revoke --writer-role conductor --id <wid> --by <your id>`. |
+| The user OKs one such action once (e.g. "open that PR") | A **one-off**, never a reduced path. Take a fresh `<wid>` from `python3 KIT/bin/go_ledger.py next-id --pr <N> --action <a> --head <sha>` (`--branch <name>` when there is no PR). Record it before relaying, for the shepherd's publisher and your own alike (`go_ledger.py add --writer-role conductor … --granted-by user --relayed-by $CAO_TERMINAL_ID`), then relay `GO <wid> action=<a> pr=<N or null> branch=<name or null> head=<sha> new_head=<sha or null> body_sha256=<hex> policy_version=<v> expires_in=<minutes> granted_by=user` with the user's words, bound to exactly that action, target, content and a short expiry. The publisher's full `check_mandate.py` then prints `ALLOW oneoff go=<wid>`. Withdrawn: `go_ledger.py revoke --writer-role conductor --id <wid> --by <your id>`. |
 | Shepherd: third bot-review round on #N | Ask the user whether to continue, or reply once and stop. |
 | Shepherd: competing human PR has our change | Ask the user whether to close ours. Never close it yourself. |
-| Shepherd `STALLED …` | Inspect (§7). Message the worker, or delete it and re-dispatch. |
+| Shepherd `STALLED …` | Inspect (§6). Message the worker, or delete it and re-dispatch. |
 | Shepherd `STOP` resources | Tell the user **once**, with the top memory holders. Create nothing. |
-| Shepherd lists orphans we started | Check each (§8). Remove by exact PID only when every check holds. |
-| `cao_pr_reviewer` reports a refused plan | Plan approval (§5). |
-| `cao_pr_reviewer` `REVIEWED #N …` | Relay to the user in the next update. |
+| Shepherd lists orphans we started | Check each (§7). Remove by exact PID only when every check holds. |
 | Your own worker reports READY | Verify (§4) before you accept it. Then publish through a publisher if a mandate or the user covers it. |
-| The user: "pause" / "resume" / "revoke X" / "switch the shepherd to act" / "standing OK for Y" | Edit mandates (§6). |
+| The user: "pause" / "resume" / "revoke X" / "switch the shepherd to act" / "standing OK for Y" | Edit mandates (§5). |
+
+Why the GO is yours alone: the ledger is what every pre-write check trusts, so only the one agent
+that answers to the user may write it (`check_mandate.py --go-id` refuses a row you didn't write).
 
 ## 3. Dispatch sizing
 | Work | Provider / tier / effort | Template |
@@ -69,164 +85,130 @@ the shipped files), `API` = `http://localhost:9889` (the default `cao-server` ad
 | Independent pre-push or security review | Claude Code `large` / `high`, read-only | `templates/prepush-reviewer.md` |
 | Push, post a prepared body, CI re-run | Claude Code `small` / `low`, exact commands | `templates/publisher.md` |
 | Update-branch and arm auto-merge | Claude Code `small` / `low`, exact commands | `templates/automerge-armer.md` |
-| A task that needs a fixed contract | the installed profile (e.g. `cao_pr_reviewer`) | — |
 
 - `purpose` is snake_case (`pr101_ci_fixer`). Call `assign` straight after
-  `create_ephemeral_agent`, because the profile expires in about 15 minutes. If the server
-  refuses `effort`, drop that field.
-- Codex can't `git push` or `gh pr view`, so pushes always go to a Claude Code publisher, and
-  Codex reads PRs through files you give it.
-- **THROTTLE:** one new worker at a time, smallest adequate tier, and delete finished workers first.
-- After `assign`, name the worker to the user as role → terminal window (CAO session) → id. The
+  `create_ephemeral_agent`: the profile expires in about 15 minutes. If the server refuses
+  `effort`, drop that field.
+- Pushes and posts always go to a small Claude Code publisher with exact commands, and Codex reads
+  PRs through files you give it. Why: whether a Codex sandbox can push depends on the host, so the
+  kit never relies on it either way.
+- **THROTTLE:** one new worker at a time, smallest adequate tier, delete finished workers first.
+- After `assign`, name the worker to the user as role → window (CAO session) → id. The
   window name starts with the ephemeral profile name.
 
-## 4. Verification commands
-Run these yourself; a worker's report is a claim.
-
+## 4. Verification (run these yourself; a worker's report is a claim)
 ```sh
 W=<worktree>; B=<branch>; OLD=<remote head>; NEW=<new head>
 git -C "$W" merge-base --is-ancestor "$OLD" "$NEW" && echo FF-OK          # fast-forward only
-git -C "$W" -c core.hooksPath=/dev/null ls-remote --heads origin "$B"  # remote head
-gh api repos/your-org/your-repo/pulls/<N> --jq .head.sha       # PR head
+git -C "$W" -c core.hooksPath=/dev/null ls-remote --heads origin "$B"     # remote head
+gh api repos/REPO/pulls/<N> --jq .head.sha       # PR head
 git -C "$W" range-diff <old_base>..<old_head> <new_base>..<new_head>       # rebase-only: all '='
 ```
+- **Change-set after a main merge:** `python3 KIT/bin/changeset_check.py "$W" OM..OH NM..MG`
+  (`OM` old main, `OH` old PR head, `NM` new main, `MG` the merge). It compares the numstat and
+  each file's sorted `+/-` lines, and prints `SAME`, or `DIFF: <files>` (exit 1). Then read
+  `git -C "$W" show --remerge-diff "$MG" | head -200`: only the intended conflict-resolution
+  lines may differ, and that call is yours. Also grep `git diff main HEAD` for CHANGELOG or doc
+  lines the PR replaced that now show up only as context; no script sees those.
+- **Posted body equals the file:** `python3 KIT/bin/body_equals.py posted.md prepared.md` (or `-`
+  for stdin) prints `BODY-OK`, or `BODY-DIFF` and a short diff. Never `diff <(file) <(cat)`: it hangs.
+- **Leaks and internal ids** in every outward body and every diff: run
+  `python3 KIT/bin/leak_check.py FILE` (or `-` for stdin); it must print `CLEAN`. It is the one leak
+  check, every pattern blocks, and it prints `HIT <kind> line=<n>` without the matched value: local
+  paths, 8-hex ids (a terminal id looks like a short commit), e-mail addresses, credential shapes,
+  account and instance ids, host names and HTML comments. Add the words that are private to you to
+  its pattern list. Bodies use full 40-character SHAs, because an 8-character short SHA matches the
+  internal-id pattern. A hit means fix it and scan again.
+- **Tests:** the focused set includes your repo's root-level guard tests (the ones that check the
+  whole tree, not one module). After a main merge or a restack, run those guards on the new tip, plus the CI-shaped full
+  suite under `--acquire-heavy` or the both-ways signature and caller grep. Check that the RED test
+  failed before the fix and that the named mutants die. Run `pgrep -fl pytest` before you trust
+  "green": a worker's leftover background suite can still turn red.
+- **No data change** in a nit round: compare the `repr` of the affected schema objects before and after.
 
-**Change-set check after a main merge** (`OM` = old main, `OH` = old PR head,
-`NM` = new main, `MG` = the merge commit):
-```sh
-cmp <(git -C "$W" diff --numstat "$OM" "$OH") <(git -C "$W" diff --numstat "$NM" "$MG") && echo NUMSTAT-SAME
-for f in $(git -C "$W" diff --name-only "$OM" "$OH"); do
-  cmp -s <(git -C "$W" diff "$OM" "$OH" -- "$f" | grep -vE '^(\+\+\+|---) ' | grep -E '^[+-]' | sort) \
-         <(git -C "$W" diff "$NM" "$MG" -- "$f" | grep -vE '^(\+\+\+|---) ' | grep -E '^[+-]' | sort) \
-    || echo "CHANGED $f"
-done
-git -C "$W" show --remerge-diff "$MG" | head -200
-```
-Only the intended conflict-resolution lines may differ. Also grep `git diff main HEAD` for
-CHANGELOG or doc lines the PR replaced that now show up only as context.
-
-**Posted body equals the file.** Never use `diff <(file) <(cat)`; it hangs.
-```sh
-python3 - posted.md prepared.md <<'PY'
-import sys
-n = lambda p: open(p, encoding="utf-8").read().replace("\r\n", "\n").rstrip("\n")
-sys.exit(0 if n(sys.argv[1]) == n(sys.argv[2]) else 1)
-PY
-```
-
-**Leak and internal-id grep** of every outward body and every diff:
-```sh
-grep -nE '/Users/|/home/|/tmp/|/private/|<your workspace folder names>|brief [0-9]|token|secret|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[a-z]{2,}' FILE
-grep -noE '\b[0-9a-f]{8}\b' FILE   # each hit must be a commit of this PR (git cat-file -e), never a terminal id
-```
-A hit means fix it and scan again. Private names and labels stay out of public text.
-
-**Tests.** The focused set must include the repo-root guards (`test/test_*.py`) and
-`test/decisions/`. After a main merge or a restack, run the root guards on the new tip, plus the
-CI-shaped full suite under `--acquire-heavy` or the both-ways signature and caller grep. Check
-that the RED test failed before the fix, and that the named mutants die. Make sure the worker
-left no background suite running: `pgrep -fl pytest` before you trust "green".
-
-**No data change** in a nit round: compare the `repr` of the affected schema objects before
-and after.
-
-## 5. Reviewer plan approval (mandate M7; only with the optional reviewer)
-1. `python3 KIT/bin/resource_gate.py`: STOP means no. THROTTLE means defer, unless the user is waiting.
-2. Fetch the live author and base into a fresh scope file in your scratch directory `$D`:
-   ```sh
-   gh pr view <N> -R your-org/your-repo --json author,baseRefName > "$D/review-scope.json" || exit 1
-   A=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("author", dict()).get("login") or "")' "$D/review-scope.json") || exit 1
-   B=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("baseRefName") or "")' "$D/review-scope.json") || exit 1
-   python3 KIT/bin/check_mandate.py --holder conductor --action approve_review_plan \
-     --pr-author "$A" --base "$B"
-   ```
-   It must print `ALLOW M7-approve-review-plan`.
-3. The workflow is exactly `pr-review` or `branch-review`.
-4. Read the PR head:
-   `gh api repos/your-org/your-repo/pulls/<N> --jq '.head.sha+" "+.base.ref+" "+.state+" "+.user.login'`.
-   It must be OPEN with base `main`, and its head must equal the plan's `head_sha`, or the head
-   the reviewer reported for `pr-review`.
-5. **Follow-ups** (`branch-review`): `base_sha` must be the last reviewed head (see
-   `KIT/reviews/ledger.json`) and an ancestor of the head:
-   `gh api repos/your-org/your-repo/compare/<base_sha>...<head_sha> --jq '.status+" behind="+(.behind_by|tostring)'`
-   → `ahead behind=0`. After a rebase, it must instead equal the merge base:
-   `gh api repos/your-org/your-repo/compare/main...<head_sha> --jq .merge_base_commit.sha`.
-6. Check both workflow files against their **trusted baselines** (recorded by you, the user,
-   after you read the two scripts yourself, in `KIT/state/plan-approvals.jsonl`):
-   `python3 KIT/bin/plan_hash_check.py ~/.aws/cli-agent-orchestrator/workflows/pr-review.py ~/.aws/cli-agent-orchestrator/workflows/branch-review.py`
-   must print `MATCH` twice and exit 0. `REFUSE missing_baseline` or `REFUSE changed` means
-   **refuse**, and ask the user (one question, with both hashes). **Never record a baseline
-   yourself.** A new baseline is appended only on the user's explicit words, as
-   `{"kind":"baseline","workflow","file","sha256","verified_at","verified_by":"user","evidence":"<their words>"}`,
-   with `python3 KIT/bin/state_schema.py append-plan-row --row '<that JSON>'` (never by hand: it
-   checks the row and the file first, and `ERROR` means nothing was written).
-7. `cao workflow approve <plan_id>`. Append
-   `{"kind":"approval","at","plan_id","workflow","pr","head","base","sha256":{…}}` to
-   `KIT/state/plan-approvals.jsonl` with `state_schema.py append-plan-row --row '<that JSON>'`
-   (approval rows are a log; the checker never trusts them) and one line to `PB/log.md`.
-8. Tell the reviewer to retry, and tell the user in the next update.
-Any mismatch, any other workflow, or any request to disable enforcement goes to the user.
-
-## 6. Editing mandates (only on the user's explicit words)
-1. Copy the file first: `cp KIT/mandates.json KIT/state/mandates.json.bak-$(date -u +%Y%m%dT%H%M%SZ)`.
-2. Make exactly the change the user asked for:
+## 5. Editing mandates (only on the user's explicit words)
+1. Back up first: `python3 KIT/bin/state_write.py --from KIT/mandates.json --out KIT/state/mandates.json.bak-$(date -u +%Y%m%dT%H%M%SZ)`.
+2. Prepare a changed copy in `KIT/work/`, then `state_write.py --out KIT/mandates.json --from <prepared-file>`.
+   Make exactly the change the user asked for, no wider:
    - **Pause:** `"paused": true, "paused_by": "user", "paused_at": "<UTC>", "reason": "<their words>"`.
-   - **Resume:** `"paused": false`, and set the three fields back to `null`.
-   - **Revoke:** that mandate's `"revoked": true`. Never delete it.
+   - **Resume:** `"paused": false`, and the three fields back to `null`.
+   - **Revoke:** that mandate's `"revoked": true`. Never delete it: the history is the audit.
    - **Observe → act:** `"shepherd_mode": "act"`.
-   - **New OK:** a new mandate with `granted_by: "user"`, `granted_at`, a `source`, and no
-     wider scope than the user's words.
-3. Bump `policy_version`. Check the file parses (`python3 -m json.tool KIT/mandates.json >/dev/null`),
-   then run one `check_mandate.py` probe that shows the new effect.
-4. Mirror the change to CAO memory with `memory_store`: key `super-agent-mandates`, the change,
-   the user's words and the date.
+   - **New OK:** a new mandate with `granted_by: "user"`, `granted_at`, a `source`, a `tier` (1, or
+     2 when its use needs a reading of text; a missing tier refuses), and no wider scope than the
+     user's words.
+3. Bump `policy_version` (it voids every older GO). Check it parses
+   (`python3 -m json.tool KIT/mandates.json >/dev/null`), then run one `check_mandate.py` probe
+   that shows the new effect.
+4. Mirror it to CAO memory with `memory_store`: key `super-agent-mandates`, the change, the
+   user's words and the date.
 5. Tell the shepherd in one line: `MANDATES CHANGED policy_version=<v>: <change>`.
 
-## 7. Stalled-worker check (your own workers, when you are awake anyway)
+## 6. Stalled-worker check (your own workers, when you are awake anyway)
 For each worker you created: `curl -s $API/terminals/<id>` (`status`, `last_active`) and
-`curl -s "$API/terminals/<id>/output?mode=last"`. A worker is stalled when any of these holds:
+`curl -s "$API/terminals/<id>/output?mode=last"`. It is stalled when:
 - its status is `error`, or the terminal is gone (404) and it never called back;
 - its status is `waiting_user_answer`, or the output shows a permission or yes/no prompt;
-- it is idle or completed with no callback after 10 minutes. It probably ended its turn while
-  waiting on a background job;
-- it is `processing` with `last_active` more than 45 minutes old, and its output tail hasn't
-  changed since your last look.
-Action: message it once with a precise instruction, or delete it (§8 rules) and re-dispatch.
-Check the outside state first so no action is repeated.
+- it is idle or completed with no callback after 10 minutes (it probably ended its turn waiting
+  on a background job);
+- it is `processing`, `last_active` is over 45 minutes old, and its output tail hasn't changed
+  since your last look.
+Then message it once with a precise instruction, or delete it (§7) and re-dispatch. Check the
+outside state first, so no action runs twice.
 
-## 8. Deleting workers and orphans
-- **Delete a terminal** only when every queued job has called back (or you verified each
-  outcome directly), and when its `tmux_session`/`tmux_window` differs from your own
-  (`GET $API/terminals/$CAO_TERMINAL_ID`).
-- **Orphan processes** (listed by the shepherd or found by you): only ones we started. Kill by
-  exact PID only when (a) `ps -o args= -p PID` matches what we started **and** (b) for a server,
-  `lsof -nP -a -p PID -iTCP:<port> -sTCP:LISTEN` succeeds, or for scratch, `lsof -a -p PID +D <scratch>`
-  shows our own path. On any mismatch, print STOP and kill nothing. Never touch the user's apps
-  or security agents.
+## 7. Deleting workers and orphans
+- **Delete a terminal** only when every queued job has called back (or you verified each outcome
+  directly), and when its `tmux_session`/`tmux_window` differs from yours
+  (`GET $API/terminals/$CAO_TERMINAL_ID`). Why: deleting a terminal that shares your pane kills you.
+- **Orphan processes** (the shepherd's list or yours): only ones we started. Kill by exact PID
+  only when (a) `ps -o args= -p PID` matches what we started **and** (b) for a server,
+  `lsof -nP -a -p PID -iTCP:<port> -sTCP:LISTEN` succeeds, or for scratch,
+  `lsof -a -p PID +D <scratch>` shows our own path. On any mismatch print STOP and kill nothing.
+  Never touch the user's apps or security agents.
 - **Scratch:** delete by exact path, one kind at a time (`*-export`, `trees`, `home*`, `venv*`,
   caches, `mut*`), after `lsof +D` shows nobody uses it. Keep `*.md`, `*.json` and small logs.
 
-## 9. Restart recovery (oldest first)
+## 8. Restart recovery (oldest first)
 1. Read `KIT/mandates.json`. If `paused` is true, stay paused.
 2. Read `KIT/state/outbox.jsonl`, the `KIT/state/outbox/*.pending` entries,
-   `KIT/state/plan-approvals.jsonl`, `go.jsonl`, `holds.json`, the last 40 lines of
-   `PB/log.md`, and your newest brief files. A `.pending` post is reconciled (publisher
-   RECONCILE steps) before anything else is posted on that PR. Run
-   `python3 KIT/bin/state_schema.py check` (exit 0 `OK`): any `state_corrupt:<file>:<line>:<why>`
-   line is a damaged state file that every script refuses to act on. Inspect that row, repair it
-   by hand from the evidence (or ask the user), and re-run `check` before anything else.
-3. For every action that may or may not have happened (a push, a post, an approval, an arm),
-   oldest first: check the live state **before** repeating it. Use `ls-remote` for heads,
-   `gh api …/issues/<N>/comments` for an identical body, `outbox.py check`, and
-   `gh pr view --json autoMergeRequest`.
-4. Re-run `check_mandate.py` for each pending action.
+   `go.jsonl`, `holds.json`, the last 40 lines of `PB/log.md`
+   and your newest brief files. A `.pending` post is reconciled (publisher RECONCILE steps) before
+   anything else is posted on that PR. Run `python3 KIT/bin/state_schema.py check` (exit 0 `OK`):
+   a `state_corrupt:<file>:<line>:<why>` line is a damaged file every script refuses. Inspect the
+   row, repair it by hand from the evidence (or ask the user), and re-run `check` before anything else.
+3. For every action that may or may not have happened (push, post, approval, arm), oldest first,
+   check the live state **before** repeating it: `ls-remote` for heads,
+   `gh api …/issues/<N>/comments` for an identical body, `outbox.py check`,
+   `gh pr view --json autoMergeRequest`. Why: a repeat is a public double post or push.
+4. Re-run `check_mandate.py` for each pending action; the mandates may have changed.
 5. List live sessions and terminals (`GET $API/sessions`). Keep workers that are still working.
    Never delete the old conductor record from inside the relaunched conductor.
-6. Make sure the shepherd is alive. If it isn't, start a fresh one with `assign`.
+6. Make sure the shepherd is alive; if it isn't, replace it (§9). If only the supervisor is gone,
+   start it again (§9 First start step 4), unless its log says `not_writer`: then the lease moved (§Writer lease).
 
-## 10. Starting the shepherd (once)
+## 9. Starting the shepherd and its tick supervisor
+You own the tick loop, not the shepherd. `PB/tick_supervisor.sh` runs `tick_loop.sh` detached, posts
+each WAKE to the shepherd's inbox and restarts the loop itself; it is keyed to `SHEPHERD_ID`, writes
+`PB/state/tick_supervisor.pid` and stops for good on `not_writer`. Why: a loop run as an agent's
+background job dies with that job, or loses its wake when the agent's turn ends.
+
+**First start:**
 1. Make sure the user has installed `pr_shepherd`. Installing is the user's step.
-2. Stop any other tick loop: its owner stops its own background job. Then check that
-   `pgrep -fl tick_loop.sh` prints nothing.
-3. Gate, then `assign(agent_profile="pr_shepherd", message="Read and follow KIT/shepherd-playbook.md exactly (KIT = <the absolute kit path>). Start with §1 Setup. Report to me with send_message (receiver_id omitted).")`.
-4. Tell the user the shepherd's window name. Expect `SHEPHERD READY …`, then quiet until a real event.
+2. One loop, one shepherd: `pgrep -fl 'tick_[l]oop\.sh'` prints nothing, no supervisor runs (no pid
+   file, or its pid's `ps -o args=` isn't `tick_supervisor.sh`), and no other `pr_shepherd` is live.
+   A loop you didn't start belongs to its owner: ask it to stop it; don't kill it.
+3. Gate, then `assign(agent_profile="pr_shepherd", message="Read and follow KIT/shepherd-playbook.md exactly. Start with §1 Setup. Remap owners --from <previous owner id>. Report to me with send_message (receiver_id omitted).")`.
+   The previous owner is the old shepherd's id, or the terminal the `PB/watch.json` owners hold.
+4. After `SHEPHERD READY <id> …`, start the supervisor from a **script file** in `KIT/work/` (an
+   inline guard matches its own command text):
+   `env -i HOME="$HOME" USER="$USER" LOGNAME="$LOGNAME" LANG="$LANG" PATH="$PATH" SHEPHERD_ID=<shepherd id> SENDER_ID=$CAO_TERMINAL_ID setsid nohup bash PB/tick_supervisor.sh >/dev/null 2>&1 </dev/null &`.
+   Check the pid file names a live `tick_supervisor.sh`. Tell the user the shepherd's window name;
+   expect quiet until a real event.
+
+**Replacing the shepherd** (new profile, dead terminal, planned restart):
+1. Ask the old shepherd, if alive, to write its state and a handover file. It rightly refuses to
+   stop the loop: it didn't start it.
+2. `kill -TERM` the supervisor (the pid file's pid, args checked), then the loop (its `pgrep` pid,
+   args checked). Bash defers TERM until the running `poll.py` ends (up to about 2 min). Confirm the
+   pid file and `PB/state/tick_loop.lock` are gone and `pgrep` prints nothing.
+3. `delete_terminal` the old shepherd (§7), then First start steps 3–4 with `--from <old shepherd id>`.

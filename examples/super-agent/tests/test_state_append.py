@@ -150,7 +150,7 @@ def test_f9_append_row_runs_the_check_first(tmp_path):
 def test_f9_every_writer_refuses_damaged_files_before_writing(tmp_path, monkeypatch, damage, why):
     monkeypatch.setenv("SUPER_AGENT_STATE_DIR", str(tmp_path / "state"))
     SS = load("state_schema")
-    (tmp_path / "state").mkdir()
+    (tmp_path / "state").mkdir(exist_ok=True)
     k = "0" * 64
     hist = dict(HIST_ROW, key=k)
     for name, row, check in (("go.jsonl", go_row(), SS.check_go_file_append),
@@ -167,7 +167,7 @@ def test_f9_every_writer_refuses_damaged_files_before_writing(tmp_path, monkeypa
 def test_f9_append_checks_refuse_bad_rows_in_process(tmp_path, monkeypatch):
     monkeypatch.setenv("SUPER_AGENT_STATE_DIR", str(tmp_path / "state"))
     SS = load("state_schema")
-    (tmp_path / "state").mkdir()
+    (tmp_path / "state").mkdir(exist_ok=True)
     hist = tmp_path / "state" / "outbox.jsonl"
     hist.write_bytes(json.dumps(HIST_ROW).encode())
     with pytest.raises(SS.RowRefused, match=r"^row_refused:outbox.jsonl:2:url:"):
@@ -245,7 +245,7 @@ def test_f9_outbox_history_round_trip(tmp_path, unterminated):
 @ENDINGS
 def test_f9_plan_ledger_round_trip(tmp_path, unterminated):
     led = tmp_path / "state" / "plan-approvals.jsonl"
-    led.parent.mkdir()
+    led.parent.mkdir(exist_ok=True)
     led.write_text(json.dumps(BASELINE) + "\n")
     if unterminated:
         strip_final_lf(led)

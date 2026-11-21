@@ -1,4 +1,4 @@
-"""WAKE reasons are journaled before poll.py saves the new seen ids, and an
+"""Round 7, F11: WAKE reasons are journaled before poll.py saves the new seen ids, and an
 undelivered WAKE is replayed before the next poll, so an interruption never turns into QUIET."""
 import json
 import os
@@ -20,7 +20,7 @@ COMMENT = {'databaseId': 101, 'author': {'login': 'maintainer-login'}, 'createdA
 
 def gh_pr(comments):
     return {'pullRequest': {
-        'number': 102, 'title': 'ours', 'author': {'login': 'your-login'}, 'autoMergeRequest': None,
+        'number': 1263, 'title': 'ours', 'author': {'login': 'your-login'}, 'autoMergeRequest': None,
         'state': 'OPEN', 'merged': False, 'mergedBy': None, 'isDraft': False, 'mergeable': 'MERGEABLE',
         'mergeStateStatus': 'CLEAN', 'reviewDecision': 'REVIEW_REQUIRED', 'headRefOid': 'a' * 40,
         'headRefName': 'fix/x', 'reviewRequests': {'nodes': []}, 'comments': {'nodes': comments},
@@ -35,7 +35,7 @@ def world(tmp_path, monkeypatch, capsys):
     config = {'watch_dir': tmp_path, 'watch': tmp_path / 'watch.json', 'ledger': tmp_path / 'ledger.json',
               'queue': tmp_path / 'state' / 'digest-pending.json', 'digest': tmp_path / 'digest.md',
               'journal': tmp_path / 'state' / 'wake-journal.json'}
-    config['watch'].write_text('{"repo":"owner/repo","prs":{"102":{}},"identities":{"ours":["your-login"]}}')
+    config['watch'].write_text('{"repo":"owner/repo","prs":{"1263":{}}}')
     config['ledger'].write_text('{"prs":{}}')
     monkeypatch.setattr(poll, 'CONFIG', config)
     monkeypatch.setattr(poll, 'HERE', str(tmp_path))
@@ -80,7 +80,7 @@ def test_interruption_before_emit_wake_replays_the_original_reason(world):
 
 def test_journal_is_written_before_the_seen_ids(world, monkeypatch):
     world.tick()
-    state = world.path / 'state' / 'pr-102.json'
+    state = world.path / 'state' / 'pr-1263.json'
     before = state.read_bytes()
     world.gh['comments'] = [COMMENT]
 
@@ -160,7 +160,7 @@ def test_replay_emits_the_oldest_undelivered_wake_first(world):
 def loop_setup(tmp_path, reports):
     for name in ['tick_loop.sh', 'config.py', 'digest_store.py', 'wake_rules.py']:
         shutil.copyfile(SOURCE / name, tmp_path / name)
-    (tmp_path / 'watch.json').write_text('{"identities":{"ours":["your-login"]}}')
+    (tmp_path / 'watch.json').write_text('{}')
     (tmp_path / 'ledger.json').write_text('{"prs":{}}')
     (tmp_path / 'config.json').write_text(json.dumps({'watch_dir': '.', 'ledger_path': 'ledger.json'}))
     (tmp_path / 'mock-reports.json').write_text(json.dumps(reports))
@@ -174,8 +174,9 @@ journal_add(load()['journal'], d)
 print(json.dumps(d))
 ''')
     env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(tmp_path), 'PYTHON': sys.executable,
-           'PR_WATCH_CONFIG': str(tmp_path / 'config.json'), 'INTERVAL': '0', 'RETRY_DELAY': '0',
-           'CAO_TERMINAL_ID': 'test-owner', 'PYTHONDONTWRITEBYTECODE': '1'}
+           'PR_WATCH_CONFIG': str(tmp_path / 'config.json'), 'SUPER_AGENT_STATE_DIR': str(tmp_path / 'fixture-kitstate'), 'INTERVAL': '0', 'RETRY_DELAY': '0',
+           'CAO_TERMINAL_ID': 'test-owner', 'PYTHONDONTWRITEBYTECODE': '1',
+           'CAO_WORKPLACE_CONFIG': os.environ['CAO_WORKPLACE_CONFIG']}
     return env
 
 

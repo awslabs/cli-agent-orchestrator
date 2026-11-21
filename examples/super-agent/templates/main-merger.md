@@ -1,13 +1,13 @@
 # Template: main-merger (Codex)
 
 **Use for:** mergeStateStatus is BEHIND with red CI, or DIRTY/CONFLICTING. Merge commit, never rebase. No push.
-**Before you dispatch:** run `python3 {kit}/bin/resource_gate.py` and obey its exit code.
+**Before you dispatch:** run `python3 KIT/bin/resource_gate.py` and obey its exit code.
 **GO (0):** go ahead. **THROTTLE (3):** at most one new worker at a time, small tiers where they'll
 do, no parallel suites, delete finished workers first, defer non-urgent work. **STOP (1):** create
 nothing and start no suite; let running work finish; the shepherd tells the conductor, and the
 conductor tells the user once, with the top memory holders.
 **Mandate:** No mandate is needed for the local merge. The push is mandate M4 (`main_merge_push`), done through a publisher.
-Fill every `{placeholder}` (`{kit}` is the absolute path of your kit copy, `{main_clone}` the absolute path of your main clone of the repo). Write the brief to `{kit}/work/pr-{pr}/{nn}-main-merge.md`, with any GitHub data it needs (review bodies, comments, CI logs) as files next to it. Then call
+Fill every `{placeholder}`, the kit's own too (`{kit}`, `{repo}`, `{repo_url}`, `{login}`, `{cao_api}`, `{cao_source}`: the values `python3 KIT/bin/workplace.py show` prints). Before you send anything, run `python3 KIT/bin/check_brief.py --brief <each brief file>` ; and, only for a message you will pass through a shell (for example `cao launch "<msg>"`), `python3 KIT/bin/check_brief.py --message <that message file>` (a shell runs a backtick or `$(`, so put the brief in a file and point the message at it). Messages sent with the MCP assign or handoff tools never pass through a shell and need no `--message` check. Every check you run must print `OK`. Write the brief to `KIT/work/pr-{pr}/{nn}-main-merge.md`, with any GitHub data it needs (review bodies, comments, CI logs) as files next to it. Then call
 `create_ephemeral_agent` with the spec, and `assign` with the message straight away (the profile
 expires in about 15 minutes; if the server refuses `effort`, drop it).
 
@@ -79,8 +79,9 @@ Creator: terminal {creator_id}. Kit: {kit}.
 - **Never kill or pause any process you didn't start.** Clean your scratch by exact path
   (`rm -rf -- "${D:?}/${SUB:?}"`, never a glob). Review scratch can be 1–22 GiB.
 - **Never** run `checkout`, `reset`, `clean`, `stash` or `rm` in the main clone
-  `{main_clone}`. Read other commits with `git show <sha>:<path>`.
+  `{cao_source}`. Read other commits with `git show <sha>:<path>`.
 - **Env names only, never values.** Never run a bare `env`, `printenv` or `set`.
+- **Lessons go to CAO memory.** When you learn a reusable lesson (a pitfall, a gotcha, a fix that will recur), store it with the CAO MCP `memory_store` at global scope, with a descriptive key and tags; never write a provider-native memory file. To update a key, store the full text and read it back. Name the key in your report.
 - **Report** with `send_message` (leave `receiver_id` out) in exactly this format. A field you don't
   know is `null`, never a placeholder:
   ```

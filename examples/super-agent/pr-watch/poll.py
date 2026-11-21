@@ -15,14 +15,13 @@ import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
-from config import load
+from config import load, login, require_writer, writer_section
 from digest_store import journal_add
-from wake_rules import last_review_at, ours, timestamp
+from wake_rules import last_review_at, timestamp
 
 CONFIG = load()
 HERE = str(CONFIG["watch_dir"])
 STATE_DIR = os.path.join(HERE, "state")
-OURS = set()  # filled from watch.json "identities.ours" in main()
 BAD = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"}
 EXCERPT = 1500
 
@@ -63,7 +62,7 @@ def item(kind, node, **extra):
     body = node.get("body") or ""
     return {
         "kind": kind, "id": node["databaseId"], "author": a,
-        "ours": a in OURS, "bot": a.endswith("[bot]") or a in {
+        "ours": a == login(), "bot": a.endswith("[bot]") or a in {
             "copilot-pull-request-reviewer", "github-advanced-security", "github-actions"},
         "at": node.get("createdAt") or node.get("submittedAt"), "url": node.get("url"),
         "body": body[:EXCERPT] + ("…" if len(body) > EXCERPT else ""), **extra,
@@ -137,7 +136,9 @@ def ready_to_merge(f):
             and f.get("ci") == "SUCCESS" and not f.get("ci_failing") and f.get("mergeable") == "MERGEABLE")
 
 
+@writer_section
 def save(path, data):
+    require_writer()
     fd, tmp = tempfile.mkstemp(dir=STATE_DIR, suffix=".tmp")
     with os.fdopen(fd, "w") as fh:
         json.dump(data, fh, indent=1)
@@ -156,7 +157,7 @@ def watch_targets(watch, ledger):
 def review_cutoff(cur, meta):
     head = meta.get("last_reviewed_head", "")
     dates = [a["at"] for a in cur["activity"] if a.get("kind") == "review"
-             and a.get("author") in OURS and a.get("at")
+             and a.get("author") == login() and a.get("at")
              and head and a.get("commit", "")[:8] == head[:8]]
     return max(dates, default=last_review_at(meta))
 
@@ -170,25 +171,24 @@ def reviewed_events(prev, cur, meta):
         events.append({"kind":"field", "field":"head", "old":old[:8], "new":new})
     cutoff = timestamp(review_cutoff(cur, meta))
     seen = {(a["kind"], a.get("id")) for a in events if a["kind"] != "field"}
-    events += [a for a in cur["activity"] if a.get("author") not in OURS
+    events += [a for a in cur["activity"] if a.get("author") != login()
                and (a["kind"], a.get("id")) not in seen
                and (cutoff is None or (timestamp(a.get("at")) is not None and timestamp(a["at"]) > cutoff))]
     return events
 
 
 def main():
+    require_writer()
     baseline = "--baseline" in sys.argv
     with open(CONFIG["watch"]) as fh:
         watch = json.load(fh)
-    OURS.clear()
-    OURS.update(ours(watch))
     with open(CONFIG["ledger"]) as fh:
         ledger = json.load(fh)
-    os.makedirs(STATE_DIR, exist_ok=True)
+    # State must already exist; never recreate a fenced watcher.
     owner, repo = watch["repo"].split("/")
     report = {"polled_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "items": [], "errors": []}
     targets = watch_targets(watch, ledger)
-    snapshots = []  # saved only after the report is in the wake journal
+    snapshots = []  # saved only after the report is in the wake journal (F11)
     for kind, number, meta in targets:
         path = os.path.join(STATE_DIR, f"{kind}-{number}.json")
         try:
@@ -250,4 +250,10 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except ValueError as exc:
+        if not str(exc).startswith("not_writer"):
+            raise
+        print(exc)
+        sys.exit(1)

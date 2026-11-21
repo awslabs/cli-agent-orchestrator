@@ -89,7 +89,8 @@ def test_followup_whitespace_scope_denies_wildcard_mandate(tmp_path, field):
     args = {"holder": "conductor", "action": "approve_review_plan", field: "   "}
     rc, out = check(tmp_path, data, **args)
     assert rc == 1
-    assert out.startswith("DENY missing_pr_scope")
+    # A blank author is refused even earlier, as not a GitHub login.
+    assert out.startswith("DENY bad_pr_author" if field == "author" else "DENY missing_pr_scope")
 
 
 @pytest.mark.parametrize("pending_pr", [101, 102])
@@ -106,7 +107,7 @@ def test_followup_damaged_pending_is_reported_and_blocks(tmp_path, pending_pr):
 
 @pytest.mark.parametrize("revoked", [False, True])
 def test_followup_update_cap_does_not_widen_on_revocation(tmp_path, revoked):
-    data = json.loads((KIT / "mandates.json").read_text())
+    data = json.loads((KIT / "mandates.example.json").read_text())
     arm = next(m for m in data["mandates"] if m["action"] == "arm_automerge")
     arm["conditions"]["max_changed_lines"] = 300
     arm["revoked"] = revoked
@@ -116,7 +117,7 @@ def test_followup_update_cap_does_not_widen_on_revocation(tmp_path, revoked):
 
 
 def test_followup_update_cap_never_exceeds_default(tmp_path):
-    data = json.loads((KIT / "mandates.json").read_text())
+    data = json.loads((KIT / "mandates.example.json").read_text())
     arm = next(m for m in data["mandates"] if m["action"] == "arm_automerge")
     arm["conditions"]["max_changed_lines"] = 5000
     result = gate(tmp_path, pr(mergeStateStatus="BEHIND", additions=1501, deletions=0),
@@ -144,17 +145,8 @@ def test_followup_usage_has_no_fixed_author_or_base(rel, command):
     lines = [line for line in text.splitlines() if command in line]
     assert lines
     for line in lines:
-        assert not re.search(r"--pr-author\s+your-login\b", line)
+        assert not re.search(r"--pr-author\s+(?:your-login|\{login\}|LOGIN)\b", line)
         assert not re.search(r"--base\s+main\b", line)
-
-
-def test_followup_conductor_plan_check_uses_live_scope():
-    text = (KIT / "conductor-playbook.md").read_text().split("## 5. Reviewer plan approval", 1)[1]
-    step = text.split("3. The workflow", 1)[0]
-    assert "gh pr view <N>" in step
-    assert '--json author,baseRefName > "$D/review-scope.json"' in step
-    assert step.index("gh pr view") < step.index("check_mandate.py --holder")
-    assert '--pr-author "$A" --base "$B"' in step
 
 
 def test_followup_prewrite_summary_includes_scope_and_remote_config():

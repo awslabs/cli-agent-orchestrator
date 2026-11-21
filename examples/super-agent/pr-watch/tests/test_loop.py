@@ -10,7 +10,7 @@ SOURCE=Path(__file__).resolve().parents[1]
 def setup(tmp_path, reports):
     for name in ['tick_loop.sh','config.py','digest_store.py','wake_rules.py']:
         shutil.copyfile(SOURCE/name,tmp_path/name)
-    (tmp_path/'watch.json').write_text('{"identities":{"ours":["your-login"]}}');(tmp_path/'ledger.json').write_text('{"prs":{}}')
+    (tmp_path/'watch.json').write_text('{}');(tmp_path/'ledger.json').write_text('{"prs":{}}')
     (tmp_path/'config.json').write_text(json.dumps({'watch_dir':'.','ledger_path':'ledger.json'}))
     (tmp_path/'mock-reports.json').write_text(json.dumps(reports))
     (tmp_path/'poll.py').write_text('''import json
@@ -54,7 +54,7 @@ def test_bad_configuration_reports_error(tmp_path):
     p=run(tmp_path,env);assert p.returncode==2;assert 'configuration_error' in p.stdout
 
 def test_24h_catchup_delivers_once(tmp_path):
-    env=setup(tmp_path,[{'polled_at':'2026-11-09T01:00Z','errors':[]}]);(tmp_path/'state').mkdir()
+    env=setup(tmp_path,[{'polled_at':'2026-11-09T01:00Z','errors':[]}]);(tmp_path/'state').mkdir(exist_ok=True)
     (tmp_path/'state/digest-pending.json').write_text(json.dumps([{'at':'2026-11-08T00:00Z','line':'noise'}]))
     p=run(tmp_path,env);assert p.returncode==0;assert ':: digest' in p.stdout
     assert json.loads((tmp_path/'state/digest-pending.json').read_text())==[]

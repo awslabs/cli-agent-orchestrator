@@ -1,12 +1,20 @@
 import copy
+import importlib.util
 import json
 
 import pytest
 
-from conftest import KIT, base_env, run, write_json, ledger
+from conftest import KIT, base_env, run, write_json, ledger, KIT_MANDATES
 
 REPO = "your-org/your-repo"
 URL = "https://github.com/your-org/your-repo.git"
+
+
+def check_module():
+    spec = importlib.util.spec_from_file_location("check_mandate_tier_tests", KIT / "bin" / "check_mandate.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def doc(**top):
@@ -20,11 +28,11 @@ def doc(**top):
             {"id": "M1", "holder": "shepherd", "action": "ff_fix_push",
              "scope": {"repo": REPO, "pr_author": "your-login", "base": "main"},
              "conditions": {}, "granted_by": "user", "granted_at": "2026-11-03",
-             "source": "memory:test", "revoked": False},
+             "source": "memory:test", "revoked": False, "tier": 1},
             {"id": "M7", "holder": "conductor", "action": "approve_review_plan",
              "scope": {"repo": REPO, "pr_author": "*", "base": "main"},
              "conditions": {}, "granted_by": "user", "granted_at": "2026-11-07",
-             "source": "memory:test", "revoked": False},
+             "source": "memory:test", "revoked": False, "tier": 1},
         ],
     }
     d.update(top)
@@ -165,7 +173,7 @@ def test_second_mandate_for_same_action_can_match(tmp_path):
 # --- the shipped mandates.json encodes the example's standing OKs, unwidened ---
 
 def shipped():
-    return json.loads((KIT / "mandates.json").read_text())
+    return json.loads(KIT_MANDATES.read_text())
 
 
 def test_shipped_is_observe_and_unpaused():
@@ -180,22 +188,28 @@ def test_shipped_mandates_well_formed():
     actions = {m["action"]: m for m in d["mandates"]}
     assert set(actions) == {"ff_fix_push", "factual_fix_reply", "rerun_failed_outage",
                             "main_merge_push", "update_branch", "arm_automerge",
-                            "approve_review_plan", "clear_hold"}
+                            "clear_hold"}  # no conductor-held OK: the review-plan approval is gone
     for m in d["mandates"]:
-        # M7 belongs to the optional reviewer and ships revoked; every other OK ships active
-        assert m["granted_by"] == "user" and m["revoked"] is (m["action"] == "approve_review_plan")
+        assert m["granted_by"] == "user"
+        if m["revoked"] is True:
+            for field in ("revoked_by", "revoked_at", "revoked_source"):
+                assert m.get(field), (m["id"], field)
+        else:
+            assert m["revoked"] is False
         assert m["scope"]["repo"] == REPO and m["scope"]["base"] == "main"
         assert m["source"] and m["granted_at"] and m["id"]
-        if m["action"] == "approve_review_plan":
-            assert m["holder"] == "conductor"
-        else:
-            assert m["holder"] == "shepherd" and m["scope"]["pr_author"] == "your-login"
+        assert m["holder"] == "shepherd" and m["scope"]["pr_author"] == "your-login"
     assert actions["arm_automerge"]["conditions"]["max_changed_lines"] == 1500
     assert actions["arm_automerge"]["conditions"]["never_prs"] == []
     assert actions["update_branch"]["conditions"]["never_prs"] == []
-    plan = actions["approve_review_plan"]["conditions"]["workflows"]
-    assert sorted(plan) == ["branch-review",
-                            "pr-review"]
+    assert {action: actions[action]["tier"] for action in (
+        "ff_fix_push", "rerun_failed_outage", "main_merge_push",
+        "update_branch", "arm_automerge",
+    )} == {
+        "ff_fix_push": 1, "rerun_failed_outage": 1, "main_merge_push": 1,
+        "update_branch": 1, "arm_automerge": 1,
+    }
+    assert actions["factual_fix_reply"]["tier"] == actions["clear_hold"]["tier"] == 2
 
 
 def test_shipped_forbidden_set():
@@ -223,6 +237,7 @@ def recheck(tmp_path, data, *extra, action="ff_fix_push", go_rows=None):
     path = write_json(tmp_path / "mandates.json", data)
     if go_rows is not None:
         (tmp_path / "state").mkdir(exist_ok=True)
+    if go_rows is not None:
         (tmp_path / "state" / "go.jsonl").write_text("".join(json.dumps(r) + "\n" for r in go_rows))
     args = ["--mandates", path, "--holder", "shepherd", "--action", action,
             "--pr-author", "your-login", "--base", "main", *extra]
@@ -297,6 +312,19 @@ def test_go_missing_denies(tmp_path):
     assert rc == 1 and out.startswith("DENY go_missing")
 
 
+def test_go_missing_hint_names_only_real_go_ledger_commands(tmp_path):
+    # go_ledger.py has no `show`; the hint points at the ledger file and `add`
+    path = write_json(tmp_path / "mandates.json", doc())
+    (tmp_path / "state").mkdir(exist_ok=True)
+    (tmp_path / "state" / "go.jsonl").write_text(json.dumps(go_row(id="other")) + "\n")
+    r = run("check_mandate.py", "--mandates", path, "--holder", "shepherd", "--action", "ff_fix_push",
+            "--pr-author", "your-login", "--base", "main", *GO_ARGS, env=base_env(tmp_path))
+    assert r.returncode == 1 and r.stdout.split()[0] == "DENY"
+    assert r.stdout.strip().startswith("DENY go_missing")
+    assert r.stderr.startswith("hint: no GO record with id 101-ff_fix_push-11111111 in state/go.jsonl")
+    assert "go_ledger.py show" not in r.stderr and "go_ledger.py add" in r.stderr
+
+
 def test_go_file_absent_denies(tmp_path):
     rc, out = recheck(tmp_path, doc(), *GO_ARGS)
     assert rc == 1 and out.startswith("DENY go_missing")
@@ -362,7 +390,7 @@ def test_go_checked_in_act_mode_too(tmp_path):
 
 
 def test_corrupt_go_file_denies(tmp_path):
-    (tmp_path / "state").mkdir()
+    (tmp_path / "state").mkdir(exist_ok=True)
     (tmp_path / "state" / "go.jsonl").write_text("{broken\n")
     rc, out = recheck(tmp_path, doc(), *GO_ARGS)
     assert (rc, out) == (1, "DENY state_corrupt:go.jsonl:1:row:not_json")
@@ -407,6 +435,60 @@ def test_clear_hold_needs_go_even_in_act_mode(tmp_path):
     assert rc == 3 and out == "OBSERVE M8-clear-hold"
 
 
+@pytest.mark.parametrize("action,mid", [("clear_hold", "M8-clear-hold"), ("factual_fix_reply", "M2-factual-fix-reply"),
+                                        ("ff_fix_push", "M1-ff-fix-push")])
+def test_a_matching_mandate_without_a_tier_fails_closed(tmp_path, action, mid):
+    """A hand-edited OK that lost its tier must not read as tier 1: in act mode a text reply would
+    then go out with no GO. Every matching mandate needs tier 1 or 2."""
+    d = act(shipped())
+    for m in d["mandates"]:
+        if m["action"] == action:
+            del m["tier"]
+    assert check(tmp_path, d, action=action) == (1, f"DENY malformed_mandates:tier:{mid}")
+
+
+@pytest.mark.parametrize("tier", ["2", "1", 3, 0, True, False, 1.0, None])
+def test_a_tier_that_is_not_the_integer_1_or_2_fails_closed(tmp_path, tier):
+    """A string "2" must not read as tier 1, and True must not read as 1."""
+    d = act(doc())
+    d["mandates"][0]["tier"] = tier
+    assert check(tmp_path, d) == (1, "DENY malformed_mandates:tier:M1")
+
+
+def test_a_conductor_held_tier2_mandate_needs_a_go(tmp_path):
+    """Tier 2 is checked before the conductor's own shortcut, so it still needs a GO."""
+    d = doc()
+    d["mandates"][1]["tier"] = 2
+    assert check(tmp_path, d, holder="conductor", action="approve_review_plan") == (3, "OBSERVE M7")
+    d["mandates"][1]["tier"] = 1
+    assert check(tmp_path, d, holder="conductor", action="approve_review_plan") == (0, "ALLOW M7")
+
+
+@pytest.mark.parametrize("policy", ["absent", None])
+def test_a_missing_or_null_policy_version_denies_without_an_expected_version(tmp_path, policy):
+    """No --expect-policy-version here: the policy itself must carry a version, or nothing is allowed."""
+    d = act(doc())
+    if policy == "absent":
+        del d["policy_version"]
+    else:
+        d["policy_version"] = policy
+    assert check(tmp_path, act(doc()))[0] == 0  # the control: the same call allows with a version
+    rc, out = check(tmp_path, d)
+    assert rc == 1 and out == "DENY unreadable_input:ValueError"
+@pytest.mark.parametrize("tier", [1])
+def test_go_always_required_holds_in_act_mode_for_a_non_tier2_mandate(tmp_path, tier):
+    """The shipped M8 is tier 2, so the tier-2 OBSERVE answers first and the test above never reaches
+    go_always_required (mutant cm_go_always_required survived it). Here only that condition stands
+    between an act-mode shepherd without a GO and ALLOW."""
+    d = act(doc())
+    d["mandates"][0]["conditions"] = {"go_always_required": True}
+    if tier is not None:
+        d["mandates"][0]["tier"] = tier
+    assert check(tmp_path, d) == (3, "OBSERVE M1")
+    d["mandates"][0]["conditions"] = {"go_always_required": False}
+    assert check(tmp_path, d) == (0, "ALLOW M1")
+
+
 def test_clear_hold_with_go_allows_in_act_mode(tmp_path):
     d = act(shipped())
     row = go_row(id="101-clear_hold-x", action="clear_hold", policy_version=d["policy_version"],
@@ -417,6 +499,15 @@ def test_clear_hold_with_go_allows_in_act_mode(tmp_path):
 
 def test_other_act_mode_mandates_still_allow_without_go(tmp_path):
     assert check(tmp_path, act(shipped()), action="ff_fix_push") == (0, "ALLOW M1-ff-fix-push")
+
+
+def test_tier2_still_needs_go_in_act_mode_when_condition_flag_is_removed(tmp_path):
+    d = act(shipped())
+    m2 = next(m for m in d["mandates"] if m["action"] == "factual_fix_reply")
+    m2["conditions"].pop("go_always_required", None)
+    assert check(tmp_path, d, action="factual_fix_reply") == (
+        3, "OBSERVE M2-factual-fix-reply"
+    )
 
 
 def test_shipped_clear_hold_mandate_is_go_always():
@@ -740,7 +831,8 @@ def test_f1_repeated_flag_counts_as_two_urls(tmp_path):
 @pytest.mark.parametrize("value", ["https://github.com/attacker/cli-agent-orchestrator.git", URL + "/", ""])
 def test_f1_push_dest_must_be_the_authorised_url(tmp_path, value):
     rc, out = dest_check(tmp_path, push_dest=value)
-    reason = "push_dest_invalid" if not value else f"push_dest_mismatch (not the authorised URL for {REPO})"
+    reason = ("push_dest_invalid (want https:// or file://, with no space or control character)" if not value
+              else f"push_dest_mismatch (not the authorised URL for {REPO})")
     assert (rc, out) == (1, f"DENY {reason}")
 
 
@@ -822,7 +914,7 @@ def with_forbidden_mandate(**top):
     d["mandates"].append({"id": "MF", "holder": "shepherd", "action": "force_push",
                           "scope": {"repo": REPO, "pr_author": "your-login", "base": "main"},
                           "conditions": {}, "granted_by": "user", "granted_at": "2026-11-09",
-                          "source": "memory:test", "revoked": False})
+                          "source": "memory:test", "revoked": False, "tier": 1})
     return d
 
 
@@ -861,6 +953,101 @@ def test_sweep_go_always_required_controls(tmp_path):
     m8 = [m for m in d["mandates"] if m["action"] == "clear_hold"][0]
     assert check(tmp_path, d, action="clear_hold") == (3, "OBSERVE M8-clear-hold")
     m8["conditions"]["go_always_required"] = False
+    assert check(tmp_path, d, action="clear_hold") == (3, "OBSERVE M8-clear-hold")
+    m8["tier"] = 1
     assert check(tmp_path, d, action="clear_hold") == (0, "ALLOW M8-clear-hold")
     del m8["conditions"]
     assert check(tmp_path, d, action="clear_hold") == (0, "ALLOW M8-clear-hold")
+
+
+# review P3-1: an invalid --pr-author is refused before any mandate (a "*" scope included) is matched
+@pytest.mark.parametrize("author", ["", "{login}", "LOGIN", "*", "bad login", "a/b/c", "a" * 40, "x/y", "name[bot]x"])
+def test_invalid_pr_author_is_refused_first(tmp_path, author):
+    for holder, action in (("shepherd", "ff_fix_push"), ("conductor", "approve_review_plan")):
+        rc, out = check(tmp_path, act(doc()), holder=holder, action=action, author=author)
+        if author == "LOGIN":  # a well-formed login that no mandate names
+            assert out != "DENY bad_pr_author" and not out.startswith("ALLOW M1")
+        else:
+            assert (rc, out) == (1, "DENY bad_pr_author"), (holder, author)
+
+
+@pytest.mark.parametrize("author", ["your-login", "dependabot[bot]", "app/dependabot", "a" * 39])
+def test_valid_logins_and_bot_forms_reach_the_mandates(tmp_path, author):
+    rc, out = check(tmp_path, act(doc()), holder="conductor", action="approve_review_plan", author=author)
+    assert (rc, out) == (0, "ALLOW M7")
+
+
+def test_pr_author_pattern_matches_the_workplace_login_rule():
+    import importlib.util
+    def load(name):
+        spec = importlib.util.spec_from_file_location(f"t_{name}", KIT / "bin" / f"{name}.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    cm, wp = load("check_mandate"), load("workplace")
+    for login in ("your-login", "new-user", "a", "a" * 39, "-x", "x-", "a" * 40, "bad login", ""):
+        assert bool(cm.PR_AUTHOR_RE.match(login)) == bool(wp.LOGIN_RE.match(login)), login
+
+
+# --- push destination blind spots ---
+
+@pytest.mark.parametrize("nick", ["upstream", "origin", "evil.git", "github.com:awslabs"])
+def test_a_slashless_authorised_url_refuses(tmp_path, nick):
+    """`git push <X>` with no "/" in X also reads .git/remotes/<X> and .git/branches/<X>, which
+    `remote get-url` and `config --get-regexp` never show: the gate would match its own echo while
+    the push goes wherever that legacy file says. An authorised URL must hold a "/"."""
+    d = act(doc(push_urls={REPO: nick}))
+    rc, out = dest_check(tmp_path, d, push_dest=nick, push_url=nick, fetch_url=nick)
+    assert (rc, out) == (1, f"DENY push_url_unbound:{REPO} (authorised URL has no '/', so git would "
+                            "read .git/remotes/<name>)")
+
+
+@pytest.mark.parametrize("rw", [
+    # what `git config --get-regexp '^url\.'` prints: section and variable lowercased, the base kept
+    "url.https://Evil.Example/.pushinsteadof https://github.com/",
+    "url.HTTPS://github.com/Attacker/.insteadof https://github.com/awslabs/",
+    # the case git never prints still refuses
+    "URL.https://evil.example/.PushInsteadOf https://github.com/"])
+def test_rewrites_refuse_whatever_case_git_reports_them_in(tmp_path, rw):
+    """git lowercases config section and variable names (remote.<name>.pushurl, url.<base>.insteadof),
+    so the gate must not key on their case: any rewrite line refuses."""
+    assert dest_check(tmp_path, url_rewrites=rw) == (
+        1, "DENY push_url_rewrite (an insteadOf/pushInsteadOf rule is configured)")
+
+
+# --- any rerun_* GO binds its run_id (here a user one-off re-run of a flaky run) ---
+
+FLAKY_RUN = "12345678903"
+
+
+def flaky_row(**over):
+    return oneoff_row(id="101-rerun_failed_flaky-x", action="rerun_failed_flaky", pr="101",
+                      branch=None, run_id=FLAKY_RUN, **over)
+
+
+def flaky_check(tmp_path, rows, *extra):
+    args = ("--go-id", "101-rerun_failed_flaky-x", "--pr", "101", "--expect-head", H1,
+            "--remote-head", H1, "--expect-policy-version", "test-1", *extra)
+    return recheck(tmp_path, doc(), *args, action="rerun_failed_flaky", go_rows=rows)
+
+
+def test_flaky_rerun_oneoff_with_run_id_allows(tmp_path):
+    assert flaky_check(tmp_path, [flaky_row()], "--run-id", FLAKY_RUN) == (
+        0, "ALLOW oneoff go=101-rerun_failed_flaky-x")
+
+
+def test_flaky_rerun_oneoff_other_run_id_or_none_denies(tmp_path):
+    assert flaky_check(tmp_path, [flaky_row()], "--run-id", "12345678904") == (
+        1, "DENY go_mismatch:run_id:101-rerun_failed_flaky-x")
+    assert flaky_check(tmp_path, [flaky_row()]) == (1, "DENY go_needs:--run-id (a rerun GO binds its run)")
+
+
+def test_go_ledger_flaky_rerun_needs_run_id_and_non_rerun_refuses_it(tmp_path):
+    env = base_env(tmp_path)
+    common = ("--pr", "101", "--head", H1, "--policy-version", "test-1", "--granted-by", "conductor")
+    r = ledger("add", "--id", "f1", "--action", "rerun_failed_flaky", *common, env=env)
+    assert (r.returncode, r.stdout.strip()) == (2, "ERROR a rerun_* GO needs --run-id (1-20 digits)")
+    r = ledger("add", "--id", "f2", "--action", "rerun_failed_flaky", *common, "--run-id", FLAKY_RUN, env=env)
+    assert (r.returncode, r.stdout.strip()) == (0, "ADDED f2")
+    r = ledger("add", "--id", "f3", "--action", "arm_automerge", *common, "--run-id", FLAKY_RUN, env=env)
+    assert (r.returncode, r.stdout.strip()) == (2, "ERROR --run-id is for rerun_* actions only")

@@ -72,7 +72,7 @@ def test_rendered_publisher_push_and_read_disable_hooks():
     assert "-c core.hooksPath=/dev/null ls-remote" in publisher_step(6)
 
 
-DOC_PATHS = sorted([*(KIT / "templates").glob("*.md"), *(KIT / "agents").glob("*.md"),
+DOC_PATHS = sorted([*(KIT / "templates").glob("*.md"), *(KIT / "agents").glob("*.md.tmpl"),
                     *(KIT / "rules").glob("*.md"), KIT / "conductor-playbook.md",
                     KIT / "shepherd-playbook.md", KIT / "README.md"])
 

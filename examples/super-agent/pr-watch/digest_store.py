@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Durable digest adapter; wake_rules itself stays pure. Single loop holds lock.
 
-Wake journal, one atomic JSON list (config 'journal', default state/wake-journal.json):
+Wake journal (F11), one atomic JSON list (config 'journal', default state/wake-journal.json):
 poll.py appends {id, report, wake: null} BEFORE it saves the new seen ids; process() then either
 records the WAKE {report, reason} in that entry or retires it (QUIET/DIGEST: its digest lines are
 already in the queue); --delivered retires it only after the loop has emitted the WAKE; --replay
@@ -15,15 +15,17 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
-from config import load
-from wake_rules import decide, known_checks, last_review_at, ours
+from config import load, require_writer, writer_section
+from wake_rules import decide, known_checks, last_review_at
 
 
 def read(path, default=None):
     return json.loads(path.read_text()) if path.exists() else default
 
 
+@writer_section
 def atomic(path, text):
+    require_writer()
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix='.tmp')
     try:
@@ -45,6 +47,7 @@ def journal_path(config):
 
 
 def journal_add(path, report):
+    require_writer()
     """Append one poll report to the journal (atomically); the report gets its journal_id."""
     path = Path(path)
     entries = read(path, [])
@@ -70,8 +73,10 @@ def journal_update(config, jid, wake=None, retire=False):
 
 
 def process(path, config):
+    require_writer()
     raw = read(path)
     raw['watch'] = read(config['watch'])
+    full_watch = raw['watch']
     raw['reviewer_ledger'] = read(config['ledger'])
     pending = read(config['queue'], [])
     result = decide(raw)
@@ -87,9 +92,11 @@ def process(path, config):
     raw['filter_reasons'] = result['reasons']
     raw['digest_lines'] = [p['at']+' '+p['line'] for p in pending]
     # Keep only the policy context required to re-run the pure CLI on this report.
-    raw['watch'] = {'identities': {'ours': sorted(ours(raw['watch']))}, 'known_ci_failures': {
+    raw['watch'] = {'known_ci_failures': {
         str(i['number']): sorted(known_checks(raw['watch'], i['number']))
-        for i in raw.get('items', []) if i.get('kind') == 'pr'}}
+        for i in raw.get('items', []) if i.get('kind') == 'pr'},
+        'issues': {k: {'wake_on_comment': True} for k, v in full_watch.get('issues', {}).items() if (v or {}).get('wake_on_comment')},
+        'prs': {k: {'wake_on_change': True} for k, v in full_watch.get('prs', {}).items() if (v or {}).get('wake_on_change')}}
     reviewed = raw['reviewer_ledger'].get('prs', {})
     raw['reviewer_ledger'] = {'prs': {
         str(i['number']): {'last_reviewed_at': last_review_at(reviewed[str(i['number'])])}
@@ -108,6 +115,7 @@ def process(path, config):
 
 
 def delivered(path, config, others=()):
+    require_writer()
     report = read(path)
     included = report['digest_pending']
     pending = read(config['queue'], [])
@@ -123,8 +131,8 @@ def replay(config):
     """The oldest undelivered WAKE as (report, reason), else None; re-filters unprocessed reports."""
     for entry in read(journal_path(config), []):
         if entry['wake'] is None:
+            require_writer()
             reports = Path(config.get('watch_dir') or journal_path(config).parent)/'reports'
-            reports.mkdir(parents=True, exist_ok=True)
             source = reports/('replay-'+entry['id'].replace(':', '')+'.json')
             write_json(source, entry['report'])
             result = process(source, config)
@@ -149,4 +157,11 @@ def main():
     reasons = ' | '.join(result['reasons']).replace('\n',' ').replace('\t',' ')
     print(result['mode']+'\t'+result['report']+'\t'+reasons)
 
-if __name__ == '__main__': main()
+if __name__ == '__main__':
+    try:
+        main()
+    except ValueError as exc:
+        if not str(exc).startswith('not_writer'):
+            raise
+        print(exc)
+        sys.exit(1)

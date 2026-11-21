@@ -21,11 +21,13 @@ KIT = Path(__file__).resolve().parent.parent
 TESTS = KIT / "tests"
 
 CM, AG, OB, RG = "check_mandate.py", "automerge_gate.py", "outbox.py", "resource_gate.py"
-GL, PH, RO, HD = "go_ledger.py", "plan_hash_check.py", "remap_owners.py", "holds.py"
-AE, SS = "api_envelope.py", "state_schema.py"
-MJ, RM, PUB, SPB = "../mandates.json", "../README.md", "../templates/publisher.md", "../shepherd-playbook.md"
-CPB, PSH, CCO = "../conductor-playbook.md", "../agents/pr_shepherd.md", "../agents/cao_conductor.md"
+GL, RO, HD = "go_ledger.py", "remap_owners.py", "holds.py"
+AE, SS, CC = "api_envelope.py", "state_schema.py", "changeset_check.py"
+MJ, RM, PUB, SPB = "../mandates.example.json", "../README.md", "../templates/publisher.md", "../shepherd-playbook.md"
+CPB, PSH, CCO = "../conductor-playbook.md", "../agents/pr_shepherd.md.tmpl", "../agents/cao_conductor.md.tmpl"
 ARM_T = "../templates/automerge-armer.md"
+PWS = "../pr-watch/tick_supervisor.sh"
+PWR = "../pr-watch/README.md"
 M = [
     # check_mandate.py
     ("cm_paused", CM, [('if doc.get("paused") is not False:', "if False:")]),
@@ -145,7 +147,7 @@ M = [
     ("ag_already_armed", AG, [('if action == "arm" and armed:', "if False:")]),
     ("ag_update_word", AG, [('word = "ARM" if action == "arm" else "UPDATE_BRANCH"', 'word = "ARM"')]),
     ("ag_size_cap", AG, [('if lines > limits["cap"]:', 'if lines > limits["cap"] + 1:')]),
-    ("ag_cap_from_mandate", AG, [('cap = cond.get("max_changed_lines", DEFAULT_CAP)', "cap = DEFAULT_CAP")]),
+    ('ag_cap_from_mandate', AG, [('limit = cond.get("max_changed_lines", DEFAULT_CAP)', 'limit = DEFAULT_CAP')]),
     ("ag_scope_from_mandate", AG, [("    if not author or not isinstance(repo, str) or not repo:\n        raise BadInput",
                                     "    if False:\n        raise BadInput")]),
     # automerge_gate.py: clear-by-reading bound to the exact body
@@ -164,6 +166,7 @@ M = [
     ("ag_classic_404_ignored", AG, [('    if classic["http_status"] == 404:\n', '    if classic["http_status"] == -1:\n')]),
     # --- real versus historical findings; recompute from the current body ---
     ("ag_d1_nonzero_count", AG, [("    if NONZERO_COUNT.search(text):\n        return True", "    if False:\n        return True")]),
+    ("ag_d1_nonzero_hash_lookbehind", AG, [('(?<![\\w.#])', '(?<![\\w.])')]),
     ("ag_d1_line_tag", AG, [("        if line_tagged(line):\n            return True", "        if False:\n            return True")]),
     ("ag_d1_heading_list", AG, [("        elif in_findings and LIST_ITEM.match(line):", "        elif False:")]),
     ("ag_d1_zero_count_is_no_item", AG, [(r'    return not re.match(r"^[:=][ \t]*0+(?![0-9])", rest)', "    return True")]),
@@ -225,7 +228,7 @@ M = [
     ("doc_d7_outbox_record", MJ, [('outbox.py sent <key> --url <url>"', 'outbox.py record <key> --url <url>"')]),
     ("doc_d2_reduced_path", PUB, [("**Push pin:**", "**A conductor one-off** uses the same steps, with each `check_mandate.py` line replaced by "
                                    "`python3 -c 'import json,sys; sys.exit(json.load(open(\"m\"))[\"paused\"] is not False)'`.\n**Push pin:**")]),
-    ("doc_d3_bare_push", PUB, [("5. git -C {worktree} push {push_url} {new}:refs/heads/{branch}", "5. git -C {worktree} push {push_url} {branch}")]),
+    ("doc_d3_bare_push", PUB, [("5. git -C {worktree} -c core.hooksPath=/dev/null -c core.sshCommand= push --no-verify {push_url} {new}:refs/heads/{branch}", "5. git -C {worktree} -c core.hooksPath=/dev/null -c core.sshCommand= push --no-verify {push_url} {branch}")]),
     ("doc_d3_pin_dropped", PUB, [(' --new-head {new} --local-head "$L"', "")]),
     ("doc_d4_no_status", SPB, [("gh api -i $R/branches/main/protection >", "gh api $R/branches/main/protection >")]),
     ("doc_d5_steal", PUB, [("R6. python3 $K/outbox.py failed {key} --reason search_found_no_post --owner-gone --generation",
@@ -260,8 +263,7 @@ M = [
     ("ob_failed_needs_reservation", OB, [('            if not os.path.exists(pending):\n                print(f"NOT_RESERVED {a.key}")\n',
                                           '            if False:\n                print(f"NOT_RESERVED {a.key}")\n')]),
     ("ob_history_row_counts", OB, [("        pass\n    return find(key)\n", "        pass\n    return None\n")]),
-    ("ob_find_post_login", OB, [('hits = [c for c in rows if c["user"]["login"] == login\n            and ',
-                                 "hits = [c for c in rows if True\n            and ")]),
+    ('ob_find_post_login', OB, [('hits = [c for c in rows if c["user"]["login"].casefold() == login.casefold()\n            and ', 'hits = [c for c in rows if True\n            and ')]),
     ("ob_find_post_exact_body", OB, [("and normalise(c[\"body\"]) == want]", "and True]")]),
     ("ob_find_post_many", OB, [("    if len(hits) > 1:\n", "    if False:\n")]),
     ("ob_key_pr", OB, [('{"pr": str(pr),', '{"pr": "",')]),
@@ -286,9 +288,9 @@ M = [
                                   '    url = url.rstrip("/").lower()\n    return url[:-4] if url.endswith(".git") else url')]),
     ("cm_f1_push_pre_write", CM, [("    if is_push(action) and pre_write:\n        return check_destination", "    if False:\n        return check_destination")]),
     ("cm_f1_repeated_joined", CM, [('else "\\n".join(v)', "else v[-1]")]),
-    ("doc_f1_push_origin", PUB, [("5. git -C {worktree} push {push_url} {new}", "5. git -C {worktree} push origin {new}")]),
-    ("doc_f1_ls_remote_origin", PUB, [("R=$(git -C {worktree} ls-remote {push_url} refs/heads/{branch} | cut -f1); L=",
-                                       "R=$(git -C {worktree} ls-remote origin refs/heads/{branch} | cut -f1); L=")]),
+    ("doc_f1_push_origin", PUB, [("5. git -C {worktree} -c core.hooksPath=/dev/null -c core.sshCommand= push --no-verify {push_url} {new}", "5. git -C {worktree} -c core.hooksPath=/dev/null -c core.sshCommand= push --no-verify origin {new}")]),
+    ("doc_f1_ls_remote_origin", PUB, [("R=$(git -C {worktree} -c core.hooksPath=/dev/null ls-remote {push_url} refs/heads/{branch} | cut -f1); L=",
+                                       "R=$(git -C {worktree} -c core.hooksPath=/dev/null ls-remote origin refs/heads/{branch} | cut -f1); L=")]),
     ("doc_f1_pushurl_not_passed", PUB, [(' --push-url "$PU"', "")]),
     ("doc_f1_rewrites_not_read", PUB, [("RW=$(git -C {worktree} config --get-regexp '^url\\.')", 'RW=""')]),
     # holds.py clear runs the full check_mandate decision
@@ -328,14 +330,14 @@ M = [
     ("rg_throttle_free_mem", RG, [('elif f < th["free_memory_pct_lt"]:', 'elif f <= th["free_memory_pct_lt"]:')]),
     ("rg_throttle_swap", RG, [('s > th["swap_used_gib_gt"]:', 's >= th["swap_used_gib_gt"]:')]),
     ("rg_throttle_disk", RG, [('elif d < th["disk_free_gib_lt"]:', 'elif d <= th["disk_free_gib_lt"]:')]),
-    ("rg_throttle_load", RG, [('load > th["load_per_cpu_gt"]:', 'load >= th["load_per_cpu_gt"]:')]),
+    ('rg_throttle_load', RG, [('    if load is not None and load > th["load_per_cpu_gt"]:', '    if load is not None and load >= th["load_per_cpu_gt"]:')]),
     ("rg_load_per_cpu", RG, [('load = m["load1"] / m["ncpu"]', 'load = m["load1"] / 10')]),
     ("rg_throttle_terminals", RG, [('elif t >= th["live_terminals_gte"]:', 'elif t > th["live_terminals_gte"]:')]),
-    ("rg_unmeasured_throttles", RG, [('throttle.append(f"unmeasured:{name}")', "pass")]),
-    ("rg_cao_error_throttles", RG, [("stop, throttle = [], list(errors)", "stop, throttle = [], []")]),
+    ('rg_unmeasured_throttles', RG, [('throttle.append(f"unmeasured:{name}{disk_suffix if name == \'disk_free_gib\' else \'\'}")', 'pass')]),
+    ('rg_cao_error_throttles', RG, [('stop, throttle = [], list(errors) + problems', 'stop, throttle = [], problems')]),
     ("rg_cao_error_no_crash", RG, [("    except Exception as exc:\n        return None, f\"cao_api:",
                                     "    except ImportError as exc:\n        return None, f\"cao_api:")]),
-    ("rg_terminals_all_sessions", RG, [("total += len(terms)", "total = len(terms)")]),
+    ('rg_terminals_all_sessions', RG, [('            all_terms.extend(terms)', '            all_terms = list(terms)')]),
     ("rg_stop_wins", RG, [("    if stop:\n", "    if False:\n")]),
     ("rg_fake_means_no_probes", RG, [("    if fake:\n", "    if False:\n")]),
     # resource_gate.py: validation and live parsers
@@ -357,12 +359,27 @@ M = [
     ("rg_free_parser", RG, [('m = re.search(r"free percentage:', 'm = re.search(r"free percentagez:')]),
     # resource_gate.py: heavy slot
     ("rg_heavy_refused_on_stop", RG, [('if verdict == "STOP":', "if False:")]),
-    ("rg_heavy_one_at_a_time", RG, [("        if os.path.isdir(marker):\n            owner = _owner(marker)",
-                                     "        if False:\n            owner = _owner(marker)"),
-                                    ("        os.mkdir(marker)\n", "        os.makedirs(marker, exist_ok=True)\n")]),
-    ("rg_heavy_stale_reported", RG, [("            if age > stale_s:\n", "            if False:\n")]),
-    ("rg_stale_from_last_refresh", RG, [('\n            age = time.time() - owner["refreshed_at"]',
-                                         '\n            age = time.time() - owner["acquired_at"]')]),
+    ("rg_heavy_slots_bound", RG, [("        if len(holders) >= slots:\n", "        if False:\n")]),
+    ("rg_heavy_throttle_cap", RG, [('        if verdict == "THROTTLE" and holders:  # capacity 1 while throttled\n',
+                                    "        if False:  # capacity 1 while throttled\n")]),
+    ("rg_heavy_throttle_cap_needs_a_holder", RG, [('        if verdict == "THROTTLE" and holders:  # capacity 1 while throttled\n',
+                                                   '        if verdict == "THROTTLE":  # capacity 1 while throttled\n')]),
+    ("rg_heavy_slots_off_by_one", RG, [("        if len(holders) >= slots:\n", "        if len(holders) > slots:\n")]),
+    ("rg_heavy_slots_ignored", RG, [("    slots = heavy_slots(cfg)\n", "    slots = 1\n")]),
+    ("rg_heavy_slots_default_one", RG, [('return (cfg.get("heavy") or {}).get("slots", 1)',
+                                         'return (cfg.get("heavy") or {}).get("slots", 3)')]),
+    ("rg_heavy_free_slot_name", RG, [("                    if SS.heavy_holder_name(s) not in used)",
+                                      "                    if True)")]),
+    ("rg_heavy_stale_reported", RG, [("            if stale:\n                return 1, (f\"REFUSED STALE",
+                                      "            if False:\n                return 1, (f\"REFUSED STALE")]),
+    ("rg_heavy_stale_warned", RG, [("    if stale:\n        print(f\"STALE", "    if False:\n        print(f\"STALE")]),
+    ("rg_stale_from_last_refresh", RG, [('if now - r["refreshed_at"] > stale_s]', 'if now - r["acquired_at"] > stale_s]')]),
+    ("rg_heavy_release_own_slot", RG, [("        name, owner = mine[0]\n        os.remove(os.path.join(marker, name))",
+                                        "        name, owner = mine[0]\n        os.remove(os.path.join(marker, holders[0][0]))")]),
+    ("rg_heavy_last_release_only", RG, [("        if len(holders) == 1:  # the last holder", "        if True:  # the last holder")]),
+    ("rg_heavy_slots_validated", RG, [("                if not 1 <= value <= SS.HEAVY_MAX_SLOTS:\n", "                if False:\n")]),
+    ("rg_heavy_slots_integer", RG, [("                if isinstance(value, bool) or not isinstance(value, int):\n                    raise BadConfig(section + '.' + key + ':not_integer')",
+                                     "                if False:\n                    raise BadConfig(section + '.' + key + ':not_integer')")]),
     ("rg_lifecycle_lock", RG, [("                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n",
                                 "                pass\n")]),
     ("rg_lock_token", RG, [("return isinstance(held, str) and secrets.compare_digest(held, token)", "return True")]),
@@ -371,22 +388,15 @@ M = [
     ("rg_refresh_updates", RG, [('        owner["refreshed_at"] = time.time()\n', "        pass\n")]),
     ("rg_refresh_stale_refused", RG, [("\n        if age > stale_s:\n            return 1, (f\"REFUSED STALE",
                                        "\n        if False:\n            return 1, (f\"REFUSED STALE")]),
-    ("rg_release_not_held", RG, [("            return 1, \"NOT_HELD\"\n        owner = _owner(marker)\n        if not _is_owner(owner, token):\n            return 1, f\"REFUSED not_owner held_by={owner.get('label')}\"\n        os.remove",
-                                  "            pass\n        owner = _owner(marker)\n        if not _is_owner(owner, token):\n            return 1, f\"REFUSED not_owner held_by={owner.get('label')}\"\n        os.remove")]),
+    ("rg_release_not_held", RG, [("            return 1, \"NOT_HELD\"\n        mine = [(n, r) for n, r in holders if _is_owner(r, token)]\n        if not mine:\n            return 1, f\"REFUSED not_owner held_by={_held_by(holders)}\"\n        name, owner = mine[0]\n        os.remove",
+                                  "            pass\n        mine = [(n, r) for n, r in holders if _is_owner(r, token)]\n        if not mine:\n            return 1, f\"REFUSED not_owner held_by={_held_by(holders)}\"\n        name, owner = mine[0]\n        os.remove")]),
     ("rg_label_validated", RG, [("if a.acquire_heavy is not None and not LABEL_RE.fullmatch(a.acquire_heavy):", "if False:")]),
-    # plan_hash_check.py
-    ("ph_missing_baseline_refused", PH, [("        if want is None:\n", "        if False:\n")]),
-    ("ph_changed_refused", PH, [("        elif got != want:\n", "        elif False:\n")]),
-    ("ph_only_baselines_trusted", PH, [('        if row["kind"] != "baseline":\n            continue', '        if False:\n            continue')]),
-    ("ph_latest_baseline_wins", PH, [('        out[row["file"]] = row["sha256"]\n', '        out.setdefault(row["file"], row["sha256"])\n')]),
-    ("ph_exit_code", PH, [("return 0 if ok else 1", "return 0")]),
     # remap_owners.py
     ("ro_only_the_old_owner", RO, [('if isinstance(owner, dict) and owner.get("terminal") == old:',
                                     "if isinstance(owner, dict):")]),
     ("ro_issues_too", RO, [('for group in ("prs", "issues"):', 'for group in ("prs",):')]),
-    ("ro_identities_added", RO, [('        doc["identities"] = {"ours": list(ours), **BOT_IDENTITIES}', "        pass")]),
-    ("ro_identities_kept", RO, [('    if "identities" not in doc:', "    if True:")]),
-    ("ro_identities_need_ours", RO, [("        if not ours:\n", "        if False:\n")]),
+    ("ro_identities_added", RO, [('    if "identities" not in doc:\n', "    if False:\n")]),
+    ("ro_identities_kept", RO, [('    if "identities" not in doc:\n', "    if True:\n")]),
     # outbox search rows + the strictness sweep
     ("ob_f4_rows_checked", OB, [("        why = bad_comment(c)\n        if why:\n", "        why = bad_comment(c)\n        if False:\n")]),
     ("ob_f4_body_str", OB, [('    if not isinstance(c.get("body"), str):\n        return "a row has no string body"',
@@ -413,7 +423,7 @@ M = [
     ("ag_sw_pending_not_ordered", AG, [(' and r.get("state") != "PENDING"),', "),")]),
     ("ag_sw_conditions_object", AG, [("            if not isinstance(cond, dict):  # null or a list", "            if False:  # null or a list")]),
     ("ag_sw_never_prs_type", AG, [("            if not isinstance(listed, list) or not all(strict_int(n, 1) for n in listed):", "            if False:")]),
-    ("ag_sw_cap_type", AG, [("                if not strict_int(cap, 0):", "                if False:")]),
+    ('ag_sw_cap_type', AG, [('                if not strict_int(limit, 0):', '                if False:')]),
     ("cm_sw_forbidden_list", CM, [('    if not isinstance(forbidden, list) or not all(isinstance(x, str) and x for x in forbidden):', "    if False:")]),
     ("cm_sw_forbidden_items", CM, [('    if not isinstance(forbidden, list) or not all(isinstance(x, str) and x for x in forbidden):',
                                     "    if not isinstance(forbidden, list):")]),
@@ -576,6 +586,13 @@ M = [
     # -- heavy/active/owner.json
     ("ss_owner_raise", SS, [("    why = HEAVY_OWNER.problem(row)\n    if why:\n        raise StateCorrupt", "    why = HEAVY_OWNER.problem(row)\n    if False:\n        raise StateCorrupt")]),
     ("ss_owner_write_checked", SS, [("    why = HEAVY_OWNER.problem(row)\n    if why:\n        raise RowRefused", "    why = HEAVY_OWNER.problem(row)\n    if False:\n        raise RowRefused")]),
+    ("ss_heavy_unknown_entry", SS, [("    if unknown:\n        raise StateCorrupt(label(os.path.join(active, unknown[0]))",
+                                     "    if False:\n        raise StateCorrupt(label(os.path.join(active, unknown[0]))")]),
+    ("ss_heavy_holder_is_a_file", SS, [("        if m and os.path.isfile(path) and not os.path.islink(path):", "        if m:")]),
+    ("ss_heavy_duplicate_token", SS, [('        if row["token"] in seen:\n            raise StateCorrupt', '        if False:\n            raise StateCorrupt')]),
+    ("ss_heavy_tmp_skipped", SS, [("        if HEAVY_TMP_RE.fullmatch(name):\n            continue\n", "")]),
+    ("ss_heavy_write_name_checked", SS, [("    if not HEAVY_HOLDER_RE.fullmatch(name):\n        raise RowRefused", "    if False:\n        raise RowRefused")]),
+    ("ss_heavy_check_all_holders", SS, [("        for _, name in holders:\n            p = os.path.join(active, name)", "        for _, name in holders[:1]:\n            p = os.path.join(active, name)")]),
     # -- strict JSON and line reading
     ("ss_json_duplicates", SS, [("        if k in out:\n            raise ValueError", "        if False:\n            raise ValueError")]),
     ("ss_json_nan", SS, [("    return json.loads(text_, object_pairs_hook=_no_duplicates, parse_constant=_no_constant)",
@@ -611,33 +628,106 @@ M = [
     ("ag_ss_holds_validated", AG, [("    return SS.load_holds(path)", "    return SS.json_doc(path) if os.path.exists(path) else {}")]),
     ("ag_ss_hold_write_checked", AG, [("        SS.check_holds_write(path, holds)  # never write a hold the readers would reject\n", "")]),
     ("ag_ss_corrupt_denies", AG, [('        word, detail = "DENY", str(exc)\n    except BadInput', '        word, detail = "ARM", str(exc)\n    except BadInput')]),
-    ("hd_ss_ledger_corrupt_refused", HD, [("    except SS.StateCorrupt as exc:  # state_corrupt:go.jsonl:<line>:<why>\n        return refuse(str(exc))",
-                                           "    except SS.StateCorrupt as exc:  # state_corrupt:go.jsonl:<line>:<why>\n        records = []")]),
+    ("hd_ss_ledger_corrupt_refused", HD, [("    except (SS.StateCorrupt, SS.NotWriter) as exc:  # state_corrupt:go.jsonl:<line>:<why>\n        return refuse(str(exc))",
+                                           "    except (SS.StateCorrupt, SS.NotWriter) as exc:  # state_corrupt:go.jsonl:<line>:<why>\n        records = []")]),
     ("hd_ss_holds_read_validated", HD, [("        holds = GATE.read_holds(path)\n", "        holds = SS.json_doc(path) if os.path.exists(path) else {}\n")]),
     ("hd_ss_cleared_checked", HD, [("        SS.check_holds_write(path, holds)\n", "")]),
-    ("rg_ss_owner_validated", RG, [('        return SS.load_owner(os.path.join(marker, "owner.json"))', '        return SS.json_doc(os.path.join(marker, "owner.json"))')]),
-    ("rg_ss_owner_write_checked", RG, [('    SS.check_owner_write(os.path.join(marker, "owner.json"), data)  # never write what _owner rejects\n', "")]),
-    ("rg_ss_corrupt_refused", RG, [('    except SS.StateCorrupt as exc:\n        print(f"REFUSED {exc} (report it to the conductor; never take it over)")\n        return 1',
-                                    '    except SS.StateCorrupt as exc:\n        print(f"REFUSED {exc} (report it to the conductor; never take it over)")\n        return 0')]),
-    ("ph_ss_ledger_validated", PH, [("    for row in SS.load_plan_ledger(path):", "    for row in [r for _, r in SS.jsonl_rows(path)]:")]),
-    ("ph_ss_corrupt_refused", PH, [('        print(f"REFUSE corrupt_ledger {exc}")\n        return 1', '        print(f"REFUSE corrupt_ledger {exc}")\n        return 0')]),
+    ("rg_ss_owner_validated", RG, [("        holders = SS.load_heavy_holders(marker)\n",
+                                    "        holders = [(n, SS.json_doc(os.path.join(marker, n))) for _, n in SS.heavy_holder_files(marker)]\n")]),
+    ("rg_ss_owner_write_checked", RG, [("    SS.check_owner_write(path, data)  # never write what _holders rejects\n", "")]),
+    ('rg_ss_corrupt_refused', RG, [('    except (SS.StateCorrupt, SS.NotWriter) as exc:\n        line = f"REFUSED {exc} (report it to the conductor; never take it over)"; print(line); emit_hint(line)\n        return 1', '    except (SS.StateCorrupt, SS.NotWriter) as exc:\n        line = f"REFUSED {exc} (report it to the conductor; never take it over)"; print(line); emit_hint(line)\n        return 0')]),
+    # check_mandate.py and go_ledger.py: a rerun GO binds its run id; an authorised push URL holds a "/"
+    ('cm_rerun_prefix', CM, [('if action.startswith("rerun_") and extra.get("run_id") is None:', 'if action == "rerun_failed_outage" and extra.get("run_id") is None:')]),
+    ('cm_rerun_needs_run_id', CM, [('    if action.startswith("rerun_") and extra.get("run_id") is None:', '    if False:')]),
+    ('cm_go_run_id_unbound', CM, [('"policy_version": doc.get("policy_version"), "run_id": extra.get("run_id")}', '"policy_version": doc.get("policy_version")}')]),
+    ('cm_bad_run_id', CM, [('    if run_id is not None and not SS.RUN_ID_RE.fullmatch(run_id):', '    if False:')]),
+    ('cm_push_url_needs_slash', CM, [('    if "/" not in want:\n', '    if False:\n')]),
+    ('ss_run_id_only_rerun', SS, [('    if "run_id" in row and not row["action"].startswith("rerun_"):', '    if False:')]),
+    ('gl_rerun_needs_run_id', GL, [('        if a.run_id is None or not SS.RUN_ID_RE.fullmatch(a.run_id):', '        if False:')]),
+    ('gl_run_id_dropped', GL, [('        row["run_id"] = a.run_id', '        pass')]),
+    ('doc_rerun_run_id', PUB, [('--remote-head "$R" --run-id {run_id} {go_rerun}', '--remote-head "$R" {go_rerun}')]),
+    # changeset_check.py: -z listings and literal pathspecs, so a quoted or odd path is compared as itself
+    ('cc_name_only_quoted', CC, [('paths = set(nul_records(git(repo, "diff", "--no-renames", "--name-only", "-z", old)))', 'paths = set(nul_records(git(repo, "diff", "--no-renames", "--name-only", old)))')]),
+    ('cc_numstat_quoted', CC, [('old_numstat = nul_records(git(repo, "diff", "--no-renames", "--numstat", "-z", old))', 'old_numstat = nul_records(git(repo, "diff", "--no-renames", "--numstat", old))')]),
+    ('cc_pathspec_magic', CC, [('["git", "-C", repo, "--literal-pathspecs", *args]', '["git", "-C", repo, *args]')]),
+    ('cc_non_utf8_path_crashes', CC, [('errors="surrogateescape", capture_output=True', 'capture_output=True')]),
+    # the review fixes (P2-3, P2-4, P3-3, P3-4, P3-5): each one reverted on its own
+    ('rv_ag_inactive_cap_counts', AG, [('            active = (m.get("revoked") is False and m.get("granted_by") == "user"\n                      and m.get("holder") == "shepherd")', '            active = True')]),
+    ('rv_ag_last_cap_wins', AG, [('cap = limit if cap is None else min(cap, limit)', 'cap = limit')]),
+    ('rv_ag_update_ignores_revoked_cap', AG, [('if (active or action == "update_branch") and m.get("action") == "arm_automerge":', 'if active and m.get("action") == "arm_automerge":')]),
+    ('rv_ag_author_case_sensitive', AG, [('    if author_key not in ours or (scope_author != "*" and author_key != scope_key):', '    if author not in ids["ours"] or (scope_author != "*" and author != scope_author):')]),
+    ('rv_cm_author_case_sensitive', CM, [('or want_author.casefold() != pr_author.casefold()):', 'or want_author != pr_author):')]),
+    ('rv_ob_login_case_sensitive', OB, [('c["user"]["login"].casefold() == login.casefold()', 'c["user"]["login"] == login')]),
+    ('rv_ob_pending_blocks_only_its_key', OB, [('                    if pending["pr"] == str(a.pr):', '                    if False:')]),
+    ('rv_ob_damaged_pending_skipped', OB, [('                    except SS.StateCorrupt:\n                        print("PENDING (a damaged reservation must be reconciled first)")\n                        return PENDING_EXIT', '                    except SS.StateCorrupt:\n                        continue')]),
+    ('rv_cm_remote_config_optional', CM, [('    remotes = extra.get("remote_config")\n', '    remotes = extra.get("remote_config") or ""\n')]),
+    ('rv_cm_url_named_remote_allowed', CM, [('        if "://" in name or norm_url(name) == norm_url(want):', '        if False:')]),
+    ('rv_cm_only_the_exact_url_name_refused', CM, [('        if "://" in name or norm_url(name) == norm_url(want):', '        if norm_url(name) == norm_url(want):')]),
+    ('rv_cm_pushdefault_not_skipped', CM, [('        if key.lower() == "remote.pushdefault":\n            continue\n', '')]),
+    ('rv_cm_any_scheme_push_url', CM, [('    if not re.match(r"(?:https|file)://", want, re.IGNORECASE) or', '    if False and not re.match(r"(?:https|file)://", want, re.IGNORECASE) or')]),
+    ('rv_cm_any_scheme_push_dest', CM, [('    if isinstance(dest, str) and (not re.match(r"(?:https|file)://", dest, re.IGNORECASE)', '    if isinstance(dest, str) and False and (not re.match(r"(?:https|file)://", dest, re.IGNORECASE)')]),
+    ('rv_pub_ls_remote_runs_hooks', PUB, [('6. git -C {worktree} -c core.hooksPath=/dev/null ls-remote {push_url}', '6. git -C {worktree} ls-remote {push_url}')]),
+    ('rv_spb_fixed_author', SPB, [('   python3 KIT/bin/check_mandate.py --holder shepherd --action <a> --pr-author "$A" --base "$B"', '   python3 KIT/bin/check_mandate.py --holder shepherd --action <a> --pr-author LOGIN --base main')]),
+    ('rv_pub_push_fixed_author', PUB, [('--action {push_action} --pr-author "$A" --base "$B"', '--action {push_action} --pr-author {login} --base main')]),
+    ('rv_pub_rerun_fixed_author', PUB, [('--action rerun_failed_outage --pr-author "$A" --base "$B"', '--action rerun_failed_outage --pr-author {login} --base main')]),
+    ('rv_pub_remote_config_not_passed', PUB, [(' --remote-config "$RC"', '')]),
+    ('rv_arm_fixed_author', ARM_T, [('--action arm_automerge --pr-author "$A" --base "$B"', '--action arm_automerge --pr-author {login} --base main')]),
+    # tick_supervisor.sh: a WAKE whose inbox POST failed is kept and re-delivered, never dropped
+    ("pw_sup_pending_cleared_undelivered", PWS, [('    deliver_retry "$first" || return 1\n', '    deliver_retry "$first" || true\n')]),
+    ("pw_sup_no_retry", PWS, [('    [ "$n" -ge "$TRIES" ] && return 1\n', '    return 1\n')]),
+    # check_mandate.py: tier validation, tier 2 before the conductor shortcut, a policy version, the writer fence
+    ("own_tier_unvalidated", CM, [('            if type(tier) is not int or tier not in (1, 2):\n', '            if False:\n')]),
+    ("cm_tier_missing_ok", CM, [('            if type(tier) is not int or tier not in (1, 2):\n',
+                                 '            if tier is not None and (type(tier) is not int or tier not in (1, 2)):\n')]),
+    ("own_tier2_after_conductor", CM, [('            if tier == 2 and go is None:\n                return "OBSERVE", m["id"]\n            if holder == "conductor":\n                return "ALLOW", m["id"]\n',
+                                        '            if holder == "conductor":\n                return "ALLOW", m["id"]\n            if tier == 2 and go is None:\n                return "OBSERVE", m["id"]\n')]),
+    ("own_policy_missing_ok", CM, [('        if not isinstance(doc, dict) or doc.get("policy_version") is None:  # absent or null\n',
+                                    '        if False:\n')]),
+    ("cm_policy_null_ok", CM, [('        if not isinstance(doc, dict) or doc.get("policy_version") is None:  # absent or null\n',
+                                '        if not isinstance(doc, dict) or "policy_version" not in doc:\n')]),
+    ("cm_writer_fence_off", CM, [('            SS.require_writer()\n        except (SS.NotWriter, OSError) as exc:\n            word, detail = "DENY"',
+                                  '            pass\n        except (SS.NotWriter, OSError) as exc:\n            word, detail = "DENY"')]),
+    # publisher.md and the playbooks: the act-mode GO rule, the body helper, the run check, the run id in WOULD and GO
+    ("doc_pub_go_post_act_mode", PUB, [("In act mode `{go_post}` still needs `--go-id <wid>` (M2 is tier 2), and", "In act mode `{go_post}` is empty, and")]),
+    ("doc_pub_body_equals", PUB, [("13. python3 $K/body_equals.py {readback_file} {body_file}", "13. diff {readback_file} {body_file}")]),
+    ("doc_pub_rerun_head_unchecked", PUB, [("--json status,conclusion,headSha,event,headBranch", "--json status,conclusion")]),
+    ("doc_spb_would_no_run_id", SPB, [(" run_id=<the run a rerun_* re-runs | null>", "")]),
+    ("doc_cpb_go_no_run_id", CPB, [("body_sha256=<hex or null> run_id=<id or null> policy_version=<v>", "body_sha256=<hex or null> policy_version=<v>")]),
+    # tick_supervisor.sh, round 3: write-ahead, a damaged pending file, order, no loop while pending, not_writer
+    ("pw_sup_no_write_ahead", PWS, [('    pend_or_stop append "$MSG" && log "kept WAKE in $PENDING before delivery"  # write-ahead\n',
+                                     '    deliver_retry "$MSG" || pend_or_stop append "$MSG"\n')]),
+    ("pw_sup_blank_posted", PWS, [('rows = [r for r in lines() if r.strip()] if exists else []', 'rows = lines() if exists else []')]),
+    ("pw_sup_symlink_followed", PWS, [('    if not stat.S_ISREG(st.st_mode):\n', '    if stat.S_ISDIR(st.st_mode):\n')]),
+    ("pw_sup_unreadable_ignored", PWS, [('    if not os.access(path, os.R_OK | os.W_OK):\n', '    if False:\n'),
+                                        ('        unusable(f"unreadable ({type(exc).__name__})")', '        return []')]),
+    ("pw_sup_unusable_continues", PWS, [('  rm -f -- "$PIDF"; exit 4\n}', '  return 0\n}')]),
+    ("pw_sup_newest_first", PWS, [('    print(rows[0])\n', '    print(rows[-1])\n')]),
+    ("pw_sup_loop_while_pending", PWS, [('    log "pending WAKE still undelivered; no new loop yet"; pause "${SUPERVISOR_ERROR_SLEEP:-60}"; stop_if_asked; continue\n',
+                                         '    log "pending WAKE still undelivered; no new loop yet"; pause "${SUPERVISOR_ERROR_SLEEP:-60}"; stop_if_asked\n')]),
+    ("pw_sup_not_writer_unrecorded", PWS, [('log "$NOTE"; printf \'%s\\n\' "$NOTE" > "$STOPPED"; echo "$NOTE"', 'log "$NOTE"; echo "$NOTE"')]),
+    ("doc_pub_rerun_branch_unsourced", PUB, [("14. H=$(gh pr view {pr} -R {repo} --json headRefName --jq .headRefName) || exit 1; ", "14. ")]),
+    ("doc_cpb_new_ok_no_tier", CPB, [("a `source`, a `tier` (1, or\n     2 when its use needs a reading of text; a missing tier refuses), and", "a `source`, and")]),
+    ("doc_pwr_no_write_ahead", PWR, [("(fsync'd) **before** the first delivery\nattempt", "after the delivery\nattempts fail")]),
 ]
 # the state_schema tests (test_state_*.py) exercise each script's reads and writes of its
 # state files, so every script that reads or writes one also runs its test_state_* file.
 ST_ALL = ["test_state_schema.py", "test_state_go.py", "test_state_holds.py", "test_state_plan_owner.py",
           "test_state_outbox.py", "test_state_append.py"]
-TEST_FOR = {CM: ["test_check_mandate.py", "test_publisher_push.py", "test_holds.py", "test_state_go.py"],
+REVIEW = ["test_review_fixes.py", "test_review_delta.py", "test_review_followup.py"]
+TEST_FOR = {CM: ["test_check_mandate.py", "test_publisher_push.py", "test_holds.py", "test_state_go.py",
+                 "test_lease_followups.py"] + REVIEW,
             GL: ["test_check_mandate.py", "test_state_go.py", "test_state_append.py", "test_would_ids.py"],
-            AG: ["test_automerge_gate.py", "test_state_holds.py"], AE: ["test_automerge_gate.py"],
-            OB: ["test_outbox.py", "test_state_outbox.py", "test_state_append.py"],
-            RG: ["test_resource_gate.py", "test_state_plan_owner.py"],
-            PH: ["test_plan_hash_check.py", "test_state_plan_owner.py"], RO: ["test_remap_owners.py"],
+            AG: ["test_automerge_gate.py", "test_state_holds.py"] + REVIEW, AE: ["test_automerge_gate.py"], CC: ["test_changeset_check.py"],
+            OB: ["test_outbox.py", "test_state_outbox.py", "test_state_append.py"] + REVIEW,
+            RG: ["test_resource_gate.py", "test_state_plan_owner.py", "test_heavy_slots.py"],
+            RO: ["test_remap_owners.py"],
             HD: ["test_holds.py", "test_automerge_gate.py", "test_state_holds.py", "test_state_go.py"],
-            SS: ST_ALL, MJ: ["test_docs.py"], RM: ["test_docs.py"],
-            PUB: ["test_docs.py", "test_publisher_push.py"], SPB: ["test_docs.py"],
-            CPB: ["test_docs.py"], PSH: ["test_docs.py"], CCO: ["test_docs.py"], ARM_T: ["test_docs.py"]}
+            SS: ST_ALL + ["test_heavy_slots.py"], MJ: ["test_docs.py"], RM: ["test_docs.py"],
+            PUB: ["test_docs.py", "test_publisher_push.py"] + REVIEW, SPB: ["test_docs.py"] + REVIEW,
+            CPB: ["test_docs.py"], PSH: ["test_docs.py"], CCO: ["test_docs.py"], ARM_T: ["test_docs.py"] + REVIEW,
+            PWS: ["../pr-watch/tests/test_supervisor_deliver.py"], PWR: ["test_docs.py"]}
 DOC_FILES = ("README.md", "conductor-playbook.md", "shepherd-playbook.md")
-DOC_DIRS = ("agents", "templates")
+DOC_DIRS = ("agents", "templates", "rules")
 
 
 def make_copy(dest):
@@ -647,12 +737,12 @@ def make_copy(dest):
     shutil.copytree(KIT / "bin", dest / "bin", ignore=shutil.ignore_patterns("__pycache__"))
     for d in DOC_DIRS:  # the doc-contract tests and the push test read these from the copy
         shutil.copytree(KIT / d, dest / d)
-    for f in ("mandates.json", "resources.json") + DOC_FILES:
-        shutil.copy2(KIT / f, dest / f)
+    for f in ("mandates.example.json", "workplace.json", "resources.json", "resources.linux.json") + DOC_FILES:
+        shutil.copy2(KIT / f, dest / f)  # bin/workplace.py reads <copy>/workplace.json
+    # the README setup test copies the watch example; the pr-watch tests run against the copy
+    shutil.copytree(KIT / "pr-watch", dest / "pr-watch",
+                    ignore=shutil.ignore_patterns("__pycache__", "state", "reports"))
     (dest / "state").mkdir()
-    ledger = KIT / "state" / "plan-approvals.jsonl"  # your trusted baselines, if you recorded any
-    if ledger.exists():
-        shutil.copy2(ledger, dest / "state" / "plan-approvals.jsonl")
 
 
 def run_tests(kit_copy, test_files, basetemp):
@@ -660,7 +750,8 @@ def run_tests(kit_copy, test_files, basetemp):
     # HOME stays real: pytest may live in the user site-packages. Scripts under test still get
     # a temp HOME from conftest.base_env.
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", ""),
-           "PYTHONDONTWRITEBYTECODE": "1", "SUPER_AGENT_KIT": str(kit_copy)}
+           "PYTHONDONTWRITEBYTECODE": "1", "SUPER_AGENT_KIT": str(kit_copy),
+           "PR_WATCH_SOURCE": str(kit_copy / "pr-watch")}
     r = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-x",
                         f"--basetemp={basetemp}", *(str(TESTS / t) for t in test_files)],
                        cwd=str(basetemp.parent), env=env, capture_output=True, text=True, timeout=600)

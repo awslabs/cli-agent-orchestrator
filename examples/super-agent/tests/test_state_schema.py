@@ -82,7 +82,7 @@ def test_check_cli_on_a_valid_state_dir(tmp_path):
     assert clear_item(tmp_path, MAINTAINER_CLEAN).stdout.startswith("CLEARED")
     expect(gate(tmp_path, pr(), [review(body="P3: x", rid=1005)]), HOLD, "HOLD")
     (tmp_path / "state" / "plan-approvals.jsonl").write_text(json.dumps(BASELINE) + "\n")
-    (tmp_path / "state" / "heavy" / "active").mkdir(parents=True)
+    (tmp_path / "state" / "heavy" / "active").mkdir(parents=True, exist_ok=True)
     write_json(tmp_path / "state" / "heavy" / "active" / "owner.json",
                {"label": "a", "token": "0" * 32, "acquired_at": 1.0, "refreshed_at": 1.0, "pid": 1})
     r = run("state_schema.py", "check", env=base_env(tmp_path))
@@ -101,10 +101,10 @@ def test_check_cli_reports_every_corrupt_file(tmp_path):
                                      f"state_corrupt:outbox/{k}.sent:1:document:not_json"]
 
 
-def test_check_cli_on_a_state_dir_with_one_baseline(tmp_path):
-    sd = tmp_path / "state"
-    sd.mkdir()
-    (sd / "plan-approvals.jsonl").write_text(json.dumps(BASELINE) + "\n")
+def test_check_cli_on_the_shipped_state_dir(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    (state / "plan-approvals.jsonl").write_text(json.dumps(BASELINE) + "\n")
     env = {"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"}
-    r = run("state_schema.py", "check", "--state-dir", sd, env=env)
+    r = run("state_schema.py", "check", "--state-dir", state, env=env)
     assert (r.returncode, r.stdout.strip()) == (0, "OK 1 files"), r.stdout

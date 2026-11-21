@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from conftest import KIT, base_env, run, write_json
+from conftest import base_env, run, write_json, KIT_MANDATES
 
 H = "a" * 40
 REPO = "your-org/your-repo"
@@ -12,7 +12,7 @@ BODY = "APPROVE (0 P1, 0 P2, 0 P3)\n\nRead the diff and re-ran the tests.\n\nFin
 
 
 def pv():
-    return json.loads((KIT / "mandates.json").read_text())["policy_version"]
+    return json.loads(KIT_MANDATES.read_text())["policy_version"]
 
 
 def body_file(tmp_path, text=BODY, item="review:7"):
@@ -138,7 +138,7 @@ def test_real_finding_refused_even_with_a_go(tmp_path):
 def test_paused_refused(tmp_path):
     bf = body_file(tmp_path)
     go(tmp_path)
-    d = json.loads((KIT / "mandates.json").read_text())
+    d = json.loads(KIT_MANDATES.read_text())
     d["paused"] = True
     m = write_json(tmp_path / "m.json", d)
     r = clear(tmp_path, bf, "--mandates", m)
@@ -148,7 +148,7 @@ def test_paused_refused(tmp_path):
 def test_revoked_clear_hold_mandate_refused(tmp_path):
     bf = body_file(tmp_path)
     go(tmp_path)
-    d = json.loads((KIT / "mandates.json").read_text())
+    d = json.loads(KIT_MANDATES.read_text())
     for x in d["mandates"]:
         if x["action"] == "clear_hold":
             x["revoked"] = True
@@ -186,7 +186,7 @@ def test_clear_refuses_a_go_not_written_by_the_conductor(tmp_path, over, why):
 # --- clearing runs the full check_mandate decision (scope, GO repo, policy, pause) ---
 
 def mandates_with(tmp_path, **scope):
-    d = json.loads((KIT / "mandates.json").read_text())
+    d = json.loads(KIT_MANDATES.read_text())
     for x in d["mandates"]:
         if x["action"] == "clear_hold":
             x["scope"].update(scope)
@@ -240,7 +240,7 @@ def test_f2_narrowed_m8_scope_with_a_matching_new_go_is_refused(tmp_path, scope,
 
 def test_f2_policy_bump_voids_an_old_go(tmp_path):
     bf = body_file(tmp_path)
-    d = json.loads((KIT / "mandates.json").read_text())
+    d = json.loads(KIT_MANDATES.read_text())
     d["policy_version"] = "bumped-1"
     go(tmp_path)
     r = clear(tmp_path, bf, "--mandates", write_json(tmp_path / "m.json", d))
@@ -250,7 +250,7 @@ def test_f2_policy_bump_voids_an_old_go(tmp_path):
 def test_f2_paused_after_the_go_is_refused_in_act_mode_too(tmp_path):
     bf = body_file(tmp_path)
     go(tmp_path)
-    d = json.loads((KIT / "mandates.json").read_text())
+    d = json.loads(KIT_MANDATES.read_text())
     d["shepherd_mode"], d["paused"] = "act", True
     r = clear(tmp_path, bf, "--mandates", write_json(tmp_path / "m.json", d))
     assert (r.returncode, r.stdout) == (1, "REFUSED paused\n") and not cleared(tmp_path)
@@ -259,7 +259,7 @@ def test_f2_paused_after_the_go_is_refused_in_act_mode_too(tmp_path):
 def test_f2_act_mode_with_a_go_clears(tmp_path):
     bf = body_file(tmp_path)
     go(tmp_path)
-    d = json.loads((KIT / "mandates.json").read_text())
+    d = json.loads(KIT_MANDATES.read_text())
     d["shepherd_mode"] = "act"
     r = clear(tmp_path, bf, "--mandates", write_json(tmp_path / "m.json", d))
     assert r.returncode == 0 and r.stdout.startswith("CLEARED #101 review:7"), r.stdout
@@ -268,7 +268,7 @@ def test_f2_act_mode_with_a_go_clears(tmp_path):
 def test_f2_user_oneoff_go_does_not_replace_a_revoked_m8(tmp_path):
     bf = body_file(tmp_path)
     go(tmp_path, granted_by="user", relayed_by="<old owner id>")
-    d = json.loads((KIT / "mandates.json").read_text())
+    d = json.loads(KIT_MANDATES.read_text())
     for x in d["mandates"]:
         if x["action"] == "clear_hold":
             x["revoked"] = True

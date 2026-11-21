@@ -2,8 +2,8 @@
 """Turn `gh api -i <endpoint>` output into the envelope automerge_gate.py --required reads:
 {"endpoint": <endpoint>, "http_status": <int | null>, "body": <JSON | null>}. Offline.
 
-  gh api -i repos/your-org/your-repo/rules/branches/main > "$D/rules.raw"
-  python3 KIT/bin/api_envelope.py --endpoint repos/your-org/your-repo/rules/branches/main \
+  gh api -i repos/REPO/rules/branches/main > "$D/rules.raw"      (REPO: repos[0] of workplace.json)
+  python3 KIT/bin/api_envelope.py --endpoint repos/REPO/rules/branches/main \
       --raw "$D/rules.raw" --out "$D/required-rules.json"
 
 `gh api -i` prints the status line and headers, a blank line, then the body, also for an error
@@ -14,12 +14,30 @@ when the raw file is empty, has no `HTTP/<v> <code>` status line, has a body tha
 or announces another page (`Link: ...; rel="next"`): one page is not the whole inventory.
 Prints ENVELOPE <status|null> and exits 0 when parsed, 2 when not.
 """
+import importlib.util
 import argparse
 import json
 import os
 import re
 import sys
 
+KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def _state_schema():
+    """bin/state_schema.py, loaded once per process (every script shares its classes)."""
+    path = os.path.join(KIT, "bin", "state_schema.py")
+    mod = sys.modules.get("kit_state_schema")
+    if mod is None or getattr(mod, "__file__", None) != path:
+        spec = importlib.util.spec_from_file_location("kit_state_schema", path)
+        if spec is None or spec.loader is None:
+            raise ImportError("state_schema.py not found next to this script")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["kit_state_schema"] = mod
+        spec.loader.exec_module(mod)
+    return mod
+
+
+SS = _state_schema()
 STATUS = re.compile(r"HTTP/[0-9.]+ ([0-9]{3})(?: .*)?")
 ENDPOINT = re.compile(r"repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+")
 
@@ -59,10 +77,15 @@ def main(argv=None):
             status, body = parse(fh.read())
     except (OSError, UnicodeDecodeError):
         status, body = None, None
-    tmp = a.out + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({"endpoint": a.endpoint, "http_status": status, "body": body}, fh)
-    os.replace(tmp, a.out)
+    try:
+        with SS.writer_locked_for_output(a.out):
+            tmp = a.out + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"endpoint": a.endpoint, "http_status": status, "body": body}, fh)
+            os.replace(tmp, a.out)
+    except SS.NotWriter as exc:
+        print(f"ERROR {exc}")
+        return 2
     print(f"ENVELOPE {status if status is not None else 'null'}")
     return 0 if status is not None else 2
 
