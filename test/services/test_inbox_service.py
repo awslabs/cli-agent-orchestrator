@@ -1040,6 +1040,57 @@ class TestDeliverPending:
         )
         assert mock_update.call_count == 3
 
+    @pytest.mark.parametrize(
+        ("pending", "status", "send_effects", "expected"),
+        [
+            ([], TerminalStatus.IDLE, [0], 0),
+            ([("a", 1)], TerminalStatus.PROCESSING, [0], 0),
+            ([("a", 1)], TerminalStatus.IDLE, [0], 1),
+            ([("a", 1), ("a", 2)], TerminalStatus.IDLE, [0], 2),
+            ([("a", 1)], TerminalStatus.IDLE, [RuntimeError("tmux error")], 0),
+            # Two senders are two runs: a failed run does not count, a delivered one does.
+            ([("a", 1), ("b", 2)], TerminalStatus.IDLE, [RuntimeError("tmux error"), 0], 1),
+            ([("a", 1), ("a", 2), ("b", 3)], TerminalStatus.IDLE, [0, 0], 3),
+        ],
+        ids=[
+            "nothing-pending",
+            "receiver-not-ready",
+            "one-delivered",
+            "two-in-one-run",
+            "failed-run",
+            "failed-run-then-delivered-run",
+            "two-runs-delivered",
+        ],
+    )
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_returns_the_number_of_messages_delivered(
+        self,
+        mock_get,
+        mock_monitor,
+        mock_term_svc,
+        mock_update,
+        pending,
+        status,
+        send_effects,
+        expected,
+    ):
+        """herdr's settle loop stops at the first positive count, so the count must be exact."""
+        messages = []
+        for sender, message_id in pending:
+            message = _make_message(id=message_id, message=f"m{message_id}")
+            message.sender_id = sender
+            messages.append(message)
+        mock_get.return_value = messages
+        mock_monitor.get_status.return_value = status
+        mock_term_svc.dispatch_input.side_effect = send_effects
+
+        delivered = InboxService().deliver_pending("term-1", num_messages=0)
+
+        assert delivered == expected
+
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
