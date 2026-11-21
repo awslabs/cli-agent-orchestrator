@@ -9,8 +9,9 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from cli_agent_orchestrator.backends.base import TerminalNotFoundError
+from cli_agent_orchestrator.backends.base import InputNotSentError, TerminalNotFoundError
 from cli_agent_orchestrator.constants import (
+    INBOX_MAX_DELIVERY_ATTEMPTS,
     INBOX_RECONCILE_GRACE_SECONDS,
     INBOX_RECONCILE_INTERVAL,
     INBOX_SWEEP_FANOUT,
@@ -1041,43 +1042,82 @@ class TestDeliverPending:
         assert mock_update.call_count == 3
 
     @pytest.mark.parametrize(
-        ("pending", "status", "send_effects", "expected"),
+        ("pending", "status", "send_effects", "attempts_used", "expected"),
         [
-            ([], TerminalStatus.IDLE, [0], 0),
-            ([("a", 1)], TerminalStatus.PROCESSING, [0], 0),
-            ([("a", 1)], TerminalStatus.IDLE, [0], 1),
-            ([("a", 1), ("a", 2)], TerminalStatus.IDLE, [0], 2),
-            ([("a", 1)], TerminalStatus.IDLE, [RuntimeError("tmux error")], 0),
-            # Two senders are two runs: a failed run does not count, a delivered one does.
-            ([("a", 1), ("b", 2)], TerminalStatus.IDLE, [RuntimeError("tmux error"), 0], 1),
-            ([("a", 1), ("a", 2), ("b", 3)], TerminalStatus.IDLE, [0, 0], 3),
+            ([], TerminalStatus.IDLE, [0], 1, 0),
+            # Not ready: queued but the readiness gate is closed (main's rule).
+            ([("a", 1)], TerminalStatus.PROCESSING, [0], 1, DELIVERY_DEFERRED),
+            ([("a", 1)], TerminalStatus.IDLE, [0], 1, 1),
+            ([("a", 1), ("a", 2)], TerminalStatus.IDLE, [0], 1, 2),
+            ([("a", 1), ("a", 2), ("b", 3)], TerminalStatus.IDLE, [0, 0], 1, 3),
+            # A failure before typing with attempts left goes back to PENDING for
+            # another try: the same situation as a refused send, so it is deferred.
+            (
+                [("a", 1)],
+                TerminalStatus.IDLE,
+                [InputNotSentError("lost read")],
+                1,
+                DELIVERY_DEFERRED,
+            ),
+            (
+                [("a", 1), ("b", 2)],
+                TerminalStatus.IDLE,
+                [InputNotSentError("lost read")] * 2,
+                1,
+                DELIVERY_DEFERRED,
+            ),
+            # A final failure leaves nothing queued to retry, so it is not deferred.
+            (
+                [("a", 1)],
+                TerminalStatus.IDLE,
+                [InputNotSentError("lost read")],
+                INBOX_MAX_DELIVERY_ATTEMPTS,
+                0,
+            ),
+            ([("a", 1)], TerminalStatus.IDLE, [RuntimeError("lost send")], 1, 0),
+            # Something delivered in the same call: the positive count wins.
+            ([("a", 1), ("b", 2)], TerminalStatus.IDLE, [InputNotSentError("lost read"), 0], 1, 1),
+            ([("a", 1), ("b", 2)], TerminalStatus.IDLE, [0, InputNotSentError("lost read")], 1, 1),
+            ([("a", 1), ("b", 2)], TerminalStatus.IDLE, [RuntimeError("lost send"), 0], 1, 1),
         ],
         ids=[
             "nothing-pending",
             "receiver-not-ready",
             "one-delivered",
             "two-in-one-run",
-            "failed-run",
-            "failed-run-then-delivered-run",
             "two-runs-delivered",
+            "retryable-failure",
+            "retryable-failure-of-two-runs",
+            "final-failure-attempts-used-up",
+            "final-failure-uncertain",
+            "retryable-run-then-delivered-run",
+            "delivered-run-then-retryable-run",
+            "uncertain-run-then-delivered-run",
         ],
     )
+    @patch("cli_agent_orchestrator.services.inbox_service.record_delivery_failure")
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_returns_the_number_of_messages_delivered(
+    def test_returns_what_the_caller_needs_to_know_about_the_queue(
         self,
         mock_get,
         mock_monitor,
         mock_term_svc,
         mock_update,
+        mock_record,
         pending,
         status,
         send_effects,
+        attempts_used,
         expected,
     ):
-        """herdr's settle loop stops at the first positive count, so the count must be exact."""
+        """The count of delivered messages, or DELIVERY_DEFERRED when messages stay queued.
+
+        herdr's settle loop stops at the first positive count and arms its
+        retries only on DELIVERY_DEFERRED, so each case must be exact.
+        """
         messages = []
         for sender, message_id in pending:
             message = _make_message(id=message_id, message=f"m{message_id}")
@@ -1086,6 +1126,7 @@ class TestDeliverPending:
         mock_get.return_value = messages
         mock_monitor.get_status.return_value = status
         mock_term_svc.dispatch_input.side_effect = send_effects
+        mock_record.return_value = attempts_used
 
         delivered = InboxService().deliver_pending("term-1", num_messages=0)
 

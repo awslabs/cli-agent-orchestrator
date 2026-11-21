@@ -253,8 +253,10 @@ class InboxService:
         """Deliver pending message(s) to a ready terminal. Use num_messages=0 for all.
 
         Return the positive delivered count, or 0 if empty or permanently failed.
-        Return DELIVERY_DEFERRED when the readiness gate blocks queued messages
-        or a refused send re-queues a message to PENDING with none delivered.
+        Return DELIVERY_DEFERRED when the readiness gate blocks queued messages,
+        or a refused send, or a failure before typing with attempts left
+        (INBOX_MAX_DELIVERY_ATTEMPTS), re-queues a message to PENDING with none
+        delivered. A final failure leaves nothing queued, so it returns 0.
 
         Status comes from the StatusMonitor (the event-driven source of truth).
         Delivery normally happens on IDLE/COMPLETED; providers that accept input
@@ -328,8 +330,11 @@ class InboxService:
         """Return 0 if empty or failed, DELIVERY_DEFERRED if deferred, or the delivered count.
 
         DELIVERY_DEFERRED means messages are queued but the readiness gate is
-        still closed, or a refused send re-queues a message to PENDING with none
-        delivered. A positive count records messages handed to the pane.
+        still closed, or a refused send, or a failure before typing with attempts
+        left, re-queues a message to PENDING with none delivered. A final
+        failure (attempts used up, uncertain, a permanent refusal) leaves
+        nothing queued to retry and returns the delivered count. A positive
+        count records messages handed to the pane.
         """
         reported: Set[int] = set()
 
@@ -562,6 +567,7 @@ class InboxService:
                     )
                 else:
                     # Refused before typing, and no later attempt can succeed.
+                    # Nothing goes back to PENDING, so this never defers.
                     self._fail_batch(
                         terminal_id,
                         batch,
@@ -576,7 +582,7 @@ class InboxService:
                         + (f" ({e.reason.value})" if e.reason else ""),
                     )
             except Exception as e:
-                self._fail_batch(
+                if self._fail_batch(
                     terminal_id,
                     batch,
                     e,
@@ -587,7 +593,8 @@ class InboxService:
                     hand_off=hand_off,
                     report=report,
                     registry=registry,
-                )
+                ):
+                    requeued_pending = True
 
         if delivered_count == 0 and requeued_pending:
             return DELIVERY_DEFERRED
@@ -652,7 +659,7 @@ class InboxService:
         report: OutcomeCallback,
         registry: PluginRegistry | None,
         reason: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         """Retry, or fail for good and report, each message of a batch whose delivery failed.
 
         A queued message that failed before anything was typed goes back to
@@ -673,11 +680,16 @@ class InboxService:
             report: Outcome reporter of this ``deliver_pending`` call.
             registry: Plugin registry for the failure notices.
             reason: Text for the notices; derived from ``error`` when None.
+
+        Returns:
+            True when a message went back to PENDING for another attempt, so
+            the caller can report the delivery as deferred.
         """
         reason = reason or _short_reason(error)
         final_outcome = DeliveryOutcome.FAILED if not_sent else DeliveryOutcome.UNCERTAIN
         final: List[InboxMessage] = []
         reported_ids: Set[int] = set()
+        requeued = False
         for message in batch:
             reported = message.id == report_to_sender and (
                 hand_off is None or hand_off.offer(final_outcome, reason)
@@ -687,6 +699,7 @@ class InboxService:
             attempts = _record_failure(message.id, reason)
             if not_sent and retryable and not reported and attempts < INBOX_MAX_DELIVERY_ATTEMPTS:
                 update_message_status(message.id, MessageStatus.PENDING)
+                requeued = True
                 report(message.id, DeliveryOutcome.RETRYING, reason)
                 logger.warning(
                     f"Message {message.id} to {terminal_id} not delivered "
@@ -706,6 +719,7 @@ class InboxService:
                 reported_ids=reported_ids,
                 registry=registry,
             )
+        return requeued
 
     @staticmethod
     def _report_failed_messages(
