@@ -78,6 +78,16 @@ def test_local_values_win_relay_merges_and_profiles_replace(root):
     assert list(cfg["profiles"]) == ["cao_conductor"]  # replaced whole: the shepherd is dropped
 
 
+def test_qwen_cli_is_an_allowed_provider(root):
+    local(root, github_login="new-user", profiles={"pr_shepherd": {"provider": "qwen_cli", "model": "qwen"}})
+    assert load(root)["profiles"]["pr_shepherd"]["provider"] == "qwen_cli"
+
+
+def test_optional_deployment_keys_are_documented_as_reserved():
+    text = (KIT / "bin" / "workplace.py").read_text()
+    assert "dashboard_port, conductor_session and relay are reserved" in text
+
+
 def test_cao_workplace_config_names_another_local_file(root, tmp_path, monkeypatch):
     other = tmp_path / "elsewhere.json"
     other.write_text('{"github_login": "from-env"}')

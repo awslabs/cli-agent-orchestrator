@@ -18,6 +18,7 @@ LOCK=state/tick_loop.lock
 trap '"$PYTHON" "$SCRIPT_DIR/config.py" --loop-unlock "$$" >/dev/null 2>&1' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+pause() { sleep "$1" & wait $!; }
 
 ts() { date -u +%Y-%m-%dT%H%M%SZ; }
 error_count() {
@@ -53,7 +54,7 @@ while true; do
   "$PYTHON" "$SCRIPT_DIR/poll.py" > "$R1" 2>"reports/tick-$T.stderr"
   ERR=$(error_count "$R1")
   if [ "$ERR" != 0 ]; then
-    sleep "$RETRY_DELAY"
+    pause "$RETRY_DELAY"
     writer_check
     R2="reports/tick-$T-retry.json"
     "$PYTHON" "$SCRIPT_DIR/poll.py" > "$R2" 2>>"reports/tick-$T.stderr"
@@ -77,5 +78,5 @@ while true; do
   fi
   writer_check
   echo "- $(date -u '+%Y-%m-%d %H:%M') UTC tick (loop $LOOP_OWNER): $MODE ($FILTER_REPORT)" | "$PYTHON" "$SCRIPT_DIR/config.py" --append-log || exit 2
-  sleep "$INTERVAL"
+  pause "$INTERVAL"
 done

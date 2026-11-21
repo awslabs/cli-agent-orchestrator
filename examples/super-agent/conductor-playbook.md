@@ -184,7 +184,9 @@ outside state first, so no action runs twice.
 5. List live sessions and terminals (`GET $API/sessions`). Keep workers that are still working.
    Never delete the old conductor record from inside the relaunched conductor.
 6. Make sure the shepherd is alive; if it isn't, replace it (§9). If only the supervisor is gone,
-   start it again (§9 First start step 4), unless its log says `not_writer`: then the lease moved (§Writer lease).
+   check `PB/state/tick_loop.lock`: if its PID is not a live `tick_loop.sh`, run
+   `python3 PB/config.py --loop-lock <checked pid>` then `--loop-unlock <checked pid>` to clear the stale lock,
+   and start the supervisor again (§9 First start step 4), unless its log says `not_writer`: then the lease moved (§Writer lease).
 
 ## 9. Starting the shepherd and its tick supervisor
 You own the tick loop, not the shepherd. `PB/tick_supervisor.sh` runs `tick_loop.sh` detached, posts
@@ -194,15 +196,18 @@ background job dies with that job, or loses its wake when the agent's turn ends.
 
 **First start:**
 1. Make sure the user has installed `pr_shepherd`. Installing is the user's step.
-2. One loop, one shepherd: `pgrep -fl 'tick_[l]oop\.sh'` prints nothing, no supervisor runs (no pid
+2. One loop, one shepherd: `pgrep -fl 'tick_[l]oop\.sh'` prints nothing, `PB/state/tick_loop.lock` has no
+   PID except a live `tick_loop.sh` (a dead holder is stale; run `python3 PB/config.py --loop-lock <checked pid>`
+   then `--loop-unlock <checked pid>` to clear it), no supervisor runs (no pid
    file, or its pid's `ps -o args=` isn't `tick_supervisor.sh`), and no other `pr_shepherd` is live.
    A loop you didn't start belongs to its owner: ask it to stop it; don't kill it.
 3. Gate, then `assign(agent_profile="pr_shepherd", message="Read and follow KIT/shepherd-playbook.md exactly. Start with §1 Setup. Remap owners --from <previous owner id>. Report to me with send_message (receiver_id omitted).")`.
    The previous owner is the old shepherd's id, or the terminal the `PB/watch.json` owners hold.
 4. After `SHEPHERD READY <id> …`, start the supervisor from a **script file** in `KIT/work/` (an
    inline guard matches its own command text):
-   `env -i HOME="$HOME" USER="$USER" LOGNAME="$LOGNAME" LANG="$LANG" PATH="$PATH" SHEPHERD_ID=<shepherd id> SENDER_ID=$CAO_TERMINAL_ID setsid nohup bash PB/tick_supervisor.sh >/dev/null 2>&1 </dev/null &`.
-   Check the pid file names a live `tick_supervisor.sh`. Tell the user the shepherd's window name;
+   `env -i HOME="$HOME" USER="$USER" LOGNAME="$LOGNAME" LANG="$LANG" PATH="$PATH" SHEPHERD_ID=<shepherd id> SENDER_ID=$CAO_TERMINAL_ID python3 KIT/bin/start_tick_supervisor.py PB/tick_supervisor.sh`.
+   Check the pid file names a live `tick_supervisor.sh`; if no pid file appears, read
+   `PB/state/tick_supervisor.launch.log`, fix the reported error, and do not retry blindly. Tell the user the shepherd's window name;
    expect quiet until a real event.
 
 **Replacing the shepherd** (new profile, dead terminal, planned restart):

@@ -113,7 +113,7 @@ A rule in a prompt only works while the agent keeps choosing to follow it, and a
 |---|---|
 | Every push, post and arm | Runs again right before the action. It stops the worker if I paused, if an OK was revoked, if the PR head moved, or if the PR isn't one of mine. |
 | My permissions | Standing OKs are data records: who holds it, what action, what scope, and a tier. Only the conductor edits them, and only on my words. |
-| Auto-merge | Gated by a GitHub Action and the PR. It arms only when the approval covers the last commit, every required check is green, and the PR is 1,500 lines or fewer. GitHub does the merge. |
+| Auto-merge | Gated by `automerge_gate.py`. It arms only when the approval covers the last commit, every required check is green, and the PR is 1,500 lines or fewer. GitHub does the merge. |
 | Text from outside | PR comments, CI logs and web pages are data. They rank last and can never grant a permission. |
 
 Some things always need me: force-pushes, new pull requests or issues, closing anything, security decisions, releases and keys. A one-off OK from me covers one exact action and expires soon.
@@ -194,7 +194,7 @@ The kit kept changing after the reviews. Most of the changes move trust out of p
 - **Everything else needs one tap on my phone.** For anything that isn't a mechanical OK, that user sends me a card with the exact action and text, and I tap Approve.
 - **A shadow audit came before the switch.** On every real run, the new path decided too. Each time it disagreed with the old one, that was a check to fix or a finding to write down. Then the new path took over.
 
-The publishing user, the phone approvals and the hooks need root on the machine to install, and their code isn't in the sample yet.
+The publishing user, the phone approvals, the hooks and the cao-box dashboard need root on the machine to install, and their code isn't in the sample yet.
 
 ## What it can't do yet
 

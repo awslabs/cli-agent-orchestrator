@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 SOURCE=Path(__file__).resolve().parents[1]
 
@@ -25,10 +26,41 @@ print(json.dumps(d))
 def run(tmp_path,env):
     return subprocess.run(['bash',str(tmp_path/'tick_loop.sh')],env=env,capture_output=True,text=True,timeout=10)
 
-def test_lock_refuses_and_keeps_existing_lock(tmp_path):
-    env=setup(tmp_path,[]);(tmp_path/'state/tick_loop.lock').mkdir(parents=True)
-    p=run(tmp_path,env);assert p.returncode==3;assert 'another_loop_running' in p.stdout
-    assert (tmp_path/'state/tick_loop.lock').exists();assert not (tmp_path/'count').exists()
+def test_lock_refuses_and_keeps_a_live_loop_holder(tmp_path):
+    env=setup(tmp_path,[]); lock=tmp_path/'state/tick_loop.lock'; lock.mkdir(parents=True)
+    holder_script=tmp_path/'live_tick_loop.sh'; holder_script.write_text('#!/bin/bash\nsleep 30\n')
+    holder=subprocess.Popen(['bash',str(holder_script)])
+    try:
+        (lock/'pid').write_text(f'{holder.pid}\n')
+        p=run(tmp_path,env);assert p.returncode==3;assert 'another_loop_running' in p.stdout
+        assert lock.exists();assert not (tmp_path/'count').exists()
+    finally:
+        holder.terminate()
+        holder.wait(timeout=3)
+
+def test_a_dead_lock_holder_is_removed_before_the_loop_starts(tmp_path):
+    env=setup(tmp_path,[]); lock=tmp_path/'state/tick_loop.lock'; lock.mkdir(parents=True)
+    (lock/'pid').write_text('99999999\n')
+    p=subprocess.run([sys.executable,str(tmp_path/'config.py'),'--loop-lock','42'],env=env,capture_output=True,text=True)
+    assert p.returncode == 0 and 'removed stale tick loop lock' in p.stdout
+    assert (lock/'pid').read_text() == '42\n'
+    p=subprocess.run([sys.executable,str(tmp_path/'config.py'),'--loop-unlock','42'],env=env,capture_output=True,text=True)
+    assert p.returncode == 0 and not lock.exists()
+
+def test_term_during_the_interval_sleep_exits_without_waiting_for_the_interval(tmp_path):
+    env=setup(tmp_path,[{'polled_at':'2026-11-09T00:00Z','errors':[]}]); env['INTERVAL']='30'
+    p=subprocess.Popen(['bash',str(tmp_path/'tick_loop.sh')],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+    try:
+        lock=tmp_path/'state/tick_loop.lock'
+        end=time.monotonic()+5
+        while not lock.exists() and time.monotonic() < end: time.sleep(.02)
+        assert lock.exists()
+        time.sleep(.2)
+        p.terminate()
+        p.wait(timeout=3)
+    finally:
+        if p.poll() is None: p.kill()
+    assert p.returncode == 143 and not lock.exists()
 
 def test_digest_then_wake_owner_and_unlock(tmp_path):
     env=setup(tmp_path,[{'polled_at':'2026-11-09T00:00Z','errors':[],'new_issues':[{'number':1}]},{'polled_at':'2026-11-09T01:00Z','errors':[],'unwatched_open_prs':[{'number':2,'author':'your-login'}]}])

@@ -22,6 +22,8 @@ raises WorkplaceConfigError, whose .reason is one word such as workplace_login_u
 an allow-list, so a secret can't be stored here by mistake. One exception: a bad value in the
 optional relay.* block turns the relay off (relay.disabled_reason, a WARNING on stderr) instead of
 invalidating everything, so it never stops the PR loop, the gates or the dashboard. Stdlib only; safe under python3 -I.
+
+dashboard_port, conductor_session and relay are reserved for optional local deployment tooling.
 """
 import argparse
 import json
@@ -42,7 +44,7 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$")
 MODE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 PROVIDERS = frozenset({"kiro_cli", "claude_code", "codex", "kimi_cli", "copilot_cli", "opencode_cli",
-                       "hermes", "cursor_cli", "antigravity_cli", "omp", "grok_cli", "mcode"})
+                       "hermes", "cursor_cli", "antigravity_cli", "omp", "grok_cli", "mcode", "qwen_cli"})
 TOP_KEYS = frozenset({"schema", "about", "github_login", "repos", "cao_api", "dashboard_port",
                       "cao_source_checkout", "profiles", "conductor_session", "relay"})
 RELAY_KEYS = frozenset({"enabled", "checkout", "secrets_file", "state_dir", "herdr_session",

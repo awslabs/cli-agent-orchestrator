@@ -107,8 +107,23 @@ def loop_mutation(command, pid=None):
             try:
                 lock.mkdir()
             except FileExistsError:
-                print('WAKE none :: another_loop_running')
-                return 3
+                try:
+                    holder = int((lock / 'pid').read_text().strip())
+                    os.kill(holder, 0)
+                    import subprocess
+                    args = subprocess.run(
+                        ['ps', '-o', 'args=', '-p', str(holder)],
+                        capture_output=True, text=True, check=False).stdout
+                    live_loop = 'tick_loop.sh' in args
+                except (OSError, ValueError):
+                    live_loop = False
+                if live_loop:
+                    print('WAKE none :: another_loop_running')
+                    return 3
+                (lock / 'pid').unlink(missing_ok=True)
+                lock.rmdir()
+                print('removed stale tick loop lock')
+                lock.mkdir()
             (lock / 'pid').write_text(pid + '\n')
         elif lock.exists() and (lock / 'pid').read_text().strip() == pid:
             (lock / 'pid').unlink()

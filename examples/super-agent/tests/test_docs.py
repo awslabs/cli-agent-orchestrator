@@ -60,6 +60,18 @@ def test_shepherd_setup_order():
     assert "bash PB/tick_loop.sh" not in wake and "Don't start or restart the loop" in wake
 
 
+def test_supervisor_start_uses_the_portable_launcher_and_checks_stale_locks():
+    start = section(text("conductor-playbook.md"), "## 9. Starting the shepherd")
+    assert "start_tick_supervisor.py" in start and "setsid" not in start
+    assert "tick_loop.lock" in start and "no pid file appears" in start
+
+
+def test_blog_names_the_real_automerge_gate_and_the_missing_dashboard():
+    blog = (KIT.parents[1] / "docusaurus/blog/2026-11-09-dark-factory-with-cao/index.md").read_text()
+    assert "Gated by `automerge_gate.py`." in blog
+    assert "cao-box dashboard" in blog and "isn't in the sample yet" in blog
+
+
 # no trust-on-first-use; the checker and the user own baselines
 def test_no_first_use_baseline():
     for rel in ("conductor-playbook.md", "agents/cao_conductor.md.tmpl"):

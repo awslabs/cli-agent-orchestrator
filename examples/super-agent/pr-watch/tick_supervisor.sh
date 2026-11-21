@@ -1,6 +1,6 @@
 #!/bin/bash
 # Keeps exactly one pr-watch/tick_loop.sh running, detached from any agent's shell, and turns each
-# WAKE it prints into a CAO inbox message for the shepherd. Started by the conductor (setsid nohup).
+# WAKE it prints into a CAO inbox message for the shepherd. Started by the conductor's Python launcher.
 # Why: a loop run as an agent's background job dies with that job, or loses its wake when the turn ends.
 #   SHEPHERD_ID  the shepherd's CAO terminal id (the wake goes there; it is also LOOP_OWNER in the log)
 #   SENDER_ID    the conductor's CAO terminal id (the inbox sender)
@@ -30,9 +30,12 @@ CYCLES="${SUPERVISOR_CYCLES:-0}"  # tests only: stop after this many cycles (0 =
 
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG"; }
 
-if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null \
-   && ps -o args= -p "$(cat "$PIDF")" | grep -q 'tick_supervisor\.sh'; then
-  echo "STOP: a supervisor already runs (pid $(cat "$PIDF"))"; exit 1
+if [ -f "$PIDF" ]; then
+  EXISTING=$(cat "$PIDF")
+  if [ "$EXISTING" != "$$" ] && kill -0 "$EXISTING" 2>/dev/null \
+     && ps -o args= -p "$EXISTING" | grep -q 'tick_supervisor\.sh'; then
+    echo "STOP: a supervisor already runs (pid $EXISTING)"; exit 1
+  fi
 fi
 echo $$ > "$PIDF"
 STOP_REQ=0
@@ -168,6 +171,12 @@ while true; do
     log "$NOTE"; printf '%s\n' "$NOTE" > "$STOPPED"; echo "$NOTE"
     rm -f -- "$PIDF"; exit 3;;
   esac
+  if [ "$RC" -ne 0 ] && case "$LINE" in "WAKE none :: "*) true;; *) false;; esac; then
+    if pend check 2>/dev/null && [ -f "$PENDING" ]; then WHERE="the error wake waits in $PENDING"; else WHERE="the shepherd was told"; fi
+    NOTE="LOOP_ERROR $(date -u +%Y-%m-%dT%H:%M:%SZ): ${LINE#WAKE none :: }; supervisor stopped; $WHERE"
+    log "$NOTE"; printf '%s\n' "$NOTE" > "$STOPPED"; echo "$NOTE"
+    rm -f -- "$PIDF"; exit 2
+  fi
   stop_if_asked
   if [ "$RC" -ne 0 ] && [ -z "$LINE" ]; then pause "${SUPERVISOR_ERROR_SLEEP:-60}"; else pause "${SUPERVISOR_SLEEP:-5}"; fi
   stop_if_asked

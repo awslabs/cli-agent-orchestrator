@@ -16,13 +16,13 @@ WAKE = "WAKE reports/tick-x.json :: pr#9:new own PR"
 NOT_WRITER = "WAKE none :: not_writer"
 
 
-def stub_loop(line):
+def stub_loop(line, rc=0):
     """A stand-in tick_loop.sh: counts its runs; the first run prints `line`, later runs are quiet."""
     return f"""#!/bin/bash
 S="$(dirname -- "$0")/state"
 echo run >> "$S/stub_runs"
 if [ "$(wc -l < "$S/stub_runs")" -eq 1 ]; then echo '{line}'; fi
-exit 0
+exit {rc}
 """
 
 
@@ -59,11 +59,11 @@ def inbox():
     server.server_close()
 
 
-def tree(tmp_path, line=WAKE):
+def tree(tmp_path, line=WAKE, rc=0):
     pb = tmp_path / "wp" / "pr-watch"
     (pb / "state").mkdir(parents=True)
     shutil.copyfile(SOURCE / "tick_supervisor.sh", pb / "tick_supervisor.sh")
-    (pb / "tick_loop.sh").write_text(stub_loop(line))
+    (pb / "tick_loop.sh").write_text(stub_loop(line, rc))
     return pb
 
 
@@ -154,6 +154,17 @@ def test_a_first_try_success_posts_once_and_keeps_nothing(tmp_path, inbox):
     assert r.returncode == 0, r.stdout + r.stderr
     assert handler.attempts == 1 and len(handler.received) == 1
     assert not (pb / "state" / "tick_supervisor.pending").exists()
+
+
+def test_a_start_error_wake_posts_once_then_stops_the_supervisor(tmp_path, inbox):
+    handler, api = inbox
+    pb = tree(tmp_path, "WAKE none :: configuration_error", rc=2)
+    r = supervise(pb, api, cycles=4, tries=1)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert runs(pb) == 1 and len(messages(handler)) == 1
+    stopped = (pb / "state" / "tick_supervisor.stopped").read_text()
+    assert "LOOP_ERROR " in stopped and "configuration_error" in stopped
+    assert not (pb / "state" / "tick_supervisor.pid").exists()
 
 
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGKILL])
