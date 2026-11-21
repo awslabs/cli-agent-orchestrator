@@ -1,5 +1,6 @@
 """Regression contract for the synthetic memory-evaluation harness."""
 
+import asyncio
 import json
 import os
 import subprocess
@@ -10,6 +11,7 @@ from pathlib import Path
 from test.memory_eval.harness import (
     ARMS,
     FIXTURE_DIR,
+    _evaluate_arm,
     assert_temporary_home,
     evaluate,
 )
@@ -154,6 +156,21 @@ def test_results_are_stable_across_python_hash_seeds(tmp_path):
         outputs.append(completed.stdout)
 
     assert len(set(outputs)) == 1
+
+
+def test_bm25_current_first_is_independent_of_wiki_listing_order(tmp_path, monkeypatch):
+    original_rglob = Path.rglob
+
+    def current_first(reverse: bool) -> float:
+        def ordered_rglob(path, pattern):
+            return iter(sorted(original_rglob(path, pattern), key=str, reverse=reverse))
+
+        with monkeypatch.context() as context:
+            context.setattr(Path, "rglob", ordered_rglob)
+            metrics = asyncio.run(_evaluate_arm(tmp_path / f"ordered-{reverse}", ARMS["bm25"]))
+        return metrics["current_first"]
+
+    assert current_first(reverse=False) == current_first(reverse=True) == 0.0
 
 
 def test_cli_leaves_process_home_untouched(tmp_path):

@@ -16,8 +16,10 @@ import re
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
 
 from sqlalchemy import create_engine
 
@@ -178,8 +180,32 @@ def _rank(keys: list[str], gold: set[str]) -> int | None:
     return None
 
 
+@contextmanager
+def _ordered_wiki_listing(*, reverse: bool):
+    """Temporarily make the production wiki listing order explicit."""
+    original_rglob = Path.rglob
+
+    def ordered_rglob(path: Path, pattern: str):
+        return iter(sorted(original_rglob(path, pattern), key=str, reverse=reverse))
+
+    with patch.object(Path, "rglob", ordered_rglob):
+        yield
+
+
+def _uses_bm25_current_first(arm: dict[str, Any]) -> bool:
+    recall = arm["recall"]
+    settings = arm["settings"]
+    return recall.get("search_mode") == "bm25" or (
+        settings.get("memory", {}).get("ranking", {}).get("default_sort") == "bm25"
+    )
+
+
 async def _arm_metrics(
-    service: MemoryService, home: Path, recall: dict[str, Any]
+    service: MemoryService,
+    home: Path,
+    recall: dict[str, Any],
+    *,
+    strict_current_first: bool = False,
 ) -> dict[str, Any]:
     context = _context(home)
     questions = _read_json("questions.json")
@@ -218,21 +244,35 @@ async def _arm_metrics(
         coverage.append(len(found & needed) / len(needed))
         full.append(needed <= found)
 
-    current_first: list[bool] = []
-    for check in current_checks:
-        results = await service.recall(
-            query=check["query"],
-            terminal_context=context,
-            scan_all=True,
-            record_access=False,
-            **recall,
-        )
-        keys = [memory.key for memory in results if not memory.is_related]
-        current_rank = _rank(keys, {check["current"]})
-        stale_rank = _rank(keys, {check["stale"]})
-        current_first.append(
-            current_rank is not None and (stale_rank is None or current_rank < stale_rank)
-        )
+    async def current_first_for_listing() -> list[bool]:
+        first: list[bool] = []
+        for check in current_checks:
+            results = await service.recall(
+                query=check["query"],
+                terminal_context=context,
+                scan_all=True,
+                record_access=False,
+                **recall,
+            )
+            keys = [memory.key for memory in results if not memory.is_related]
+            current_rank = _rank(keys, {check["current"]})
+            stale_rank = _rank(keys, {check["stale"]})
+            first.append(
+                current_rank is not None and (stale_rank is None or current_rank < stale_rank)
+            )
+        return first
+
+    if strict_current_first:
+        with _ordered_wiki_listing(reverse=False):
+            ascending_current_first = await current_first_for_listing()
+        with _ordered_wiki_listing(reverse=True):
+            descending_current_first = await current_first_for_listing()
+        current_first = [
+            ascending and descending
+            for ascending, descending in zip(ascending_current_first, descending_current_first)
+        ]
+    else:
+        current_first = await current_first_for_listing()
 
     def precision_at(wording: str, limit: int) -> float:
         return sum(rank is not None and rank <= limit for rank in ranks[wording]) / len(
@@ -277,7 +317,12 @@ def _invisible_notes(service: MemoryService, home: Path) -> int:
 
 async def _evaluate_arm(home: Path, arm: dict[str, Any]) -> dict[str, Any]:
     service = await build_memory_home(home, dict(arm["settings"]))
-    metrics = await _arm_metrics(service, home, dict(arm["recall"]))
+    metrics = await _arm_metrics(
+        service,
+        home,
+        dict(arm["recall"]),
+        strict_current_first=_uses_bm25_current_first(arm),
+    )
     metrics["invisible_notes"] = _invisible_notes(service, home)
     return metrics
 
