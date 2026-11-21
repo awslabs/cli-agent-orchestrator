@@ -47,6 +47,21 @@ def test_a_dead_lock_holder_is_removed_before_the_loop_starts(tmp_path):
     p=subprocess.run([sys.executable,str(tmp_path/'config.py'),'--loop-unlock','42'],env=env,capture_output=True,text=True)
     assert p.returncode == 0 and not lock.exists()
 
+def test_loop_lock_does_not_remove_a_lock_before_its_pid_is_written(tmp_path):
+    env=setup(tmp_path,[]); lock=tmp_path/'state/tick_loop.lock'; lock.mkdir(parents=True)
+    p=subprocess.run([sys.executable,str(tmp_path/'config.py'),'--loop-lock','42'],env=env,capture_output=True,text=True)
+    assert p.returncode == 3
+    assert p.stdout.strip().startswith('WAKE none :: ')
+    assert lock.exists() and not (lock/'pid').exists()
+
+def test_loop_lock_replaces_a_stale_lock_that_has_an_extra_file(tmp_path):
+    env=setup(tmp_path,[]); lock=tmp_path/'state/tick_loop.lock'; lock.mkdir(parents=True)
+    (lock/'pid').write_text('99999999\n'); (lock/'unexpected').write_text('race\n')
+    p=subprocess.run([sys.executable,str(tmp_path/'config.py'),'--loop-lock','42'],env=env,capture_output=True,text=True)
+    assert p.returncode == 0, p.stderr
+    assert p.stdout.splitlines() == ['removed stale tick loop lock']
+    assert (lock/'pid').read_text() == '42\n'
+
 def test_term_during_the_interval_sleep_exits_without_waiting_for_the_interval(tmp_path):
     env=setup(tmp_path,[{'polled_at':'2026-11-09T00:00Z','errors':[]}]); env['INTERVAL']='30'
     p=subprocess.Popen(['bash',str(tmp_path/'tick_loop.sh')],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)

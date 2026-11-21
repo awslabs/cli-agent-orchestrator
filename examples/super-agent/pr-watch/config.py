@@ -1,6 +1,9 @@
 """Local watcher paths, optionally overridden by PR_WATCH_CONFIG JSON."""
 import json
 import os
+import shutil
+import tempfile
+import uuid
 from pathlib import Path
 
 
@@ -104,27 +107,53 @@ def loop_mutation(command, pid=None):
                     fh.flush()
                     os.fsync(fh.fileno())
         elif command == '--loop-lock':
-            try:
-                lock.mkdir()
-            except FileExistsError:
+            def wake(reason):
+                print(f'WAKE none :: {reason}')
+                return 3
+
+            def take_lock():
+                temporary = Path(tempfile.mkdtemp(prefix=f'.{lock.name}.', dir=lock.parent))
                 try:
-                    holder = int((lock / 'pid').read_text().strip())
-                    os.kill(holder, 0)
-                    import subprocess
-                    args = subprocess.run(
-                        ['ps', '-o', 'args=', '-p', str(holder)],
-                        capture_output=True, text=True, check=False).stdout
-                    live_loop = 'tick_loop.sh' in args
-                except (OSError, ValueError):
-                    live_loop = False
-                if live_loop:
-                    print('WAKE none :: another_loop_running')
-                    return 3
-                (lock / 'pid').unlink(missing_ok=True)
-                lock.rmdir()
-                print('removed stale tick loop lock')
-                lock.mkdir()
-            (lock / 'pid').write_text(pid + '\n')
+                    (temporary / 'pid').write_text(pid + '\n')
+                    os.rename(temporary, lock)
+                    return True
+                except OSError:
+                    return False
+                finally:
+                    if temporary.exists():
+                        shutil.rmtree(temporary)
+
+            if not lock.exists() and take_lock():
+                return 0
+            try:
+                holder = int((lock / 'pid').read_text().strip())
+                os.kill(holder, 0)
+                import subprocess
+                args = subprocess.run(
+                    ['ps', '-o', 'args=', '-p', str(holder)],
+                    capture_output=True, text=True, check=False).stdout
+                live_loop = 'tick_loop.sh' in args
+            except (OSError, ValueError):
+                if not (lock / 'pid').exists():
+                    return wake('loop_lock_unavailable')
+                live_loop = False
+            if live_loop:
+                return wake('another_loop_running')
+            stale = lock.with_name(f'{lock.name}.stale-{os.getpid()}-{uuid.uuid4().hex}')
+            try:
+                os.rename(lock, stale)
+            except OSError:
+                return wake('loop_lock_unavailable')
+            try:
+                acquired = take_lock()
+            finally:
+                try:
+                    shutil.rmtree(stale)
+                except OSError:
+                    acquired = False
+            if not acquired:
+                return wake('loop_lock_unavailable')
+            print('removed stale tick loop lock')
         elif lock.exists() and (lock / 'pid').read_text().strip() == pid:
             (lock / 'pid').unlink()
             lock.rmdir()
