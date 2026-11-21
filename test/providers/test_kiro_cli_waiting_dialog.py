@@ -138,3 +138,24 @@ class TestMonitorWithTheCapturedBuffer:
             assert sm._last_status["dialog0"] in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
             sm._process_chunk("dialog0", transcript("Kiro is working") + SHELL_LINE + DIALOG)
             assert sm._last_status["dialog0"] == TerminalStatus.WAITING_USER_ANSWER
+
+    @pytest.mark.parametrize("footer", [STEER, QUEUE], ids=["steer", "queue"])
+    def test_dialog_answered_in_the_pane_is_processing(self, mock_backend, footer):
+        """No CAO input arms the latch; kiro_cli's opt-in lets the release through."""
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+        p = provider()
+        p.supports_screen_detection = False
+        sm = StatusMonitor()
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as pm,
+            patch("cli_agent_orchestrator.services.status_monitor.bus", MagicMock()),
+            patch("cli_agent_orchestrator.services.status_monitor.get_server_settings") as settings,
+        ):
+            settings.return_value = {"state_buffer_max": 32768}
+            pm.get_provider.return_value = p
+            sm._process_chunk("dialog0", IDLE_PROMPT)
+            sm._process_chunk("dialog0", transcript("Kiro is working") + SHELL_LINE + DIALOG)
+            assert sm._last_status["dialog0"] == TerminalStatus.WAITING_USER_ANSWER
+            sm._process_chunk("dialog0", "\n" + footer_line(footer))
+            assert sm._last_status["dialog0"] == TerminalStatus.PROCESSING

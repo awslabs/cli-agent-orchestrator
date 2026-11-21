@@ -521,6 +521,11 @@ class KiroCliProvider(BaseProvider):
         _idle_prompt_pattern: Regex pattern for detecting IDLE state
     """
 
+    # get_status() reads an open permission dialog as WAITING_USER_ANSWER from
+    # the bottom lines of the buffer (v2: Checks 2 and 3; v3: kiro_v3_dialog),
+    # so an unarmed PROCESSING after a waiting prompt means it was answered.
+    waiting_release_on_processing = True
+
     @classmethod
     def honors_model(
         cls,

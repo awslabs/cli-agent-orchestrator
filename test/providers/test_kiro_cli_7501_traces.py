@@ -13,7 +13,7 @@ report, so the blocked report can leave the 32 KB buffer while the dialog is sti
 
 from pathlib import Path
 from typing import Optional
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -240,3 +240,40 @@ class TestQueueModeAfterApproval:
         assert provider().get_status(buffer("queue", "q")) == TerminalStatus.PROCESSING
         p = provider(mock_backend, pane_command="kiro-cli")
         assert p.get_status(buffer("queue", "q")) == TerminalStatus.PROCESSING
+
+
+@patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+class TestMonitorAfterApproval:
+    """The status monitor with a real kiro_cli detector (waiting_release_on_processing=True)."""
+
+    def _monitor(self, mock_backend, chunks, state_buffer_max=32768):
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+        p = provider(mock_backend, pane_command="kiro-cli")
+        p.supports_screen_detection = False
+        sm = StatusMonitor()
+        seen = []
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as pm,
+            patch("cli_agent_orchestrator.services.status_monitor.bus", MagicMock()),
+            patch("cli_agent_orchestrator.services.status_monitor.get_server_settings") as settings,
+        ):
+            settings.return_value = {"state_buffer_max": state_buffer_max}
+            pm.get_provider.return_value = p
+            for chunk in chunks:
+                sm._process_chunk("trace7501", chunk)
+                seen.append(sm._last_status["trace7501"])
+        return seen
+
+    def test_approval_in_the_pane_releases_waiting(self, mock_backend):
+        """Blocked report and dialog, then the queue-mode working screen, with no CAO input between."""
+        seen = self._monitor(mock_backend, [buffer("approve", "a"), buffer("queue", "q")])
+        assert seen == [TerminalStatus.WAITING_USER_ANSWER, TerminalStatus.PROCESSING]
+
+    def test_redraw_of_the_open_dialog_keeps_waiting(self, mock_backend):
+        """The dialog is redrawn and its blocked report evicted: still waiting, no false release."""
+        redraw = buffer("esc", "r")
+        seen = self._monitor(
+            mock_backend, [buffer("esc", "a"), redraw], state_buffer_max=len(redraw) + 1
+        )
+        assert seen == [TerminalStatus.WAITING_USER_ANSWER, TerminalStatus.WAITING_USER_ANSWER]

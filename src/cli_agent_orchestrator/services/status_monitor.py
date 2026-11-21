@@ -543,7 +543,23 @@ class StatusMonitor:
             # Only explicit current-generation provider evidence may revoke the
             # ready latch; generic spinners/redraws retain the existing rules.
             armed = armed or self._has_pending_native_swarm(terminal_id)
-        if not armed:
+        # A permission prompt is often answered in the pane itself (an attached
+        # user, or another tool driving the terminal) rather than through
+        # send_input/send_special_key, so nothing arms the revert. The agent
+        # then resumes and the provider detects PROCESSING, but the latch would
+        # hold WAITING_USER_ANSWER for the rest of the turn. A provider that
+        # opts in (waiting_release_on_processing) lets that one transition
+        # through unarmed: its detector keeps reading an open dialog as waiting
+        # after eviction, so its PROCESSING means the prompt was answered.
+        # Others keep the hold, because an evicted dialog can read PROCESSING
+        # there. UNKNOWN stays suppressed above, and IDLE/COMPLETED still need
+        # a real cycle.
+        resumed_after_prompt = (
+            last == TerminalStatus.WAITING_USER_ANSWER
+            and detected == TerminalStatus.PROCESSING
+            and self._releases_waiting_on_processing(terminal_id)
+        )
+        if not armed and not resumed_after_prompt:
             if last in _STICKY_READY_STATUSES and detected in (
                 TerminalStatus.PROCESSING,
                 TerminalStatus.UNKNOWN,
@@ -598,6 +614,15 @@ class StatusMonitor:
     def _has_pending_native_swarm(terminal_id: str) -> bool:
         provider = provider_manager.get_provider(terminal_id)
         return getattr(provider, "has_pending_native_swarm", False) is True
+
+    @staticmethod
+    def _releases_waiting_on_processing(terminal_id: str) -> bool:
+        """True when the terminal's provider opts into the unarmed waiting release."""
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception:
+            return False
+        return getattr(provider, "waiting_release_on_processing", False) is True
 
     # ----- pyte rendered-screen detection (edge-debounced) -------------------
 

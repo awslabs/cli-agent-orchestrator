@@ -1324,9 +1324,10 @@ class _SequencedMonitor:
     assert latched status + published transitions.
     """
 
-    def __init__(self):
+    def __init__(self, waiting_release_on_processing=None):
         self.sm = StatusMonitor()
         self.published = []
+        self.waiting_release_on_processing = waiting_release_on_processing
 
     def feed(self, status):
         provider = MagicMock()
@@ -1336,6 +1337,8 @@ class _SequencedMonitor:
         # CAO_PYTE_STATUS default (a bare MagicMock would be truthy and route
         # through the pyte screen path).
         provider.supports_screen_detection = False
+        if self.waiting_release_on_processing is not None:
+            provider.waiting_release_on_processing = self.waiting_release_on_processing
         bus = MagicMock()
         bus.publish.side_effect = lambda topic, data: self.published.append(data["status"])
         with (
@@ -1425,6 +1428,61 @@ class TestStickyLatching:
         m.feed(TerminalStatus.IDLE)  # prompt cleared, redraw flap
         m.feed(TerminalStatus.PROCESSING)  # agent resumes the task
         assert m.status() == TerminalStatus.PROCESSING
+
+    def test_opted_in_provider_releases_waiting_when_answered_in_the_pane(self):
+        """The prompt was answered outside CAO (no notify_input_sent), and the agent resumed."""
+        m = _SequencedMonitor(waiting_release_on_processing=True)
+        m.feed(TerminalStatus.WAITING_USER_ANSWER)
+        m.feed(TerminalStatus.PROCESSING)
+        assert m.status() == TerminalStatus.PROCESSING
+        assert m.published == ["waiting_user_answer", "processing"]
+        m.feed(TerminalStatus.COMPLETED)
+        m.feed(TerminalStatus.PROCESSING)  # post-completion flap still blocked
+        assert m.status() == TerminalStatus.COMPLETED
+
+    @pytest.mark.parametrize("opt_in", [None, False], ids=["unset", "false"])
+    def test_provider_without_the_opt_in_keeps_waiting(self, opt_in):
+        """Default: an unarmed PROCESSING may be an evicted dialog misread, so WAITING holds."""
+        m = _SequencedMonitor(waiting_release_on_processing=opt_in)
+        m.feed(TerminalStatus.WAITING_USER_ANSWER)
+        m.feed(TerminalStatus.PROCESSING)
+        assert m.status() == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_opted_in_release_ignores_unknown_and_is_one_shot(self):
+        """UNKNOWN never overwrites WAITING; after an IDLE, an unarmed PROCESSING is blocked again."""
+        m = _SequencedMonitor(waiting_release_on_processing=True)
+        m.feed(TerminalStatus.WAITING_USER_ANSWER)
+        m.feed(TerminalStatus.UNKNOWN)
+        assert m.status() == TerminalStatus.WAITING_USER_ANSWER
+        m.feed(TerminalStatus.IDLE)
+        m.feed(TerminalStatus.PROCESSING)
+        assert m.status() == TerminalStatus.IDLE
+
+    @pytest.mark.parametrize(
+        "ready", [TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.ERROR]
+    )
+    def test_opt_in_does_not_release_other_ready_statuses(self, ready):
+        m = _SequencedMonitor(waiting_release_on_processing=True)
+        m.feed(ready)
+        m.feed(TerminalStatus.PROCESSING)
+        assert m.status() == ready
+
+    def test_provider_lookup_failure_keeps_waiting(self):
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.WAITING_USER_ANSWER
+        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm:
+            mock_pm.get_provider.side_effect = ValueError("terminal not found")
+            assert sm._apply_detection_locked("t1", TerminalStatus.PROCESSING) is False
+        assert sm._last_status["t1"] == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_only_kiro_cli_opts_in(self):
+        from cli_agent_orchestrator.providers.base import BaseProvider
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+        from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+
+        assert BaseProvider.waiting_release_on_processing is False
+        assert CopilotCliProvider.waiting_release_on_processing is False
+        assert KiroCliProvider.waiting_release_on_processing is True
 
     def test_arm_consumed_by_init_style_upgrade(self):
         """non-ready → ready latch consumes the arm (CLI launch reaching its
