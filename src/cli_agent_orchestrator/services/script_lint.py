@@ -55,8 +55,10 @@ Rule catalogue — eight rules:
   the difference statically.
 - ``invalid-step-id`` (ERROR) — a CAO ``step()`` or ``run_step()`` call whose
   explicit ``step_id=`` is a string literal that does not match the shared
-  ``WORKFLOW_NAME_RE`` accepted by the server. Computed ids are left to the
-  existing runtime validation because static analysis cannot resolve them.
+  ``WORKFLOW_NAME_RE`` accepted by the server, or an f-string whose literal
+  text alone already breaks it (``f"review:{name}"``: no value of ``name`` can
+  remove the colon, #1396). Other computed ids are left to the existing runtime
+  validation because static analysis cannot resolve them.
 
 ``status == "fail"`` iff at least one ERROR finding (U1-BR-1); ERRORs are
 mirrored into the legacy ``errors`` list as ``"line N: [rule_id] message"``
@@ -483,22 +485,42 @@ def _check_literal_step_id(node: ast.Call, findings: List[LintFinding]) -> None:
         if keyword.arg != "step_id":
             continue
         value = keyword.value
-        if (
-            isinstance(value, ast.Constant)
-            and isinstance(value.value, str)
-            and not _NAME_RE.fullmatch(value.value)
-        ):
-            findings.append(
-                LintFinding(
-                    rule_id="invalid-step-id",
-                    severity="error",
-                    line=node.lineno,
-                    message=(
-                        "step_id literal is invalid "
-                        "(must be a 1-64 char [A-Za-z0-9_-] identifier)"
-                    ),
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            if not _NAME_RE.fullmatch(value.value):
+                findings.append(
+                    LintFinding(
+                        rule_id="invalid-step-id",
+                        severity="error",
+                        line=node.lineno,
+                        message=(
+                            "step_id literal is invalid "
+                            "(must be a 1-64 char [A-Za-z0-9_-] identifier)"
+                        ),
+                    )
                 )
+        elif isinstance(value, ast.JoinedStr):
+            # Only the f-string's own text is known statically. Any non-empty
+            # run of a valid id is itself a valid id under WORKFLOW_NAME_RE (one
+            # character class, 1-64), so if the literal parts joined together
+            # fail it, every value the f-string can format to fails it too.
+            # Format specs live inside FormattedValue nodes and are not counted.
+            literal = "".join(
+                part.value
+                for part in value.values
+                if isinstance(part, ast.Constant) and isinstance(part.value, str)
             )
+            if literal and not _NAME_RE.fullmatch(literal):
+                findings.append(
+                    LintFinding(
+                        rule_id="invalid-step-id",
+                        severity="error",
+                        line=node.lineno,
+                        message=(
+                            "step_id f-string text is invalid for every value it can "
+                            "format to (must be a 1-64 char [A-Za-z0-9_-] identifier)"
+                        ),
+                    )
+                )
         return
 
 

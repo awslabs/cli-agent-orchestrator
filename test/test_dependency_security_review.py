@@ -316,3 +316,156 @@ def test_template_example_without_a_scope_is_rejected(tmp_path):
     path.write_text(example + "\n")
     with pytest.raises(audit.IgnoreFileError, match="paths' or 'purl'"):
         audit.load_ignore_file(path, date(2026, 11, 18))
+
+
+# ── #1400 round 3: the decision-model-host CDK app is shipped (owner ruling) ──
+
+CDK_LOCK = "examples/decision-model-host/aws/cdk/package-lock.json"
+
+
+@pytest.fixture
+def cdk_repository(tmp_path, monkeypatch):
+    import subprocess as sp
+
+    root = tmp_path / "cdk-repository"
+    lock = root / CDK_LOCK
+    lock.parent.mkdir(parents=True)
+    lock.write_text(
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"name": "cdk", "dependencies": {"aws-cdk-lib": "^2"}},
+                    "node_modules/aws-cdk-lib": {"version": "2.200.0"},
+                    "node_modules/typescript": {"version": "5.9.0", "dev": True},
+                    "node_modules/aws-cdk": {"version": "2.1000.0", "dev": True},
+                },
+            }
+        )
+    )
+    sp.run(["git", "init", "--quiet", str(root)], check=True)
+    sp.run(["git", "add", "."], cwd=root, check=True)
+    monkeypatch.setattr(audit, "__file__", str(root / "scripts" / "dependency_security.py"))
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    return root
+
+
+def _cdk_report(package, version):
+    return {
+        "SchemaVersion": 2,
+        "Results": [
+            {
+                "Target": CDK_LOCK,
+                "Type": "npm",
+                "Packages": [pkg("aws-cdk-lib", "2.200.0"), pkg("typescript", "5.9.0")],
+                "Vulnerabilities": [vuln(package, version, severity="CRITICAL")],
+            }
+        ],
+    }
+
+
+def _run_cdk(tmp_path, monkeypatch, report):
+    from test.test_dependency_security_shipped import fake_trivy
+
+    fake_trivy(monkeypatch, report)
+    out = tmp_path / "out"
+    code = audit.main(
+        ["--output-dir", str(out), "--today", TODAY, "--ignore-file", str(tmp_path / "none.yaml")]
+    )
+    return code, json.loads((out / "report.json").read_text())
+
+
+def test_cdk_runtime_dependency_finding_blocks(cdk_repository, tmp_path, monkeypatch):
+    code, report = _run_cdk(tmp_path, monkeypatch, _cdk_report("aws-cdk-lib", "2.200.0"))
+    assert code == audit.EXIT_BLOCKED == 1, report.get("error")
+    assert report["findings"][0]["classification"] == "shipped"
+
+
+@pytest.mark.parametrize(("package", "version"), [("typescript", "5.9.0"), ("aws-cdk", "2.1000.0")])
+def test_cdk_dev_dependency_finding_is_toolchain(
+    cdk_repository, tmp_path, monkeypatch, package, version
+):
+    """The control: the same CRITICAL on a devDependency of the same lockfile does not block."""
+    code, report = _run_cdk(tmp_path, monkeypatch, _cdk_report(package, version))
+    assert code == 0, report.get("error")
+    assert report["findings"][0]["classification"] == "toolchain"
+
+
+def _add_alias(root, *, dev=False):
+    """An npm alias: ``helper`` is the folder name, ``@scope/real-helper`` the real package."""
+    lock = root / CDK_LOCK
+    document = json.loads(lock.read_text())
+    entry = {"name": "@scope/real-helper", "version": "1.0.0"}
+    if dev:
+        entry["dev"] = True
+    document["packages"]["node_modules/helper"] = entry
+    lock.write_text(json.dumps(document))
+
+
+def test_cdk_alias_is_recorded_under_its_real_name_too(cdk_repository):
+    _add_alias(cdk_repository)
+
+    shipped = audit.npm_runtime_packages(cdk_repository, CDK_LOCK)
+
+    assert ("helper", "1.0.0") in shipped
+    assert ("@scope/real-helper", "1.0.0") in shipped
+
+
+def test_cdk_runtime_alias_finding_blocks(cdk_repository, tmp_path, monkeypatch):
+    """Trivy reports the real name of an alias, so the folder name alone would fail open."""
+    _add_alias(cdk_repository)
+    report = _cdk_report("@scope/real-helper", "1.0.0")
+    report["Results"][0]["Packages"].append(pkg("@scope/real-helper", "1.0.0"))
+
+    code, out = _run_cdk(tmp_path, monkeypatch, report)
+
+    assert code == audit.EXIT_BLOCKED == 1, out.get("error")
+    assert out["findings"][0]["classification"] == "shipped"
+
+
+def test_cdk_dev_alias_is_not_recorded(cdk_repository):
+    _add_alias(cdk_repository, dev=True)
+
+    shipped = audit.npm_runtime_packages(cdk_repository, CDK_LOCK)
+
+    assert not {name for name, _ in shipped} & {"helper", "@scope/real-helper"}
+
+
+def test_other_examples_still_ship_nothing():
+    assert audit.ships_nothing("examples/ag-ui/ag-ui-operator-dashboard/package-lock.json")
+    assert not audit.ships_nothing(CDK_LOCK)
+
+
+def test_finding_in_another_example_lockfile_is_toolchain(cdk_repository, tmp_path, monkeypatch):
+    other = "examples/other/package-lock.json"
+    (cdk_repository / other).parent.mkdir(parents=True)
+    (cdk_repository / other).write_text(
+        json.dumps({"lockfileVersion": 3, "packages": {"node_modules/x": {"version": "1.0.0"}}})
+    )
+    import subprocess as sp
+
+    sp.run(["git", "add", "."], cwd=cdk_repository, check=True)
+    report = {
+        "SchemaVersion": 2,
+        "Results": [
+            {"Target": CDK_LOCK, "Type": "npm", "Packages": [pkg("aws-cdk-lib", "2.200.0")]},
+            {
+                "Target": other,
+                "Type": "npm",
+                "Packages": [pkg("x", "1.0.0")],
+                "Vulnerabilities": [vuln("x", "1.0.0", severity="CRITICAL")],
+            },
+        ],
+    }
+    code, out = _run_cdk(tmp_path, monkeypatch, report)
+    assert code == 0, out.get("error")
+    assert out["findings"][0]["classification"] == "toolchain"
+
+
+@pytest.mark.parametrize("body", [{"lockfileVersion": 1, "dependencies": {}}, "not json"])
+def test_cdk_lockfile_without_packages_map_fails_closed(
+    cdk_repository, tmp_path, monkeypatch, body
+):
+    (cdk_repository / CDK_LOCK).write_text(body if isinstance(body, str) else json.dumps(body))
+    code, _ = _run_cdk(tmp_path, monkeypatch, _cdk_report("aws-cdk-lib", "2.200.0"))
+    assert code == audit.EXIT_ERROR == 2

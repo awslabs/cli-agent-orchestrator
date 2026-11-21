@@ -517,6 +517,7 @@ class CreateSessionBody(_CreateMessageBody):
     # its own stored ceiling and the created terminal is bounded by it
     # (utils/delegation.py). Rejected (400) together with a local caller.
     caller_ceiling: Optional[List[str]] = None
+    inject_memory_at_start: bool = False
 
     @field_validator("env_vars")
     @classmethod
@@ -4822,6 +4823,12 @@ async def create_session(
     via ``PATCH /terminals/{id}/group``, ``metadata`` via the
     ``update_metadata`` MCP tool).
 
+    ``body.inject_memory_at_start`` asks prompt-capable providers to receive
+    memory through their launch prompt when no initial message is supplied.
+    It defaults to false so orchestration, workflow, handoff, and direct HTTP
+    callers retain task-aware first-message delivery. ``cao launch`` sets it
+    only when that command will not deliver a first message.
+
     ``use_worktree`` (issue #100 Phase 1; review on PR #634): provision an
     isolated git worktree for this terminal instead of sharing
     ``working_directory`` as given, mirroring ``POST
@@ -4949,6 +4956,7 @@ async def create_session(
             engine=engine,
             initial_message=initial_message,
             initial_message_orchestration_type=initial_message_orchestration_type,
+            inject_memory_at_start=body.inject_memory_at_start if body else False,
             model=model,
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
@@ -11808,22 +11816,17 @@ async def get_memory_endpoint(
     _require_memory_enabled()
     svc = _get_memory_service()
     try:
-        memories = await svc.recall(
-            query=key,
+        memory = await svc.read_exact_key(
+            key,
             scope=scope.value if scope else None,
-            limit=1000,
+            scope_id=scope_id,
             scan_all=True,
-            search_mode="metadata",
             record_access=not is_non_accessing_inspection_enabled(),
         )
-        for mem in memories:
-            if mem.key != key:
-                continue
-            if scope_id is not None and not _memory_matches_scope_id(mem, scope_id, svc.base_dir):
-                continue
+        if memory is not None:
             return MemoryDetail(
-                content=mem.content,
-                **_to_memory_summary(mem, svc.base_dir).model_dump(),
+                content=memory.content,
+                **_to_memory_summary(memory, svc.base_dir).model_dump(),
             )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"Memory '{key}' not found"

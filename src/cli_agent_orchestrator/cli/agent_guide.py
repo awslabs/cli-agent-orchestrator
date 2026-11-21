@@ -118,9 +118,10 @@ same task.
 
 ## Side effects and safety
 
-- Whenever CAO creates a terminal (launch or handoff), it may write CAO memory
-  into the working directory: `.claude/CLAUDE.md`, `AGENTS.md`, or
-  `.kiro/steering/`, depending on the provider.
+- CAO memory is delivered through prompts by default and does not write project
+  files. The opt-in `memory.injection.write_project_files=true` compatibility
+  mode may change `.claude/CLAUDE.md`, `AGENTS.md`, or `.kiro/steering/`,
+  depending on the provider.
 - Shut down only what you started: `cao shutdown --session cao-<name>`. Never
   run `cao shutdown --all`. Do not send to or stop a session you did not
   launch without asking the user.

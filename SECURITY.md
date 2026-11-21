@@ -146,7 +146,8 @@ from the `dependencies` / `devDependencies` labels in `package.json`:
 | `web/package-lock.json`, `cao_mcp_apps/package-lock.json` | a Vite plugin ([`scripts/shipped-packages.mjs`](scripts/shipped-packages.mjs)) that records, per build config, the npm packages of every bundled module, the packages named in `build.rollupOptions.external`, and the owners of bundler-injected virtual helpers, to `<project>/.shipped/bundled-packages.<config>.json`; an injected module it cannot attribute fails the build |
 | `docusaurus/package-lock.json` | the same record from both webpack passes (the **client** bundle and the **server** pass that renders every page's HTML), plus every locked package matching the build-time HTML writers in the policy file (remark, rehype, MDX, Prism and friends) |
 | `tui/Cargo.lock` | `cargo tree --locked -e normal --target all` (the release build, `cargo build --release --locked`, uses default features and the package has none) |
-| `examples/**` | nothing: examples ship nothing (one list, `NO_SHIP_PREFIXES`) |
+| `examples/**` | nothing: examples ship nothing (one list, `NO_SHIP_PREFIXES`), except the named exceptions in `SHIPPED_EXAMPLES` |
+| `examples/decision-model-host/aws/cdk/package-lock.json` | the lockfile's non-dev packages: a deployable CDK app, whose runtime dependencies run in the deployed stack |
 
 Membership is by package **name**, at any version: a lockfile can hold several versions of
 one package, and a version match would let a bundled vulnerable copy look unbundled.

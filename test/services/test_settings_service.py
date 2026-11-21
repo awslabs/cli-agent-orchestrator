@@ -134,6 +134,14 @@ def test_get_memory_settings_drops_unvalidated_vault_data(settings_file):
     assert "vault" not in settings_service.get_memory_settings()
 
 
+def test_memory_injection_project_file_writes_default_off_and_round_trip(settings_file):
+    assert settings_service.get_memory_settings()["injection"]["write_project_files"] is False
+
+    settings_service.set_memory_setting("injection.write_project_files", True)
+
+    assert settings_service.get_memory_settings()["injection"]["write_project_files"] is True
+
+
 class TestSave:
     """Tests for _save function."""
 

@@ -170,6 +170,30 @@ class TestConfigSet:
         assert get_result.exit_code == 0
         assert json.loads(get_result.output) is False
 
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [("clear_on_empty", False), ("v1_fixes", False), ("write_project_files", True)],
+    )
+    def test_set_memory_injection_bool_round_trips(self, runner, _isolated_settings, name, value):
+        path = f"memory.injection.{name}"
+        result = runner.invoke(config, ["set", path, str(value).lower()])
+        assert result.exit_code == 0
+
+        on_disk = json.loads(_isolated_settings["settings"].read_text())
+        assert on_disk["memory"]["injection"][name] is value
+
+        get_result = runner.invoke(config, ["get", path])
+        assert get_result.exit_code == 0
+        assert json.loads(get_result.output) is value
+        assert getattr(ConfigService.get_config().memory.injection, name) is value
+
+    @pytest.mark.parametrize("name", ["clear_on_empty", "v1_fixes", "write_project_files"])
+    def test_set_memory_injection_rejects_non_bool(self, runner, _isolated_settings, name):
+        result = runner.invoke(config, ["set", f"memory.injection.{name}", "0"])
+
+        assert result.exit_code != 0
+        assert "must be a bool" in result.output
+
     def test_set_memory_ranking_default_sort_round_trips(self, runner, _isolated_settings):
         result = runner.invoke(config, ["set", "memory.ranking.default_sort", "bm25"])
         assert result.exit_code == 0

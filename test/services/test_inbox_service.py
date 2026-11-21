@@ -23,7 +23,7 @@ from cli_agent_orchestrator.models.terminal import (
     TerminalStatus,
 )
 from cli_agent_orchestrator.services.event_bus import EventBus
-from cli_agent_orchestrator.services.inbox_service import InboxService
+from cli_agent_orchestrator.services.inbox_service import DELIVERY_DEFERRED, InboxService
 from cli_agent_orchestrator.services.status_monitor import (
     STALE_PROCESSING_CAPTURE_INTERVAL_S,
     StatusMonitor,
@@ -798,6 +798,22 @@ class TestDeliverPending:
             "cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", False
         ):
             yield
+
+    @patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", False)
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_locked_delivery_returns_deferred_when_gate_closed(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
+
+        assert InboxService()._deliver_pending_locked("term-1", 1, None) == DELIVERY_DEFERRED
+
+        mock_term_svc.dispatch_input.assert_not_called()
+        mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")

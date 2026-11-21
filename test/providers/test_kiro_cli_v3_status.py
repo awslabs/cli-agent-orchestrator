@@ -102,3 +102,122 @@ def test_the_generic_list_footer_alone_is_not_a_dialog():
         kiro_v3_dialog(" ❯ Something\n   Else\n esc to close · ↑↓ to navigate · ↵ to select\n")
         is None
     )
+
+
+@pytest.mark.parametrize("engine", [KiroEngine.V2, KiroEngine.V3])
+@pytest.mark.parametrize("terminator", ["\x07", "\x1b\\"])
+@pytest.mark.parametrize("prefix", ["7501;", " 7501 ; "])
+def test_program_status_permission_block(engine, terminator, prefix):
+    screen = f"\x1b]{prefix}state=blocked:kind=permission:app=kiro-cli{terminator}"
+    assert _provider(engine).get_status(screen) == W
+
+
+@pytest.mark.parametrize("engine", [KiroEngine.V2, KiroEngine.V3])
+def test_program_status_working_supersedes_permission_block(engine):
+    screen = (
+        "\x1b]7501;state=blocked:kind=permission:app=kiro-cli\x07"
+        "\x1b]7501;state=working:app=kiro-cli\x07"
+    )
+    assert _provider(engine).get_status(screen) == TerminalStatus.PROCESSING
+
+
+@pytest.mark.parametrize("engine", [KiroEngine.V2, KiroEngine.V3])
+@pytest.mark.parametrize("state,fixture", [("idle", "idle"), ("done", "done_no_shell")])
+def test_program_status_answered_permission_preserves_existing_verdict(engine, state, fixture):
+    provider = _provider(engine)
+    screen = _screen(fixture)
+    expected = provider.get_status(screen)
+    assert expected in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
+    history = (
+        "\x1b]7501;state=blocked:kind=permission:app=kiro-cli\x07"
+        f"\x1b]7501;state={state}:app=kiro-cli\x07\n"
+    )
+    assert provider.get_status(history + screen) == expected
+
+
+@pytest.mark.parametrize("engine", [KiroEngine.V2, KiroEngine.V3])
+def test_program_status_other_block_kind_falls_through(engine):
+    screen = "\x1b]7501;state=blocked:kind=something-else:app=kiro-cli\x07"
+    assert _provider(engine).get_status(screen) == TerminalStatus.PROCESSING
+
+
+@pytest.mark.parametrize("engine", [KiroEngine.V2, KiroEngine.V3])
+def test_program_status_permission_block_overrides_thinking_ghost_text(engine):
+    screen = (
+        "Thinking... (esc to cancel)\n" "\x1b]7501;state=blocked:kind=permission:app=kiro-cli\x07"
+    )
+    assert _provider(engine).get_status(screen) == W
+
+
+@pytest.mark.parametrize("engine", [KiroEngine.V2, KiroEngine.V3])
+def test_program_status_exit_to_shell_ends_permission_block(engine):
+    provider = _provider(engine)
+    provider._initialized = True
+    provider.shell_baseline = "zsh"
+    history = "\x1b]7501;state=blocked:kind=permission:app=kiro-cli\x07\n"
+    with patch("cli_agent_orchestrator.providers.kiro_cli.get_backend") as backend:
+        backend.return_value.get_pane_current_command.return_value = "zsh"
+        assert provider.get_status(history + _screen("exit_after")) == TerminalStatus.IDLE
+
+
+@pytest.mark.parametrize("engine", [KiroEngine.V2, KiroEngine.V3])
+@pytest.mark.parametrize("fixture", ["idle", "after_approval_denied"])
+def test_program_status_later_idle_ends_permission_block(engine, fixture):
+    provider = _provider(engine)
+    screen = _screen(fixture)
+    expected = provider.get_status(screen)
+    history = "\x1b]7501;state=blocked:kind=permission:app=kiro-cli\x07\n"
+    assert expected != W
+    assert provider.get_status(history + screen) == expected
+
+
+@pytest.mark.parametrize("engine", [KiroEngine.V2, KiroEngine.V3])
+def test_program_status_permission_key_order(engine):
+    screen = "\x1b]7501;app=kiro-cli:state=blocked:kind=permission\x07"
+    assert _provider(engine).get_status(screen) == W
+
+
+@pytest.mark.parametrize("engine", [KiroEngine.V2, KiroEngine.V3])
+def test_program_status_permission_kind_is_exact(engine):
+    screen = "\x1b]7501;state=blocked:kind=permissionx:app=kiro-cli\x07"
+    assert _provider(engine).get_status(screen) == TerminalStatus.PROCESSING
+
+
+@pytest.mark.parametrize("engine", [KiroEngine.V2, KiroEngine.V3])
+@pytest.mark.parametrize("app", ["omp", "kiro-cli2"])
+def test_program_status_permission_app_is_exact(engine, app):
+    screen = f"\x1b]7501;state=blocked:kind=permission:app={app}\x07"
+    assert _provider(engine).get_status(screen) == TerminalStatus.PROCESSING
+
+
+@pytest.mark.parametrize("engine", [KiroEngine.V2, KiroEngine.V3])
+@pytest.mark.parametrize(
+    "fixture,agent",
+    [
+        ("kiro_cli_permission_stale_answered.txt", "cao-workspace-expert"),
+        ("kiro_cli_permission_stale_long_response.txt", "cao-query-decomposer-supervisor"),
+    ],
+)
+def test_program_status_legacy_answered_permission_preserves_existing_verdict(
+    engine, fixture, agent
+):
+    provider = _provider(engine, agent=agent)
+    screen = (FIXTURES / fixture).read_text(encoding="utf-8")
+    expected = provider.get_status(screen)
+    history = "\x1b]7501;state=blocked:kind=permission:app=kiro-cli\x07\n"
+    assert expected != W
+    assert provider.get_status(history + screen) == expected
+
+
+@pytest.mark.parametrize("engine", [KiroEngine.V2, KiroEngine.V3])
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        ("state=working:state=blocked:kind=permission:app=kiro-cli", W),
+        ("state=blocked:state=working:kind=permission:app=kiro-cli", TerminalStatus.PROCESSING),
+        ("kind=permission:app=kiro-cli", W),
+    ],
+)
+def test_program_status_duplicate_keys_and_missing_state(engine, payload, expected):
+    screen = "\x1b]7501;state=blocked:kind=permission:app=kiro-cli\x07" f"\x1b]7501;{payload}\x07"
+    assert _provider(engine).get_status(screen) == expected
