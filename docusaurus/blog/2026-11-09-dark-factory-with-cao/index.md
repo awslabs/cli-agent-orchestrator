@@ -74,7 +74,7 @@ The shepherd's workers are sized to the job and deleted when done: a fixer and a
 ![The user talks to the conductor; the conductor talks to the PR shepherd; a separate Kiro Crew bot reviews other people's pull requests; the shepherd creates short-lived workers; a zero-token poll loop wakes the shepherd](./agents.svg)
 *One conversation for me; the shepherd and its workers report to the conductor. The Kiro Crew bot reviews on its own.*
 
-This isn't a demo. From 6 November until early on 9 November (UTC), my account merged 8 pull requests, filed 5 issues, and merged 44 PRs from the Kiro Crew bot.
+This isn't a demo. From 6 November until early on 9 November (UTC), my account merged 8 pull requests and filed 5 issues, and the Kiro Crew bot reviewed 44 PRs.
 
 ## The dashboard I watch
 
