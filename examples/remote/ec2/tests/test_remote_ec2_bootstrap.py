@@ -3,6 +3,7 @@ right files with the right modes and never calls IMDS or a system command."""
 
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from remote_ec2_support import (
     FAKE_INSTANCE_ID,
     MUTATING,
     recording_stub,
+    SAMPLE_DIR,
     tree_snapshot,
     write_stub,
 )
@@ -85,10 +87,13 @@ def test_a_second_dry_run_is_identical(sandbox) -> None:
 
 
 def seed_volume_box_env(root: Path) -> Path:
-    vol = root / "Users" / ".cao-box" / "box.env"
+    vol = root / "mnt" / "cao" / ".cao-box" / "box.env"
     vol.parent.mkdir(parents=True)
     vol.write_text(f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION={SESSION}\n", encoding="utf-8")
     return vol
+
+
+VOLUME_SETTINGS = {**SETTINGS, "DATA_MOUNT": "/mnt/cao"}
 
 
 def test_a_real_root_run_writes_the_files_with_the_right_modes(sandbox) -> None:
@@ -96,7 +101,7 @@ def test_a_real_root_run_writes_the_files_with_the_right_modes(sandbox) -> None:
     vol = seed_volume_box_env(root)
     arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
 
-    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **{**SETTINGS, "DATA_MOUNT": "/mnt/cao"})
     assert result.returncode == 0, result.stdout + result.stderr
 
     etc_env = root / "etc" / "cao-box" / "box.env"
@@ -111,12 +116,12 @@ def test_a_real_root_run_writes_the_files_with_the_right_modes(sandbox) -> None:
         text = path.read_text(encoding="utf-8")
         assert "@BOX_" not in text
         if not unit.endswith(".timer"):
-            assert "/Users/boxuser" in text
+            assert "/home/cao-herdr" in text
     for script in ["herdr-start.sh", "wait-herdr-socket.sh", "backup.sh", "restore.sh"]:
         assert mode(root / "usr" / "local" / "lib" / "cao-box" / script) == 0o755
-    settings = root / "Users" / "boxuser" / ".aws" / "cli-agent-orchestrator" / "settings.json"
+    settings = root / "home" / "cao-herdr" / ".aws" / "cli-agent-orchestrator" / "settings.json"
     assert f'"herdr_session": "{SESSION}"' in settings.read_text(encoding="utf-8")
-    assert mode(root / "Users" / "boxuser" / ".claude" / "settings.json") == 0o600
+    assert mode(root / "home" / "cao-herdr" / ".claude" / "settings.json") == 0o600
     # The only system command a --root run may call is the offline enable.
     assert sandbox.recorded_calls() == [
         f"systemctl --root={root} enable herdr-cao.service cao-server.service cao-backup.timer"
@@ -130,7 +135,7 @@ def test_a_real_root_run_writes_the_files_with_the_right_modes(sandbox) -> None:
 def test_a_root_run_without_box_env_never_calls_imds(sandbox) -> None:
     root = make_root(sandbox.root)
     arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
-    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **{**SETTINGS, "DATA_MOUNT": "/mnt/cao"})
     assert result.returncode == 0, result.stderr
     assert "IMDS is never called under --root" in result.stdout
     assert not (root / "etc" / "cao-box" / "box.env").exists()
@@ -140,13 +145,13 @@ def test_a_root_run_without_box_env_never_calls_imds(sandbox) -> None:
 def test_settings_that_disagree_with_box_env_stop_the_run(sandbox) -> None:
     root = make_root(sandbox.root)
     seed_volume_box_env(root)
-    settings = root / "Users" / "boxuser" / ".aws" / "cli-agent-orchestrator" / "settings.json"
+    settings = root / "home" / "cao-herdr" / ".aws" / "cli-agent-orchestrator" / "settings.json"
     settings.parent.mkdir(parents=True)
     settings.write_text(
         '{"terminal": {"herdr_session": "cao-i-0000000000000000b"}}\n', encoding="utf-8"
     )
     arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
-    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **VOLUME_SETTINGS)
     assert result.returncode == 1
     assert "make them match" in result.stderr
 
@@ -156,11 +161,11 @@ def test_a_changed_backup_target_is_rewritten_and_an_unset_one_is_kept(sandbox) 
     seed_volume_box_env(root)
     arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
     backup_env = root / "etc" / "cao-box" / "backup.env"
-    assert sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS).returncode == 0
-    changed = {**SETTINGS, "BACKUP_S3_URI": "s3://example-bucket/other/"}
+    assert sandbox.run("bootstrap.sh", "--root", str(root), **VOLUME_SETTINGS).returncode == 0
+    changed = {**VOLUME_SETTINGS, "BACKUP_S3_URI": "s3://example-bucket/other/"}
     assert sandbox.run("bootstrap.sh", "--root", str(root), **changed).returncode == 0
     assert "s3://example-bucket/other/" in backup_env.read_text(encoding="utf-8")
-    unset = {k: v for k, v in SETTINGS.items() if not k.startswith("BACKUP_")}
+    unset = {k: v for k, v in VOLUME_SETTINGS.items() if not k.startswith("BACKUP_")}
     result = sandbox.run("bootstrap.sh", "--root", str(root), **unset)
     assert result.returncode == 0
     assert "kept" in result.stdout and "s3://example-bucket/other/" in result.stdout
@@ -190,8 +195,8 @@ def test_refuses_anything_but_ubuntu_2404_arm64(sandbox, os_id, version, arch) -
         ({"HERDR_SHA256": "abc"}, "64 lowercase hex"),
         ({"BOX_UID": "0"}, "BOX_UID must be"),
         ({"BOX_USER": "x; rm"}, "plain Linux user name"),
-        ({"BOX_HOME": "/Users/boxuser/a b"}, "BOX_HOME must be"),
-        ({"BOX_HOME": "/Users/boxuser/a|b"}, "BOX_HOME must be"),
+        ({"BOX_HOME": "/home/cao-herdr/a b"}, "BOX_HOME must be"),
+        ({"BOX_HOME": "/home/cao-herdr/a|b"}, "BOX_HOME must be"),
         ({"BOX_HOME": "/Users/../etc"}, "contain .."),
         ({"DATA_VOLUME_ID": "vol-123"}, "DATA_VOLUME_ID looks like"),
         ({"DATA_DEVICE": "/dev/nvme1n1"}, "DATA_DEVICE alone is not accepted"),
@@ -248,7 +253,122 @@ def test_a_real_run_with_a_test_hook_stops_before_any_step(sandbox, hook, with_r
     assert f"{hook} set: BOX_TEST_* variables are for --dry-run tests only" in result.stderr
     assert "== 0." not in result.stdout
     assert sandbox.recorded_calls() == []
+
+
+def test_default_settings_use_the_fixed_box_user_and_home(sandbox) -> None:
+    root = make_root(sandbox.root)
+    arm_stubs(sandbox)
+    settings = {k: v for k, v in SETTINGS.items() if k not in {"BOX_USER", "BOX_HOME", "DATA_MOUNT"}}
+    result = sandbox.run("bootstrap.sh", "--dry-run", "--root", str(root), **settings)
+    assert result.returncode == 0, result.stderr
+    assert "user cao-herdr (uid 1001) with home /home/cao-herdr" in result.stdout
+    assert "-> /home/cao-herdr" in result.stdout
+
+
+def test_documented_settings_example_uses_the_fixed_box_user_and_home() -> None:
+    readme = (SAMPLE_DIR / "README.md").read_text(encoding="utf-8")
+    agent_setup = (SAMPLE_DIR / "AGENT-SETUP.md").read_text(encoding="utf-8")
+    for text in (readme, agent_setup):
+        assert "BOX_USER=cao-herdr" in text
+        assert "BOX_UID=2001" in text
+        assert "BOX_HOME=/home/cao-herdr" in text
+        assert "DATA_MOUNT=/home/cao-herdr" in text
+
+
+def test_reviewed_docs_describe_the_current_restore_and_tmux_behavior() -> None:
+    readme = (SAMPLE_DIR / "README.md").read_text(encoding="utf-8")
+    agent_setup = (SAMPLE_DIR / "AGENT-SETUP.md").read_text(encoding="utf-8")
+    snippet = (SAMPLE_DIR / "ssh" / "config.snippet").read_text(encoding="utf-8")
+
+    assert "sudo install -D -m 0644 /dev/stdin /etc/cao-box/box.env" in readme
+    assert "<instance-id> ssh-ed25519 <base64>" in readme
+    assert "Starts them, unless `--no-start`" in readme
+    assert "User cao-tmux" in readme
+    assert "cao-tmux.service" in readme
+    assert "BOX_SSH_PUBLIC_KEY=ssh-ed25519" in agent_setup
+    assert "bootstrap.sh only enables the units" not in agent_setup
+    assert "User cao-herdr" in snippet
+
+
+def test_a_crlf_ssh_key_in_a_settings_file_is_accepted(sandbox) -> None:
+    root = make_root(sandbox.root)
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+    kit = sandbox.root / "kit" / "box-settings.env"
+    lines = [
+        *settings_lines(),
+        "BOX_SSH_PUBLIC_KEY=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey",
+    ]
+    kit.parent.mkdir(parents=True)
+    kit.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+    kit.chmod(0o600)
+
+    result = sandbox.run("bootstrap.sh", "--root", str(root), "--settings", str(kit))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    authorized_keys = root / "home" / "cao-herdr" / ".ssh" / "authorized_keys"
+    assert authorized_keys.read_text(encoding="utf-8").endswith("IFakeKey\n")
+
+
+def test_an_unusable_ed25519_host_key_does_not_fail_a_completed_run(sandbox) -> None:
+    root = make_root(sandbox.root)
+    seed_volume_box_env(root)
+    host_key = root / "etc" / "ssh" / "ssh_host_ed25519_key.pub"
+    host_key.parent.mkdir(parents=True)
+    host_key.write_text("ssh-rsa AAAA-not-an-ed25519-key\n", encoding="utf-8")
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **VOLUME_SETTINGS)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_data_mount_never_allows_home(sandbox) -> None:
+    root = make_root(sandbox.root)
+    arm_stubs(sandbox)
+    result = sandbox.run(
+        "bootstrap.sh", "--dry-run", "--root", str(root), **{**SETTINGS, "DATA_MOUNT": "/home"}
+    )
+    assert result.returncode == 1
+    assert "DATA_MOUNT must be an absolute path other than / or /home" in result.stderr
     assert not (root / "etc" / "cao-box").exists()
+
+
+@pytest.mark.parametrize(
+    ("key", "message"),
+    [
+        ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey comment", ""),
+        ("-----BEGIN OPENSSH PRIVATE KEY-----", "never a private key"),
+        ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey\nssh-rsa AAAA", "one public key line"),
+        ("command=\"x\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey", "unsupported OpenSSH key type"),
+        ("ssh-dss AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey", "unsupported OpenSSH key type"),
+    ],
+)
+def test_box_ssh_public_key_validation(sandbox, key, message) -> None:
+    root = make_root(sandbox.root)
+    arm_stubs(sandbox)
+    result = sandbox.run(
+        "bootstrap.sh", "--dry-run", "--root", str(root), **{**SETTINGS, "BOX_SSH_PUBLIC_KEY": key}
+    )
+    if message:
+        assert result.returncode == 1
+        assert message in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert "install .ssh (0700) and authorized_keys (0600)" in result.stdout
+
+
+def test_box_ssh_public_key_is_installed_once_with_safe_modes(sandbox) -> None:
+    root = make_root(sandbox.root)
+    arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
+    key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey laptop"
+    settings = {**SETTINGS, "BOX_SSH_PUBLIC_KEY": key}
+    for _ in range(2):
+        result = sandbox.run("bootstrap.sh", "--root", str(root), **settings)
+        assert result.returncode == 0, result.stderr
+    authorized_keys = root / "home" / "cao-herdr" / ".ssh" / "authorized_keys"
+    assert authorized_keys.read_text(encoding="utf-8") == key + "\n"
+    assert mode(authorized_keys) == 0o600
+    assert mode(authorized_keys.parent) == 0o700
 
 
 def test_a_test_hook_with_dry_run_is_allowed(sandbox) -> None:
@@ -299,7 +419,7 @@ def test_a_tampered_box_env_stops_the_run(sandbox, extra, where) -> None:
         )
     target.write_text(target.read_text(encoding="utf-8") + extra, encoding="utf-8")
     arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
-    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **VOLUME_SETTINGS)
     assert result.returncode == 1
     assert "refusing" in result.stderr and "two session lines" in result.stderr
     etc_env = root / "etc" / "cao-box" / "box.env"
@@ -315,7 +435,7 @@ def test_a_box_env_whose_two_sessions_differ_stops_the_run(sandbox) -> None:
         f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION=cao-i-0000000000000000b\n", encoding="utf-8"
     )
     arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
-    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **VOLUME_SETTINGS)
     assert result.returncode == 1
     assert "differ" in result.stderr
 
@@ -325,7 +445,7 @@ def test_a_world_writable_volume_box_env_is_refused(sandbox) -> None:
     vol = seed_volume_box_env(root)
     vol.chmod(0o666)
     arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
-    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **VOLUME_SETTINGS)
     assert result.returncode == 1
     assert "mode 0644 or tighter" in result.stderr
     assert not (root / "etc" / "cao-box" / "box.env").exists()
@@ -337,7 +457,7 @@ def test_a_state_folder_others_can_write_is_refused(sandbox, folder) -> None:
     vol = seed_volume_box_env(root)
     (vol.parent if folder == "state" else vol.parent.parent).chmod(0o777)
     arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
-    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **VOLUME_SETTINGS)
     assert result.returncode == 1
     assert "refusing" in result.stderr
     assert not (root / "etc" / "cao-box" / "box.env").exists()
@@ -349,7 +469,7 @@ def test_box_env_is_rendered_from_the_two_values(sandbox) -> None:
     # Same values, other order: still valid, and /etc gets the canonical text.
     vol.write_text(f"CAO_HERDR_SESSION={SESSION}\nCAO_BOX_SESSION={SESSION}\n", encoding="utf-8")
     arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
-    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **VOLUME_SETTINGS)
     assert result.returncode == 0, result.stderr
     canonical = f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION={SESSION}\n"
     assert (root / "etc" / "cao-box" / "box.env").read_text(encoding="utf-8") == canonical
@@ -357,7 +477,7 @@ def test_box_env_is_rendered_from_the_two_values(sandbox) -> None:
     user_env = root / "etc" / "cao-box" / "box-user.env"
     assert (
         user_env.read_text(encoding="utf-8")
-        == "BOX_USER=boxuser\nBOX_UID=2001\nBOX_HOME=/Users/boxuser\n"
+        == "BOX_USER=cao-herdr\nBOX_UID=1001\nBOX_HOME=/home/cao-herdr\n"
     )
     assert mode(user_env) == 0o644
 
@@ -366,7 +486,7 @@ def test_a_home_layout_volume_keeps_box_env_in_etc_only(sandbox) -> None:
     # BOX_HOME=DATA_MOUNT: the volume is the user's home, so there is no
     # root-only folder on it. bootstrap must not read or write a copy there.
     root = make_root(sandbox.root)
-    home = root / "home" / "boxuser"
+    home = root / "home" / "cao-herdr"
     home.mkdir(parents=True)
     home.chmod(0o770)  # writable by the user's group, like a home could be
     etc = root / "etc" / "cao-box"
@@ -375,7 +495,7 @@ def test_a_home_layout_volume_keeps_box_env_in_etc_only(sandbox) -> None:
         f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION={SESSION}\n", encoding="utf-8"
     )
     arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
-    settings = {**SETTINGS, "BOX_HOME": "/home/boxuser", "DATA_MOUNT": "/home/boxuser"}
+    settings = {**SETTINGS, "BOX_HOME": "/home/cao-herdr", "DATA_MOUNT": "/home/cao-herdr"}
     result = sandbox.run("bootstrap.sh", "--root", str(root), **settings)
     assert result.returncode == 0, result.stderr
     assert "box.env is kept in /etc/cao-box only" in result.stderr
@@ -386,7 +506,7 @@ def test_an_unsafe_empty_state_folder_is_refused_not_written_into(sandbox) -> No
     # Someone made the volume's state folder writable and left it empty,
     # hoping bootstrap writes box.env there for them to swap later.
     root = make_root(sandbox.root)
-    state = root / "Users" / ".cao-box"
+    state = root / "mnt" / "cao" / ".cao-box"
     state.mkdir(parents=True)
     state.chmod(0o777)
     etc = root / "etc" / "cao-box"
@@ -395,7 +515,7 @@ def test_an_unsafe_empty_state_folder_is_refused_not_written_into(sandbox) -> No
         f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION={SESSION}\n", encoding="utf-8"
     )
     arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
-    result = sandbox.run("bootstrap.sh", "--root", str(root), **SETTINGS)
+    result = sandbox.run("bootstrap.sh", "--root", str(root), **VOLUME_SETTINGS)
     assert result.returncode == 1
     assert f"refusing {state}" in result.stderr
     assert list(state.iterdir()) == []
@@ -405,7 +525,7 @@ def test_a_home_layout_never_reads_a_planted_state_folder(sandbox) -> None:
     # F3: an agent creates ~/.cao-box with junk. bootstrap must not stop (that
     # would block upgrades) and must not read or write it.
     root = make_root(sandbox.root)
-    home = root / "home" / "boxuser"
+    home = root / "home" / "cao-herdr"
     planted = home / ".cao-box"
     planted.mkdir(parents=True)
     planted.chmod(0o777)
@@ -416,7 +536,7 @@ def test_a_home_layout_never_reads_a_planted_state_folder(sandbox) -> None:
         f"CAO_BOX_SESSION={SESSION}\nCAO_HERDR_SESSION={SESSION}\n", encoding="utf-8"
     )
     arm_stubs(sandbox, skip=frozenset(FILE_TOOLS))
-    settings = {**SETTINGS, "BOX_HOME": "/home/boxuser", "DATA_MOUNT": "/home/boxuser"}
+    settings = {**SETTINGS, "BOX_HOME": "/home/cao-herdr", "DATA_MOUNT": "/home/cao-herdr"}
     result = sandbox.run("bootstrap.sh", "--root", str(root), **settings)
     assert result.returncode == 0, result.stderr
     assert "nothing on the volume is read" in result.stderr
@@ -449,7 +569,7 @@ def test_a_real_root_run_never_writes_through_a_link_in_the_home(
 ) -> None:
     root = make_root(sandbox.root)
     seed_volume_box_env(root)
-    home = root / "Users" / "boxuser"
+    home = root / "home" / "cao-herdr"
     outside = root / target
     if written:
         outside.mkdir(parents=True)
@@ -506,7 +626,7 @@ def test_a_settings_file_is_read_without_the_environment(sandbox) -> None:
     result = sandbox.run("bootstrap.sh", "--dry-run", "--root", str(root), "--settings", str(kit))
     assert result.returncode == 0, result.stdout + result.stderr
     assert "settings read from" in result.stdout
-    assert "user boxuser (uid 2001) with home /Users/boxuser" in result.stdout
+    assert "user cao-herdr (uid 1001) with home /home/cao-herdr" in result.stdout
     assert sandbox.recorded_calls() == []
 
 
@@ -562,11 +682,12 @@ def test_an_unsafe_settings_file_is_refused(sandbox, case) -> None:
         kit.symlink_to(real)
         message = "is a symlink"
     elif case == "in-the-home":
-        kit = write_settings(root / "Users" / "boxuser" / "box-settings.env", settings_lines())
+        kit = write_settings(root / "home" / "cao-herdr" / "box-settings.env", settings_lines())
         message = "inside the box user's home"
     else:
         write_settings(kit, settings_lines())
-        stat_says(sandbox, kit, "2001 600")  # as if the box user (uid 2001) owned it
+        other_uid = 1001 if os.getuid() != 1001 else 1002
+        stat_says(sandbox, kit, f"{other_uid} 600")  # as if another user owned it
         message = "must be yours"
     result = sandbox.run("bootstrap.sh", "--dry-run", "--root", str(root), "--settings", str(kit))
     assert result.returncode == 1, result.stdout + result.stderr
@@ -580,7 +701,7 @@ def test_a_settings_path_through_a_link_in_the_box_users_home_is_refused(sandbox
     arm_stubs(sandbox)
     real_kit = sandbox.root / "kit"
     write_settings(real_kit / "box-settings.env", settings_lines())
-    linked_kit = root / "Users" / "boxuser" / "linked-kit"
+    linked_kit = root / "home" / "cao-herdr" / "linked-kit"
     linked_kit.parent.mkdir(parents=True)
     linked_kit.symlink_to(real_kit, target_is_directory=True)
 

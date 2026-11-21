@@ -6,7 +6,7 @@
 
 Host cao-box
   HostName <instance-id>
-  User <box-user>
+  User cao-herdr
   IdentityFile ~/.ssh/<your-key>
   ProxyCommand sh -c "aws ssm start-session --region ap-southeast-2 --target %h --document-name AWS-StartSSHSession --parameters 'portNumber=%p'"
   ForwardAgent no
@@ -19,7 +19,7 @@ Host cao-box
 # with a cao-server on the laptop's own 9889.
 Host cao-box-dash
   HostName <instance-id>
-  User <box-user>
+  User cao-herdr
   IdentityFile ~/.ssh/<your-key>
   ProxyCommand sh -c "aws ssm start-session --region ap-southeast-2 --target %h --document-name AWS-StartSSHSession --parameters 'portNumber=%p'"
   LocalForward 19889 127.0.0.1:9889
@@ -29,7 +29,7 @@ Host cao-box-dash
 # from your own /32 only.
 # Host cao-box
 #   HostName <elastic-ip-or-dns-name>
-#   User <box-user>
+#   User cao-herdr
 #   IdentityFile ~/.ssh/<your-key>
 
 # Then save the box as a herdr machine (pin the same herdr version on both):
