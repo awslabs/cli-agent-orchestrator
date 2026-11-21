@@ -48,6 +48,13 @@ class _RunStepFakeHandler(BaseHTTPRequestHandler):
                 "terminal_id": f"term-{step_id}",
                 "last_message": f"ack:{step_id}",
                 "status": "COMPLETED",
+                # Must be present: the shim reads ``data["replayed"]`` by
+                # direct indexing on purpose (BR-3/TD-7), so a fake that
+                # omits it raises KeyError instead of standing in for the
+                # real route. ``RunStepResponse.replayed`` defaults to
+                # False and the server always serialises it; this fake
+                # always executes fresh, so False is the honest value.
+                "replayed": False,
             }
         ).encode("utf-8")
         self.send_response(200)
