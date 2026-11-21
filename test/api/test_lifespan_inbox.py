@@ -160,6 +160,24 @@ class TestLifespanInboxWiring:
                 assert _find_task(tasks, svc.start.return_value) is not None
 
     @pytest.mark.asyncio
+    async def test_herdr_delivery_callback_forwards_trigger_source(self) -> None:
+        """The callback forwards its source so delivery log lines carry the
+        trigger tag — docs/herdr.md promises a dead event path is visible in
+        the logs, and the live smoke's verdict reads that tag."""
+        tasks: list = []
+        backend = MagicMock(spec=HerdrBackend)
+        backend.herdr_session = "cao"
+        with _patched_lifespan(backend, tasks) as mocks:
+            async with lifespan(app):
+                callback = mocks.herdr_cls.call_args.kwargs["delivery_callback"]
+                with patch(
+                    "cli_agent_orchestrator.api.main.inbox_service.deliver_pending",
+                    return_value=1,
+                ) as deliver:
+                    assert callback("tid1", "herdr-event") == 1
+                deliver.assert_called_once_with("tid1", registry=ANY, source="herdr-event")
+
+    @pytest.mark.asyncio
     async def test_tmux_backend_skips_herdr_service(self) -> None:
         """Non-herdr backend starts no extra herdr watcher.
 

@@ -267,10 +267,20 @@ async def test_malformed_explicit_precedes_policy_without_record(
 
 
 def test_full_same_user_definition():
+    """The CLI help must state what 'operator only' actually enforces (#1062).
+
+    It used to read "not settable through MCP or any agent-facing API", which was
+    never true of ``decisions_set_point`` on the operations MCP server and is now
+    replaced by the two rules that are: the ``@cao-ops-mcp-server`` grant, and
+    halt-lifting refused for any bound terminal even with it.
+    """
     from cli_agent_orchestrator.decisions.settings import SAME_USER
 
-    assert "'Operator only' means not settable through MCP or any agent-facing API." in SAME_USER
+    assert "'Operator only' means an operator context" in SAME_USER
+    assert "@cao-ops-mcp-server" in SAME_USER
+    assert "lifting a halt is refused there even with it" in SAME_USER
     assert "not a privilege boundary" in SAME_USER
+    assert "not settable through MCP" not in SAME_USER
 
 
 @pytest.mark.asyncio

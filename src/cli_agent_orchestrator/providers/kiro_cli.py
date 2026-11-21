@@ -115,6 +115,19 @@ IDLE_PROMPT_PATTERN_LOG = r"\x1b\[38;5;\d+m\[.+?\].*\x1b\[38;5;\d+m>\s*\x1b\[\d*
 # New TUI Patterns (Kiro CLI without --legacy-ui)
 # =============================================================================
 
+_PROGRAM_STATUS_PATTERN = re.compile(r"\x1b\]\s*7501\s*;([^\x07\x1b]*)(?:\x07|\x1b\\)")
+
+
+def _program_status(payload: str) -> dict[str, str]:
+    """Parse an OSC 7501 payload: key=value pairs split on ":", last value wins."""
+    fields: dict[str, str] = {}
+    for pair in payload.split(":"):
+        key, sep, value = pair.strip().partition("=")
+        if sep:
+            fields[key] = value
+    return fields
+
+
 # New TUI idle prompt: "Ask a question or describe a task ↵"
 # Case-insensitive match; comma between "question" and "or" is optional
 # (older versions used lowercase with comma, v1.29+ uses capitalized without)
@@ -1494,6 +1507,24 @@ class KiroCliProvider(BaseProvider):
         new_tui_idle_matches = list(re.finditer(NEW_TUI_IDLE_PATTERN, clean_output))
         has_idle_prompt = old_idle_matches[0] if old_idle_matches else None
         has_new_tui_idle = bool(new_tui_idle_matches)
+
+        # #1418: Only the last report counts. A later idle prompt or an exit
+        # to the shell ends the block even when Kiro writes no new report.
+        reports = []
+        for match in _PROGRAM_STATUS_PATTERN.finditer(clean_output):
+            fields = _program_status(match.group(1))
+            if "state" in fields:
+                reports.append((match, fields))
+        if reports:
+            last, fields = reports[-1]
+            if (
+                fields["state"] == "blocked"
+                and fields.get("kind") == "permission"
+                and fields.get("app") == "kiro-cli"
+                and not any(m.start() > last.end() for m in old_idle_matches + new_tui_idle_matches)
+                and not (self._initialized and self.shell_baseline and self._exited_to_shell())
+            ):
+                return TerminalStatus.WAITING_USER_ANSWER
 
         # Check 0b: TUI startup — Kiro emits "● Initializing..." or
         # "0 of N mcp servers initialized. ctrl-c to start chatting now"

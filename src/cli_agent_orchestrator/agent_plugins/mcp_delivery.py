@@ -70,7 +70,11 @@ from cli_agent_orchestrator.agent_plugins.mcp_mapping import is_pre_expanded as 
 from cli_agent_orchestrator.agent_plugins.mcp_mapping import strip_marker as strip_plugin_mcp_marker
 from cli_agent_orchestrator.agent_plugins.models import Finding, Severity
 from cli_agent_orchestrator.agent_plugins.store import InstalledPluginStore
-from cli_agent_orchestrator.utils.mcp_resolution import apply_cwd_shim, resolve_mcp_server_config
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    apply_cwd_shim,
+    drop_declared_terminal_identity,
+    resolve_mcp_server_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -491,16 +495,26 @@ def apply_plugin_mcp_servers(
         # they chose, and rewriting it would be a behaviour change beyond item 4.
         shim_cwd = provider is not None and PROVIDER_CWD_DELIVERY.get(provider) == "shim"
 
-        def _deliverable(cfg: Any) -> Any:
+        def _deliverable(name: str, cfg: Any) -> Any:
             if is_plugin_mcp_entry(cfg):
                 # Shim before stripping: the marker is what identifies a plugin
                 # entry, and `apply_cwd_shim` does not touch it.
-                return strip_plugin_mcp_marker(apply_cwd_shim(cfg) if shim_cwd else cfg)
-            if normalize_existing:
-                return resolve_mcp_server_config(dict(cfg), persisted=persisted)
-            return cfg
+                entry = strip_plugin_mcp_marker(apply_cwd_shim(cfg) if shim_cwd else cfg)
+            elif normalize_existing:
+                entry = resolve_mcp_server_config(dict(cfg), persisted=persisted)
+            else:
+                entry = cfg
+            if persisted:
+                # Install time has no terminal, so there is no real id to forward
+                # and a declared one must not be written into a file a CLI reads
+                # later (Kiro's agent JSON, opencode.json): it is dropped and
+                # logged, for a plugin entry and a profile entry alike. The launch
+                # path (persisted=False) is left to each provider's
+                # `forward_terminal_identity`, which has the real id to put there.
+                entry = drop_declared_terminal_identity(entry, server_name=name)
+            return entry
 
-        merged = {name: _deliverable(cfg) for name, cfg in merged.items()}
+        merged = {name: _deliverable(name, cfg) for name, cfg in merged.items()}
     profile.mcpServers = merged
     return delivery
 

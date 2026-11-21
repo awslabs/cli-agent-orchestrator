@@ -462,7 +462,13 @@ class TestCodexBuildCommand:
         assert "mcp_servers.test-server.command=" in command
         # Contract changed by review 5222539218 (item 6): env is one inline table
         # with quoted keys, so any schema-valid key is expressible.
-        assert 'mcp_servers.test-server.env={ "API_KEY" = "secret123" }' in command
+        # This terminal's own id joins the table since #1062: requesting
+        # inheritance via env_vars is not enough when the explicit table is what
+        # Codex passes (see TestCodexForwardsTheRealTerminalId).
+        assert (
+            'mcp_servers.test-server.env={ "API_KEY" = "secret123", '
+            '"CAO_TERMINAL_ID" = "test1234" }' in command
+        )
         assert "secret123" in command
         # CAO_TERMINAL_ID always forwarded even without explicit env_vars
         assert "mcp_servers.test-server.env_vars=" in command
@@ -1489,7 +1495,12 @@ class TestMcpKeyValidation:
         command = provider._build_codex_command()
         match = _re.search(r"mcp_servers\.srv\.env=(\{.*?\})'", command)
         assert match, command
-        assert tomllib.loads(f"x = {match.group(1)}")["x"] == {env_key: "value"}
+        # Every server's env table also carries this terminal's own
+        # CAO_TERMINAL_ID since #1062 (see TestCodexForwardsTheRealTerminalId).
+        assert tomllib.loads(f"x = {match.group(1)}")["x"] == {
+            env_key: "value",
+            "CAO_TERMINAL_ID": "tid",
+        }
 
     @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_an_empty_env_key_is_still_expressible(self, mock_load):
@@ -1508,7 +1519,10 @@ class TestMcpKeyValidation:
         command = provider._build_codex_command()
         match = _re.search(r"mcp_servers\.srv\.env=(\{.*?\})'", command)
         assert match, command
-        assert tomllib.loads(f"x = {match.group(1)}")["x"] == {"": "value"}
+        assert tomllib.loads(f"x = {match.group(1)}")["x"] == {
+            "": "value",
+            "CAO_TERMINAL_ID": "tid",
+        }
 
     @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_accepts_normal_names_and_env_keys(self, mock_load, monkeypatch):
@@ -1521,7 +1535,54 @@ class TestMcpKeyValidation:
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
         assert "mcp_servers.cao-mcp-server.command=" in command
-        assert 'mcp_servers.cao-mcp-server.env={ "API_KEY" = "v" }' in command
+        assert (
+            'mcp_servers.cao-mcp-server.env={ "API_KEY" = "v", "CAO_TERMINAL_ID" = "tid" }'
+            in command
+        )
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_entry_merely_named_cao_mcp_server_gains_no_coordinates(
+        self, mock_load, monkeypatch, tmp_path
+    ):
+        """Pin for the #1062/#1089 convergence. The test above is this fixture with
+        no ``CAO_*`` exported; on main it was green in CI and red for any developer
+        with ``CAO_HOME_DIR`` set, because #1089 trusted the entry NAME and handed
+        this CAO's coordinates to an entry that launches ``cmd``. The bundled
+        server is identified by SHAPE (``is_bundled_cao_server``), never by name,
+        so with the coordinates exported the env table is still exactly the
+        profile's own key plus the terminal id."""
+        monkeypatch.setenv("CAO_API_PORT", "9777")
+        monkeypatch.setenv("CAO_HOME_DIR", str(tmp_path))
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        mock_load.return_value = self._profile_with(
+            {"cao-mcp-server": {"command": "cmd", "args": [], "env": {"API_KEY": "v"}}}
+        )
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+        assert (
+            'mcp_servers.cao-mcp-server.env={ "API_KEY" = "v", "CAO_TERMINAL_ID" = "tid" }'
+            in command
+        )
+        for coord in ("CAO_API_PORT", "CAO_API_HOST", "CAO_HOME_DIR"):
+            assert coord not in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_entry_merely_named_cao_mcp_server_is_not_deferred_exempt(self, mock_load):
+        """The launch config's own ``is_cao_server`` flag (it keeps the CAO tools
+        out of Codex's deferred tool search) is decided by shape, like the
+        coordinates and the identity. An entry NAMED ``cao-mcp-server`` whose
+        command is a foreign program gets no ``omit_tools_from``; the real
+        bundled server, under any name, does."""
+        mock_load.return_value = self._profile_with(
+            {
+                "cao-mcp-server": {"command": "cmd", "args": []},
+                "orchestrator": {"command": "cao-mcp-server", "args": []},
+            }
+        )
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+        assert 'mcp_servers.cao-mcp-server.omit_tools_from=["deferred"]' not in command
+        assert 'mcp_servers.orchestrator.omit_tools_from=["deferred"]' in command
 
     @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_bundled_server_is_told_this_cao_address(self, mock_load, monkeypatch):
@@ -1534,13 +1595,19 @@ class TestMcpKeyValidation:
         )
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
-        assert 'mcp_servers.cao-mcp-server.env={ "CAO_API_PORT" = "9899" }' in command
+        # The bundled server's env table carries the coordinate. Since #1062 the
+        # launching terminal's own id travels in the SAME explicit table (not only
+        # via env_vars inheritance), so assert the coordinate is present rather than
+        # pinning the whole table.
+        assert '"CAO_API_PORT" = "9899"' in command
+        assert "mcp_servers.cao-mcp-server.env=" in command
 
     @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
-    def test_bundled_server_default_cao_is_unchanged(self, mock_load, monkeypatch):
-        """A default CAO (none of the three address vars set) writes exactly the
-        same command as before this fix: no ``.env=`` override for the bundled
-        server beyond what ``env_vars`` already adds."""
+    def test_bundled_server_default_cao_adds_no_coordinate(self, mock_load, monkeypatch):
+        """A default CAO (none of the three address vars set) adds no address
+        coordinate to the bundled server's env. The terminal id still travels there
+        since #1062 -- identity must reach the server even where env_vars inheritance
+        fails -- so the env table is exactly the id, with none of the three coordinates."""
         for key in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
             monkeypatch.delenv(key, raising=False)
         mock_load.return_value = self._profile_with(
@@ -1548,13 +1615,18 @@ class TestMcpKeyValidation:
         )
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
-        assert "mcp_servers.cao-mcp-server.env=" not in command
+        assert 'mcp_servers.cao-mcp-server.env={ "CAO_TERMINAL_ID" = "tid" }' in command
+        for coord in ("CAO_API_PORT", "CAO_API_HOST", "CAO_HOME_DIR"):
+            assert coord not in command
 
     @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_uvx_launched_entry_named_cao_mcp_server_gets_the_address(self, mock_load, monkeypatch):
         """#1075 P3-1: an entry started through ``uvx`` is still the CAO server
-        when its own entry name is ``cao-mcp-server``, even though ``command``
-        is ``uvx`` rather than the bare console script."""
+        even though ``command`` is ``uvx`` rather than the bare console script.
+        It is recognised by SHAPE -- ``cao-mcp-server`` is an ``args`` token
+        (#1062 ``is_bundled_cao_server``) -- not by its entry name. Since #1062
+        the terminal id travels in the same explicit env table, so the coordinate
+        is asserted present rather than the whole table pinned."""
         monkeypatch.setenv("CAO_API_PORT", "9899")
         monkeypatch.delenv("CAO_API_HOST", raising=False)
         monkeypatch.delenv("CAO_HOME_DIR", raising=False)
@@ -1568,17 +1640,43 @@ class TestMcpKeyValidation:
         )
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
-        assert 'mcp_servers.cao-mcp-server.env={ "CAO_API_PORT" = "9899" }' in command
+        assert "mcp_servers.cao-mcp-server.env=" in command
+        assert '"CAO_API_PORT" = "9899"' in command
+        assert '"CAO_TERMINAL_ID" = "tid"' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_uvx_launched_entry_under_another_name_gets_the_address(self, mock_load, monkeypatch):
+        """The under-match #1089 left: the same ``uvx`` launch keyed ``orchestrator``
+        is still the bundled server by shape, so it gains the address too."""
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+        mock_load.return_value = self._profile_with(
+            {
+                "orchestrator": {
+                    "command": "uvx",
+                    "args": ["--from", "cli-agent-orchestrator", "cao-mcp-server"],
+                }
+            }
+        )
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+        assert "mcp_servers.orchestrator.env=" in command
+        assert '"CAO_API_PORT" = "9899"' in command
 
     @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_non_cao_server_never_gets_the_address(self, mock_load, monkeypatch):
+        """A foreign ``uvx`` server gains no coordinate. Since #1062 every server's
+        env table carries the terminal id, so the table is exactly that."""
         monkeypatch.setenv("CAO_API_PORT", "9899")
         mock_load.return_value = self._profile_with(
             {"my-server": {"command": "uvx", "args": ["--from", "pkg", "my-server"]}}
         )
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
-        assert "mcp_servers.my-server.env=" not in command
+        assert 'mcp_servers.my-server.env={ "CAO_TERMINAL_ID" = "tid" }' in command
+        for coord in ("CAO_API_PORT", "CAO_API_HOST", "CAO_HOME_DIR"):
+            assert coord not in command
 
 
 class TestCodexProviderCodexConfig:
@@ -6112,7 +6210,13 @@ class TestCodexEnvIsOneInlineTable:
 
     def test_env_is_written_as_one_inline_table(self):
         command = self._build({"A": "1", "LOG.LEVEL": "info"})
-        assert self._env_table(command) == {"A": "1", "LOG.LEVEL": "info"}
+        # Plus this terminal's own CAO_TERMINAL_ID, which #1062 writes into every
+        # server's table rather than trusting env_vars inheritance alone.
+        assert self._env_table(command) == {
+            "A": "1",
+            "LOG.LEVEL": "info",
+            "CAO_TERMINAL_ID": "test1234",
+        }
         assert "env.LOG.LEVEL" not in command, "the dotted key must not reach the path"
 
     def test_a_dotted_env_key_no_longer_aborts_the_launch(self):
@@ -6122,7 +6226,11 @@ class TestCodexEnvIsOneInlineTable:
 
     def test_env_values_with_quotes_and_newlines_round_trip_through_tomllib(self):
         command = self._build({'Q"K': 'a"b', "NL": "x\ny"})
-        assert self._env_table(command) == {'Q"K': 'a"b', "NL": "x\ny"}
+        assert self._env_table(command) == {
+            'Q"K': 'a"b',
+            "NL": "x\ny",
+            "CAO_TERMINAL_ID": "test1234",
+        }
 
     def test_a_dotted_server_name_still_raises_for_profile_entries(self):
         """Only PLUGIN entries are pre-filtered; a hand-written profile still fails fast.

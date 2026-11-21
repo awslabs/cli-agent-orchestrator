@@ -211,11 +211,68 @@ The operations stdio MCP server offers `decisions_status`, `decisions_off`, `dec
 `decisions_set_tier`, `decisions_set_exclusions`, `decisions_list` and
 `decisions_purge`. These run locally in-process; there are no decision HTTP
 routes. The agent-facing MCP server has no tools to read, change or ask for
-decisions. A profile that grants operations MCP tools grants these controls too.
+decisions.
 
-“Operator only” means not settable through MCP or any agent-facing API. It is a
-same-user local control, not a privilege boundary: `settings.json` can be edited
-by the same user, including an agent with shell access.
+Every tool on that surface is gated on the calling terminal's allowlist (its
+resolved `allowedTools`), which must carry `@cao-ops-mcp-server` (or `*`, or a glob
+that covers it) (#1062). `CAO_TERMINAL_ID` is forwarded into every server in a
+profile's `mcpServers` map, so the server knows which terminal is calling and reads
+that terminal's recorded list.
+
+**Whether listing the server grants these controls depends on the profile's
+allowlist, so check which case a profile is in:**
+
+- A profile with **no explicit `allowedTools:`** (and no `--allowed-tools` at
+  launch) gets `@<server>` appended for each server it declares itself (the #772
+  rule, see [Tool Restrictions](tool-restrictions.md#how-overrides-work)).
+  Declaring the server under the key `cao-ops-mcp-server` therefore **does** grant
+  it, for every role default including `supervisor` and `reviewer`. Listing the
+  server only to reach `decisions_off` hands that profile every other control here
+  except lifting a halt. The Kiro `tools:` field is not this list: setting it
+  alone withholds nothing.
+- A profile that **pins `allowedTools:`** holds the grant only if the list names
+  it. To declare the server and withhold its controls, pin `allowedTools:` without
+  `@cao-ops-mcp-server`; `decisions_off` stays reachable regardless.
+- The grant is the fixed selector, not the key. A profile that declares the server
+  itself under another key is appended `@<that key>`, which this gate does not
+  accept. A server an agent plugin provides (`cao-ops` in the operator
+  agent-plugin) is never appended at all; the operator names it. In both cases add
+  `@cao-ops-mcp-server` beside the key's own entry.
+
+A bound terminal without the grant is refused on every ops tool, with two
+deliberate rules:
+
+- `decisions_off` stays reachable without the grant. It is argument-free and
+  off-only — the operator's kill switch — and a fail-safe that needs a grant is
+  not a fail-safe. A bound terminal that calls it is named, by the
+  `CAO_TERMINAL_ID` it claims, in a WARNING on the operations server's log, so
+  an operator who finds the node halted can see which terminal pulled it. See
+  [Tool Restrictions](tool-restrictions.md).
+- Lifting a halt is refused for any bound terminal, grant or not:
+  `decisions_set_point` to `shadow` or `on` removes the halt marker, so allowing it
+  over MCP would let a caller undo an operator's `cao decisions off`. It takes an
+  operator context — `cao decisions set <point> <state>` on the CLI, or an MCP host
+  running this server with no `CAO_TERMINAL_ID`. The refusal is enforced inside the
+  mutation, not only in the middleware: `set_point` takes the exclusive egress lock,
+  re-reads the marker under it, refuses before writing anything, and removes the
+  marker only if it observed it under that lock — so a halt published beside a call
+  already in flight survives. `decisions_off` publishes its marker *without* waiting
+  for that lock, because the shared side is held for the whole of an outstanding
+  decision request and a kill switch that waits on one is not a kill switch; an
+  operator setter that finds the lock busy proceeds with a logged warning rather
+  than losing the only way to lift a halt, while a bound caller is refused.
+
+An operator context — an MCP host with no `CAO_TERMINAL_ID`, which includes
+`cao-ops` in the operator agent-plugin when a client runs it outside CAO — is
+unchanged and may do all of the above. The same agent plugin delivered to an agent that
+CAO launches runs in a bound terminal and is gated like any other
+(see [Agent Plugins](agent-plugins.md)).
+
+“Operator only” therefore means an operator context: over the operations MCP server
+a bound CAO terminal needs the `@cao-ops-mcp-server` grant, and lifting a halt is
+refused there even with it. It is a same-user local control, not a privilege
+boundary: `settings.json` can be edited by the same user, including an agent with
+shell access.
 The same user can also install a decider package. Concurrent settings writers
 can lose updates because the existing settings writer is not atomic.
 
@@ -731,9 +788,17 @@ and verifies nothing about who granted consent; a package's record of who grante
 it is a provenance note, not an identity claim. Any process running as you,
 including an agent with shell access, can edit `settings.json` or a package's
 consent file and can read any key or endpoint the package stores. What keeps
-agents out is each profile's tool restrictions, and two rules a package must
-follow: no agent-facing tool may grant consent, and its consent command must
-need an interactive terminal. CAO's own agent-facing tools offer no consent.
+agents out of the *tool* surfaces is each profile's tool restrictions, now
+including the operations server: `@cao-mcp-server` gates every agent-facing CAO
+tool except the four callback-protocol exemptions (`send_message`,
+`complete_assignment`, `workflow_return`, `answer_user_prompt`) and the two
+`discovery`-granted tools, and `@cao-ops-mcp-server` gates every operations tool
+but `decisions_off` (#671, #972, #1062). See
+[Tool Restrictions](tool-restrictions.md) for both gates, the exemptions and the
+glob spellings that satisfy a grant. Two rules a package must follow do the rest: no agent-facing
+tool may grant consent, and its consent command must need an interactive terminal.
+CAO's own agent-facing tools offer no consent. None of this constrains an agent
+that already has a shell — it runs as you.
 
 ## Known limitations
 

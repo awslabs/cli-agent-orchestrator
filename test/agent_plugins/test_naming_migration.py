@@ -109,10 +109,19 @@ _UNSCOPED_DOCS = [
     # PR #1000 (#827): "What an approval does not cover" names agent-plugin MCP
     # delivery as a launch input outside plan_id. CAO's own noun, qualified.
     "workflows.md",
+    # #1062: gained one agent-plugin reference, naming `cao-ops` as the operator
+    # context the ops-MCP gate leaves unchanged. It had ZERO plugin occurrences
+    # before, so the strict rule applies cleanly. (tool-restrictions.md gained the
+    # same reference but also carries a third party's bare noun: see
+    # _THIRD_PARTY_DOCS_CITING_AGENT_PLUGINS.)
+    "decisions.md",
     # PR #652: the weekly release does not count the bot's
     # `chore(agent-plugin): repin packages to vX.Y.Z` commit, and the doc quotes that
     # subject so an operator can recognise it. CAO's own noun, inside a code span.
     "RELEASING.md",
+    # Remote CAO guide: the only occurrences are AWS's own `session-manager-plugin`
+    # program, inside code spans. No CAO plugin system is mentioned.
+    "remote.md",
 ]
 
 #: Docs whose H1 scopes the noun ("# Event Plugins", "# Agent Plugins"), so bare
@@ -136,8 +145,8 @@ _VOCABULARY_BACKLOG_DOCS = [
     # Its one bare "plugin" is the operator's Claude Code plugins (the subagent bullet:
     # "can be any agent in the operator's Claude Code agent store or plugins"). That is
     # Claude Code's own extension system, not a CAO agent plugin, so no CAO qualifier fits.
-    # The doc does not cite CAO agent plugins, so it stays out of
-    # _THIRD_PARTY_DOCS_CITING_AGENT_PLUGINS.
+    # Since #1062 the doc ALSO cites CAO's agent plugins (the `cao-ops` operator
+    # context), so it is declared in _THIRD_PARTY_DOCS_CITING_AGENT_PLUGINS too.
     "tool-restrictions.md",
     # Its two bare "plugin" mentions are Claude Code plugins and plugins installed in
     # Kiro Crew, both reaching the CAO Shelf relay chat's model: third-party extension
@@ -170,6 +179,10 @@ _THIRD_PARTY_DOCS_CITING_AGENT_PLUGINS = [
     # Its bare noun is Cursor's own plugin manifest, which no CAO qualifier fits, so
     # it takes the narrower promise here rather than moving to _UNSCOPED_DOCS.
     "cursor-cli.md",
+    # #1062 names `cao-ops` in the operator agent-plugin as the operator context the
+    # ops-MCP gate leaves unchanged (qualified spelling). Its one bare noun is the
+    # operator's Claude Code plugins, which no CAO qualifier fits.
+    "tool-restrictions.md",
 ]
 
 #: Every spelling that counts as *qualified* when naming CAO's agent plugins.

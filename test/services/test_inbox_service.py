@@ -23,7 +23,7 @@ from cli_agent_orchestrator.models.terminal import (
     TerminalStatus,
 )
 from cli_agent_orchestrator.services.event_bus import EventBus
-from cli_agent_orchestrator.services.inbox_service import InboxService
+from cli_agent_orchestrator.services.inbox_service import DELIVERY_DEFERRED, InboxService
 from cli_agent_orchestrator.services.status_monitor import (
     STALE_PROCESSING_CAPTURE_INTERVAL_S,
     StatusMonitor,
@@ -803,6 +803,90 @@ class TestDeliverPending:
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_empty_inbox_returns_zero(self, mock_get, mock_monitor, mock_term_svc, mock_update):
+        mock_get.return_value = []
+        assert InboxService().deliver_pending("term-1") == 0
+        mock_term_svc.dispatch_input.assert_not_called()
+        mock_update.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "reason, expected_status, expected_result",
+        [
+            (
+                TerminalInputBlockedReason.WAITING_USER_ANSWER,
+                MessageStatus.PENDING,
+                DELIVERY_DEFERRED,
+            ),
+            (TerminalInputBlockedReason.IDENTITY_PENDING, MessageStatus.PENDING, DELIVERY_DEFERRED),
+            (TerminalInputBlockedReason.PROVIDER_ERROR, MessageStatus.FAILED, 0),
+        ],
+    )
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_refused_send_return_contract(
+        self,
+        mock_get,
+        mock_monitor,
+        mock_term_svc,
+        mock_update,
+        reason,
+        expected_status,
+        expected_result,
+    ):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.dispatch_input.side_effect = TerminalInputBlockedError(
+            "Input refused", reason=reason
+        )
+        assert InboxService().deliver_pending("term-1") == expected_result
+        assert mock_update.call_args_list == [
+            call(1, MessageStatus.DELIVERED),
+            call(1, expected_status),
+        ]
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_delivered_count_survives_transient_refusal(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        first = _make_message(id=1)
+        second = _make_message(id=2)
+        second.sender_id = "sender-2"
+        mock_get.return_value = [first, second]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.dispatch_input.side_effect = [None, TerminalNotFoundError("s:w")]
+        assert InboxService().deliver_pending("term-1", num_messages=0) == 1
+        assert mock_term_svc.dispatch_input.call_count == 2
+        assert mock_update.call_args_list == [
+            call(1, MessageStatus.DELIVERED),
+            call(2, MessageStatus.DELIVERED),
+            call(2, MessageStatus.PENDING),
+        ]
+
+    @patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", False)
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_locked_delivery_returns_deferred_when_gate_closed(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
+
+        assert InboxService()._deliver_pending_locked("term-1", 1, None) == DELIVERY_DEFERRED
+
+        mock_term_svc.dispatch_input.assert_not_called()
+        mock_update.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivers_message_when_idle(self, mock_get, mock_monitor, mock_term_svc, mock_update):
         mock_get.return_value = [_make_message()]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
@@ -1026,7 +1110,7 @@ class TestDeliverPending:
         mock_term_svc.dispatch_input.side_effect = TerminalNotFoundError("s:w")
 
         svc = InboxService()
-        svc.deliver_pending("term-1")
+        assert svc.deliver_pending("term-1") == DELIVERY_DEFERRED
 
         # Final status is PENDING (reset after the optimistic DELIVERED), never FAILED.
         assert mock_update.call_args_list[-1] == call(1, MessageStatus.PENDING)
