@@ -276,12 +276,11 @@ def test_compiled_topic_uses_cao_owned_dates(
     )
     path.write_text(compiled, encoding="utf-8")
     entry = _entry("compiled-dates", updated_at="2026-03-01T00:00:00Z")
-    entry["created_at"] = "2026-01-01T00:00:00Z"
 
     memory = MemoryService(tmp_path, engine)._parse_wiki_file(path, compiled, entry)
 
     assert memory is not None
-    assert memory.created_at == datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert memory.created_at == datetime(2026, 3, 1, tzinfo=timezone.utc)
     assert memory.updated_at == datetime(2026, 3, 1, tzinfo=timezone.utc)
     assert memory.created_at <= memory.updated_at
 

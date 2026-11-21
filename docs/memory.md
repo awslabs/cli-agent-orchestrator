@@ -551,7 +551,10 @@ cao config set memory.parser.lenient false
 After a successful LLM compile, CAO post-processes the article to add a
 `cao-compiled` marker and exactly one canonical entry heading. The heading uses the newest
 merged entry's timestamp, not the compile time, so recompiling an old fact does not make it
-look new.
+look new. Any timestamp headings retained from the LLM article are demoted to
+`### Entry <timestamp>`, so they cannot be mistaken for canonical entries during export or
+after a code rollback. A compiled topic's `created_at` and `updated_at` both come from its
+canonical heading, so both use the newest merged entry timestamp.
 
 `cao memory repair` now reports and indexes a header-valid topic using its loose heading,
 existing database dates, or file modification time as fallbacks. The default dry-run and

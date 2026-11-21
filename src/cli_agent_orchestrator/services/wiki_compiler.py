@@ -275,7 +275,7 @@ def _postprocess_compiled(
         if _COMPILED_MARKER_RE.fullmatch(line):
             continue
         heading = _ENTRY_HEADING_RE.fullmatch(line)
-        lines.append(f"### {heading.group(1)}" if heading is not None else line)
+        lines.append(f"### Entry {heading.group(1)}" if heading is not None else line)
 
     # The header block is the leading H1/id-comment pair (either order), with
     # surrounding blank lines. Insert metadata immediately after it.

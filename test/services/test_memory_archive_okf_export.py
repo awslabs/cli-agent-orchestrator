@@ -237,6 +237,57 @@ class TestConformance:
         assert report.exported == 1
         assert body == f"# compiled-topic\n\n{recalled.content}"
 
+    @pytest.mark.parametrize(
+        "llm_headings",
+        [
+            (
+                "## 2026-01-01T00:00:00Z\nfirst fact\n\n"
+                "## 2026-02-01T00:00:00Z\nsecond fact\n\n"
+                "third fact"
+            ),
+            (
+                "## 2026-01-01T00:00:00Z\nfirst fact\n\n"
+                "## 2026-02-01T00:00:00Z\nsecond fact\n\n"
+                "## 2026-03-01T00:00:00Z\nthird fact"
+            ),
+            (
+                "## 2026-03-01T00:00:00Z\nthird fact\n\n"
+                "## 2026-02-01T00:00:00Z\nsecond fact\n\n"
+                "## 2026-01-01T00:00:00Z\nfirst fact"
+            ),
+        ],
+        ids=["keeps-first-two", "keeps-all", "newest-first"],
+    )
+    def test_compiled_topic_round_trips_through_okf_import(
+        self, svc, backend, dest, tmp_path, llm_headings
+    ):
+        _store(svc, "compiled-round-trip", "first fact")
+        source_path = svc.get_wiki_path("global", None, "compiled-round-trip")
+        source = _postprocess_compiled(
+            source_path.read_text(encoding="utf-8").split("## ", 1)[0] + llm_headings,
+            newest_entry_at="2026-03-01T00:00:00Z",
+            entry_count=3,
+            compiled_at="2026-03-02T00:00:00Z",
+        )
+        source_path.write_text(source, encoding="utf-8")
+        source_memory = _run(svc.recall(scope="global", limit=10, scan_all=True))[0]
+        assert backend.export_bundle("global", None, dest, False, False).exported == 1
+
+        imported_engine = create_engine(
+            f"sqlite:///{tmp_path / 'imported.db'}", connect_args={"check_same_thread": False}
+        )
+        Base.metadata.create_all(bind=imported_engine)
+        imported_svc = MemoryService(
+            base_dir=tmp_path / "imported-memory", db_engine=imported_engine
+        )
+        imported_backend = OkfArchiveBackend(imported_svc)
+        assert imported_backend.import_bundle(dest, "global", "skip", False).imported == 1
+        imported_memory = _run(imported_svc.recall(scope="global", limit=10, scan_all=True))[0]
+
+        assert imported_memory.content == source_memory.content
+        assert source_memory.created_at <= source_memory.updated_at
+        assert imported_memory.created_at <= imported_memory.updated_at
+
 
 class TestSecretGate:
     """Design test 2: skip by default, redact opt-in, pattern names only."""

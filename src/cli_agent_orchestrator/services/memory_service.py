@@ -4449,7 +4449,7 @@ class MemoryService:
             )
 
         if timestamps:
-            created_at = (_entry_time("created_at") or timestamps[0]) if compiled else timestamps[0]
+            created_at = timestamps[0]
             updated_at = timestamps[-1]
         else:
             # Leniency applies only to an otherwise-canonical topic. A random
