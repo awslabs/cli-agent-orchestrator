@@ -52,6 +52,17 @@ ELISION_MARKER = "[... earlier content elided by CAO compiler — see git histor
 
 _SENTINEL_STRIP_RE = re.compile(r"<<<CAO_(NEW_OBSERVATION|EXISTING_ARTICLE)_(BEGIN|END)_v\d+>>>")
 _ID_HEADER_RE = re.compile(r"^<!--\s*id:\s*([^\s>][^>]*?)\s*-->")
+_ENTRY_HEADING_RE = re.compile(r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)$", re.MULTILINE)
+_LOOSE_ENTRY_HEADING_RE = re.compile(
+    r"^#{2,} [^\n]*?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)[^\n]*$",
+    re.MULTILINE,
+)
+_CANONICAL_ENTRY_HEADING_RE = re.compile(
+    r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$", re.MULTILINE
+)
+_COMPILED_MARKER_RE = re.compile(
+    r"^<!-- cao-compiled: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z entries=(\d+) -->$"
+)
 _FENCE_RE = re.compile(r"^```", re.MULTILINE)
 # Matches every markdown link form so none bypass rule 7's "no links except
 # the canonical See Also bullet" contract: inline ``[text](url)``,
@@ -97,6 +108,8 @@ _PROMPT_SYSTEM = (
     "  `<!-- id: {topic_key} -->`.\n"
     "- Merge the new observation INTO the article body: integrate, deduplicate and\n"
     "  reorganise the content. Do not simply append the observation at the end.\n"
+    "- Preserve entry timestamps. CAO will normalize them and own the single\n"
+    "  canonical `## <ISO timestamp>` heading after you return the article.\n"
     "- Do NOT emit YAML frontmatter (no leading `---`).\n"
     "- Do NOT emit `<script>`, `<iframe>`, `<object>`, `<embed>`, `<style>` tags.\n"
     "- Do NOT include any markdown links. (U2 will reintroduce a `## See Also`\n"
@@ -206,13 +219,106 @@ def _append_fallback(existing: str, new_entry: str) -> str:
     return f"## {ts}\n{new_entry}\n"
 
 
+def _canonical_timestamp(value: str) -> str:
+    """Validate and normalize a minute- or second-precision UTC timestamp."""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z", value):
+        raise ValueError("newest_entry_at must be an ISO-8601 UTC timestamp")
+    normalized = value if len(value) == 20 else value.replace("Z", ":00Z")
+    datetime.strptime(normalized, "%Y-%m-%dT%H:%M:%SZ")
+    return normalized
+
+
+def _resolve_newest_entry_at(
+    existing: str,
+    new_entry: str,
+    newest_entry_at: Optional[str],
+    fallback_updated_at: Optional[str],
+) -> str:
+    """Resolve the fact timestamp without letting compilation refresh recency."""
+    if newest_entry_at is not None:
+        return _canonical_timestamp(newest_entry_at)
+    if not new_entry.strip():
+        existing_timestamps = _ENTRY_HEADING_RE.findall(existing)
+        if existing_timestamps:
+            return max(_canonical_timestamp(value) for value in existing_timestamps)
+        loose_timestamps = _LOOSE_ENTRY_HEADING_RE.findall(existing)
+        if loose_timestamps:
+            return max(_canonical_timestamp(value) for value in loose_timestamps)
+        if fallback_updated_at is not None:
+            return _canonical_timestamp(fallback_updated_at)
+    # Direct compile callers predating the explicit timestamp parameter cannot
+    # supply the new observation's fact time. Keep their behavior deterministic
+    # at call time; the production store path always supplies newest_entry_at.
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _compiled_entry_count(existing: str, new_entry: str) -> int:
+    marker_counts = [
+        int(match.group(1))
+        for line in existing.splitlines()
+        if (match := _COMPILED_MARKER_RE.fullmatch(line)) is not None
+    ]
+    previous = max(marker_counts, default=len(_ENTRY_HEADING_RE.findall(existing)))
+    return max(1, previous + (1 if new_entry.strip() else 0))
+
+
+def _postprocess_compiled(
+    compiled: str,
+    *,
+    newest_entry_at: str,
+    entry_count: int,
+    compiled_at: str,
+) -> str:
+    """Make CAO, rather than the untrusted LLM, own compiled-topic metadata."""
+    lines: list[str] = []
+    for line in compiled.splitlines():
+        if _COMPILED_MARKER_RE.fullmatch(line):
+            continue
+        heading = _ENTRY_HEADING_RE.fullmatch(line)
+        lines.append(f"### Entry {heading.group(1)}" if heading is not None else line)
+
+    # The header block is the leading H1/id-comment pair (either order), with
+    # surrounding blank lines. Insert metadata immediately after it.
+    header_end = 0
+    saw_header = False
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            if saw_header:
+                header_end = index + 1
+            continue
+        if stripped.startswith("# ") or _ID_HEADER_RE.fullmatch(stripped):
+            saw_header = True
+            header_end = index + 1
+            continue
+        break
+
+    prefix = lines[:header_end]
+    while prefix and not prefix[-1].strip():
+        prefix.pop()
+    body = lines[header_end:]
+    while body and not body[0].strip():
+        body.pop(0)
+    marker = f"<!-- cao-compiled: {compiled_at} entries={entry_count} -->"
+    rendered = prefix + [marker, "", f"## {newest_entry_at}"]
+    if body:
+        rendered.extend(["", *body])
+    return "\n".join(rendered).rstrip() + "\n"
+
+
 # -----------------------------------------------------------------------------
 # Output validator — rules run in order; first failure → fallback
 # -----------------------------------------------------------------------------
 
 
 def _validate_output(
-    compiled: str, *, existing: str, new_entry: str, expected_header: str
+    compiled: str,
+    *,
+    existing: str,
+    new_entry: str,
+    expected_header: str,
+    newest_entry_at: str,
+    enforce_canonical_heading: bool = True,
 ) -> Optional[str]:
     """Return None if accepted, else ``"output_validation:<rule>"`` reason."""
     # 1. Non-empty
@@ -295,6 +401,18 @@ def _validate_output(
     floor = max(len(existing) // 4, len(new_entry))
     if len(compiled) < floor:
         return "output_validation:10"
+
+    # 11. Post-processing must leave exactly CAO's fact-dated canonical
+    # heading, never an LLM-provided duplicate or the compile timestamp.
+    if enforce_canonical_heading:
+        canonical_headings = _CANONICAL_ENTRY_HEADING_RE.findall(compiled)
+        if canonical_headings != [newest_entry_at]:
+            return "output_validation:11"
+        existing_headings = _ENTRY_HEADING_RE.findall(existing)
+        if existing_headings and newest_entry_at < max(
+            _canonical_timestamp(value) for value in existing_headings
+        ):
+            return "output_validation:11"
 
     return None
 
@@ -524,6 +642,8 @@ async def compile(
     topic_key: str,
     timeout_s: float = DEFAULT_TIMEOUT_S,
     provider_hint: Optional[str] = None,
+    newest_entry_at: Optional[str] = None,
+    fallback_updated_at: Optional[str] = None,
 ) -> CompileResult:
     """Merge ``new_entry`` into ``existing_content``; return a ``CompileResult``.
 
@@ -540,12 +660,18 @@ async def compile(
     new_bytes = (new_entry or "").encode("utf-8")
     if len(new_bytes) > NEW_ENTRY_MAX_BYTES:
         raise ValueError(
-            f"new_entry exceeds {NEW_ENTRY_MAX_BYTES} byte cap " f"(got {len(new_bytes)} bytes)"
+            f"new_entry exceeds {NEW_ENTRY_MAX_BYTES} byte cap (got {len(new_bytes)} bytes)"
         )
 
     sanitised_new = _strip_sentinels(new_entry or "")
     sanitised_existing = _strip_sentinels(_truncate_existing(existing_content or ""))
     expected_header = _expected_header(topic_key, existing_content or "")
+    canonical_entry_at = _resolve_newest_entry_at(
+        existing_content or "",
+        new_entry or "",
+        newest_entry_at,
+        fallback_updated_at,
+    )
 
     fallback = _append_fallback(existing_content or "", new_entry or "")
 
@@ -625,7 +751,23 @@ async def compile(
         existing=existing_content or "",
         new_entry=new_entry or "",
         expected_header=expected_header,
+        newest_entry_at=canonical_entry_at,
+        enforce_canonical_heading=False,
     )
+    processed = _postprocess_compiled(
+        raw,
+        newest_entry_at=canonical_entry_at,
+        entry_count=_compiled_entry_count(existing_content or "", new_entry or ""),
+        compiled_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    if reason is None:
+        reason = _validate_output(
+            processed,
+            existing=existing_content or "",
+            new_entry=new_entry or "",
+            expected_header=expected_header,
+            newest_entry_at=canonical_entry_at,
+        )
     if reason is not None:
         elapsed = _now_ms() - started
         logger.warning(
@@ -641,7 +783,7 @@ async def compile(
 
     elapsed = _now_ms() - started
     return CompileResult(
-        compiled_content=raw,
+        compiled_content=processed,
         used_llm=True,
         fallback_reason=None,
         elapsed_ms=elapsed,
