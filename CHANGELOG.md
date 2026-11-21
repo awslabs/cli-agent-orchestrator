@@ -11,9 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`cao memory show` finds an existing key when recall ranks by BM25** (#1329).
 - **herdr backend: event-driven inbox delivery works again on herdr 0.9.x (protocol 22)**.
-  herdr ≥0.9 acks a broadcast `pane.updated` subscription but never emits the event, so every
-  inbox delivery silently fell back to the 30s reconciliation sweep (measured 51s/83s
-  end-to-end on 0.9.5, slower than the tmux watchdog). The service now subscribes to
+  herdr ≥0.9 acks a broadcast `pane.updated` subscription but no longer emits it on
+  agent-status transitions, so every inbox delivery silently fell back to the 30s
+  reconciliation sweep (measured 51s/83s end-to-end on 0.9.5, slower than the tmux
+  watchdog). The service now subscribes to
   `pane.agent_status_changed` per managed pane — validated against a live snapshot, because
   herdr resets the connection when a subscription names an unknown pane — while keeping the
   broadcast for older herdr versions, and recycles the connection (one `events.subscribe`

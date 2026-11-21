@@ -9,8 +9,8 @@ Design:
 - Maintains a pane_id → terminal_id map for managed panes
 - Subscribes to pane.agent_status_changed per managed pane, validated against a
   fresh snapshot: herdr ≥0.9 accepts a broadcast pane.updated subscription but
-  never emits the event, and rejects (and then RESETS the connection on) any
-  subscription naming a pane it does not know
+  no longer emits it on agent-status transitions, and rejects (and then RESETS
+  the connection on) any subscription naming a pane it does not know
 - herdr allows exactly ONE events.subscribe per connection (a second resets the
   connection, measured on 0.7.5 and again on 0.9.5), so a pane registered after
   connect is picked up by an intentional reconnect, not an incremental call
@@ -1155,9 +1155,9 @@ class HerdrInboxService:
 
         The subscription set is:
         - pane.agent_status_changed PER MANAGED PANE. herdr ≥0.9 (protocol 22)
-          accepts a broadcast pane.updated subscription but never emits the
-          event, so the per-pane form is the only one that actually delivers
-          agent-status transitions there. pane_id is required by the schema.
+          accepts a broadcast pane.updated subscription but no longer emits it
+          on agent-status transitions, so the per-pane form is the only one
+          that actually delivers them. pane_id is required by the schema.
         - a broadcast pane.updated, kept for older herdr versions (≤0.8) that
           emit it with agent_status in the payload. Duplicate signals are
           harmless: _deliver is idempotent and _record_agent_status dedupes.
