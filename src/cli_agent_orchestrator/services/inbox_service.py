@@ -47,6 +47,9 @@ from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
 
+# Pending messages exist, but the readiness gate is still closed.
+DELIVERY_DEFERRED = -1
+
 # Poll interval for the submit-confirmation wait. Short because the common case
 # is a healthy delivery that is already PROCESSING on the first or second read.
 # A dropped delivery costs INBOX_SUBMIT_CONFIRM_TIMEOUT for the first wait plus
@@ -179,6 +182,9 @@ class InboxService:
     ) -> int:
         """Deliver pending message(s) to a ready terminal. Use num_messages=0 for all.
 
+        Return 0 when nothing is pending, DELIVERY_DEFERRED when queued messages
+        are blocked by the readiness gate, or the positive delivered count.
+
         Status comes from the StatusMonitor (the event-driven source of truth).
         Delivery normally happens on IDLE/COMPLETED; providers that accept input
         mid-turn (``accepts_input_while_processing``) also receive messages while
@@ -226,13 +232,10 @@ class InboxService:
         after_dispatch: Callable[[], None] = lambda: None,
         source: Optional[str] = None,
     ) -> int:
-        """Return the number of messages actually handed to the pane.
+        """Return 0 if empty, DELIVERY_DEFERRED if gated, or the delivered count.
 
-        The count lets an event-driven caller (the herdr settle-retry) stop
-        re-checking once a delivery lands, instead of running out its whole
-        window. Zero covers both "nothing pending" and "pending but the
-        readiness gate is still closed"; the caller only needs the positive
-        signal.
+        DELIVERY_DEFERRED means messages are queued but the readiness gate is
+        still closed. A positive count records messages handed to the pane.
         """
         limit = num_messages if num_messages > 0 else 100
         messages = get_pending_messages(terminal_id, limit=limit)
@@ -269,7 +272,7 @@ class InboxService:
                 ):
                     eager_eligible = False
             if not eager_eligible:
-                return 0
+                return DELIVERY_DEFERRED
             eager = True
 
         # Mark DELIVERED before sending (#164). send_input() types into the tmux
