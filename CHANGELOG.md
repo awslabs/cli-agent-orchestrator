@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add the Qwen Code (`qwen_cli`) provider with profile, skill, MCP and model support.
 
+- **kiro_cli (v2 TUI): an open permission dialog reads `waiting_user_answer` in the cases #1426 missed**.
+  A dialog Kiro redrew on a tmux attach/resize, or one whose blocked OSC 7501 report the rolling
+  buffer had already dropped, read `processing`; so did one drawn below older working text, such as
+  the spinner line on screen when the dialog opened or agent output quoting "Kiro is working". An
+  approved prompt (blocked report still last, working text after it) now reads `processing`
+  instead of `waiting_user_answer`, Kiro's own later report outranks stale dialog text, and the
+  "/" command menu footer is no longer read as a blocking selector. v3 status is unchanged. Tests
+  replay real 7501 traces (approve, deny, esc, ctrl-c, exit, queue-mode footer).
+
 - **`cao memory show` finds an existing key when recall ranks by BM25** (#1329).
 - **herdr backend: event-driven inbox delivery works again on herdr 0.9.x (protocol 22)**.
   herdr ≥0.9 acks a broadcast `pane.updated` subscription but no longer emits it on
