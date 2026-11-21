@@ -562,7 +562,12 @@ class TestCreateInboxMessageResponseTiming:
         ):
             try:
                 body = await create_inbox_message_endpoint(
-                    self._request(), "abcdef12", "sender01", "hello", _scopes=[]
+                    self._request(),
+                    "abcdef12",
+                    "sender01",
+                    "hello",
+                    wait_for_outcome=True,
+                    _scopes=[],
                 )
                 assert (body["success"], body["delivery"], body["error"]) == (
                     True,
@@ -801,6 +806,117 @@ def _failure_notices(receiver_id):
     return [m for m in _inbox(receiver_id) if m.message.startswith("[CAO delivery failed]")]
 
 
+class TestInboxPostWaitSelection:
+    """The POST keeps the 5 s wait of earlier versions unless the client asks for the outcome.
+
+    Clients of this route time out after 8 to 30 s (the web UI, the shelf and
+    fleet examples, the cross-node notice, the EKS broker, older CAO MCP
+    clients). Only a client that sets ``wait_for_outcome`` and has an HTTP
+    timeout past INBOX_DELIVERY_OUTCOME_WAIT gets the long wait.
+    """
+
+    @staticmethod
+    def _delivered_at_once(receiver_id, **kwargs):
+        from cli_agent_orchestrator.models.inbox import DeliveryOutcome
+
+        kwargs["on_outcome"](kwargs["report_to_sender"], DeliveryOutcome.DELIVERED, None)
+
+    @pytest.mark.parametrize(
+        ("query", "expected_wait"),
+        [
+            ("", 7.0),
+            ("&wait_for_outcome=false", 7.0),
+            ("&wait_for_outcome=true", 31.0),
+        ],
+        ids=["absent", "false", "true"],
+    )
+    def test_the_query_parameter_picks_the_wait(self, client, query, expected_wait):
+        seen = []
+        real_wait = asyncio.wait
+
+        async def spy(futures, *, timeout=None, **kwargs):
+            seen.append(timeout)
+            return await real_wait(futures, timeout=timeout, **kwargs)
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message",
+                return_value=TestCreateInboxMessageResponseTiming._stored_message(),
+            ),
+            patch("cli_agent_orchestrator.api.main.delegation_callback_service.on_send_message"),
+            patch(
+                "cli_agent_orchestrator.api.main.inbox_service.deliver_pending",
+                side_effect=self._delivered_at_once,
+            ),
+            patch("cli_agent_orchestrator.api.main.INBOX_IMMEDIATE_DELIVERY_WAIT", 7.0),
+            patch("cli_agent_orchestrator.api.main.INBOX_DELIVERY_OUTCOME_WAIT", 31.0),
+            patch("cli_agent_orchestrator.api.main.asyncio.wait", spy),
+        ):
+            response = client.post(
+                f"/terminals/abcdef12/inbox/messages?sender_id=sender01&message=hello{query}"
+            )
+
+        assert response.status_code == 200
+        assert response.json()["delivery"] == "delivered"
+        assert seen == [expected_wait]
+
+    @pytest.mark.asyncio
+    async def test_without_the_parameter_a_held_receiver_lock_gets_in_progress_at_the_short_wait(
+        self, live
+    ):
+        from cli_agent_orchestrator.api.main import create_inbox_message_endpoint
+        from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+        with (
+            patch("cli_agent_orchestrator.api.main.INBOX_IMMEDIATE_DELIVERY_WAIT", 0.05),
+            patch("cli_agent_orchestrator.api.main.INBOX_DELIVERY_OUTCOME_WAIT", 600.0),
+            inbox_service._delivery_lock(C),  # another delivery holds the receiver
+        ):
+            # A wrong choice of the long wait would block here; fail fast instead.
+            body = await asyncio.wait_for(
+                create_inbox_message_endpoint(
+                    TestCreateInboxMessageResponseTiming._request(), C, W, "status", _scopes=[]
+                ),
+                timeout=20,
+            )
+        await TestCreateInboxMessageResponseTiming._drain_background_tasks()
+
+        assert (body["success"], body["delivery"], body["error"]) == (True, "in_progress", None)
+        assert _stored(C).status.value == "delivered", "the attempt went on once the lock freed"
+
+    @pytest.mark.asyncio
+    async def test_with_the_parameter_the_post_waits_past_the_short_wait_for_the_outcome(
+        self, live
+    ):
+        from cli_agent_orchestrator.api.main import create_inbox_message_endpoint
+        from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+        live.paste.dispatch_input.side_effect = _not_sent("herdr-core lost terminal.read")
+        lock = inbox_service._delivery_lock(C)
+        lock.acquire()
+        asyncio.get_running_loop().call_later(0.3, lock.release)  # well past the short wait
+        with (
+            patch("cli_agent_orchestrator.api.main.INBOX_IMMEDIATE_DELIVERY_WAIT", 0.01),
+            patch("cli_agent_orchestrator.api.main.INBOX_DELIVERY_OUTCOME_WAIT", 600.0),
+        ):
+            body = await asyncio.wait_for(
+                create_inbox_message_endpoint(
+                    TestCreateInboxMessageResponseTiming._request(),
+                    C,
+                    W,
+                    "status",
+                    wait_for_outcome=True,
+                    _scopes=[],
+                ),
+                timeout=20,
+            )
+        await TestCreateInboxMessageResponseTiming._drain_background_tasks()
+
+        assert (body["success"], body["delivery"]) == (False, "failed")
+        assert "lost terminal.read" in body["error"]
+        assert _failure_notices(W) == [], "the POST reported it, so no notice"
+
+
 class TestPostHandOffAfterTheBound:
     """Ruling on in_progress: exactly one of the POST or the queued path reports a failure.
 
@@ -822,7 +938,12 @@ class TestPostHandOffAfterTheBound:
 
         with patch("cli_agent_orchestrator.api.main.INBOX_DELIVERY_OUTCOME_WAIT", self.BOUND):
             body = await create_inbox_message_endpoint(
-                TestCreateInboxMessageResponseTiming._request(), C, W, "status", _scopes=[]
+                TestCreateInboxMessageResponseTiming._request(),
+                C,
+                W,
+                "status",
+                wait_for_outcome=True,
+                _scopes=[],
             )
         return body
 

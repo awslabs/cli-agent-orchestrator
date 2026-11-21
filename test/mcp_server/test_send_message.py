@@ -351,6 +351,45 @@ class TestSendToInboxDeliveryOutcome:
         timeouts = [c.kwargs["timeout"] for c in mock_post.call_args_list]
         assert timeouts == [self._outcome_wait() + 10] * 2
 
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.post")
+    def test_the_post_asks_for_the_outcome_wait(self, mock_post):
+        """The 5 s default of the route would hide a failure that the long timeout is for."""
+        from cli_agent_orchestrator.utils.orchestration import _send_to_inbox
+
+        mock_post.return_value = self._response({"success": True, "delivery": "delivered"})
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "badc0de1"}):
+            _send_to_inbox("c0ffee01", "Done!", expect_reply=True)
+        params = mock_post.call_args.kwargs["params"]
+        assert params == {
+            "sender_id": "badc0de1",
+            "message": "Done!",
+            "expect_reply": "true",
+            "wait_for_outcome": "true",
+        }
+
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.post")
+    def test_the_callback_retry_asks_for_the_outcome_wait_too(self, mock_post):
+        from cli_agent_orchestrator.utils.orchestration import _send_to_inbox
+
+        mock_post.side_effect = [
+            self._response({}, status_code=404),
+            self._response({"success": True, "delivery": "queued"}),
+        ]
+        with (
+            patch.dict(os.environ, {"CAO_TERMINAL_ID": "badc0de1"}),
+            patch(
+                "cli_agent_orchestrator.utils.orchestration._callback_route",
+                return_value=("http://supervisor-node:9889", "5ca1ab1e"),
+            ),
+        ):
+            _send_to_inbox("c0ffee01", "Done!")
+        urls = [c.args[0] for c in mock_post.call_args_list]
+        assert urls[1].startswith("http://supervisor-node:9889/")
+        assert [c.kwargs["params"]["wait_for_outcome"] for c in mock_post.call_args_list] == [
+            "true",
+            "true",
+        ]
+
     @pytest.mark.parametrize(
         "body",
         [

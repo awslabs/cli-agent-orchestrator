@@ -87,6 +87,7 @@ from cli_agent_orchestrator.constants import (
     DEFAULT_PROVIDER,
     HANDOFF_RESULTS_ROUTE,
     INBOX_DELIVERY_OUTCOME_WAIT,
+    INBOX_IMMEDIATE_DELIVERY_WAIT,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
     MODEL_ID_MAX_LEN,
@@ -10360,6 +10361,7 @@ async def create_inbox_message_endpoint(
     sender_id: str,
     message: str,
     expect_reply: bool = False,
+    wait_for_outcome: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Store an inbox message, attempt its delivery, and report what happened to it.
@@ -10368,11 +10370,17 @@ async def create_inbox_message_endpoint(
     attempt (reply-delivery-failure D5): ``delivered`` (the paste reached the
     terminal), ``queued`` (the receiver was not ready, or older messages were
     ahead), ``failed`` (nothing was typed) or ``uncertain`` (some or all of it
-    may have been typed), or ``in_progress`` when INBOX_DELIVERY_OUTCOME_WAIT
-    ran out first. ``failed`` and ``uncertain`` set ``success`` false and
-    ``error``; such a message is marked failed and never retried by the
-    server, because the sender now owns the retry. After ``in_progress`` a
-    failure of the message is handled as a queued one (retry or notice).
+    may have been typed), or ``in_progress`` when the wait ran out first.
+    ``failed`` and ``uncertain`` set ``success`` false and ``error``; such a
+    message is marked failed and never retried by the server, because the
+    sender now owns the retry. After ``in_progress`` a failure of the message
+    is handled as a queued one (retry or notice).
+
+    The POST waits at most INBOX_IMMEDIATE_DELIVERY_WAIT (5 s) by default.
+    ``wait_for_outcome=true`` raises the wait to INBOX_DELIVERY_OUTCOME_WAIT
+    (45 s). A client that sets it must use an HTTP timeout longer than that
+    wait, or it sees an error for a message that is stored and may still
+    arrive. Clients that do not set it keep the short wait.
     """
     try:
         inbox_msg = create_inbox_message(
@@ -10409,8 +10417,16 @@ async def create_inbox_message_endpoint(
     # deliver_pending does blocking I/O (status reads, the paste, the submit
     # confirmation), so it runs on a worker thread. The answer waits for this
     # message's outcome, which is reported when the paste lands, not for the
-    # confirmation. The hand-off decides who reports a failure: this POST
-    # while it waits, the queued path once it has answered in_progress.
+    # confirmation, and only up to the wait chosen below. A sender held past
+    # its own HTTP timeout (30s default, less for the web UI and the examples)
+    # would be tempted to send the message again (PR #1004 review, P2-2), so
+    # the long wait is for a client that asks for it. The attempt itself keeps
+    # running in the background either way. The hand-off decides who reports a
+    # failure: this POST while it waits, the queued path once it has answered
+    # in_progress.
+    wait_seconds = (
+        INBOX_DELIVERY_OUTCOME_WAIT if wait_for_outcome else INBOX_IMMEDIATE_DELIVERY_WAIT
+    )
     loop = asyncio.get_running_loop()
     settled = asyncio.Event()
     hand_off = DeliveryHandOff()
@@ -10441,7 +10457,7 @@ async def create_inbox_message_endpoint(
     try:
         await asyncio.wait(
             {delivery, settled_wait},
-            timeout=INBOX_DELIVERY_OUTCOME_WAIT,
+            timeout=wait_seconds,
             return_when=asyncio.FIRST_COMPLETED,
         )
     finally:
@@ -10470,7 +10486,7 @@ async def create_inbox_message_endpoint(
             "Immediate delivery attempt for %s has no outcome after %ss; answering "
             "in_progress while it continues in the background",
             receiver_id,
-            INBOX_DELIVERY_OUTCOME_WAIT,
+            wait_seconds,
         )
         delivery_value = "in_progress"
 

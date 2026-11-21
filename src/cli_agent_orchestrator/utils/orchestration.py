@@ -75,9 +75,9 @@ def _mcp_timeout() -> float:
 
 
 def _inbox_post_timeout() -> float:
-    """HTTP timeout for an inbox POST, which waits for its delivery outcome.
+    """HTTP timeout for an inbox POST that sends ``wait_for_outcome``.
 
-    The POST can hold for INBOX_DELIVERY_OUTCOME_WAIT before it answers
+    Such a POST can hold for INBOX_DELIVERY_OUTCOME_WAIT before it answers
     (reply-delivery-failure D5), so the client must wait longer than that, or
     a message that may still arrive would read to the sender as an error.
     """
@@ -1662,7 +1662,9 @@ def _send_to_inbox(receiver_id: str, message: str, expect_reply: bool = False) -
     if callback_url and receiver_id == callback_terminal_id:
         base_url = callback_url
 
-    params = {"sender_id": sender_id, "message": message}
+    # The long wait is asked for here, together with the timeout that covers
+    # it (_inbox_post_timeout): the route's default is the short wait.
+    params = {"sender_id": sender_id, "message": message, "wait_for_outcome": "true"}
     if expect_reply:
         params["expect_reply"] = "true"
 

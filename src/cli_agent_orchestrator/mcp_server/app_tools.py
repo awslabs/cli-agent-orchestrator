@@ -449,9 +449,10 @@ def _route_command(kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                     # "operator" unless the gesture supplies one.
                     "sender_id": payload.get("sender_id") or "operator",
                     "message": message,
+                    # Ask for the delivery outcome (reply-delivery-failure D5);
+                    # the timeout below covers INBOX_DELIVERY_OUTCOME_WAIT.
+                    "wait_for_outcome": "true",
                 },
-                # The POST waits up to INBOX_DELIVERY_OUTCOME_WAIT for the
-                # delivery outcome (reply-delivery-failure D5).
                 timeout=_inbox_post_timeout(),
             )
             # The POST's own verdict: a message reported failed or uncertain is

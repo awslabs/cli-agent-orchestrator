@@ -737,6 +737,7 @@ def test_operator_send_message_waits_past_the_outcome_bound(mcp_timeout) -> None
     read_timeout = timeout[-1] if isinstance(timeout, tuple) else timeout
     assert read_timeout >= INBOX_DELIVERY_OUTCOME_WAIT + 10
     assert read_timeout >= mcp_timeout
+    assert calls[0]["params"]["wait_for_outcome"] == "true", "the long timeout needs the long wait"
 
 
 @pytest.mark.parametrize(

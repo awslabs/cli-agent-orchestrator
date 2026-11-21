@@ -408,15 +408,28 @@ DELEGATION_PICKUP_TIMEOUT_SECONDS = _env_positive_float(
     "CAO_DELEGATION_PICKUP_TIMEOUT_SECONDS", 300.0
 )
 
-# How long POST /terminals/{id}/inbox/messages waits for the outcome of its
-# own message's immediate delivery attempt (reply-delivery-failure D5). The
-# sender's HTTP timeout is this plus 10 s (utils/orchestration.py
-# _inbox_post_timeout), and that must stay below the shortest agent-CLI MCP
-# tool-call limit measured (60 s, Codex's default), or the sender sees a tool
-# error for a message that may still arrive. 45 s keeps it at 55 s. A slower
-# attempt (herdr-app can hold a send for up to 90 s) answers in_progress, and a
-# later failure of that message is handled as queued. The submit confirmation
-# is never waited for: the answer comes when the paste lands.
+# How long POST /terminals/{id}/inbox/messages waits for its immediate delivery
+# attempt to reach the pane before answering. The message is already stored
+# when the wait starts and the attempt keeps running in the background, so
+# this bounds API latency only -- it never decides whether a message is
+# delivered. It has to stay well inside the sender's HTTP timeout (30s default,
+# settings_service.py): a POST that lands while the receiver's lock is held by
+# an unconfirmed delivery could otherwise wait out that whole confirmation,
+# time out at the sender, and tempt it to send the message a second time.
+# Clients of the route time out after 8 to 30 s, so this is the wait unless the
+# client asks for INBOX_DELIVERY_OUTCOME_WAIT with ``wait_for_outcome``.
+INBOX_IMMEDIATE_DELIVERY_WAIT = 5.0
+
+# How long the POST waits when the client sets ``wait_for_outcome``: for the
+# outcome of its own message's immediate delivery attempt, so the sender can
+# learn of a failure (reply-delivery-failure D5). Only a client whose HTTP
+# timeout is longer than this may ask: the CAO MCP clients send it with
+# _inbox_post_timeout (utils/orchestration.py), which is this plus 10 s and
+# must stay below the shortest agent-CLI MCP tool-call limit measured (60 s,
+# Codex's default). 45 s keeps it at 55 s. A slower attempt (herdr-app can
+# hold a send for up to 90 s) answers in_progress, and a later failure of that
+# message is handled as queued. The submit confirmation is never waited for:
+# the answer comes when the paste lands.
 INBOX_DELIVERY_OUTCOME_WAIT = 45.0
 
 # Worker threads the OpenCode poller and the reconcile sweep fan out over.
