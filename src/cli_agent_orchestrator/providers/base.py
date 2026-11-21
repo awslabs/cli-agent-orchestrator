@@ -297,6 +297,17 @@ class BaseProvider(ABC):
     # Uses the stale-processing probe/commit contract; active dialogs must stay waiting.
     supports_stale_waiting_capture: bool = False
 
+    # Opt-in for StatusMonitor to release a latched WAITING_USER_ANSWER on an
+    # unarmed PROCESSING detection. A prompt answered in the pane itself (an
+    # attached user) arms nothing, so without this the latch holds waiting for
+    # the rest of the turn. Set True ONLY when get_status() keeps reading an
+    # open dialog as WAITING_USER_ANSWER from the bottom of the buffer even
+    # after the dialog's first frame has been evicted from the rolling buffer:
+    # otherwise an evicted, still-open dialog reads PROCESSING and the release
+    # would hide it. Providers that leave this False keep the hold, and recover
+    # through the armed path or the stale-waiting capture.
+    waiting_release_on_processing: bool = False
+
     # Opt-in for the mid-burst PROCESSING probe (StatusMonitor._midburst_processing_probe).
     # Set True ONLY alongside a probe_processing_from_screen() override that is
     # side-effect free. The probe runs on a HALF-DRAWN frame, off the two edges
