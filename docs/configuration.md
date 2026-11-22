@@ -68,6 +68,7 @@ Every derived path resolves from this value, so one override moves everything â€
   "terminal": {
     "backend": "tmux",
     "herdr_session": "cao",
+    "herdr_auto_start": true,
     "herdr_app_session": "cao",
     "keep_finished": {
       "enabled": false,
@@ -223,6 +224,7 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 |---------|---------|--------------|
 | `enabled` | `true` | Master switch for the memory subsystem. |
 | `compile_mode` | `"llm"` | `llm` or `append`. `append` skips the LLM wiki-compiler entirely. |
+| `parser.lenient` | `true` | Parse header-valid native topics without canonical entry headings. Set to `false` to restore legacy parsing. |
 | `lifecycle.enabled` | `false` | Opt-in active supersedes exclusion for injection plus recall demotion/labels. Nested under `memory.lifecycle`; env override `CAO_MEMORY_LIFECYCLE_ENABLED`. Read/validation errors leave it off. |
 | `injection.clear_on_empty` | `true` | Replace an existing managed provider block with an empty stamped block after a successful retrieval selects no memories. |
 | `injection.v1_fixes` | `true` | Enable project-alias traversal, per-scope clipping, and skip-oversized injection hygiene fixes. |
@@ -290,13 +292,17 @@ CAO's default backend is [tmux](tmux.md). [herdr](https://herdr.dev/) is an expe
 {
   "terminal": {
     "backend": "herdr",
-    "herdr_session": "my-session"
+    "herdr_session": "my-session",
+    "herdr_auto_start": true
   }
 }
 ```
 
 - `backend`: `"tmux"` (default), `"herdr"` [EXPERIMENTAL], or `"herdr-app"` [EXPERIMENTAL] (see [Herdr app backend](herdr-app.md)).
 - `herdr_session`: the herdr session name to connect to (default `"cao"`).
+- `herdr_auto_start`: start a missing herdr server (default `true`). Set it to
+  `false` when systemd owns herdr; CAO then fails immediately if the configured
+  session is unavailable.
 - `herdr_app_session`: the herdr-core (`hc`) session the `herdr-app` backend uses (default `"cao"`; env `CAO_HERDR_APP_SESSION`).
 - `spawn_mode`: `"window"` (default) or `"pane"` â€” where a terminal created by
   `assign` / `handoff` lands. See [Watching a fleet in one window](#watching-a-fleet-in-one-window).
@@ -537,6 +543,7 @@ Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved t
 |---|---|---|
 | `CAO_TERMINAL_BACKEND` | `terminal.backend` | str |
 | `CAO_HERDR_SESSION` | `terminal.herdr_session` | str |
+| `CAO_HERDR_AUTO_START` | `terminal.herdr_auto_start` | bool |
 | `CAO_TERMINAL_SPAWN_MODE` | `terminal.spawn_mode` | str |
 | `CAO_TERMINAL_PANE_WINDOW` | `terminal.pane_window` | str |
 | `CAO_TERMINAL_PANE_LAYOUT` | `terminal.pane_layout` | str |

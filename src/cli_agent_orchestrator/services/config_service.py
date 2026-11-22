@@ -67,6 +67,10 @@ class LifecycleConfig(BaseModel):
     enabled: bool = False
 
 
+class MemoryParserConfig(BaseModel):
+    lenient: bool = True
+
+
 class InjectionConfig(BaseModel):
     clear_on_empty: bool = True
     v1_fixes: bool = True
@@ -81,6 +85,7 @@ class MemoryConfig(BaseModel):
     enabled: bool = True
     explain_enabled: bool = True
     non_accessing_inspection: bool = True
+    parser: MemoryParserConfig = Field(default_factory=MemoryParserConfig)
     lifecycle: LifecycleConfig = Field(default_factory=LifecycleConfig)
     injection: InjectionConfig = Field(default_factory=InjectionConfig)
     ranking: RankingConfig = Field(default_factory=RankingConfig)
@@ -103,6 +108,7 @@ class KeepFinishedConfig(BaseModel):
 class TerminalConfig(BaseModel):
     backend: str = "tmux"
     herdr_session: str = "cao"
+    herdr_auto_start: bool = True
     herdr_app_session: str = "cao"
     spawn_mode: str = "window"
     pane_window: str = "cao-agents"
@@ -189,6 +195,7 @@ _LEGACY_KEY_MAP: Dict[str, Tuple[str, ...]] = {
 _OWNED_DEFAULTS: Dict[str, Any] = {
     "terminal.backend": "tmux",
     "terminal.herdr_session": "cao",
+    "terminal.herdr_auto_start": True,
     "terminal.herdr_app_session": "cao",
     "terminal.spawn_mode": "window",
     "terminal.pane_window": "cao-agents",
@@ -217,6 +224,7 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
 ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_TERMINAL_BACKEND": ("terminal.backend", "str", "tmux"),
     "CAO_HERDR_SESSION": ("terminal.herdr_session", "str", "cao"),
+    "CAO_HERDR_AUTO_START": ("terminal.herdr_auto_start", "bool", True),
     "CAO_HERDR_APP_SESSION": ("terminal.herdr_app_session", "str", "cao"),
     "CAO_TERMINAL_SPAWN_MODE": ("terminal.spawn_mode", "str", "window"),
     "CAO_TERMINAL_PANE_WINDOW": ("terminal.pane_window", "str", "cao-agents"),
@@ -476,6 +484,8 @@ def _get_owned_section(path: str, default: Any) -> Any:
     if section == "memory":
         if key == "lifecycle.enabled":
             return settings_service.is_memory_lifecycle_enabled()
+        if key == "parser.lenient":
+            return settings_service.is_memory_parser_lenient()
         if key.startswith("injection."):
             injection_key = key.split(".", 1)[1]
             if injection_key not in settings_service.MEMORY_INJECTION_DEFAULTS:
@@ -667,6 +677,7 @@ _ALL_PATHS = sorted(
         "memory.compile_mode",
         "memory.flush_threshold",
         "memory.compile_timeout_s",
+        "memory.parser.lenient",
         "memory.ranking.default_sort",
         "memory.vault",
         "terminal.keep_finished.enabled",
@@ -755,6 +766,7 @@ class ConfigService:
                 enabled=_get_value("memory.enabled", default=True),
                 explain_enabled=settings_service.is_memory_explain_enabled(),
                 non_accessing_inspection=settings_service.is_non_accessing_inspection_enabled(),
+                parser=MemoryParserConfig(lenient=settings_service.is_memory_parser_lenient()),
                 lifecycle=LifecycleConfig(enabled=settings_service.is_memory_lifecycle_enabled()),
                 injection=InjectionConfig(
                     **{
@@ -774,6 +786,7 @@ class ConfigService:
             terminal=TerminalConfig(
                 backend=_get_value("terminal.backend", default="tmux"),
                 herdr_session=_get_value("terminal.herdr_session", default="cao"),
+                herdr_auto_start=_get_value("terminal.herdr_auto_start", default=True),
                 herdr_app_session=_get_value("terminal.herdr_app_session", default="cao"),
                 spawn_mode=_get_value("terminal.spawn_mode", default="window"),
                 pane_window=_get_value("terminal.pane_window", default="cao-agents"),
