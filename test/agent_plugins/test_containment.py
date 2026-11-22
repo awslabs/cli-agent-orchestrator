@@ -100,6 +100,22 @@ class TestDegenerateInputs:
     def test_empty_candidate_resolves_to_the_root(self, root):
         assert resolve_within_root(root, "") == Path(os.path.realpath(root))
 
+    @pytest.mark.parametrize(
+        "candidate", ["\x00", "./bin/run\x00evil", "sub\x00dir", "/tmp/a\x00b"]
+    )
+    def test_nul_byte_candidate_returns_none(self, root, candidate):
+        assert resolve_within_root(root, candidate) is None
+
+    def test_nul_byte_root_returns_none(self, root):
+        bad_root = f"{root}/bad\x00root"
+        assert canonical_root(bad_root) is None
+        assert resolve_within_root(bad_root, "skills/demo") is None
+
+    def test_non_path_and_bytes_inputs_return_none(self, root):
+        assert canonical_root(42) is None  # type: ignore[arg-type]
+        assert canonical_root(b"/tmp/bytes-root") is None  # type: ignore[arg-type]
+        assert resolve_within_root(root, b"skills/demo") is None  # type: ignore[arg-type]
+
 
 # --- Property 3: Containment ------------------------------------------------
 # Validates: Requirements 7.1, 7.2, 7.3, 7.4
