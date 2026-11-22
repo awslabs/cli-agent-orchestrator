@@ -123,7 +123,9 @@ def pytest_collection_modifyitems(items):
         plugin_file.unlink(missing_ok=True)
         shutil.rmtree(probe_dir)
 
-    expected = [f"test/_support/{probe_dir.name}/test_collected.py::test_{letter}" for letter in "fedcba"]
+    expected = [
+        f"test/_support/{probe_dir.name}/test_collected.py::test_{letter}" for letter in "fedcba"
+    ]
     random.Random(0).shuffle(expected)
 
     assert order == expected
