@@ -153,9 +153,10 @@ FAKE_SHA = "ab" * 32
 
 # Every setting bootstrap.sh needs, with fake pins and checksums.
 BOOTSTRAP_SETTINGS = {
-    "BOX_USER": "boxuser",
-    "BOX_UID": "2001",
-    "BOX_HOME": "/Users/boxuser",
+    "BOX_USER": "cao-herdr",
+    "BOX_UID": "1001",
+    "BOX_HOME": "/home/cao-herdr",
+    "DATA_MOUNT": "/home/cao-herdr",
     "HERDR_VERSION": "v0.9.3",
     "HERDR_SHA256": FAKE_SHA,
     "CAO_REF": "0123456789abcdef0123456789abcdef01234567",
@@ -217,10 +218,10 @@ class FakeSystem:
         self.wipefs_out = ""
         self.holders: list[str] = []
         self.user_uid: str | None = None  # None: the user doesn't exist
-        self.user_home = "/Users/boxuser"
+        self.user_home = "/home/cao-herdr"
         self.uid_taken = False
         self.home_owner = "0"
-        self.groups = "boxuser"
+        self.groups = "cao-herdr"
 
     @property
     def devfs(self) -> Path:
@@ -295,18 +296,18 @@ class FakeSystem:
             stubs,
             "id",
             'case "$*" in\n'
-            f'  "-u boxuser") {id_user} ;;\n'
-            f'  "-nG boxuser") echo "{self.groups}" ;;\n'
+            f'  "-u cao-herdr") {id_user} ;;\n'
+            f'  "-nG cao-herdr") echo "{self.groups}" ;;\n'
             '  "-u") echo 0 ;;\n'
             '  *) echo "id stub: unexpected $*" >&2; exit 64 ;;\n'
             "esac\n",
         )
-        passwd_line = f"boxuser:x:{self.user_uid}:{self.user_uid}::{self.user_home}:/bin/bash"
+        passwd_line = f"cao-herdr:x:{self.user_uid}:{self.user_uid}::{self.user_home}:/bin/bash"
         write_stub(
             stubs,
             "getent",
             'case "$*" in\n'
-            f'  "passwd boxuser") echo "{passwd_line}" ;;\n'
+            f'  "passwd cao-herdr") echo "{passwd_line}" ;;\n'
             f'  "passwd {BOOTSTRAP_SETTINGS["BOX_UID"]}") {"echo taken" if self.uid_taken else "exit 2"} ;;\n'
             "  *) exit 2 ;;\n"
             "esac\n",

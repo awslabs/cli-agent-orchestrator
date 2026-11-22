@@ -47,6 +47,9 @@ from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
 
+# Pending messages exist, but the readiness gate is still closed.
+DELIVERY_DEFERRED = -1
+
 # Poll interval for the submit-confirmation wait. Short because the common case
 # is a healthy delivery that is already PROCESSING on the first or second read.
 # A dropped delivery costs INBOX_SUBMIT_CONFIRM_TIMEOUT for the first wait plus
@@ -179,6 +182,10 @@ class InboxService:
     ) -> int:
         """Deliver pending message(s) to a ready terminal. Use num_messages=0 for all.
 
+        Return the positive delivered count, or 0 if empty or permanently failed.
+        Return DELIVERY_DEFERRED when the readiness gate blocks queued messages
+        or a refused send re-queues a message to PENDING with none delivered.
+
         Status comes from the StatusMonitor (the event-driven source of truth).
         Delivery normally happens on IDLE/COMPLETED; providers that accept input
         mid-turn (``accepts_input_while_processing``) also receive messages while
@@ -226,13 +233,11 @@ class InboxService:
         after_dispatch: Callable[[], None] = lambda: None,
         source: Optional[str] = None,
     ) -> int:
-        """Return the number of messages actually handed to the pane.
+        """Return 0 if empty or failed, DELIVERY_DEFERRED if deferred, or the delivered count.
 
-        The count lets an event-driven caller (the herdr settle-retry) stop
-        re-checking once a delivery lands, instead of running out its whole
-        window. Zero covers both "nothing pending" and "pending but the
-        readiness gate is still closed"; the caller only needs the positive
-        signal.
+        DELIVERY_DEFERRED means messages are queued but the readiness gate is
+        still closed, or a refused send re-queues a message to PENDING with none
+        delivered. A positive count records messages handed to the pane.
         """
         limit = num_messages if num_messages > 0 else 100
         messages = get_pending_messages(terminal_id, limit=limit)
@@ -242,6 +247,7 @@ class InboxService:
         status = status_monitor.get_status(terminal_id)
         eager = False
         delivered_count = 0
+        requeued_pending = False
         if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
             # Not ready on the normal path. Eager delivery (#251) lets providers
             # that accept input mid-turn receive messages while PROCESSING or
@@ -269,7 +275,7 @@ class InboxService:
                 ):
                     eager_eligible = False
             if not eager_eligible:
-                return 0
+                return DELIVERY_DEFERRED
             eager = True
 
         # Mark DELIVERED before sending (#164). send_input() types into the tmux
@@ -400,6 +406,7 @@ class InboxService:
                         )
                 self._arm_message_edges(terminal_id, batch)
             except TerminalNotFoundError as e:
+                requeued_pending = True
                 # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
                 # for this window). Treat as transient: reset to PENDING so the
                 # reconcile sweep retries rather than marking FAILED. These were
@@ -431,6 +438,7 @@ class InboxService:
                     TerminalInputBlockedReason.WAITING_USER_ANSWER,
                     TerminalInputBlockedReason.IDENTITY_PENDING,
                 ):
+                    requeued_pending = True
                     for message in batch:
                         update_message_status(message.id, MessageStatus.PENDING)
                     logger.warning(
@@ -456,6 +464,8 @@ class InboxService:
                     update_message_status(message.id, MessageStatus.FAILED)
                 self._close_message_edges(terminal_id, batch, _short_reason(e), registry)
 
+        if delivered_count == 0 and requeued_pending:
+            return DELIVERY_DEFERRED
         return delivered_count
 
     def deliver_pending_in_background(

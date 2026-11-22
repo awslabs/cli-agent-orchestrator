@@ -72,7 +72,7 @@ Decisions this sample has already made for you, all of which you can change:
 | Region | Sydney, `ap-southeast-2` | Close to the user, so typing feels fast. See [Bedrock in Sydney](#bedrock-in-sydney). |
 | Box | `m8g.4xlarge` (Graviton4, 16 vCPU, 64 GiB) | 4 GiB per vCPU suits several agents plus builds. Alternatives: `c8g.4xlarge` (32 GiB), `r8g.4xlarge` (128 GiB), `m7g.4xlarge` (Graviton3) as the fallback. |
 | OS | Ubuntu 24.04 LTS, arm64 | glibc 2.39. It's the OS that Docker's, Claude Code's, VS Code's and Kiro's install docs name. Security updates run to 2029. |
-| Home path | Your laptop's home path, for example `/Users/<you>` | Absolute paths in your kits, prompts and memory keep working unchanged. |
+| Home path | `/home/cao-herdr` | The data volume mounts at the home itself, leaving Ubuntu's `/home/ubuntu` visible. Set `BOX_HOME=/Users/<you>` and `DATA_MOUNT=/Users/<you>` when your kits, prompts or memory use absolute laptop paths. |
 | Editing | `hx` and `yazi` in herdr panes | Nothing to sync. VS Code Remote-SSH is optional. |
 | Docker | Off (`INSTALL_DOCKER=yes` turns it on) | Membership of the `docker` group is root on the box, for every agent. |
 
@@ -191,9 +191,11 @@ sudo git clone https://github.com/awslabs/cli-agent-orchestrator.git /opt/cao-bo
 cd /opt/cao-box-src/cli-agent-orchestrator/examples/remote/ec2
 sudo install -m 0600 /dev/null /opt/cao-box-src/box-settings.env
 sudo tee /opt/cao-box-src/box-settings.env > /dev/null <<'EOF'
-BOX_USER=<you>
-BOX_UID=<uid>                 # 1000-59999 (a macOS uid such as 501 is refused); pick one and never change it
-BOX_HOME=/Users/<you>
+BOX_USER=cao-herdr
+BOX_UID=2001                  # 1000-59999 (a macOS uid such as 501 is refused); pick one and never change it
+BOX_HOME=/home/cao-herdr
+DATA_MOUNT=/home/cao-herdr
+BOX_SSH_PUBLIC_KEY=ssh-ed25519 <base64-from-your-public-key> <optional-comment>
 DATA_VOLUME_ID=<vol-id>
 HERDR_VERSION=<laptop-herdr-version>
 HERDR_SHA256=<sha256 of herdr-linux-aarch64>
@@ -222,6 +224,11 @@ writable by group or others, and outside `BOX_HOME`. `bootstrap.sh` also
 refuses to run for real if any `BOX_TEST_*` variable is set (those are hooks
 for its dry-run tests).
 
+At the end, it prints `HOST KEY: ssh-ed25519 AAAA…`, with the host-key comment
+stripped. Before connecting, add `<instance-id> ssh-ed25519 <base64>` to the
+laptop's `known_hosts`, using the instance id from the SSH entry and the printed
+key.
+
 The data-volume step formats **only** a disk that matches `DATA_VOLUME_ID`'s
 NVMe serial, is a whole disk, isn't the root disk, has no partitions, holders
 or mounts, has no signatures (`wipefs -n` is empty and `blkid -p` exits 2),
@@ -229,8 +236,43 @@ or mounts, has no signatures (`wipefs -n` is empty and `blkid -p` exits 2),
 A disk that already has ext4 or xfs is mounted as it is. Leave the flag off
 on later runs.
 
-Then add your laptop's **public** key to `/Users/<you>/.ssh/authorized_keys`
-(mode 0600, owned by `<you>`).
+Set `BOX_SSH_PUBLIC_KEY` to the one line from your laptop's public key. On the
+box, `bootstrap.sh` installs it as `cao-herdr`, creates `~/.ssh` with mode
+0700 and `authorized_keys` with mode 0600, and does not duplicate it on a
+re-run. It accepts only one normal OpenSSH public-key line, never options or
+a private key. As a fallback, add the public key by hand as `cao-herdr`;
+never let root write in the box user's home.
+
+### tmux mode
+
+The default is still `ATTACH_MODE=herdr`. To use CAO's native tmux backend
+instead, omit the herdr pins and set these settings:
+
+```text
+ATTACH_MODE=tmux
+BOX_UID=2001
+# BOX_USER=cao-tmux and BOX_HOME=/home/cao-tmux are the tmux defaults.
+```
+
+Setup installs tmux 3.3 or newer, does not install herdr or `herdr-cao`, and
+starts `cao-tmux.service` before `cao-server.service`. `cao-tmux.service`
+owns tmux's normal per-user socket in its own cgroup, so restarting
+`cao-server.service` cannot kill running agent sessions; explicitly stopping
+`cao-tmux.service` intentionally does. There is no
+`PrivateTmp`, allowing the same user to attach from SSH:
+
+```bash
+ssh -t cao-box tmux attach
+```
+
+In both `cao-box` entries in [`ssh/config.snippet`](ssh/config.snippet), change
+`User cao-herdr` to `User cao-tmux` before using tmux mode. Select the attach
+mode before the first run; change modes by building a new box.
+
+For tmux mode, step 7's `ssh cao-box true` then proves the `cao-tmux` login.
+In step 8, check `cao-tmux.service cao-server.service cao-backup.timer` and
+run `sudo -u cao-tmux -i /usr/local/lib/cao-box/box-resume.sh`; do not use
+`herdr-cao.service` or the herdr machine command.
 
 ### 7. Connect the laptop
 
@@ -243,24 +285,21 @@ herdr machine add cao-box --remote-session cao-<instance-id> --label cao-box
 ```
 
 **If `herdr machine add` offers to stop the remote server, answer No** (that's
-the default). The session name is in `/etc/cao-box/box.env` on the box (and
-a copy on the data volume, see [Backups and restore](#backups-and-restore)).
+the default). The session name is in `/etc/cao-box/box.env` on the box. When
+`DATA_MOUNT` differs from `BOX_HOME`, a root-only copy is also on the data
+volume (see [Backups and restore](#backups-and-restore)).
 
-### 8. Start the services, log in, check
+### 8. Check the services, log in
 
-From your admin shell (the Session Manager shell; `<you>` has no sudo, and
+From your admin shell (the Session Manager shell; `cao-herdr` has no sudo, and
 shouldn't):
 
 ```bash
-sudo systemctl start herdr-cao.service
-sudo systemctl start cao-server.service     # waits for herdr's socket; fails if it never appears
-sudo systemctl start cao-backup.timer       # bootstrap only enables it; a reboot would start it too
-# cao-server takes a few seconds to listen after systemd says it started:
-for i in $(seq 1 30); do curl -fsS http://127.0.0.1:9889/health && break; sleep 1; done
-sudo -u <you> -i /usr/local/lib/cao-box/box-resume.sh   # as <you>: herdr state is per user
+systemctl is-active herdr-cao.service cao-server.service cao-backup.timer
+sudo -u cao-herdr -i /usr/local/lib/cao-box/box-resume.sh   # herdr state is per user
 ```
 
-Then as `<you>` (over SSH, or in a herdr pane):
+Then as `cao-herdr` (over SSH, or in a herdr pane):
 
 ```bash
 claude          # Bedrock through the instance role, see config/claude-settings.box.json.example
@@ -272,7 +311,7 @@ Claude Code asks "do you trust this folder?" the first time it opens a
 folder, and an agent that CAO launches waits on that question until the
 launch times out. On your laptop your folders are already trusted; on a fresh
 box they aren't. So trust each folder you'll launch agents in, once, as
-`<you>`: either open `claude` there and answer yes, or record it directly
+`cao-herdr`: either open `claude` there and answer yes, or record it directly
 (replace the paths with your own):
 
 ```bash
@@ -312,8 +351,8 @@ Claude Code and launch one agent with `cao launch`.
 - CAO can keep the terminal records of sessions from before the reboot (their
   status reads `unknown`). Remove each old session with
   `cao shutdown --session <name>` before you relaunch.
-- Run [`bin/box-resume.sh`](bin/box-resume.sh) as `<you>` for the read-only
-  checks: `sudo -u <you> -i /usr/local/lib/cao-box/box-resume.sh`.
+- Run [`bin/box-resume.sh`](bin/box-resume.sh) as `cao-herdr` for the read-only
+  checks: `sudo -u cao-herdr -i /usr/local/lib/cao-box/box-resume.sh`.
 
 **Phase 2 (optional): move your kit and Telegram.**
 Copy your conductor-style kit, prompts and memory to the same paths on the
@@ -475,10 +514,10 @@ flags. herdr's own `session-snapshots/` are kept. That herdr then comes up
 empty is an assumption that phase 0 checks.
 
 The session name is `cao-<instance-id>`. It's read once from the instance
-metadata (IMDSv2) at bootstrap and kept in `.cao-box/box.env` on the data
-volume, with a copy in `/etc/cao-box/box.env` for the units. It's never
-recomputed, so it doesn't drift, and it survives stop and start and a
-whole-box restore.
+metadata (IMDSv2) at bootstrap and kept in `/etc/cao-box/box.env` for the
+units. When `DATA_MOUNT` differs from `BOX_HOME`, a root-only
+`.cao-box/box.env` copy on the data volume also preserves it. It's never
+recomputed, so it doesn't drift.
 
 ### Editing
 
@@ -503,22 +542,24 @@ up one step at a time: see [`telegram/README.md`](telegram/README.md).
 
 ### The home path
 
-`bootstrap.sh` creates the user with `BOX_HOME` as their real home, uid and
-gid `BOX_UID`, and mounts the data volume at its parent (`DATA_MOUNT`, for
-example `/Users`). Set
-`BOX_HOME` to your laptop's home path, and absolute paths in your kits keep
-working.
+`bootstrap.sh` creates `cao-herdr` with `/home/cao-herdr` as its real home,
+uid and gid `BOX_UID`, and mounts the data volume at that home
+(`DATA_MOUNT=/home/cao-herdr`). It never mounts at `/home`, which would hide
+Ubuntu's `ubuntu` home.
 
-- **Why not a symlink?** `/Users/<you> -> /home/<you>` lets literal paths
+**Why a fixed user name?** Each attach mode gets one name: herdr uses
+`cao-herdr` and tmux uses `cao-tmux`. The same commands therefore work on
+every box in that mode. If kits, prompts or memory hold absolute laptop paths, set
+`BOX_HOME=/Users/<you>` and `DATA_MOUNT=/Users/<you>` instead.
+
+- **Why not a symlink?** `/Users/<you> -> /home/cao-herdr` lets literal paths
   work. But git worktrees, path guards and anything that resolves real paths
   sees `/home/...` and may disagree.
-- **No kit paths to keep?** Use the ordinary layout instead:
-  `BOX_HOME=/home/<you> DATA_MOUNT=/home/<you>`. That mounts the volume as the
-  home itself and leaves the default `ubuntu` user alone. `bootstrap.sh`
-  gives the freshly mounted folder to `<you>` and copies `/etc/skel` into it.
-  In this layout the volume has no root-only folder, so `box.env` lives only
-  in `/etc/cao-box/`, and nothing on the volume is ever read for it. Copy it
-  by hand before a whole-box restore.
+- In the default layout the volume is the home itself and leaves the default
+  `ubuntu` user alone. `bootstrap.sh` gives the freshly mounted folder to
+  `cao-herdr` and copies `/etc/skel` into it. The volume has no root-only
+  folder, so `box.env` lives only in `/etc/cao-box/`, and nothing on the
+  volume is ever read for it. Copy it by hand before a whole-box restore.
 
 ## Backups and restore
 
@@ -529,11 +570,11 @@ backups hold message text: inbox, handoff results, launch records and
 memory metadata.
 
 ```bash
-# A drill, as <you>: restore into a temp folder, check it, touch nothing live. Monthly.
+# A drill, as cao-herdr: restore into a temp folder, check it, touch nothing live. Monthly.
 /usr/local/lib/cao-box/restore.sh --drill s3://<backup-bucket>/cao-box/cao-<stamp>.db.gz
 
-# The real thing, as root from the admin shell (<you> has no sudo):
-sudo /usr/local/lib/cao-box/restore.sh --live /Users/<you>/backups/cao/cao-<stamp>.db.gz --yes
+# The real thing, as root from the admin shell (cao-herdr has no sudo):
+sudo /usr/local/lib/cao-box/restore.sh --live /home/cao-herdr/backups/cao/cao-<stamp>.db.gz --yes
 ```
 
 - A drill refuses a `--to` folder inside the live CAO home, or any folder
@@ -562,15 +603,23 @@ sudo /usr/local/lib/cao-box/restore.sh --live /Users/<you>/backups/cao/cao-<stam
 
 **Whole-box restore:**
 1. Make a volume from a snapshot and attach it to a fresh instance.
-2. Run `bootstrap.sh` with the same settings, the same `BOX_UID` and the new
+2. If `DATA_MOUNT` is `BOX_HOME` (the default and the `/Users/<you>` layout),
+   find the old session name in the laptop's herdr machine entry (the step 7
+   mismatch error also shows it), then as root write it before bootstrap:
+   ```bash
+   sudo install -D -m 0644 /dev/stdin /etc/cao-box/box.env <<'EOF'
+   CAO_BOX_SESSION=cao-<old-instance-id>
+   CAO_HERDR_SESSION=cao-<old-instance-id>
+   EOF
+   ```
+3. Run `bootstrap.sh` with the same settings, the same `BOX_UID` and the new
    `DATA_VOLUME_ID`, without `--format-new-volume`.
-3. It finds the filesystem and mounts it, checks the home belongs to
-   `BOX_UID`, and reads `.cao-box/box.env` from the volume. The folder must
-   be root's, and the file must be exactly the two session lines with equal
-   values. It then writes those two lines afresh into `/etc/cao-box/box.env`.
-   So the session name stays the old one, and it matches CAO's `settings.json`
-   and the laptop's saved machine. It stops if `settings.json` and `box.env`
-   disagree.
+4. With a separate `DATA_MOUNT`, it finds the filesystem and mounts it, checks
+   the home belongs to `BOX_UID`, and reads `.cao-box/box.env` from the volume.
+   The folder must be root's, and the file must be exactly the two session
+   lines with equal values. In either layout the old session name matches CAO's
+   `settings.json` and the laptop's saved machine. It stops if `settings.json`
+   and `box.env` disagree.
 
 ## Checking it works
 
@@ -645,7 +694,7 @@ providers don't depend on it.
 ```bash
 herdr                                                 # cao-box is in the sidebar and reconnects by itself
 herdr --remote cao-box --session cao-<instance-id>    # straight to the box's session
-herdr session attach cao-<instance-id>                # from an SSH shell on the box, as <you>
+herdr session attach cao-<instance-id>                # from an SSH shell on the box, as cao-herdr
 ```
 
 `herdr machine status cao-box` checks it without attaching. If herdr says the box isn't
@@ -659,7 +708,7 @@ aws ec2 stop-instances --region ap-southeast-2 --instance-ids <instance-id>
 aws ec2 start-instances --region ap-southeast-2 --instance-ids <instance-id>
 ```
 
-After a start, wait for SSM to show Online, then run `box-resume.sh` as `<you>`; the units come
+After a start, wait for SSM to show Online, then run `box-resume.sh` as `cao-herdr`; the units come
 back on boot by themselves. While it's stopped you pay for the EBS volumes and snapshots only.
 While your laptop sleeps, everything on the box keeps running; only the laptop's herdr window and
 any dashboard tunnel drop, and herdr reconnects on wake. More in
@@ -672,17 +721,18 @@ snapshots, S3, KMS and Bedrock usage. This sample quotes no prices: check
 the EC2, EBS and Bedrock pricing pages for Sydney. Set a budget alarm
 before you start.
 
-To remove everything, first get the user's OK to terminate the instance, then
-terminate it:
+To remove everything, note that terminating the instance deletes its root volume
+and everything on it. While the box is still running, have the user download what
+they want to keep. Then get the user's OK to terminate the instance, and terminate it:
 
 ```bash
 aws ec2 terminate-instances --region ap-southeast-2 --instance-ids <instance-id>
 aws ec2 wait instance-terminated --region ap-southeast-2 --instance-ids <instance-id>
 ```
 
-Before deleting data, show the user the exact data volume id, every snapshot
-id with its date, the backup bucket, and the KMS key id. The user downloads
-what they want to keep. Get a separate explicit OK to delete that data, then:
+Before deleting the remaining data, show the user the exact data volume id, every
+snapshot id with its date, the backup bucket, and the KMS key id. Get a separate
+explicit OK to delete that data, then:
 
 ```bash
 aws ec2 delete-volume --region ap-southeast-2 --volume-id <data-volume-id>      # it survives termination
@@ -709,7 +759,7 @@ Then remove the `cao-box` entries from the laptop's `~/.ssh/config`, run
 
 | File | What it does |
 |---|---|
-| [`bootstrap.sh`](bootstrap.sh) | Sets up the box. Idempotent, with `--dry-run`. Ubuntu 24.04 arm64 only. Formats only a verified blank data volume, and only with `--format-new-volume`. Checks every download's sha256. Enables units but never starts them. |
+| [`bootstrap.sh`](bootstrap.sh) | Sets up the box. Idempotent, with `--dry-run`. Ubuntu 24.04 arm64 only. Formats only a verified blank data volume, and only with `--format-new-volume`. Checks every download's sha256. Starts them, unless `--no-start` is set. |
 | [`backup.sh`](backup.sh), [`restore.sh`](restore.sh) | Nightly backup; a restore drill (as the box user) and a live restore (root only). |
 | [`bin/box-session-name.sh`](bin/box-session-name.sh) | Prints `cao-<instance-id>` from IMDSv2. |
 | [`bin/herdr-start.sh`](bin/herdr-start.sh), [`bin/herdr-clean-layout.sh`](bin/herdr-clean-layout.sh) | Start herdr with the minimal environment, after moving the saved layout aside. |

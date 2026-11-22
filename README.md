@@ -155,6 +155,7 @@ provider override while keeping the same sequence.
 - [Kubernetes deployment](examples/cao-clusters/kubernetes/eks/README.md): run a supervisor and worker fleet on
   Amazon EKS, with shared workspace, per-pod state, and credential delivery.
 - [Updating CAO](docs/updating.md): update an installed uv tool.
+- [Remote CAO](docs/remote.md): run CAO on one always-on EC2 box and reach it from your laptop.
 
 ### Configure and integrate
 
@@ -171,7 +172,11 @@ provider override while keeping the same sequence.
   surface — the CLI, TUI, web panel, and the `/plugins*` HTTP routes — is built
   but **gated off by default** pending a naming decision. Set
   `CAO_AGENT_PLUGINS_ENABLED` to open it; until then the routes answer `404`,
-  exactly as an unregistered path would.
+  exactly as an unregistered path would. CAO's own packages also install without
+  that gate from the repository's marketplace catalogs:
+  `/plugin marketplace add awslabs/cli-agent-orchestrator` in Claude Code, or
+  `codex plugin marketplace add awslabs/cli-agent-orchestrator` in Codex
+  ([details](docs/agent-plugins.md#install-from-the-marketplace)).
 - [Event plugins](docs/plugins.md): outbound events, installation, and authoring.
 - Provider behavior:
   [Kiro CLI](docs/kiro-cli.md), [Claude Code](docs/claude-code.md),
