@@ -87,6 +87,10 @@ def pytest_collection_modifyitems(items):
 
     def collect(seed: str) -> tuple[list[str], str]:
         env = os.environ.copy()
+        # A nested collect-only run must not inherit the outer run's assurance gates
+        # or options: CAO_MUST_RUN would fail it for the gate tests it does not collect.
+        env.pop("CAO_MUST_RUN", None)
+        env.pop("PYTEST_ADDOPTS", None)
         env["CAO_TEST_SHUFFLE_SEED"] = seed
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(probe_dir), env.get("PYTHONPATH")]))
         result = subprocess.run(
