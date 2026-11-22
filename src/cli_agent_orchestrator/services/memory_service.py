@@ -79,6 +79,7 @@ _LENIENT_ENTRY_HEADING_RE = re.compile(
     re.MULTILINE,
 )
 _LEGACY_ENTRY_TIMESTAMP_RE = re.compile(r"## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)")
+_LEGACY_ENTRY_HEADING_RE = re.compile(r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$", re.MULTILINE)
 _COMPILED_MARKER_RE = re.compile(
     r"^<!-- cao-compiled: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z entries=\d+ -->$"
 )
@@ -2557,6 +2558,8 @@ class MemoryService:
         scan_all: bool = False,
         *,
         record_access: bool = True,
+        resolved_sources: Optional[tuple[list[Path], list[VaultBinding], int, Any]] = None,
+        index_entries: Optional[dict[Path, list[dict]]] = None,
     ) -> Optional[Memory]:
         """Read one exact key without routing the lookup through ranked search."""
         if not _is_memory_enabled():
@@ -2590,6 +2593,8 @@ class MemoryService:
                 search_dirs = [project_dir] if project_dir.exists() else []
                 vault_bindings = []
                 selected_scope_id = scope_id
+        elif resolved_sources is not None:
+            search_dirs, vault_bindings, _max_body_chars, vault_config = resolved_sources
         else:
             search_dirs, vault_bindings, _max_body_chars, vault_config = self._resolve_sources(
                 scope,
@@ -2603,7 +2608,12 @@ class MemoryService:
             index_path = project_dir / "wiki" / "index.md"
             if not index_path.exists():
                 continue
-            for entry in self._parse_index(index_path):
+            entries = index_entries.get(index_path) if index_entries is not None else None
+            if entries is None:
+                entries = self._parse_index(index_path)
+                if index_entries is not None:
+                    index_entries[index_path] = entries
+            for entry in entries:
                 entry = dict(entry)
                 if entry["scope"] == MemoryScope.PROJECT.value:
                     entry["scope_id"] = (
@@ -2636,8 +2646,13 @@ class MemoryService:
                 consumer="explicit_recall",
                 policy=policy,
             )
-            if memory is not None and (
-                selected_scope_id is None or self._effective_scope_id(memory) == selected_scope_id
+            if (
+                memory is not None
+                and (scope is None or memory.scope == scope)
+                and (
+                    selected_scope_id is None
+                    or self._effective_scope_id(memory) == selected_scope_id
+                )
             ):
                 results.append(memory)
 
@@ -2983,6 +2998,11 @@ class MemoryService:
                 MemoryScope.FEDERATED.value,
             ]
         )
+        resolved_sources = None
+        index_entries: Optional[dict[Path, list[dict]]] = None
+        if scope is None:
+            resolved_sources = self._resolve_sources(None, terminal_context, scan_all=False)
+            index_entries = {}
         matches = []
         for candidate_scope in scopes:
             memory = await self.read_exact_key(
@@ -2990,6 +3010,8 @@ class MemoryService:
                 scope=candidate_scope,
                 terminal_context=terminal_context,
                 record_access=False,
+                resolved_sources=resolved_sources,
+                index_entries=index_entries,
             )
             if memory is not None:
                 matches.append(memory)
@@ -4682,6 +4704,20 @@ class MemoryService:
                 return [first_match, match], [first_time, last_time], len(matches)
             return [first_match], [first_time], len(matches)
 
+        def _parseable_entry_count(matches: list[re.Match[str]], group: int | str) -> int:
+            count = 0
+            for match in matches:
+                value = match.group(group)
+                try:
+                    datetime.strptime(
+                        value if len(value) == 20 else value.replace("Z", ":00Z"),
+                        "%Y-%m-%dT%H:%M:%SZ",
+                    )
+                except ValueError:
+                    continue
+                count += 1
+            return count
+
         lenient = is_memory_parser_lenient()
         heading_matches: list[re.Match[str]] = []
         timestamps: list[datetime] = []
@@ -4691,7 +4727,15 @@ class MemoryService:
                 file_content
             )
         )
-        timestamp_matches, timestamps, entry_count = _timestamp_boundaries(timestamp_candidates, 1)
+        timestamp_matches, timestamps, _entry_count = _timestamp_boundaries(timestamp_candidates, 1)
+        entry_count = _parseable_entry_count(
+            list(
+                (_CANONICAL_ENTRY_HEADING_RE if compiled else _LEGACY_ENTRY_HEADING_RE).finditer(
+                    file_content
+                )
+            ),
+            1,
+        )
         use_legacy_split = False
         if not compiled and not lenient:
             if not timestamps:
@@ -4700,9 +4744,12 @@ class MemoryService:
         elif not compiled and timestamps:
             use_legacy_split = True
         elif not compiled:
-            heading_matches, timestamps, entry_count = _timestamp_boundaries(
+            heading_matches, timestamps, _entry_count = _timestamp_boundaries(
                 list(_LENIENT_ENTRY_HEADING_RE.finditer(file_content)),
                 "timestamp",
+            )
+            entry_count = _parseable_entry_count(
+                list(_LENIENT_ENTRY_HEADING_RE.finditer(file_content)), "timestamp"
             )
 
         if timestamps:

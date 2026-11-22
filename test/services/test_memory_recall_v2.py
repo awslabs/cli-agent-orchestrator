@@ -212,6 +212,59 @@ def test_v2_fields_and_get_count_all_hidden_entries(service: MemoryService) -> N
     assert len(fetched["history"]) == 4
 
 
+def test_entry_count_ignores_non_heading_and_unparseable_timestamps(
+    service: MemoryService,
+) -> None:
+    _topic(
+        service,
+        "valid-history-only",
+        (
+            "A body token ## 2026-10-01T01:02:03Z is not an entry.\n"
+            "### 2026-10-02T01:02:03Z\n"
+            "A sub-heading is not an entry.\n"
+            "## 2026-13-01T01:02:03Z\n"
+            "An invalid timestamp is not an entry."
+        ),
+        timestamps=(
+            ("2026-09-01T01:02:03Z", "Earlier real entry."),
+            ("2026-11-14T05:54:00Z", "Current real entry."),
+        ),
+    )
+
+    result = asyncio.run(service.get_memory("valid-history-only", scope="global"))
+
+    assert result["earlier_entries"] == 1
+
+
+def test_memory_get_without_scope_resolves_and_parses_sources_once(
+    service: MemoryService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _topic(service, "single-lookup", "Global body.")
+    resolve_calls = 0
+    index_parse_calls = 0
+    original_resolve_sources = service._resolve_sources
+    original_parse_index = service._parse_index
+
+    def counting_resolve_sources(*args, **kwargs):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return original_resolve_sources(*args, **kwargs)
+
+    def counting_parse_index(*args, **kwargs):
+        nonlocal index_parse_calls
+        index_parse_calls += 1
+        return original_parse_index(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_resolve_sources", counting_resolve_sources)
+    monkeypatch.setattr(service, "_parse_index", counting_parse_index)
+
+    result = asyncio.run(service.get_memory("single-lookup"))
+
+    assert result["scope"] == "global"
+    assert resolve_calls == 1
+    assert index_parse_calls == 1
+
+
 @pytest.mark.parametrize("scope", ["agent", "federated"])
 def test_memory_get_hides_noninjectable_scopes_from_memory_manager(
     service: MemoryService, scope: str
