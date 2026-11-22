@@ -1207,3 +1207,63 @@ jobs:
         uses: ./.github/actions/codeql
         with:
           language: ${{ matrix.language }}
+
+  # Advisory aggregate only: branch protections do not require this job.
+  ci-gate:
+    name: CI gate (advisory)
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    needs:
+      - test
+      - web-build
+      - aidlc-portfolio-example
+      - cao-mcp-apps
+      - coverage-ratchet
+      - cao-mcp-apps-e2e
+      - lint
+      - ag-ui-demo
+      - ag-ui-construct-demos
+      - agent-plugins-dogfood
+      - ag-ui-stock-client-live
+      - ag-ui-operator-dashboard
+      - rust
+      - security
+      - dependency-security
+      - dependency-review
+      - codeql
+    permissions: {}
+    env:
+      NEEDS_JSON: ${{ toJSON(needs) }}
+      EVENT_NAME: ${{ github.event_name }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Verify every CI job succeeded
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          event_name = os.environ["EVENT_NAME"]
+          repository = os.environ["REPOSITORY"]
+          failures = []
+
+          for job_id, outcome in needs.items():
+              result = outcome["result"]
+              skipped_is_allowed = (
+                  result == "skipped"
+                  and job_id == "dependency-review"
+                  # Mirrors dependency-review's job-level `if:` condition.
+                  and (
+                      event_name != "pull_request"
+                      or repository != "awslabs/cli-agent-orchestrator"
+                  )
+              )
+              if result != "success" and not skipped_is_allowed:
+                  failures.append(f"{job_id}: {result}")
+
+          if failures:
+              print("CI gate found unsuccessful jobs:", ", ".join(failures))
+              sys.exit(1)
+          PY
