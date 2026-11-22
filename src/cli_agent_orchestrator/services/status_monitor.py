@@ -1904,6 +1904,71 @@ class StatusMonitor:
         if loop is not None:
             self._spawn_tracked(loop, confirm())
 
+    def seed_from_viewport(
+        self, terminal_id: str, session_name: str, window_name: str
+    ) -> Optional[TerminalStatus]:
+        """Seed initial status from a live pane viewport after server restart (#1438).
+
+        Only ``WAITING_USER_ANSWER`` is applied (an open permission/approval dialog
+        draws nothing until answered, so re-attaching the pipe alone would leave
+        status ``UNKNOWN`` indefinitely). Any other verdict leaves status
+        ``UNKNOWN`` for the live output stream to settle, and any read or
+        detection failure seeds nothing.
+        """
+        with self._lock:
+            if self._last_status.get(terminal_id) is not None:
+                return None
+            generation = self._capture_generation.get(terminal_id, 0)
+
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception as e:
+            logger.debug(f"seed_from_viewport [{terminal_id}]: get_provider failed: {e}")
+            return None
+        if provider is None:
+            return None
+
+        try:
+            from cli_agent_orchestrator.backends.registry import get_backend
+
+            viewport = get_backend().get_history(
+                session_name,
+                window_name,
+                strip_escapes=True,
+                visible_only=True,
+            )
+        except Exception as e:
+            logger.debug(f"seed_from_viewport [{terminal_id}]: viewport read failed: {e}")
+            return None
+        if not viewport:
+            return None
+
+        use_screen = getattr(provider, "supports_screen_detection", False)
+        probe = getattr(provider, "probe_stale_processing_capture", None)
+        try:
+            if use_screen:
+                detected = provider.get_status_from_screen(viewport.splitlines())
+            elif callable(probe):
+                detected = probe(viewport)
+            else:
+                detected = provider.get_status(viewport)
+        except Exception as e:
+            logger.debug(f"seed_from_viewport [{terminal_id}]: detection failed: {e}")
+            return None
+
+        if detected != TerminalStatus.WAITING_USER_ANSWER:
+            return None
+
+        if self._apply_detection(
+            terminal_id,
+            TerminalStatus.WAITING_USER_ANSWER,
+            capture_generation=generation,
+            expected_status=None,
+            check_status=True,
+        ):
+            return TerminalStatus.WAITING_USER_ANSWER
+        return None
+
     def get_buffer(self, terminal_id: str) -> str:
         """Get accumulated output buffer for a terminal."""
         with self._lock:
