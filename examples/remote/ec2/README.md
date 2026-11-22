@@ -331,7 +331,8 @@ Take it one phase at a time. Each phase leaves your laptop setup running, so
 you can stop at any point.
 
 **Phase 0: prove herdr over SSH (a toy session).**
-Do quick-start steps 1–7, then start only `herdr-cao.service`. From the
+Do quick-start steps 1–7 with `--no-start` in step 6, then start only
+`herdr-cao.service`. From the
 laptop's herdr, open a pane on the box and run `top`.
 - Reboot the laptop. The box's session should be listed again and `top` still
   running.
@@ -344,7 +345,8 @@ laptop's herdr, open a pane on the box and run `top`.
   linux-arm64 build. Claude Code and Codex work without it.
 
 **Phase 1: CAO and one agent.**
-Start `cao-server.service` (installed from the pinned `CAO_REF`). Log in to
+Start `cao-server.service` and `cao-backup.timer` (installed from the pinned
+`CAO_REF`). Log in to
 Claude Code and launch one agent with `cao launch`.
 - Reboot the box. Both units come back, `cao-<instance-id>` is listed, no old
   pane text is replayed, and a fresh launch works.
@@ -456,8 +458,9 @@ herdr's socket and fails if it never appears.
 
 The same is true of any `cao` command you run by hand: if herdr is down, it
 starts a herdr of its own. So check `systemctl is-active herdr-cao` before
-running `cao` commands after a problem. A CAO setting to turn the auto-start
-off is a planned follow-up. The dashboard goes through `ssh -N cao-box-dash` and
+running `cao` commands after a problem. Set `"herdr_auto_start": false` in the
+`terminal` object of the box user's `~/.aws/cli-agent-orchestrator/settings.json`.
+This needs a `CAO_REF` that includes #1411. The dashboard goes through `ssh -N cao-box-dash` and
 `http://127.0.0.1:19889`. There's exactly one cao-server per CAO home, so
 never point the laptop's CAO at the box's files.
 
@@ -604,8 +607,9 @@ sudo /usr/local/lib/cao-box/restore.sh --live /home/cao-herdr/backups/cao/cao-<s
 **Whole-box restore:**
 1. Make a volume from a snapshot and attach it to a fresh instance.
 2. If `DATA_MOUNT` is `BOX_HOME` (the default and the `/Users/<you>` layout),
-   find the old session name in the laptop's herdr machine entry (the step 7
-   mismatch error also shows it), then as root write it before bootstrap:
+   find the old session name in the laptop's herdr machine entry (the `make
+   them match` error from `bootstrap.sh` also shows it), then as root write it
+   before bootstrap:
    ```bash
    sudo install -D -m 0644 /dev/stdin /etc/cao-box/box.env <<'EOF'
    CAO_BOX_SESSION=cao-<old-instance-id>
@@ -614,8 +618,9 @@ sudo /usr/local/lib/cao-box/restore.sh --live /home/cao-herdr/backups/cao/cao-<s
    ```
 3. Run `bootstrap.sh` with the same settings, the same `BOX_UID` and the new
    `DATA_VOLUME_ID`, without `--format-new-volume`.
-4. With a separate `DATA_MOUNT`, it finds the filesystem and mounts it, checks
-   the home belongs to `BOX_UID`, and reads `.cao-box/box.env` from the volume.
+4. It finds the filesystem, mounts it and checks that the home belongs to
+   `BOX_UID`. With a separate `DATA_MOUNT`, it also reads `.cao-box/box.env`
+   from the volume.
    The folder must be root's, and the file must be exactly the two session
    lines with equal values. In either layout the old session name matches CAO's
    `settings.json` and the laptop's saved machine. It stops if `settings.json`
@@ -759,7 +764,7 @@ Then remove the `cao-box` entries from the laptop's `~/.ssh/config`, run
 
 | File | What it does |
 |---|---|
-| [`bootstrap.sh`](bootstrap.sh) | Sets up the box. Idempotent, with `--dry-run`. Ubuntu 24.04 arm64 only. Formats only a verified blank data volume, and only with `--format-new-volume`. Checks every download's sha256. Starts them, unless `--no-start` is set. |
+| [`bootstrap.sh`](bootstrap.sh) | Sets up the box. Idempotent, with `--dry-run`. Ubuntu 24.04 arm64 only. Formats only a verified blank data volume, and only with `--format-new-volume`. Checks every download's sha256. Enables and starts the units, unless `--no-start` is set. |
 | [`backup.sh`](backup.sh), [`restore.sh`](restore.sh) | Nightly backup; a restore drill (as the box user) and a live restore (root only). |
 | [`bin/box-session-name.sh`](bin/box-session-name.sh) | Prints `cao-<instance-id>` from IMDSv2. |
 | [`bin/herdr-start.sh`](bin/herdr-start.sh), [`bin/herdr-clean-layout.sh`](bin/herdr-clean-layout.sh) | Start herdr with the minimal environment, after moving the saved layout aside. |
