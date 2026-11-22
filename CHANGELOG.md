@@ -39,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cao memory repair --apply` turn same-scope `[[wikilinks]]` and `## See Also`
   links into active `relates_to` edges with `content_link` provenance. Missing
   and cross-scope targets remain unlinked and are reported by memory lint.
-  Run `cao memory repair --apply` once after upgrade to index existing notes.
+  Run `cao memory repair --apply` after opting in to index existing notes.
   Edge sync is bounded and best-effort after durable memory writes.
   Generated See Also lines are excluded individually while authored lines in a
   mixed section remain link producers, and repeated identical stores remain

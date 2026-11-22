@@ -251,7 +251,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_MEMORY_RELATIONSHIPS_CONTENT_LINKS": (
         "memory.relationships.content_links",
         "bool",
-        True,
+        False,
     ),
     "CAO_MEMORY_LINT_ENABLED": ("memory.lint_enabled", "bool", True),
     "CAO_MEMORY_COMPILE_MODE": ("memory.compile_mode", "str", "llm"),
