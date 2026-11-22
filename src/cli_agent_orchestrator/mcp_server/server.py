@@ -65,6 +65,7 @@ from cli_agent_orchestrator.utils.orchestration import (
     _target_binding_denial,
     has_discovery_grant,
 )
+from cli_agent_orchestrator.utils.tool_mapping import CAO_CALLBACK_TOOLS
 from cli_agent_orchestrator.utils.workflow_events import parse_sse_frames
 
 logger = logging.getLogger(__name__)
@@ -1700,14 +1701,11 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
 #: authority over any other identity, and cannot mint one. Keep this set this small:
 #: a tool belongs here only if a worker CANNOT COMPLETE ITS OWN ASSIGNED WORK
 #: without it. "It would be convenient" is what produced #671.
-CALLBACK_EXEMPT_TOOLS = frozenset(
-    {
-        "send_message",
-        "complete_assignment",
-        "workflow_return",
-        "answer_user_prompt",
-    }
-)
+#:
+#: Defined once in ``utils/tool_mapping`` as ``CAO_CALLBACK_TOOLS``, because a Kiro
+#: install must also write these into the agent's ``tools`` list: Kiro hides any
+#: tool that list leaves out, whatever this gate allows.
+CALLBACK_EXEMPT_TOOLS = CAO_CALLBACK_TOOLS
 
 
 def _install_allowlist_middleware(server: Any) -> None:
