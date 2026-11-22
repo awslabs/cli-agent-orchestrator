@@ -103,10 +103,18 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
 - `GET /agents/profiles/schema` returns the agent profile JSON-Schema, so a
   client can render create and edit forms from the server's definition instead
   of duplicating the field list.
-- `POST /agents/profiles/install` installs a profile.
+- `POST /agents/profiles/install` installs a profile. `source` is a bare
+  profile name or an https:// URL. The optional `content` field (at most
+  262,144 characters) carries a profile document the client read itself, the
+  equivalent of `cao install ./agent.md`: `source` must then be a bare name,
+  the file's stem, and the server stores and installs the submitted text. The
+  server never reads a path the request names. The Web UI's Profiles tab uses
+  this for **Install → From file…**, which installs one or more picked `.md`
+  files. Requires `cao:write` or `cao:admin`.
 - `POST /agents/profiles` creates a profile in the local store from a supplied
-  document. Named distinctly from `install`, which takes a bare profile name or
-  an https:// URL rather than the document itself. The request carries `name`
+  document. Named distinctly from `install`, which takes a bare profile name, an
+  https:// URL, or a client-read file rather than an authored document. The
+  request carries `name`
   and `content`; the two identities of a profile, its storage key and its
   frontmatter `name`, must agree, so a mismatch is a 400 rather than a silent
   rename. A conflicting name returns 409. Requires `cao:write` or `cao:admin`.

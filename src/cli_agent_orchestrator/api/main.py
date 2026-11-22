@@ -1462,11 +1462,25 @@ class InstallAgentProfileRequest(BaseModel):
     ``provider`` may be omitted (None): the install service then honours the
     profile's frontmatter ``provider:`` key, falling back to the default
     provider — the same flag > frontmatter > default precedence as the CLI.
+
+    ``content`` carries a profile document the client read itself (the web
+    UI's file picker), the HTTP equivalent of ``cao install ./agent.md``.
+    The server still never reads a path: ``source`` must then be a bare
+    profile name (the file's stem), and the text goes to ``install_agent``
+    as ``profile_content``, the same import shape the CLI uses.
     """
 
     source: str
     provider: Optional[str] = None
     env_vars: Optional[Dict[str, str]] = None
+    content: Optional[str] = Field(
+        default=None,
+        max_length=262_144,
+        description=(
+            "Profile markdown to import under the bare name in `source`, "
+            "instead of resolving `source` as a name or URL"
+        ),
+    )
 
 
 # Scaffold templates are identified as ``category/name`` (e.g.
@@ -3954,12 +3968,24 @@ async def install_agent_profile_endpoint(
     https:// URLs; local filesystem paths are handled by the CLI entry point
     alone. A remote caller therefore cannot coerce the server into reading
     arbitrary ``.md`` files from disk.
+
+    A client that has the file itself sends its text as ``content`` with the
+    stem as ``source``. ``install_agent`` then takes its name branch, so a
+    URL or path-shaped ``source`` is refused by the same name validator.
     """
-    result = install_agent(
-        source=request.source,
-        provider=request.provider,
-        env_vars=request.env_vars,
-    )
+    if request.content is not None:
+        result = install_agent(
+            source=request.source,
+            provider=request.provider,
+            env_vars=request.env_vars,
+            profile_content=request.content,
+        )
+    else:
+        result = install_agent(
+            source=request.source,
+            provider=request.provider,
+            env_vars=request.env_vars,
+        )
     if not result.success:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result.message)
 
