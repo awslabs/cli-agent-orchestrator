@@ -74,6 +74,7 @@ NEVER_SERIALIZED = (
     "snippet",
     "status",
     "timestamp_clamped",
+    "v2_fields_present",
 )
 
 # The phrase each of those fields' descriptions carries, so the promise in the

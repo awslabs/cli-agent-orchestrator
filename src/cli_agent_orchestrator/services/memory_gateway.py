@@ -161,7 +161,12 @@ async def recall_memory(
     )
     from cli_agent_orchestrator.models.memory import Memory
 
-    return [Memory.model_validate(item) for item in payload["memories"]]
+    memories = []
+    for item in payload["memories"]:
+        memory = Memory.model_validate(item)
+        memory.v2_fields_present = "fact_date" in item
+        memories.append(memory)
+    return memories
 
 
 async def get_memory(

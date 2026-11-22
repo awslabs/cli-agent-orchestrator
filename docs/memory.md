@@ -246,7 +246,8 @@ unscoped key exists in more than one visible scope it returns
 explicit MCP recall, a successful get counts as access. Pass
 `include_history=True` to return all available entries newest first. The
 `max_chars` cap applies independently to the latest-entry `content` and the
-combined `history` body.
+combined `history` body. `links_out` and `links_in` each return at most five
+links.
 
 `sort_by` controls ranking: `recency` (newest first), `score` (composite 3-factor —
 BM25 relevance + recency + usage), or `usage` (most accessed). When no `scope` is
@@ -291,6 +292,8 @@ makes latest-entry truncation visible through `content_truncated`. With the
 setting off and `detail="full"`, the pinned recall response is unchanged.
 `fact_date` is the earliest valid entry timestamp, including for a compiled
 article, while `edited_at` is the latest.
+For remote recall, enable `memory.recall.v2_fields` on both the worker and
+the memory-owner node; otherwise the worker omits the optional v2 fields.
 
 ### `memory_forget`
 
@@ -836,7 +839,7 @@ important decisions, recurring corrections — store it immediately using the `m
 CAO tool. Keep each memory to 1–2 sentences. Store decisions and conclusions, not conversation.
 Use `memory_recall` to check if you already know something before asking the user.
 Use `detail="snippet"` for compact search results and `memory_get` when you need
-one result's complete body.
+one result's latest entry (or available history when requested).
 
 Note: `memory_store`, `memory_recall`, and `memory_get` are CAO's cross-provider
 memory tools, distinct from any provider-native memory system.

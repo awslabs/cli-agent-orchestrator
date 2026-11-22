@@ -143,6 +143,11 @@ class Memory(BaseModel):
         exclude=True,
         description="Transient lifecycle label (e.g. superseded); never persisted or serialized by model_dump.",
     )
+    v2_fields_present: bool = Field(
+        default=False,
+        exclude=True,
+        description="Transient remote-wire marker; never persisted or serialized.",
+    )
     fact_date: Optional[datetime] = Field(
         default=None,
         exclude=True,
@@ -322,11 +327,11 @@ def _fallback_snippet(memory: "Memory", limit: int = 300) -> str:
     if len(content) <= limit:
         return content
     terms = memory.match.get("terms", []) if isinstance(memory.match, dict) else []
-    lowered = content.lower()
     positions = [
-        (position, len(term))
+        (match.start(), len(term))
         for term in terms
-        if isinstance(term, str) and (position := lowered.find(term.lower())) >= 0
+        if isinstance(term, str)
+        and (match := re.search(re.escape(term), content, re.IGNORECASE)) is not None
     ]
     start = (
         max(0, min(position for position, _length in positions) - limit // 4) if positions else 0

@@ -42,7 +42,7 @@ memory_recall(query="database widgets endpoint testing")
 
 For a compact response, pass `detail="snippet"`; each result includes a
 `memory_get` hint. Use `memory_get(key=..., scope=...)` to fetch one note's
-complete body and available history.
+ latest entry and available history.
 
 Omit `scope` to search all scopes (results follow precedence session → project → global → agent → federated).
 Filter with `scope=` or `memory_type=` when you know where to look. Recall is for searching

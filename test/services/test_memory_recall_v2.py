@@ -6,13 +6,18 @@ import asyncio
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from test.fixtures.vault_factory import build_vault_fixture
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel
-from cli_agent_orchestrator.models.memory import Memory, mcp_recall_wire_dict
+from cli_agent_orchestrator.models.memory import (
+    Memory,
+    _fallback_snippet,
+    mcp_recall_wire_dict,
+)
 from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.services.memory_service import (
     MemoryAmbiguousScopeError,
@@ -97,6 +102,34 @@ def test_v2_fields_off_keeps_the_pinned_mcp_wire_shape(monkeypatch: pytest.Monke
     }
 
 
+def test_recall_route_omits_v2_fields_and_content_for_snippets(
+    service: MemoryService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from cli_agent_orchestrator.api import main
+
+    monkeypatch.setattr(settings_service, "is_memory_recall_v2_fields_enabled", lambda: False)
+    monkeypatch.setattr(main, "_get_memory_service", lambda: service)
+    _topic(
+        service,
+        "route-snippet",
+        "Cobalt route content.",
+        timestamps=(("2026-11-14T05:54:00Z", ""),),
+    )
+
+    response = TestClient(main.app, base_url="http://localhost").post(
+        "/internal/memory/recall",
+        json={"query": "cobalt", "detail": "snippet"},
+    )
+
+    assert response.status_code == 200
+    result = response.json()["memories"][0]
+    assert "fact_date" not in result
+    assert "content" not in result
+    assert "cobalt" in result["snippet"].lower()
+
+
 def test_snippet_contains_matched_terms_and_get_hint(service: MemoryService) -> None:
     _topic(
         service,
@@ -143,6 +176,18 @@ def test_snippet_match_terms_only_claim_terms_in_the_window(service: MemoryServi
     assert rows[0].match["terms"] == ["cobalt"]
 
 
+def test_snippets_keep_a_match_after_turkish_capital_i(service: MemoryService) -> None:
+    content = ("İ" * 600) + " target " + ("z" * 600)
+
+    assert "target" in service._snippet(content, ["target"]).lower()
+    assert (
+        "target"
+        in _fallback_snippet(
+            _memory().model_copy(update={"content": content, "match": {"terms": ["target"]}})
+        ).lower()
+    )
+
+
 def test_v2_fields_expose_dates_match_and_hidden_history(
     service: MemoryService, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -182,7 +227,10 @@ def test_v2_fields_expose_dates_match_and_hidden_history(
     assert wire["content_truncated"] is True
 
 
-def test_v2_fields_and_get_count_all_hidden_entries(service: MemoryService) -> None:
+def test_v2_fields_and_get_count_all_hidden_entries(
+    service: MemoryService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings_service, "is_memory_recall_v2_fields_enabled", lambda: True)
     _topic(
         service,
         "long-history",
@@ -223,7 +271,11 @@ def test_entry_count_ignores_non_heading_and_unparseable_timestamps(
             "### 2026-10-02T01:02:03Z\n"
             "A sub-heading is not an entry.\n"
             "## 2026-13-01T01:02:03Z\n"
-            "An invalid timestamp is not an entry."
+            "An invalid timestamp is not an entry.\n"
+            "## 2026-02-30T01:02:03Z\n"
+            "An invalid calendar day is not an entry.\n"
+            "## 2026-01-01T24:00:00Z\n"
+            "An invalid time is not an entry."
         ),
         timestamps=(
             ("2026-09-01T01:02:03Z", "Earlier real entry."),
@@ -234,6 +286,166 @@ def test_entry_count_ignores_non_heading_and_unparseable_timestamps(
     result = asyncio.run(service.get_memory("valid-history-only", scope="global"))
 
     assert result["earlier_entries"] == 1
+
+
+def test_lenient_entry_count_ignores_invalid_timestamp(
+    service: MemoryService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        settings_service, "get_memory_settings", lambda: {"parser": {"lenient": True}}
+    )
+    path = _topic(
+        service,
+        "lenient-invalid",
+        ("## Entry 2026-13-01T01:02:03Z\ninvalid\n\n" "## Entry 2026-11-14T05:54:00Z\nvalid"),
+    )
+    memory = service._parse_wiki_file(
+        path,
+        path.read_text(encoding="utf-8"),
+        {"key": "lenient-invalid", "scope": "global", "memory_type": "reference", "tags": ""},
+        count_entries=True,
+    )
+
+    assert memory is not None
+    assert memory.earlier_entries == 0
+
+
+def test_memory_get_history_uses_only_parseable_entry_boundaries(service: MemoryService) -> None:
+    _topic(
+        service,
+        "history-boundaries",
+        (
+            "A body token ## 2026-10-01T01:02:03Z is not an entry.\n"
+            "### Standup 2026-10-02T01:02:03Z\n"
+            "A dated sub-heading remains in the current entry.\n"
+            "## 2026-13-01T01:02:03Z\n"
+            "An invalid timestamp is not an entry."
+        ),
+        timestamps=(
+            ("2026-09-01T01:02:03Z", "Earlier real entry."),
+            ("2026-11-14T05:54:00Z", "Current real entry."),
+        ),
+    )
+
+    result = asyncio.run(
+        service.get_memory("history-boundaries", scope="global", include_history=True)
+    )
+
+    assert len(result["history"]) == result["earlier_entries"] + 1
+    assert [item["date"] for item in result["history"]] == [
+        "2026-11-14T05:54:00Z",
+        "2026-09-01T01:02:03Z",
+    ]
+
+
+def test_memory_manager_bm25_fills_limit_from_visible_scopes(service: MemoryService) -> None:
+    context = {"agent_profile": MEMORY_MANAGER_PROFILE}
+    for number in range(3):
+        asyncio.run(
+            service.store(
+                content=f"cobalt visible global note {number}",
+                scope="global",
+                memory_type="reference",
+                key=f"visible-{number}",
+            )
+        )
+    for number in range(4):
+        asyncio.run(
+            service.store(
+                content=f"cobalt cobalt cobalt private agent note {number}",
+                scope="agent",
+                memory_type="reference",
+                key=f"private-{number}",
+                terminal_context=context,
+            )
+        )
+
+    rows = asyncio.run(
+        service.recall(
+            query="cobalt",
+            limit=3,
+            search_mode="bm25",
+            terminal_context=context,
+            record_access=False,
+        )
+    )
+
+    assert len(rows) == 3
+    assert {row.scope for row in rows} == {"global"}
+
+
+def _configure_vault_exact_read(
+    service: MemoryService, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, dict[str, str]]:
+    from cli_agent_orchestrator.services import memory_service
+    from cli_agent_orchestrator.services.memory_service import resolve_project_id
+    from cli_agent_orchestrator.services.vault import reader
+    from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
+    from cli_agent_orchestrator.services.vault.config import VaultConfig
+
+    session_factory = sessionmaker(bind=service._db_engine)
+    monkeypatch.setattr(reconcile_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(reader, "SessionLocal", session_factory)
+    monkeypatch.setattr(reconcile_module, "_replace_vault_edges", lambda _notes, **_kwargs: None)
+    monkeypatch.setattr(reconcile_module, "_clear_stale_vault_edges", lambda *_args: None)
+    monkeypatch.setattr(reconcile_module, "_emit_audit_events", lambda *_args: None)
+    monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+    ordinary_policy = lambda require_injectable, **_kwargs: reader.VaultInjectionPolicy(
+        require_injectable, "test", False
+    )
+    monkeypatch.setattr(reader, "_resolve_injection_policy", ordinary_policy)
+    monkeypatch.setattr(memory_service, "_resolve_injection_policy", ordinary_policy)
+
+    fixture = build_vault_fixture(tmp_path)
+    context = {"agent_profile": "fixture-reference", "cwd": str(tmp_path)}
+    mappings = [
+        (
+            mapping.model_copy(update={"scope_id": resolve_project_id(tmp_path)})
+            if mapping.scope == "project"
+            else mapping
+        )
+        for mapping in fixture.vault.mappings
+    ]
+    vault = fixture.vault.model_copy(update={"mappings": mappings})
+    monkeypatch.setattr(
+        settings_service, "get_vault_config", lambda: VaultConfig(enabled=True, vaults=[vault])
+    )
+    return fixture.root, context
+
+
+def test_memory_get_without_scope_finds_callers_agent_vault_note(
+    service: MemoryService, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, context = _configure_vault_exact_read(service, tmp_path, monkeypatch)
+    from cli_agent_orchestrator.services.vault.identity import derive_cao_key
+    from cli_agent_orchestrator.services.vault.reconcile import reconcile
+
+    reconcile(settings_service.get_vault_config().vaults[0], apply=True, run_id="exact-agent")
+
+    result = asyncio.run(
+        service.get_memory(derive_cao_key("Glossary.md"), terminal_context=context)
+    )
+
+    assert result["scope"] == "agent"
+    assert result["content"] == "Glossary"
+
+
+def test_memory_get_without_scope_detects_agent_and_project_vault_ambiguity(
+    service: MemoryService, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, context = _configure_vault_exact_read(service, tmp_path, monkeypatch)
+    (root / "Projects" / "CAO Design" / "Glossary.md").write_text(
+        "Project glossary.\n", encoding="utf-8"
+    )
+    from cli_agent_orchestrator.services.vault.identity import derive_cao_key
+    from cli_agent_orchestrator.services.vault.reconcile import reconcile
+
+    reconcile(settings_service.get_vault_config().vaults[0], apply=True, run_id="exact-ambiguous")
+
+    with pytest.raises(MemoryAmbiguousScopeError) as caught:
+        asyncio.run(service.get_memory(derive_cao_key("Glossary.md"), terminal_context=context))
+
+    assert caught.value.scopes == ["project", "agent"]
 
 
 def test_memory_get_without_scope_resolves_and_parses_sources_once(
@@ -526,6 +738,34 @@ def test_memory_get_history_is_newest_first_and_capped(service: MemoryService) -
     assert result["content_truncated"] is True
 
 
+def test_memory_get_marks_earlier_entries_as_truncated_without_history(
+    service: MemoryService,
+) -> None:
+    _topic(
+        service,
+        "hidden-history",
+        "",
+        timestamps=(
+            ("2026-10-01T01:02:03Z", "Earlier entry."),
+            ("2026-11-14T05:54:00Z", "Current entry."),
+        ),
+    )
+
+    result = asyncio.run(service.get_memory("hidden-history", scope="global"))
+
+    assert result["content"] == "Current entry."
+    assert result["content_truncated"] is True
+
+
+def test_memory_get_clips_plain_content_at_max_chars(service: MemoryService) -> None:
+    _topic(service, "clip-plain", "abcdefghijklmnopqrstuvwxyz")
+
+    result = asyncio.run(service.get_memory("clip-plain", scope="global", max_chars=8))
+
+    assert result["content"] == "abcdefgh"
+    assert result["content_truncated"] is True
+
+
 def test_memory_get_complete_history_is_not_truncated(service: MemoryService) -> None:
     _topic(
         service,
@@ -592,3 +832,12 @@ def test_recall_v2_setting_defaults_false_and_round_trips() -> None:
 
     assert settings_service.is_memory_recall_v2_fields_enabled() is True
     assert ConfigService.get_config().memory.recall.v2_fields is True
+
+
+def test_recall_v2_setting_honors_environment_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        settings_service, "_load", lambda: {"memory": {"recall": {"v2_fields": False}}}
+    )
+    monkeypatch.setenv("CAO_MEMORY_RECALL_V2_FIELDS", "true")
+
+    assert settings_service.is_memory_recall_v2_fields_enabled() is True

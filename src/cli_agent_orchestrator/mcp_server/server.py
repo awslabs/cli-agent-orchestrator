@@ -2144,7 +2144,10 @@ async def memory_recall(
                 mcp_recall_wire_dict(
                     m,
                     detail=detail_value,
-                    include_v2_fields=is_memory_recall_v2_fields_enabled(),
+                    include_v2_fields=(
+                        is_memory_recall_v2_fields_enabled()
+                        and (not remote_memory_url() or m.v2_fields_present)
+                    ),
                 )
                 for m in memories
             ],
@@ -2173,12 +2176,13 @@ async def memory_get(
         default=8000,
         ge=1,
         le=100_000,
-        description="Maximum memory body characters to return.",
+        description="Maximum characters for each returned memory body field.",
     ),
 ) -> Dict[str, Any]:
     """Read one visible memory by exact key.
 
-    Returns its body, lifecycle status, history count, and existing links.
+    Returns its latest entry, lifecycle status, history count, and up to five
+    links in each direction.
     An omitted scope that matches more than one visible note returns
     ``ambiguous_scope`` with the matching scopes.
     """
@@ -2191,6 +2195,12 @@ async def memory_get(
 
     if not is_memory_enabled():
         return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
+    if scope is not None and scope not in {"global", "project", "session", "agent", "federated"}:
+        return {
+            "success": False,
+            "error_kind": "not_found",
+            "error": f"memory not found: {key!r}",
+        }
     try:
         terminal_context = _get_terminal_context_from_env()
         memory = (

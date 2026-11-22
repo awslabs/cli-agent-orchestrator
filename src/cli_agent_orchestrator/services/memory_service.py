@@ -71,7 +71,7 @@ _CANONICAL_ENTRY_HEADING_RE = re.compile(
     r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$", re.MULTILINE
 )
 _COMPILED_ENTRY_HEADING_RE = re.compile(
-    r"^### Entry (?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$",
+    r"^### Entry (?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)$",
     re.MULTILINE,
 )
 _LENIENT_ENTRY_HEADING_RE = re.compile(
@@ -83,6 +83,21 @@ _LEGACY_ENTRY_HEADING_RE = re.compile(r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}
 _COMPILED_MARKER_RE = re.compile(
     r"^<!-- cao-compiled: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z entries=\d+ -->$"
 )
+
+
+def _parseable_entry_boundaries(file_content: str) -> list[tuple[re.Match[str], datetime]]:
+    """Return valid native entry headings, using the parser's canonical rule."""
+    boundaries = []
+    for match in _LEGACY_ENTRY_HEADING_RE.finditer(file_content):
+        try:
+            timestamp = datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            continue
+        boundaries.append((match, timestamp))
+    return boundaries
+
 
 # #861: cap hybrid score/usage widening at 200 per source, never below the requested limit.
 HYBRID_CANDIDATE_MIN = 50
@@ -177,6 +192,10 @@ class MemoryNotFoundError(LookupError):
     """An exact-key read found no note visible to this caller."""
 
     error_kind = "not_found"
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        super().__init__(f"memory not found: {key!r}")
 
 
 class MemoryAmbiguousScopeError(LookupError):
@@ -2093,7 +2112,12 @@ class MemoryService:
             return {}
 
     def _load_related_memory(
-        self, key: str, scope: str, scope_id: Optional[str]
+        self,
+        key: str,
+        scope: str,
+        scope_id: Optional[str],
+        *,
+        count_entries: bool = False,
     ) -> "Optional[Memory]":
         """Load a single related Memory with the same guards as primary recall.
 
@@ -2139,7 +2163,7 @@ class MemoryService:
                 "memory_type": "",
                 "tags": "",
             }
-            return self._parse_wiki_file(resolved, file_content, entry)
+            return self._parse_wiki_file(resolved, file_content, entry, count_entries=count_entries)
         except Exception as e:
             logger.debug(f"_load_related_memory failed key={sanitised}: {e}")
             return None
@@ -2558,6 +2582,7 @@ class MemoryService:
         scan_all: bool = False,
         *,
         record_access: bool = True,
+        count_entries: bool = False,
         resolved_sources: Optional[tuple[list[Path], list[VaultBinding], int, Any]] = None,
         index_entries: Optional[dict[Path, list[dict]]] = None,
     ) -> Optional[Memory]:
@@ -2632,7 +2657,9 @@ class MemoryService:
                     entry["scope"], entry_scope_id, private_scope_ids
                 ):
                     continue
-                memory = self._load_related_memory(key, entry["scope"], entry_scope_id)
+                memory = self._load_related_memory(
+                    key, entry["scope"], entry_scope_id, count_entries=count_entries
+                )
                 if memory is not None:
                     results.append(memory)
 
@@ -2776,6 +2803,9 @@ class MemoryService:
             return []
         if detail not in {"full", "snippet"}:
             raise ValueError("detail must be 'full' or 'snippet'")
+        from cli_agent_orchestrator.services.settings_service import (
+            is_memory_recall_v2_fields_enabled,
+        )
 
         explicit_search_mode = search_mode is not None
         explicit_sort_by = sort_by is not None
@@ -2830,6 +2860,16 @@ class MemoryService:
         if search_mode == "bm25" and not query:
             return []
 
+        allowed_scopes = None
+        if scope is None and (
+            recall_policy.is_curator
+            or (terminal_context or {}).get("agent_profile") == MEMORY_MANAGER_PROFILE
+        ):
+            allowed_scopes = {
+                MemoryScope.SESSION.value,
+                MemoryScope.PROJECT.value,
+                MemoryScope.GLOBAL.value,
+            }
         pool = await self._recall_pool(
             query,
             scope,
@@ -2840,6 +2880,8 @@ class MemoryService:
             search_mode,
             sort_by,
             recall_policy,
+            count_entries=is_memory_recall_v2_fields_enabled(),
+            allowed_scopes=allowed_scopes,
             **eligibility_kwargs,
         )
         pool.rows = self._visible_to_caller(pool.rows, terminal_context)
@@ -2923,9 +2965,11 @@ class MemoryService:
         """Choose a compact window spanning the matched terms when possible."""
         if len(content) <= limit:
             return content
-        lowered = content.lower()
         positions = [
-            (position, len(term)) for term in terms if (position := lowered.find(term)) >= 0
+            (match.start(), len(term))
+            for term in terms
+            if isinstance(term, str)
+            and (match := re.search(re.escape(term), content, re.IGNORECASE)) is not None
         ]
         if positions:
             first = min(position for position, _length in positions)
@@ -3002,6 +3046,18 @@ class MemoryService:
         index_entries: Optional[dict[Path, list[dict]]] = None
         if scope is None:
             resolved_sources = self._resolve_sources(None, terminal_context, scan_all=False)
+            native_dirs, vault_bindings, max_body_chars, vault_config = resolved_sources
+            if vault_config is not None:
+                from cli_agent_orchestrator.services.vault.binding import resolve
+
+                agent_binding = resolve(
+                    MemoryScope.AGENT.value,
+                    self.resolve_scope_id(MemoryScope.AGENT.value, terminal_context),
+                    vault_config=vault_config,
+                )
+                if isinstance(agent_binding, VaultBinding) and agent_binding not in vault_bindings:
+                    vault_bindings.append(agent_binding)
+            resolved_sources = (native_dirs, vault_bindings, max_body_chars, vault_config)
             index_entries = {}
         matches = []
         for candidate_scope in scopes:
@@ -3010,6 +3066,7 @@ class MemoryService:
                 scope=candidate_scope,
                 terminal_context=terminal_context,
                 record_access=False,
+                count_entries=True,
                 resolved_sources=resolved_sources,
                 index_entries=index_entries,
             )
@@ -3052,7 +3109,7 @@ class MemoryService:
         result["links_out"] = links_out
         result["links_in"] = links_in
         if include_history:
-            truncated = len(content) > max_chars
+            truncated = memory.content_truncated or len(content) > max_chars
             remaining = max_chars
             visible_history = []
             for item in history:
@@ -3085,9 +3142,8 @@ class MemoryService:
             file_content = Path(memory.file_path).read_text(encoding="utf-8")
         except OSError:
             return []
-        matches = list(_LENIENT_ENTRY_HEADING_RE.finditer(file_content))
-        compiled = any(_COMPILED_MARKER_RE.fullmatch(line) for line in file_content.splitlines())
-        if compiled or not matches:
+        boundaries = _parseable_entry_boundaries(file_content)
+        if not boundaries:
             return [
                 {
                     "date": memory.updated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -3095,13 +3151,14 @@ class MemoryService:
                 }
             ]
         entries = []
-        for index, match in enumerate(matches):
-            end = matches[index + 1].start() if index + 1 < len(matches) else len(file_content)
+        for index, (match, timestamp) in enumerate(boundaries):
+            end = (
+                boundaries[index + 1][0].start()
+                if index + 1 < len(boundaries)
+                else len(file_content)
+            )
             content = self._strip_existing_see_also(file_content[match.end() : end]).strip()
-            value = match.group("timestamp")
-            if len(value) == 17:
-                value = value.replace("Z", ":00Z")
-            entries.append({"date": value, "content": content})
+            entries.append({"date": timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"), "content": content})
         return list(reversed(entries))
 
     def _memory_links(self, memory: Memory) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
@@ -3330,6 +3387,8 @@ class MemoryService:
         sort_by: str,
         policy: Optional[VaultInjectionPolicy],
         *,
+        count_entries: bool = False,
+        allowed_scopes: Optional[set[str]] = None,
         eligibility: Optional[memory_eligibility.EligibilityCheck] = None,
     ) -> RecallPool:
         """Select candidates without ordering, access increments or expansion."""
@@ -3355,6 +3414,8 @@ class MemoryService:
                 terminal_context=terminal_context,
                 scan_all=scan_all,
                 policy=policy,
+                allowed_scopes=allowed_scopes,
+                count_entries=count_entries,
                 **tier_kwargs,
                 **eligibility_kwargs,
             )
@@ -3376,6 +3437,8 @@ class MemoryService:
             terminal_context=terminal_context,
             scan_all=scan_all,
             policy=policy,
+            allowed_scopes=allowed_scopes,
+            count_entries=count_entries,
             **eligibility_kwargs,
         )
         if search_mode == "metadata" or not query:
@@ -3395,6 +3458,8 @@ class MemoryService:
                 terminal_context,
                 scan_all,
                 policy,
+                allowed_scopes=allowed_scopes,
+                count_entries=count_entries,
                 **eligibility_kwargs,
             )
             return RecallPool(rows, all_terms, sort_by)
@@ -3414,6 +3479,8 @@ class MemoryService:
             terminal_context=terminal_context,
             scan_all=scan_all,
             policy=policy,
+            allowed_scopes=allowed_scopes,
+            count_entries=count_entries,
             **eligibility_kwargs,
         )
         return RecallPool(metadata_results + bm25_results, set(), sort_by)
@@ -3439,6 +3506,8 @@ class MemoryService:
         scan_all: bool,
         policy: Optional[VaultInjectionPolicy],
         *,
+        count_entries: bool = False,
+        allowed_scopes: Optional[set[str]] = None,
         eligibility: Optional[memory_eligibility.EligibilityCheck] = None,
     ) -> tuple[list[Memory], set[tuple]]:
         """#961's identity merge and partial-fill contract, before final ranking."""
@@ -3463,6 +3532,8 @@ class MemoryService:
                 terminal_context=terminal_context,
                 scan_all=scan_all,
                 policy=policy,
+                allowed_scopes=allowed_scopes,
+                count_entries=count_entries,
                 all_terms_first=True,
                 all_term_identities=all_term_identities,
                 **eligibility_kwargs,
@@ -3884,6 +3955,8 @@ class MemoryService:
         scan_all: bool = False,
         policy: Optional[VaultInjectionPolicy] = None,
         *,
+        count_entries: bool = False,
+        allowed_scopes: Optional[set[str]] = None,
         eligibility: Optional[memory_eligibility.EligibilityCheck] = None,
     ) -> list[Memory]:
         """Substring-match recall via index.md walk (Phase 1 path)."""
@@ -3921,6 +3994,8 @@ class MemoryService:
                 # Filter by scope
                 if scope and entry["scope"] != scope:
                     continue
+                if allowed_scopes is not None and entry["scope"] not in allowed_scopes:
+                    continue
                 if self._native_entry_is_vault_mapped(
                     entry["scope"], entry.get("scope_id"), vault_config
                 ):
@@ -3957,7 +4032,9 @@ class MemoryService:
                     continue
 
                 # Parse memory from file
-                memory = self._parse_wiki_file(wiki_file, file_content, entry)
+                memory = self._parse_wiki_file(
+                    wiki_file, file_content, entry, count_entries=count_entries
+                )
                 if memory:
                     results.append(memory)
 
@@ -3968,6 +4045,8 @@ class MemoryService:
             consumer="explicit_recall",
             policy=policy,
         ):
+            if allowed_scopes is not None and candidate.binding.scope not in allowed_scopes:
+                continue
             if memory_type and candidate.metadata.memory_type != memory_type:
                 continue
             memory = load_candidate(
@@ -4271,9 +4350,11 @@ class MemoryService:
         terminal_context: Optional[dict],
         scan_all: bool,
         *,
+        count_entries: bool = False,
         vault_candidates: Optional[Sequence[VaultCandidate]] = None,
         max_body_chars: int = 4096,
         policy: Optional[VaultInjectionPolicy] = None,
+        allowed_scopes: Optional[set[str]] = None,
         all_terms_first: bool = False,
         all_term_identities: Optional[set[tuple]] = None,
         eligibility: Optional[memory_eligibility.EligibilityCheck] = None,
@@ -4353,6 +4434,8 @@ class MemoryService:
 
                 if scope and file_scope != scope:
                     continue
+                if allowed_scopes is not None and file_scope not in allowed_scopes:
+                    continue
                 if self._native_entry_is_vault_mapped(file_scope, entry_scope_id, vault_config):
                     continue
                 if scope_id and entry_scope_id != scope_id:
@@ -4392,6 +4475,8 @@ class MemoryService:
         vault_memories: dict[int, Memory] = {}
         vault_indexes: set[int] = set()
         for candidate in vault_candidates:
+            if allowed_scopes is not None and candidate.binding.scope not in allowed_scopes:
+                continue
             memory = load_candidate(
                 candidate,
                 max_body_chars=max_body_chars,
@@ -4469,7 +4554,9 @@ class MemoryService:
                 continue
             wiki_file, entry = candidates[idx]
             assert wiki_file is not None
-            memory = self._parse_wiki_file(wiki_file, contents[idx], entry)
+            memory = self._parse_wiki_file(
+                wiki_file, contents[idx], entry, count_entries=count_entries
+            )
             if memory:
                 results.append(memory)
                 if all_term_identities is not None and idx in all_term_indexes:
@@ -4603,13 +4690,17 @@ class MemoryService:
 
         return entries
 
-    def _parse_wiki_file(self, wiki_file: Path, file_content: str, entry: dict) -> Optional[Memory]:
+    def _parse_wiki_file(
+        self, wiki_file: Path, file_content: str, entry: dict, *, count_entries: bool = False
+    ) -> Optional[Memory]:
         """Parse a wiki topic file into a Memory object."""
-        memory, _ = self._parse_wiki_file_with_split(wiki_file, file_content, entry)
+        memory, _ = self._parse_wiki_file_with_split(
+            wiki_file, file_content, entry, count_entries=count_entries
+        )
         return memory
 
     def _parse_wiki_file_with_split(
-        self, wiki_file: Path, file_content: str, entry: dict
+        self, wiki_file: Path, file_content: str, entry: dict, *, count_entries: bool = False
     ) -> tuple[Optional[Memory], Optional[WikiContentSplit]]:
         """Parse a wiki topic and expose the content split used by recall."""
         if self._native_identity_is_migration_dormant(
@@ -4734,14 +4825,15 @@ class MemoryService:
             )
         )
         timestamp_matches, timestamps, _entry_count = _timestamp_boundaries(timestamp_candidates, 1)
-        entry_count = _parseable_entry_count(
-            list(
-                (_CANONICAL_ENTRY_HEADING_RE if compiled else _LEGACY_ENTRY_HEADING_RE).finditer(
-                    file_content
-                )
-            ),
-            1,
-        )
+        if count_entries:
+            entry_count = _parseable_entry_count(
+                list(
+                    (
+                        _CANONICAL_ENTRY_HEADING_RE if compiled else _LEGACY_ENTRY_HEADING_RE
+                    ).finditer(file_content)
+                ),
+                1,
+            )
         use_legacy_split = False
         if not compiled and not lenient:
             if not timestamps:
@@ -4754,9 +4846,10 @@ class MemoryService:
                 list(_LENIENT_ENTRY_HEADING_RE.finditer(file_content)),
                 "timestamp",
             )
-            entry_count = _parseable_entry_count(
-                list(_LENIENT_ENTRY_HEADING_RE.finditer(file_content)), "timestamp"
-            )
+            if count_entries:
+                entry_count = _parseable_entry_count(
+                    list(_LENIENT_ENTRY_HEADING_RE.finditer(file_content)), "timestamp"
+                )
 
         if timestamps:
             created_at = timestamps[0]
@@ -4837,7 +4930,11 @@ class MemoryService:
                 try:
                     compiled_fact_dates.append(
                         datetime.strptime(
-                            match.group("timestamp"),
+                            (
+                                match.group("timestamp")
+                                if len(match.group("timestamp")) == 20
+                                else match.group("timestamp").replace("Z", ":00Z")
+                            ),
                             "%Y-%m-%dT%H:%M:%SZ",
                         ).replace(tzinfo=timezone.utc)
                     )
