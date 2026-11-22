@@ -179,7 +179,7 @@ def send(worker_id, message, is_async, timeout):
         poll_until_done(
             terminal_id,
             timeout if timeout is not None else _DEFAULT_SEND_TIMEOUT,
-            read_status=lambda tid: client.terminal_status(worker_id, tid),
+            read_status=lambda tid, budget: client.terminal_status(worker_id, tid, budget),
         )
     except KeyboardInterrupt:
         interrupted = True
@@ -260,7 +260,7 @@ def attach(worker_id):
             poll_until_done(
                 terminal_id,
                 _DEFAULT_SEND_TIMEOUT,
-                read_status=lambda tid: client.terminal_status(worker_id, tid),
+                read_status=lambda tid, budget: client.terminal_status(worker_id, tid, budget),
             )
         except KeyboardInterrupt:
             # Stop waiting on this turn, keep the session. The agent is still

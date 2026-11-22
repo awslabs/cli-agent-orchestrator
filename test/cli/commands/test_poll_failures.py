@@ -161,6 +161,29 @@ def test_a_stalled_poll_past_the_request_timeout_still_prints_the_reply():
     assert polls == 5
 
 
+def test_one_stalled_broker_read_does_not_outrun_the_timeout():
+    """`--timeout` bounds the READ, not just the gap between reads (#1059).
+
+    The stand-in holds one status request open for 75s. Before #1059 that read
+    inherited `FleetClient`'s 60s read timeout, so `cao worker send --timeout 5`
+    reported "Timed out after 60s" — 55s after the operator's budget, naming a
+    number they never asked for. The budget now reaches the transport, which
+    caps its own read with it, so the wait ends at about the requested timeout.
+    This test runs the real clock on purpose: the overrun it measures is the
+    defect.
+    """
+    script = [("stall", 75)]
+    started = time.monotonic()
+    result, _polls = _run_worker_send(script, timeout=5)
+    elapsed = time.monotonic() - started
+
+    assert result.exit_code != 0
+    assert "Timed out after" in result.output
+    # A 60s read would land here at 60s+. A few seconds of slack covers the
+    # poll interval and the loopback round-trip, not a 60s stalled read.
+    assert elapsed < 20, f"reported after {elapsed:.1f}s for a 5s timeout"
+
+
 @pytest.mark.parametrize("sender", SENDERS)
 def test_a_404_fails_at_once(sender):
     script = ["processing", 404]

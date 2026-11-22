@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **`cao worker send --timeout N` no longer overruns by up to a minute when one broker read stalls** (#1059).
+  `poll_until_done` could only check its deadline between polls, so a single status read that outlived the
+  budget ran the whole wait past it: the read inherited `FleetClient`'s 60s read timeout, and
+  `cao worker send --timeout 5` reported "Timed out after 60s" (measured 62s elapsed). The poll now hands
+  each read the seconds it has left, and the transport caps its own read with it — the broker read at
+  `min(60s, remaining)` and the local GET at `min(5s, remaining)` — so the wait ends at about the timeout
+  the operator asked for, and a read cut short that way reports as the ordinary retryable read timeout.
+  `cao worker attach` uses the same path. `FleetClient.terminal_status`'s budget argument is optional, so
+  `cao worker status` keeps its patient read.
+
 - Add the Qwen Code (`qwen_cli`) provider with profile, skill, MCP and model support.
 
 - **kiro_cli (v2 TUI): an open permission dialog reads `waiting_user_answer` in the cases #1426 missed**.
