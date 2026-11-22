@@ -25,6 +25,13 @@ from cli_agent_orchestrator.utils import api_http
 # been seen yet", so one shared constant describes both.
 STAMP_GRACE_SECONDS = TURN_START_CONFIRM_SECONDS
 
+# Per-read cap for the LOCAL status GET in ``poll_until_done``. A status read is
+# one in-memory lookup on this node's server, so a read that takes longer than
+# this means the server is not answering; capping it keeps a stalled read inside
+# the caller's ``--timeout`` budget instead of letting it spend the budget in one
+# call (#1059). The actual cap is ``min(this, budget remaining)``.
+_POLL_READ_TIMEOUT = 5.0
+
 if TYPE_CHECKING:
     from cli_agent_orchestrator.utils.fleet import BrokerRequestError
 
@@ -316,7 +323,7 @@ def poll_until_done(
     timeout: float,
     polling_interval: float = 1.0,
     idle_stable_polls: int = 3,
-    read_status: Optional[Callable[[str], Optional[str]]] = None,
+    read_status: Optional[Callable[[str, float], Optional[str]]] = None,
     min_generation: Optional[int] = None,
     stamp_grace: float = STAMP_GRACE_SECONDS,
 ) -> None:
@@ -382,12 +389,26 @@ def poll_until_done(
     a terminal on a remote node - a `cao worker` reached through a cluster broker -
     is judged done by exactly this logic rather than by a second copy of it. The
     IDLE-versus-COMPLETED reasoning above is provider behaviour, not transport
-    behaviour, so it must not be duplicated per transport.
+    behaviour, so it must not be duplicated per transport. It is called as
+    ``read_status(terminal_id, remaining_seconds)``; see the ``timeout`` note
+    below for why the budget is handed to the transport.
 
     A failed poll is retried until ``timeout`` unless it is a 4xx (see
     ``_is_transient_poll_error``); the agent keeps working while the server or
     broker is briefly unavailable, and giving up on one 503 made ``cao session
     send`` drop a reply that was on its way (#1016).
+
+    ``timeout`` BOUNDS EACH READ, NOT JUST THE GAP BETWEEN READS (#1059). The
+    deadline is only observable between polls, so a read that outlives it runs the
+    whole wait past its budget: through the fleet broker one status read inherited
+    a 60s read timeout, and ``cao worker send --timeout 5`` took over a minute
+    (measured). ``read_status`` therefore receives, as its second argument, the
+    seconds left before the deadline — always positive, since the loop raises once
+    none is left — and each transport caps its own request with it
+    (``FleetClient.terminal_status`` at ``min(60s, remaining)``, the local GET at
+    ``min(_POLL_READ_TIMEOUT, remaining)``). A read cut short that way surfaces as
+    the ordinary transient read timeout, so the retry path and the timeout
+    message report it like any other stalled poll.
 
     Raises click.ClickException on ERROR status, on a 4xx, or on timeout, which
     names the last failed poll if the final ones failed.
@@ -413,7 +434,11 @@ def poll_until_done(
     last_error: Optional[str] = None
     while True:
         elapsed = time.time() - start
-        if elapsed > timeout:
+        # ``>=``, not ``>``: this is also what keeps ``remaining`` strictly
+        # positive, and a read timeout of exactly 0 is not a short read —
+        # ``requests`` raises a bare ``ValueError`` for it, which is not a
+        # ``RequestException`` and so would escape the classifier below as a crash.
+        if elapsed >= timeout:
             message = f"Timed out after {int(elapsed)}s waiting for terminal {terminal_id}"
             if last_error is not None:
                 message += f"; the last poll failed: {last_error}"
@@ -423,14 +448,22 @@ def poll_until_done(
         try:
             generation: Optional[int] = None
             current_generation: Optional[int] = None
+            # Seconds left in the caller's budget. Strictly positive here: the
+            # deadline check above raised as soon as none was left. Each
+            # transport caps its own read with it, so one stalled read cannot
+            # carry the wait past its timeout (#1059).
+            remaining = timeout - elapsed
             if read_status is not None:
                 # A transport override reports a status only; it cannot carry the
                 # generation, so such a caller degrades to the frame-based wait.
-                status = read_status(terminal_id)
+                status = read_status(terminal_id, remaining)
             else:
                 # Per-request timeout so a stalled server/network can't block past
                 # the outer timeout budget (matches wait_until_terminal_status).
-                resp = api_http.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
+                resp = api_http.get(
+                    f"{API_BASE_URL}/terminals/{terminal_id}",
+                    timeout=min(_POLL_READ_TIMEOUT, remaining),
+                )
                 resp.raise_for_status()
                 payload = resp.json()
                 payload = payload if isinstance(payload, dict) else {}

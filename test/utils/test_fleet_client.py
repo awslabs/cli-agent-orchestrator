@@ -331,6 +331,46 @@ class TestProxiedRoutes:
         ):
             assert client.terminal_status("w1", "t1") == "completed"
 
+    def test_terminal_status_without_a_budget_keeps_the_patient_read(self, client):
+        """`cao worker status` names no budget, so it keeps the 60s read."""
+        with patch(
+            "cli_agent_orchestrator.utils.fleet.requests.request",
+            return_value=_response(payload={"id": "t1", "status": "processing"}),
+        ) as request:
+            client.terminal_status("w1", "t1")
+
+        assert request.call_args.kwargs["timeout"] == (5.0, 60.0)
+
+    def test_a_short_poll_budget_caps_the_read_at_the_deadline(self, client):
+        """One stalled read must not outlast the poller's --timeout (#1059)."""
+        with patch(
+            "cli_agent_orchestrator.utils.fleet.requests.request",
+            return_value=_response(payload={"id": "t1", "status": "processing"}),
+        ) as request:
+            client.terminal_status("w1", "t1", budget=2.5)
+
+        assert request.call_args.kwargs["timeout"] == (5.0, 2.5)
+
+    def test_a_budget_larger_than_the_read_timeout_does_not_widen_it(self, client):
+        with patch(
+            "cli_agent_orchestrator.utils.fleet.requests.request",
+            return_value=_response(payload={"id": "t1", "status": "processing"}),
+        ) as request:
+            client.terminal_status("w1", "t1", budget=600.0)
+
+        assert request.call_args.kwargs["timeout"] == (5.0, 60.0)
+
+    def test_a_budget_capped_read_timeout_is_the_ordinary_transient_failure(self, client):
+        """The short read surfaces exactly like the 60s one: retryable, not a 4xx."""
+        with patch(
+            "cli_agent_orchestrator.utils.fleet.requests.request",
+            side_effect=requests.Timeout("Read timed out. (read timeout=2.5)"),
+        ):
+            with pytest.raises(click.ClickException) as exc:
+                client.terminal_status("w1", "t1", budget=2.5)
+
+        assert "2.5" in exc.value.format_message()
+
 
 class TestSoleTerminal:
     def test_returns_the_workers_one_terminal(self, client):

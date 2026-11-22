@@ -713,6 +713,12 @@ Done-detection is the same logic a local `cao session send` uses, with the statu
 read through the broker rather than re-implemented, so a worker running a provider
 that idles mid-turn is not reported as hung.
 
+`--timeout` bounds the wait itself, including each individual status read: a read
+that stalls is cut off at the deadline rather than held for the broker's full read
+timeout, so the command reports a timeout at about the number you asked for. A
+stalled read is retried while the agent keeps working, and the reply is still
+printed when it lands. `cao worker attach` waits the same way.
+
 ### cao worker sessions
 
 List the sessions and terminals inside a worker.

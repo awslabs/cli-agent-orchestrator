@@ -319,8 +319,10 @@ class TestSend:
         runner.invoke(worker, ["send", "w1", "hi"])
 
         read_status = poll.call_args.kwargs["read_status"]
-        assert read_status("t1") == "idle"
-        broker.terminal_status.assert_called_with("w1", "t1")
+        assert read_status("t1", 12.5) == "idle"
+        # The poll's remaining budget reaches the broker read, so one stalled
+        # read cannot spend more than the caller's --timeout (#1059).
+        broker.terminal_status.assert_called_with("w1", "t1", 12.5)
 
     def test_the_default_timeout_is_used_when_none_is_given(self, runner, broker, poll):
         broker.sole_terminal.return_value = _terminal("t1")

@@ -703,6 +703,92 @@ class TestPollUntilDone:
                 poll_until_done("abcd1234", timeout=60, polling_interval=0)
 
 
+class TestEachReadIsCappedByTheRemainingBudget:
+    """#1059: ``--timeout`` has to bound the READ, not only the gap between reads.
+
+    The deadline only becomes observable between polls, so a read that outlives
+    it spends the caller's budget inside one request: through the fleet broker a
+    status read inherited a 60s read timeout, and ``cao worker send --timeout 5``
+    reported a 60s timeout (measured 62s). Each transport now receives the
+    seconds left and caps its own read with them.
+    """
+
+    def _resp(self, status):
+        m = MagicMock()
+        m.raise_for_status.return_value = None
+        m.json.return_value = {"status": status}
+        return m
+
+    def test_the_transport_is_handed_the_seconds_left(self):
+        """A ``read_status`` override gets the budget as its second argument."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        budgets = []
+
+        def read_status(terminal_id, budget):
+            budgets.append(budget)
+            return "completed"
+
+        poll_until_done("abcd1234", timeout=30, polling_interval=0, read_status=read_status)
+
+        assert len(budgets) == 1
+        assert 0 < budgets[0] <= 30
+
+    def test_the_local_get_is_capped_at_the_read_timeout_and_the_budget(self):
+        """``min(5s, remaining)``: patient on a long wait, bounded on a short one."""
+        from cli_agent_orchestrator.utils.terminal import _POLL_READ_TIMEOUT, poll_until_done
+
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.return_value = self._resp("completed")
+            poll_until_done("abcd1234", timeout=60, polling_interval=0)
+
+        assert g.call_args.kwargs["timeout"] == _POLL_READ_TIMEOUT
+
+    def test_a_budget_shorter_than_the_read_timeout_caps_the_get_below_it(self):
+        from cli_agent_orchestrator.utils.terminal import _POLL_READ_TIMEOUT, poll_until_done
+
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.return_value = self._resp("completed")
+            poll_until_done("abcd1234", timeout=2, polling_interval=0)
+
+        capped = g.call_args.kwargs["timeout"]
+        assert capped < _POLL_READ_TIMEOUT
+        assert 0 < capped <= 2
+
+    def test_the_budget_handed_over_is_never_zero(self):
+        """A zero read timeout is not a short read: ``requests`` raises a bare
+        ``ValueError`` for it, which the poll's ``RequestException`` classifier
+        would not catch. The loop must time out instead of reading with 0."""
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        seen = []
+
+        def read_status(terminal_id, budget):
+            seen.append(budget)
+            return "processing"
+
+        # The deadline passes on the second pass, before any read with 0 is made.
+        times = iter([0.0, 0.0, 5.0, 5.0, 5.0])
+        with (
+            patch(
+                "cli_agent_orchestrator.utils.terminal.time.time", side_effect=lambda: next(times)
+            ),
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            with pytest.raises(click.ClickException, match="Timed out"):
+                poll_until_done("abcd1234", timeout=5, polling_interval=0, read_status=read_status)
+
+        assert all(budget > 0 for budget in seen), seen
+
+
 class TestWaitForInitialDelivery:
     """PR #566 round 9: the CLI waits on the server's durable delivery verdict."""
 

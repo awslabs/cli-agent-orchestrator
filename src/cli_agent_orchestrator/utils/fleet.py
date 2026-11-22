@@ -148,8 +148,20 @@ class FleetClient:
 
     # -- the worker's own cao-server, proxied --------------------------------
 
-    def node_get(self, worker_id: str, path: str, params: Optional[dict[str, Any]] = None) -> Any:
-        return self._request("GET", self._node_path(worker_id, path), params=params).json()
+    def node_get(
+        self,
+        worker_id: str,
+        path: str,
+        params: Optional[dict[str, Any]] = None,
+        *,
+        read_timeout: Optional[float] = None,
+    ) -> Any:
+        return self._request(
+            "GET",
+            self._node_path(worker_id, path),
+            params=params,
+            read_timeout=read_timeout,
+        ).json()
 
     def node_post(self, worker_id: str, path: str, params: Optional[dict[str, Any]] = None) -> Any:
         response = self._request("POST", self._node_path(worker_id, path), params=params)
@@ -176,11 +188,30 @@ class FleetClient:
             self.node_get(worker_id, f"sessions/{quote(session_name, safe='')}/terminals"),
         )
 
-    def terminal(self, worker_id: str, terminal_id: str) -> dict[str, Any]:
-        return cast(dict[str, Any], self.node_get(worker_id, f"terminals/{terminal_id}"))
+    def terminal(
+        self, worker_id: str, terminal_id: str, *, read_timeout: Optional[float] = None
+    ) -> dict[str, Any]:
+        return cast(
+            dict[str, Any],
+            self.node_get(worker_id, f"terminals/{terminal_id}", read_timeout=read_timeout),
+        )
 
-    def terminal_status(self, worker_id: str, terminal_id: str) -> Optional[str]:
-        return self.terminal(worker_id, terminal_id).get("status")
+    def terminal_status(
+        self, worker_id: str, terminal_id: str, budget: Optional[float] = None
+    ) -> Optional[str]:
+        """One terminal's status, with the read capped by the caller's poll budget.
+
+        ``budget`` is the seconds ``poll_until_done`` has left before its
+        deadline (#1059). Without it a stalled read was held for the
+        module-wide ``_READ_TIMEOUT`` (60s), so ``cao worker send --timeout 5``
+        took over a minute before it reported a timeout. The cap is
+        ``min(_READ_TIMEOUT, budget)``: a generous budget keeps the patient
+        read, a short one ends the read at the deadline instead of past it, and
+        the resulting read timeout is the ordinary transient error the poll
+        loop already retries and its final message already reports.
+        """
+        read_timeout = _READ_TIMEOUT if budget is None else min(_READ_TIMEOUT, budget)
+        return self.terminal(worker_id, terminal_id, read_timeout=read_timeout).get("status")
 
     def terminal_output(self, worker_id: str, terminal_id: str) -> Optional[str]:
         payload = self.node_get(worker_id, f"terminals/{terminal_id}/output", {"mode": "last"})
@@ -218,6 +249,8 @@ class FleetClient:
         path: str,
         params: Optional[dict[str, Any]] = None,
         raise_for_status: bool = True,
+        *,
+        read_timeout: Optional[float] = None,
     ) -> requests.Response:
         try:
             response = requests.request(
@@ -225,7 +258,10 @@ class FleetClient:
                 f"{self.url}{path}",
                 params=params,
                 headers=self._headers,
-                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
+                timeout=(
+                    _CONNECT_TIMEOUT,
+                    _READ_TIMEOUT if read_timeout is None else read_timeout,
+                ),
             )
         except requests.RequestException as exc:
             raise BrokerRequestError(
