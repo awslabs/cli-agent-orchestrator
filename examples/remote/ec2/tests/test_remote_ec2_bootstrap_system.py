@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import re
 
 import pytest
 from remote_ec2_support import (
@@ -45,8 +46,8 @@ def test_a_blank_volume_is_formatted_only_with_the_flag(sandbox) -> None:
     result = dry_run(sandbox, fake, "--format-new-volume", **VOLUME)
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"[dry-run] would run: mkfs.ext4 -L cao-data {fake.dev}" in result.stdout
-    assert "/Users ext4 defaults,nofail 0 2" in result.stdout
-    assert "[dry-run] would run: mount /Users" in result.stdout
+    assert "/home/cao-herdr ext4 defaults,nofail 0 2" in result.stdout
+    assert "[dry-run] would run: mount /home/cao-herdr" in result.stdout
     assert sandbox.recorded_calls() == []
 
 
@@ -149,7 +150,7 @@ def test_an_existing_filesystem_is_mounted_not_formatted(sandbox, fs_type) -> No
     assert result.returncode == 0, result.stderr
     assert "mkfs" not in result.stdout
     assert f"already has an {fs_type} filesystem" in result.stdout
-    assert f"/Users {fs_type} defaults,nofail 0 2" in result.stdout
+    assert f"/home/cao-herdr {fs_type} defaults,nofail 0 2" in result.stdout
 
 
 def test_an_unsupported_filesystem_stops(sandbox) -> None:
@@ -194,66 +195,66 @@ def test_a_new_user_gets_a_pinned_uid_and_owns_local_before_user_installs(sandbo
     result = dry_run(sandbox, FakeSystem(sandbox), **BOOTSTRAP_SETTINGS)
     assert result.returncode == 0, result.stdout + result.stderr
     out = result.stdout
-    assert "would run: groupadd --gid 2001 boxuser" in out
-    assert "would run: useradd --uid 2001 --gid 2001 --home-dir /Users/boxuser --create-home" in out
+    assert "would run: groupadd --gid 1001 cao-herdr" in out
+    assert "would run: useradd --uid 1001 --gid 1001 --home-dir /home/cao-herdr --create-home" in out
     # The user makes its own folders: root never runs `install -d -o` there.
     owned = index_of(
         result,
-        "would run: runuser -u boxuser -- env HOME=/Users/boxuser PATH=/Users/boxuser/.local/bin:"
-        "/usr/local/bin:/usr/bin:/bin install -d -m 0755 /Users/boxuser/.local "
-        "/Users/boxuser/.local/bin /Users/boxuser/.config",
+        "would run: runuser -u cao-herdr -- env HOME=/home/cao-herdr PATH=/home/cao-herdr/.local/bin:"
+        "/usr/local/bin:/usr/bin:/bin install -d -m 0755 /home/cao-herdr/.local "
+        "/home/cao-herdr/.local/bin /home/cao-herdr/.config",
     )
-    herdr = index_of(result, "<download-dir>/herdr /Users/boxuser/.local/bin/herdr")
+    herdr = index_of(result, "<download-dir>/herdr /home/cao-herdr/.local/bin/herdr")
     assert owned < herdr
     # User-level installs run as the user, never as root.
     for needle in [
-        "install -m 0755 <download-dir>/herdr /Users/boxuser/.local/bin/herdr",
-        "uv-aarch64-unknown-linux-gnu/uvx /Users/boxuser/.local/bin/",
+        "install -m 0755 <download-dir>/herdr /home/cao-herdr/.local/bin/herdr",
+        "uv-aarch64-unknown-linux-gnu/uvx /home/cao-herdr/.local/bin/",
         "uv tool install --force git+",
     ]:
         line = lines(result)[index_of(result, needle)]
-        assert "would run: runuser -u boxuser -- env HOME=/Users/boxuser" in line, line
+        assert "would run: runuser -u cao-herdr -- env HOME=/home/cao-herdr" in line, line
     # Step 7 writes the config files as the user, so root changes no owner.
     for path in [
-        "/Users/boxuser/.config/herdr/config.toml",
-        "/Users/boxuser/.aws/cli-agent-orchestrator/settings.json",
-        "/Users/boxuser/.claude/settings.json",
+        "/home/cao-herdr/.config/herdr/config.toml",
+        "/home/cao-herdr/.aws/cli-agent-orchestrator/settings.json",
+        "/home/cao-herdr/.claude/settings.json",
     ]:
-        assert f"would, as boxuser: keep {path} if it exists, else write it" in out, path
+        assert f"would, as cao-herdr: keep {path} if it exists, else write it" in out, path
     assert "chown" not in out
     assert "would install config/" not in out
     assert sandbox.recorded_calls() == []
 
 
 def test_a_freshly_mounted_root_owned_home_is_given_to_the_user(sandbox) -> None:
-    home = sandbox.root / "home-mount" / "boxuser"
+    home = sandbox.root / "home-mount" / "cao-herdr"
     home.mkdir(parents=True)
     fake = FakeSystem(sandbox)
     fake.home_owner = "0"
     result = dry_run(sandbox, fake, **{**BOOTSTRAP_SETTINGS, "BOX_HOME": str(home)})
     assert result.returncode == 0, result.stdout + result.stderr
     assert "--no-create-home" in result.stdout
-    assert f"would run: chown boxuser:boxuser {home}\n" in result.stdout
+    assert f"would run: chown cao-herdr:cao-herdr {home}\n" in result.stdout
     assert f"would run: chmod 0750 {home}" in result.stdout
-    assert f"would run: runuser -u boxuser -- cp -rn /etc/skel/. {home}/" in result.stdout
+    assert f"would run: runuser -u cao-herdr -- cp -rn /etc/skel/. {home}/" in result.stdout
 
 
 def test_a_home_owned_by_another_uid_stops(sandbox) -> None:
-    home = sandbox.root / "home-mount" / "boxuser"
+    home = sandbox.root / "home-mount" / "cao-herdr"
     home.mkdir(parents=True)
     fake = FakeSystem(sandbox)
     fake.home_owner = "1500"
     result = dry_run(sandbox, fake, **{**BOOTSTRAP_SETTINGS, "BOX_HOME": str(home)})
     assert result.returncode == 1
-    assert "belongs to uid 1500, not BOX_UID 2001" in result.stderr
+    assert "belongs to uid 1500, not BOX_UID 1001" in result.stderr
     assert "== 3." not in result.stdout
 
 
 @pytest.mark.parametrize(
     ("uid", "home", "message"),
     [
-        ("1999", "/Users/boxuser", "exists with uid 1999"),
-        ("2001", "/home/boxuser", "home is /home/boxuser"),
+        ("1999", "/home/cao-herdr", "exists with uid 1999"),
+        ("1001", "/home/other", "home is /home/other"),
     ],
 )
 def test_an_existing_user_must_match_uid_and_home(sandbox, uid, home, message) -> None:
@@ -270,7 +271,7 @@ def test_a_taken_uid_stops(sandbox) -> None:
     fake.uid_taken = True
     result = dry_run(sandbox, fake, **BOOTSTRAP_SETTINGS)
     assert result.returncode == 1
-    assert "uid 2001 already belongs to another user" in result.stderr
+    assert "uid 1001 already belongs to another user" in result.stderr
 
 
 # ------------------------------------------------------------ packages, tools
@@ -290,7 +291,7 @@ def test_docker_opt_in_warns_that_the_group_is_root(sandbox) -> None:
     packages = lines(result)[index_of(result, "3. packages:")].split("3. packages:", 1)[1].split()
     assert any(p == "docker.io" for p in packages)  # the apt package name, compared exactly
     assert "That is root on this box for every agent" in result.stderr
-    assert "would run: usermod -aG docker boxuser" in result.stdout
+    assert "would run: usermod -aG docker cao-herdr" in result.stdout
 
 
 def test_every_download_is_verified_before_it_is_installed(sandbox) -> None:
@@ -304,7 +305,7 @@ def test_every_download_is_verified_before_it_is_installed(sandbox) -> None:
         result, f"would verify sha256 of herdr-linux-aarch64 v0.9.3 = {FAKE_SHA}"
     )
     assert index_of(result, "releases/download/v0.9.3/herdr-linux-aarch64") < herdr_verify
-    assert herdr_verify < index_of(result, "<download-dir>/herdr /Users/boxuser/.local/bin/herdr")
+    assert herdr_verify < index_of(result, "<download-dir>/herdr /home/cao-herdr/.local/bin/herdr")
     assert index_of(result, "gh_2.103.3_checksums.txt") < index_of(result, "would run: dpkg -i")
     for label in [
         "awscli-exe-linux-aarch64-2.0.0.zip",
@@ -342,7 +343,7 @@ def test_a_missing_pin_stops_before_any_download(sandbox, drop, listed) -> None:
 
 
 def box_home(sandbox) -> Path:
-    home = sandbox.root / "home-mount" / "boxuser"
+    home = sandbox.root / "home-mount" / "cao-herdr"
     home.mkdir(parents=True)
     return home
 
@@ -362,7 +363,7 @@ def test_a_planted_herdr_is_never_run_and_is_downloaded_again(sandbox) -> None:
     marker = sandbox.root / "herdr-ran"
     plant_herdr(home, marker)
     fake = FakeSystem(sandbox)
-    fake.home_owner = "2001"
+    fake.home_owner = "1001"
     result = dry_run(sandbox, fake, **{**BOOTSTRAP_SETTINGS, "BOX_HOME": str(home)})
     assert result.returncode == 0, result.stdout + result.stderr
     assert not marker.exists(), "root ran a herdr from the box user's home"
@@ -378,12 +379,12 @@ def test_a_dry_run_never_opens_herdr_even_with_the_pinned_hash(sandbox) -> None:
     marker = sandbox.root / "herdr-ran"
     pinned = hashlib.sha256(plant_herdr(home, marker)).hexdigest()
     fake = FakeSystem(sandbox)
-    fake.home_owner = "2001"
+    fake.home_owner = "1001"
     settings = {**BOOTSTRAP_SETTINGS, "BOX_HOME": str(home), "HERDR_SHA256": pinned}
     result = dry_run(sandbox, fake, **settings)
     assert result.returncode == 0, result.stdout + result.stderr
     herdr = home / ".local" / "bin" / "herdr"
-    assert f"would check, as boxuser, that {herdr} is a regular file with sha256" in result.stdout
+    assert f"would check, as cao-herdr, that {herdr} is a regular file with sha256" in result.stdout
     assert "releases/download/v0.9.3/herdr-linux-aarch64" in result.stdout
     assert not marker.exists(), "root ran a herdr from the box user's home"
     assert sandbox.recorded_calls() == []
@@ -402,7 +403,7 @@ def test_a_config_folder_linked_to_a_root_folder_is_refused(sandbox, folder) -> 
     link_in_home(home, folder, target)
     before = tree_snapshot(target)
     fake = FakeSystem(sandbox)
-    fake.home_owner = "2001"
+    fake.home_owner = "1001"
     result = dry_run(sandbox, fake, **{**BOOTSTRAP_SETTINGS, "BOX_HOME": str(home)})
     assert result.returncode == 1, result.stdout + result.stderr
     assert f"{home}/{folder} is a symlink; refusing" in result.stderr
@@ -418,7 +419,7 @@ def test_a_claude_folder_linked_to_the_unit_folder_is_refused(sandbox) -> None:
     link_in_home(home, ".claude", units)
     before = tree_snapshot(units)
     fake = FakeSystem(sandbox)
-    fake.home_owner = "2001"
+    fake.home_owner = "1001"
     result = dry_run(sandbox, fake, **{**BOOTSTRAP_SETTINGS, "BOX_HOME": str(home)})
     assert result.returncode == 1, result.stdout + result.stderr
     assert f"{home}/.claude is a symlink; refusing" in result.stderr
@@ -434,7 +435,7 @@ def test_a_checkout_inside_the_box_users_home_is_refused(sandbox) -> None:
     # change them before the next re-run.
     home = str(SAMPLE_DIR.parent)
     fake = FakeSystem(sandbox)
-    fake.home_owner = "2001"
+    fake.home_owner = "1001"
     result = dry_run(sandbox, fake, **{**BOOTSTRAP_SETTINGS, "BOX_HOME": home})
     assert result.returncode == 1, result.stdout + result.stderr
     assert "inside the box user's home" in result.stderr
@@ -446,16 +447,53 @@ def test_a_checkout_inside_the_box_users_home_is_refused(sandbox) -> None:
 # ---------------------------------------------------- session name and units
 
 
-def test_the_real_branch_enables_but_never_starts(sandbox) -> None:
+def test_the_real_branch_enables_and_starts_by_default(sandbox) -> None:
     result = dry_run(sandbox, FakeSystem(sandbox), **BOOTSTRAP_SETTINGS)
     assert result.returncode == 0, result.stderr
     runs = [line for line in lines(result) if "would run: systemctl" in line]
     assert runs == [
         "[dry-run] would run: systemctl daemon-reload",
         "[dry-run] would run: systemctl enable herdr-cao.service cao-server.service cao-backup.timer",
+        "[dry-run] would run: systemctl start herdr-cao.service cao-server.service cao-backup.timer",
     ]
     assert "--now" not in result.stdout
-    assert "systemctl start" not in "\n".join(l for l in lines(result) if "would run" in l)
+    assert "would wait up to 30 seconds" in result.stdout
+
+
+def test_no_start_only_enables_services(sandbox) -> None:
+    result = dry_run(sandbox, FakeSystem(sandbox), "--no-start", **BOOTSTRAP_SETTINGS)
+    assert result.returncode == 0, result.stderr
+    assert "would run: systemctl enable" in result.stdout
+    assert "would run: systemctl start" not in result.stdout
+    assert "--no-start: enabled services but did not start them" in result.stdout
+
+
+def test_tmux_mode_uses_its_user_and_never_installs_herdr(sandbox) -> None:
+    settings = {k: v for k, v in BOOTSTRAP_SETTINGS.items() if k not in {"BOX_USER", "BOX_HOME"}}
+    result = dry_run(sandbox, FakeSystem(sandbox), ATTACH_MODE="tmux", **settings)
+    assert result.returncode == 0, result.stderr
+    assert "user cao-tmux (uid" in result.stdout
+    assert "/home/cao-tmux" in result.stdout
+    assert "packages: git sqlite3 curl unzip jq xz-utils ca-certificates tmux" in result.stdout
+    assert "herdr-cao.service" not in result.stdout
+    assert "herdr-linux-aarch64" not in result.stdout
+    assert "cao-tmux.service cao-server.service cao-backup.timer" in result.stdout
+
+
+def test_tmux_unit_uses_a_separate_standard_socket_server() -> None:
+    unit = (SAMPLE_DIR / "systemd" / "cao-tmux.service").read_text(encoding="utf-8")
+    assert "Type=forking" in unit
+    assert "ExecStart=/usr/bin/tmux new-session -d -s box-keepalive" in unit
+    assert "ExecStartPost=/usr/bin/tmux set-option -s exit-empty off" in unit
+    assert "ExecStop=/usr/bin/tmux kill-server" in unit
+    assert "KillMode=none" not in unit
+    assert "\nPrivateTmp=" not in unit
+    for path in (SAMPLE_DIR / "systemd").glob("*.service"):
+        text = path.read_text(encoding="utf-8")
+        names = re.findall(r"\btmux\s+new-session\s+-d\s+-s\s+(\S+)", text)
+        assert all(not name.startswith("cao-") for name in names), (
+            f"{path.name} declares a CAO-reserved tmux session name"
+        )
 
 
 @pytest.mark.skipif(

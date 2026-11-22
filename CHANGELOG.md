@@ -47,6 +47,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses unmarked access to a real-home memory directory and relocates memory
   for live-provider test runs.
 - **FIFO output readers continue working when a busy server has allocated a descriptor above 1023** (#1350).
+- **Memory topics without a canonical entry heading are visible again** (#1329). The
+  default-on `memory.parser.lenient` parser accepts a valid topic header with body content,
+  including minute-precision timestamps; set it to `false` for the legacy behavior. LLM
+  compiles now carry exactly one CAO-owned heading dated by the newest entry, so compilation
+  does not refresh a fact's recency. `cao memory repair` indexes fallback-dated topics instead
+  of skipping them, while `--apply --add-headings` first writes a `.md.bak` copy and then adds
+  the heading. Recency-ranked keyword results can shift because previously invisible notes now
+  participate; a later phase adds the BM25 default.
 - **Provider memory file writes now default off** (#1335). CAO delivers each terminal's
   memory without writing it into project files that can be committed. Interactive
   `cao launch` sessions using a runtime start-prompt provider — Claude Code, Codex,

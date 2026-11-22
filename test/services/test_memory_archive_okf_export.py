@@ -8,8 +8,9 @@ which only the compile pipeline writes and is appended file-side here).
 
 import asyncio
 import os
+import re
 import tarfile
-from datetime import datetime
+from datetime import datetime, timezone
 
 import frontmatter
 import pytest
@@ -22,6 +23,7 @@ from cli_agent_orchestrator.services.memory_archive.okf import (
     export_bundle_to_tar,
 )
 from cli_agent_orchestrator.services.memory_service import MemoryService
+from cli_agent_orchestrator.services.wiki_compiler import _postprocess_compiled
 
 PLANTED_AWS_KEY = "AKIA" + "ABCDEFGHIJKLMNOP"
 
@@ -160,6 +162,131 @@ class TestConformance:
         manifest = (dest / "manifest.md").read_text(encoding="utf-8")
         assert not manifest.startswith("---")
         assert "edits here are not synced back" in manifest
+
+    def test_lenient_topics_export_with_recalled_bodies(self, svc, backend, dest):
+        occurred_at = datetime(2026, 11, 14, 5, 53, tzinfo=timezone.utc)
+        for key, body in (
+            ("headingless-topic", "Headingless body."),
+            ("minute-topic", "Minute-precision body."),
+        ):
+            _run(
+                svc.store(
+                    content=body,
+                    scope="global",
+                    memory_type="reference",
+                    key=key,
+                    occurred_at=occurred_at,
+                )
+            )
+
+        headingless_path = svc.get_wiki_path("global", None, "headingless-topic")
+        headingless_text = headingless_path.read_text(encoding="utf-8")
+        headingless_path.write_text(
+            re.sub(
+                r"^## 2026-11-14T05:53:00Z$",
+                "## Overview",
+                headingless_text,
+                count=1,
+                flags=re.MULTILINE,
+            ),
+            encoding="utf-8",
+        )
+        minute_path = svc.get_wiki_path("global", None, "minute-topic")
+        minute_text = minute_path.read_text(encoding="utf-8")
+        minute_path.write_text(
+            minute_text.replace("## 2026-11-14T05:53:00Z", "## 2026-11-14T05:53Z", 1),
+            encoding="utf-8",
+        )
+
+        recalled = {
+            memory.key: memory
+            for memory in _run(svc.recall(scope="global", limit=10, scan_all=True))
+        }
+        report = backend.export_bundle("global", None, dest, False, False)
+
+        assert report.exported == 2
+        assert set(recalled) == {"headingless-topic", "minute-topic"}
+        for key, memory in recalled.items():
+            _, body = _frontmatter(dest / f"{key}.md")
+            assert body == f"# {key}\n\n{memory.content}"
+
+    def test_compiled_topic_exports_recalled_body(self, svc, backend, dest):
+        occurred_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        _run(
+            svc.store(
+                content="first fact",
+                scope="global",
+                memory_type="reference",
+                key="compiled-topic",
+                occurred_at=occurred_at,
+            )
+        )
+        path = svc.get_wiki_path("global", None, "compiled-topic")
+        compiled = _postprocess_compiled(
+            path.read_text(encoding="utf-8") + "\n## 2026-02-01T00:00:00Z\nsecond fact\n",
+            newest_entry_at="2026-03-01T00:00:00Z",
+            entry_count=3,
+            compiled_at="2026-03-02T00:00:00Z",
+        )
+        path.write_text(compiled, encoding="utf-8")
+
+        recalled = _run(svc.recall(scope="global", limit=10, scan_all=True))[0]
+        report = backend.export_bundle("global", None, dest, False, False)
+        _, body = _frontmatter(dest / "compiled-topic.md")
+
+        assert report.exported == 1
+        assert body == f"# compiled-topic\n\n{recalled.content}"
+
+    @pytest.mark.parametrize(
+        "llm_headings",
+        [
+            (
+                "## 2026-01-01T00:00:00Z\nfirst fact\n\n"
+                "## 2026-02-01T00:00:00Z\nsecond fact\n\n"
+                "third fact"
+            ),
+            (
+                "## 2026-01-01T00:00:00Z\nfirst fact\n\n"
+                "## 2026-02-01T00:00:00Z\nsecond fact\n\n"
+                "## 2026-03-01T00:00:00Z\nthird fact"
+            ),
+            (
+                "## 2026-03-01T00:00:00Z\nthird fact\n\n"
+                "## 2026-02-01T00:00:00Z\nsecond fact\n\n"
+                "## 2026-01-01T00:00:00Z\nfirst fact"
+            ),
+        ],
+        ids=["keeps-first-two", "keeps-all", "newest-first"],
+    )
+    def test_compiled_topic_round_trips_through_okf_import(
+        self, svc, backend, dest, tmp_path, llm_headings
+    ):
+        _store(svc, "compiled-round-trip", "first fact")
+        source_path = svc.get_wiki_path("global", None, "compiled-round-trip")
+        source = _postprocess_compiled(
+            source_path.read_text(encoding="utf-8").split("## ", 1)[0] + llm_headings,
+            newest_entry_at="2026-03-01T00:00:00Z",
+            entry_count=3,
+            compiled_at="2026-03-02T00:00:00Z",
+        )
+        source_path.write_text(source, encoding="utf-8")
+        source_memory = _run(svc.recall(scope="global", limit=10, scan_all=True))[0]
+        assert backend.export_bundle("global", None, dest, False, False).exported == 1
+
+        imported_engine = create_engine(
+            f"sqlite:///{tmp_path / 'imported.db'}", connect_args={"check_same_thread": False}
+        )
+        Base.metadata.create_all(bind=imported_engine)
+        imported_svc = MemoryService(
+            base_dir=tmp_path / "imported-memory", db_engine=imported_engine
+        )
+        imported_backend = OkfArchiveBackend(imported_svc)
+        assert imported_backend.import_bundle(dest, "global", "skip", False).imported == 1
+        imported_memory = _run(imported_svc.recall(scope="global", limit=10, scan_all=True))[0]
+
+        assert imported_memory.content == source_memory.content
+        assert source_memory.created_at <= source_memory.updated_at
+        assert imported_memory.created_at <= imported_memory.updated_at
 
 
 class TestSecretGate:
