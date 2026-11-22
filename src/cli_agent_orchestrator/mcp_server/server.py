@@ -2125,17 +2125,17 @@ async def memory_recall(
             if remote_memory_url()
             else await MemoryService().recall(**kwargs)
         )
-        # Curated recall is inserted verbatim into another terminal's context.
-        # Keep its vault/native scope set aligned with the deterministic builder:
-        # agent-scoped memories are explicit-recall-only in this release.
-        from cli_agent_orchestrator.services.settings_service import (
-            is_memory_recall_v2_fields_enabled,
-        )
+        # Defence in depth for mocked/legacy services. MemoryService owns this
+        # restriction for real local and remote reads.
         from cli_agent_orchestrator.services.vault.reader import MEMORY_MANAGER_PROFILE
 
         if (terminal_context or {}).get("agent_profile") == MEMORY_MANAGER_PROFILE:
             injectable_scopes = {"session", "project", "global"}
             memories = [memory for memory in memories if memory.scope in injectable_scopes]
+        from cli_agent_orchestrator.services.settings_service import (
+            is_memory_recall_v2_fields_enabled,
+        )
+
         # One serializer for both recall surfaces (this tool and
         # POST /internal/memory/recall); see models/memory.py.
         return {

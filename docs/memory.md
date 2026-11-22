@@ -228,7 +228,8 @@ memory_recall(
 ```
 
 Use `detail="snippet"` for a compact matched-term window plus a `memory_get`
-hint. The result order is unchanged. Fetch one complete note on demand with:
+hint. The result order is unchanged. Fetch a note's latest entry on demand
+with:
 
 ```
 memory_get(
@@ -242,7 +243,10 @@ memory_get(
 `memory_get` uses the same scope visibility and vault policy as recall. If an
 unscoped key exists in more than one visible scope it returns
 `ambiguous_scope` with those scopes; a missing key returns `not_found`. Like an
-explicit MCP recall, a successful get counts as access.
+explicit MCP recall, a successful get counts as access. Pass
+`include_history=True` to return all available entries newest first. The
+`max_chars` cap applies independently to the latest-entry `content` and the
+combined `history` body.
 
 `sort_by` controls ranking: `recency` (newest first), `score` (composite 3-factor —
 BM25 relevance + recency + usage), or `usage` (most accessed). When no `scope` is
@@ -285,6 +289,8 @@ An older remote memory owner may reject the new sort value; upgrade both nodes.
 `edited_at`, `match`, `status`, and `earlier_entries` to recall results, and
 makes latest-entry truncation visible through `content_truncated`. With the
 setting off and `detail="full"`, the pinned recall response is unchanged.
+`fact_date` is the earliest valid entry timestamp, including for a compiled
+article, while `edited_at` is the latest.
 
 ### `memory_forget`
 

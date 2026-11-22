@@ -316,6 +316,25 @@ def _mcp_stamp(value: Optional[datetime]) -> Optional[str]:
     return value.strftime(_MCP_STAMP_FORMAT) if value else None
 
 
+def _fallback_snippet(memory: "Memory", limit: int = 300) -> str:
+    """Project a useful snippet when an older owner returned only content."""
+    content = memory.content
+    if len(content) <= limit:
+        return content
+    terms = memory.match.get("terms", []) if isinstance(memory.match, dict) else []
+    lowered = content.lower()
+    positions = [
+        (position, len(term))
+        for term in terms
+        if isinstance(term, str) and (position := lowered.find(term.lower())) >= 0
+    ]
+    start = (
+        max(0, min(position for position, _length in positions) - limit // 4) if positions else 0
+    )
+    end = min(len(content), start + limit)
+    return ("…" if start else "") + content[start:end].strip() + ("…" if end < len(content) else "")
+
+
 def recall_wire_dict(
     memory: "Memory",
     *,
@@ -336,7 +355,9 @@ def recall_wire_dict(
     wire: Dict[str, Any] = memory.model_dump(mode="json")
     if detail == "snippet":
         wire.pop("content")
-        wire["snippet"] = memory.snippet or ""
+        wire["snippet"] = (
+            memory.snippet if memory.snippet is not None else _fallback_snippet(memory)
+        )
         wire["get"] = memory.get or (f"memory_get(key={memory.key!r}, scope={memory.scope!r})")
     if include_v2_fields:
         wire["content_truncated"] = memory.content_truncated or memory.earlier_entries > 0

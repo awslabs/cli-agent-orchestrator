@@ -6,6 +6,8 @@ For the on-demand memory ranking diagnostic, see [Memory explain](memory.md#on-d
 
 `memory.parser.lenient` defaults to `true`; see [Native topic visibility](memory.md#native-topic-visibility). Set it to `false` to restore legacy parsing that skips topics without canonical entry headings.
 
+`memory.recall.v2_fields` defaults to `false`; set it to `true` to add recall-v2 dates, match reason, status, and hidden-entry counts. `CAO_MEMORY_RECALL_V2_FIELDS` overrides the file value.
+
 `memory.lifecycle.enabled` defaults to `false`; see [Supersedes lifecycle](memory.md#supersedes-lifecycle-opt-in). `CAO_MEMORY_LIFECYCLE_ENABLED` overrides the nested file value.
 
 `memory.injection.clear_on_empty` and `memory.injection.v1_fixes` default to `true`. Set either key to `false` with `cao config set` to disable that injection-hygiene behavior. `memory.injection.write_project_files` defaults to `false`; set it to `true` to opt into legacy provider memory writes under the terminal working directory.

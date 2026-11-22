@@ -70,6 +70,10 @@ VALID_SEARCH_MODES = ("metadata", "bm25", "hybrid")
 _CANONICAL_ENTRY_HEADING_RE = re.compile(
     r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$", re.MULTILINE
 )
+_COMPILED_ENTRY_HEADING_RE = re.compile(
+    r"^### Entry (?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$",
+    re.MULTILINE,
+)
 _LENIENT_ENTRY_HEADING_RE = re.compile(
     r"^#{2,} [^\n]*?(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)[^\n]*$",
     re.MULTILINE,
@@ -697,6 +701,20 @@ class MemoryService:
             return True
         expected_scope_id = private_scope_ids[scope]
         return expected_scope_id is not None and scope_id == expected_scope_id
+
+    @staticmethod
+    def _visible_to_caller(
+        memories: Sequence[Memory], terminal_context: Optional[dict]
+    ) -> list[Memory]:
+        """Apply caller-role scope visibility after native/vault discovery."""
+        if (terminal_context or {}).get("agent_profile") == MEMORY_MANAGER_PROFILE:
+            recallable_scopes = {
+                MemoryScope.SESSION.value,
+                MemoryScope.PROJECT.value,
+                MemoryScope.GLOBAL.value,
+            }
+            return [memory for memory in memories if memory.scope in recallable_scopes]
+        return list(memories)
 
     @staticmethod
     def _sanitize_scope_id(value: str) -> str:
@@ -2638,6 +2656,7 @@ class MemoryService:
                     -memory.updated_at.timestamp(),
                 )
             )
+        results = self._visible_to_caller(results, terminal_context)
 
         from cli_agent_orchestrator.services.settings_service import is_memory_lifecycle_enabled
 
@@ -2808,6 +2827,7 @@ class MemoryService:
             recall_policy,
             **eligibility_kwargs,
         )
+        pool.rows = self._visible_to_caller(pool.rows, terminal_context)
         superseded_snapshot = None
         target_plan = None
         if (
@@ -2927,6 +2947,9 @@ class MemoryService:
             memory.get = f"memory_get(key={memory.key!r}, scope={memory.scope!r})"
             if detail == "snippet":
                 memory.snippet = self._snippet(memory.content, terms)
+                memory.match["terms"] = [
+                    term for term in memory.match["terms"] if term in memory.snippet.lower()
+                ]
 
     async def get_memory(
         self,
@@ -2935,44 +2958,55 @@ class MemoryService:
         terminal_context: Optional[dict] = None,
         include_history: bool = False,
         max_chars: int = 8000,
+        *,
+        record_access: bool = True,
     ) -> dict[str, Any]:
         """Read one visible note by exact sanitised key.
 
-        Candidate discovery deliberately reuses recall so native/vault
-        bindings, private-scope filtering and eligibility policy stay in one
-        place. The census itself does not count as access; only the one note
-        returned to the explicit MCP caller does.
+        Candidate discovery uses the exact-key recall primitive so unrelated
+        topic files are not parsed. The census itself does not count as access;
+        only the one note returned to an accessing caller does.
         """
         if not _is_memory_enabled():
             raise MemoryNotFoundError(key)
         if max_chars < 1:
             raise ValueError("max_chars must be at least 1")
         sanitised = self._sanitize_key(key)
-        rows = await self.recall(
-            scope=scope,
-            limit=1_000_000,
-            terminal_context=terminal_context,
-            search_mode="metadata",
-            record_access=False,
+        scopes = (
+            [scope]
+            if scope is not None
+            else [
+                MemoryScope.SESSION.value,
+                MemoryScope.PROJECT.value,
+                MemoryScope.GLOBAL.value,
+                MemoryScope.AGENT.value,
+                MemoryScope.FEDERATED.value,
+            ]
         )
-        matches = [memory for memory in rows if memory.key == sanitised]
+        matches = []
+        for candidate_scope in scopes:
+            memory = await self.read_exact_key(
+                sanitised,
+                scope=candidate_scope,
+                terminal_context=terminal_context,
+                record_access=False,
+            )
+            if memory is not None:
+                matches.append(memory)
         if not matches:
             raise MemoryNotFoundError(sanitised)
-        scopes = list(dict.fromkeys(memory.scope for memory in matches))
-        if scope is None and len(scopes) > 1:
-            raise MemoryAmbiguousScopeError(sanitised, scopes)
+        matched_scopes = list(dict.fromkeys(memory.scope for memory in matches))
+        if scope is None and len(matched_scopes) > 1:
+            raise MemoryAmbiguousScopeError(sanitised, matched_scopes)
         memory = matches[0]
-        try:
-            self._increment_access_count([memory])
-        except Exception as exc:  # noqa: BLE001 — explicit read remains best-effort
-            logger.warning("memory_get increment failed scope=%s", memory.scope)
-            logger.debug("memory_get increment failure detail: %s", exc)
+        if record_access:
+            try:
+                self._increment_access_count([memory])
+            except Exception as exc:  # noqa: BLE001 — explicit read remains best-effort
+                logger.warning("memory_get increment failed scope=%s", memory.scope)
+                logger.debug("memory_get increment failure detail: %s", exc)
 
-        status = (
-            "superseded"
-            if self._is_superseded(memory, self._superseded_keys([memory]))
-            else "active"
-        )
+        status = memory.lifecycle_status or "active"
         history = self._memory_history(memory)
         earlier_entries = memory.earlier_entries
         content = memory.content
@@ -2996,6 +3030,7 @@ class MemoryService:
         result["links_out"] = links_out
         result["links_in"] = links_in
         if include_history:
+            truncated = len(content) > max_chars
             remaining = max_chars
             visible_history = []
             for item in history:
@@ -4616,7 +4651,7 @@ class MemoryService:
 
         def _timestamp_boundaries(
             matches: list[re.Match[str]], group: int | str
-        ) -> tuple[list[re.Match[str]], list[datetime]]:
+        ) -> tuple[list[re.Match[str]], list[datetime], int]:
             first_index: Optional[int] = None
             first_match: Optional[re.Match[str]] = None
             first_time: Optional[datetime] = None
@@ -4633,7 +4668,7 @@ class MemoryService:
                 first_match = match
                 break
             if first_index is None or first_match is None or first_time is None:
-                return [], []
+                return [], [], 0
 
             for match in reversed(matches[first_index + 1 :]):
                 value = match.group(group)
@@ -4644,18 +4679,19 @@ class MemoryService:
                     ).replace(tzinfo=timezone.utc)
                 except ValueError:
                     continue
-                return [first_match, match], [first_time, last_time]
-            return [first_match], [first_time]
+                return [first_match, match], [first_time, last_time], len(matches)
+            return [first_match], [first_time], len(matches)
 
         lenient = is_memory_parser_lenient()
         heading_matches: list[re.Match[str]] = []
         timestamps: list[datetime] = []
+        entry_count = 0
         timestamp_candidates = list(
             (_CANONICAL_ENTRY_HEADING_RE if compiled else _LEGACY_ENTRY_TIMESTAMP_RE).finditer(
                 file_content
             )
         )
-        timestamp_matches, timestamps = _timestamp_boundaries(timestamp_candidates, 1)
+        timestamp_matches, timestamps, entry_count = _timestamp_boundaries(timestamp_candidates, 1)
         use_legacy_split = False
         if not compiled and not lenient:
             if not timestamps:
@@ -4664,7 +4700,7 @@ class MemoryService:
         elif not compiled and timestamps:
             use_legacy_split = True
         elif not compiled:
-            heading_matches, timestamps = _timestamp_boundaries(
+            heading_matches, timestamps, entry_count = _timestamp_boundaries(
                 list(_LENIENT_ENTRY_HEADING_RE.finditer(file_content)),
                 "timestamp",
             )
@@ -4741,6 +4777,22 @@ class MemoryService:
         if not latest_content and not timestamps:
             return None, None
 
+        fact_date = min(timestamps) if timestamps else created_at
+        if compiled:
+            compiled_fact_dates = []
+            for match in _COMPILED_ENTRY_HEADING_RE.finditer(file_content):
+                try:
+                    compiled_fact_dates.append(
+                        datetime.strptime(
+                            match.group("timestamp"),
+                            "%Y-%m-%dT%H:%M:%SZ",
+                        ).replace(tzinfo=timezone.utc)
+                    )
+                except ValueError:
+                    continue
+            if compiled_fact_dates:
+                fact_date = min(compiled_fact_dates)
+
         memory = Memory(
             id=memory_id,
             key=entry["key"],
@@ -4754,9 +4806,9 @@ class MemoryService:
             created_at=created_at,
             updated_at=updated_at,
             content=latest_content,
-            fact_date=min(timestamps) if timestamps else created_at,
+            fact_date=fact_date,
             edited_at=max(timestamps) if timestamps else updated_at,
-            earlier_entries=0 if compiled else max(0, len(timestamps) - 1),
+            earlier_entries=0 if compiled else max(0, entry_count - 1),
         )
         split = WikiContentSplit(
             latest_section=latest_section,

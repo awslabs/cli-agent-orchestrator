@@ -11322,6 +11322,7 @@ class InternalMemoryGetRequest(BaseModel):
     scope: Optional[MemoryScope] = None
     include_history: bool = False
     max_chars: int = Field(default=8000, ge=1, le=100_000)
+    record_access: bool = True
     terminal_context: Optional[InternalMemoryContext] = None
 
 
@@ -11423,6 +11424,7 @@ async def internal_memory_get(
             scope=body.scope.value if body.scope else None,
             include_history=body.include_history,
             max_chars=body.max_chars,
+            record_access=body.record_access,
             terminal_context=(
                 body.terminal_context.model_dump(exclude_none=True)
                 if body.terminal_context

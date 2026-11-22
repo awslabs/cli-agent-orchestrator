@@ -70,7 +70,7 @@ def _post(path: str, body: dict[str, Any]) -> dict[str, Any]:
         if error.get("error_kind") == MemoryAmbiguousScopeError.error_kind:
             scopes = error.get("scopes")
             if isinstance(scopes, list) and all(isinstance(scope, str) for scope in scopes):
-                raise MemoryAmbiguousScopeError("", scopes)
+                raise MemoryAmbiguousScopeError(str(body.get("key", "")), scopes)
         if error.get("error_kind") == MemoryNotFoundError.error_kind:
             raise MemoryNotFoundError(error.get("error", "memory not found"))
     response.raise_for_status()
@@ -171,6 +171,7 @@ async def get_memory(
     include_history: bool,
     max_chars: int,
     terminal_context: Optional[dict[str, Any]],
+    record_access: bool = True,
 ) -> dict[str, Any]:
     if not remote_memory_url():
         return await MemoryService().get_memory(
@@ -179,6 +180,7 @@ async def get_memory(
             include_history=include_history,
             max_chars=max_chars,
             terminal_context=terminal_context,
+            record_access=record_access,
         )
     payload = await asyncio.to_thread(
         _post,
@@ -191,6 +193,7 @@ async def get_memory(
                 "include_history": include_history,
                 "max_chars": max_chars,
                 "terminal_context": terminal_context,
+                "record_access": False if not record_access else None,
             }.items()
             if value is not None
         },

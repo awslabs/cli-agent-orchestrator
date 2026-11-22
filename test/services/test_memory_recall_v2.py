@@ -19,6 +19,7 @@ from cli_agent_orchestrator.services.memory_service import (
     MemoryNotFoundError,
     MemoryService,
 )
+from cli_agent_orchestrator.services.vault.reader import MEMORY_MANAGER_PROFILE
 
 
 @pytest.fixture
@@ -120,6 +121,28 @@ def test_snippet_contains_matched_terms_and_get_hint(service: MemoryService) -> 
     assert wire["get"] == "memory_get(key='snippet-note', scope='global')"
 
 
+def test_snippet_match_terms_only_claim_terms_in_the_window(service: MemoryService) -> None:
+    _topic(
+        service,
+        "long-snippet",
+        "cobalt " + ("padding " * 80) + "lease",
+        timestamps=(("2026-11-14T05:54:00Z", ""),),
+    )
+
+    rows = asyncio.run(
+        service.recall(
+            query="cobalt lease",
+            scope="global",
+            search_mode="metadata",
+            detail="snippet",
+        )
+    )
+
+    assert "cobalt" in rows[0].snippet.lower()
+    assert "lease" not in rows[0].snippet.lower()
+    assert rows[0].match["terms"] == ["cobalt"]
+
+
 def test_v2_fields_expose_dates_match_and_hidden_history(
     service: MemoryService, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -159,6 +182,132 @@ def test_v2_fields_expose_dates_match_and_hidden_history(
     assert wire["content_truncated"] is True
 
 
+def test_v2_fields_and_get_count_all_hidden_entries(service: MemoryService) -> None:
+    _topic(
+        service,
+        "long-history",
+        "",
+        timestamps=(
+            ("2026-08-01T01:02:03Z", "First entry."),
+            ("2026-09-01T01:02:03Z", "Second entry."),
+            ("2026-10-01T01:02:03Z", "Third entry."),
+            ("2026-11-14T05:54:00Z", "Current entry."),
+        ),
+    )
+
+    recalled = asyncio.run(
+        service.recall(scope="global", search_mode="metadata", record_access=False)
+    )
+    fetched = asyncio.run(
+        service.get_memory(
+            "long-history",
+            scope="global",
+            include_history=True,
+            max_chars=8000,
+        )
+    )
+
+    assert recalled[0].earlier_entries == 3
+    assert fetched["earlier_entries"] == 3
+    assert len(fetched["history"]) == 4
+
+
+@pytest.mark.parametrize("scope", ["agent", "federated"])
+def test_memory_get_hides_noninjectable_scopes_from_memory_manager(
+    service: MemoryService, scope: str
+) -> None:
+    context = {"agent_profile": MEMORY_MANAGER_PROFILE}
+    asyncio.run(
+        service.store(
+            content=f"Synthetic {scope} private body.",
+            scope=scope,
+            memory_type="reference",
+            key=f"{scope}-private",
+            terminal_context=context,
+        )
+    )
+
+    with pytest.raises(MemoryNotFoundError):
+        asyncio.run(
+            service.get_memory(
+                f"{scope}-private",
+                scope=scope,
+                terminal_context=context,
+            )
+        )
+
+
+@pytest.mark.parametrize("scope", ["agent", "federated"])
+def test_internal_memory_get_hides_noninjectable_scopes_from_memory_manager(
+    service: MemoryService, scope: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from cli_agent_orchestrator.api import main
+
+    context = {"agent_profile": MEMORY_MANAGER_PROFILE}
+    asyncio.run(
+        service.store(
+            content=f"Synthetic remote {scope} private body.",
+            scope=scope,
+            memory_type="reference",
+            key=f"remote-{scope}-private",
+            terminal_context=context,
+        )
+    )
+    monkeypatch.setattr(main, "_get_memory_service", lambda: service)
+
+    response = TestClient(main.app, base_url="http://localhost").post(
+        "/internal/memory/get",
+        json={
+            "key": f"remote-{scope}-private",
+            "scope": scope,
+            "terminal_context": context,
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error_kind"] == "not_found"
+
+
+def test_internal_memory_get_maps_success_ambiguity_and_record_access(
+    service: MemoryService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from cli_agent_orchestrator.api import main
+
+    global_path = _topic(service, "route-note", "Global route body.", scope="global")
+    _topic(service, "route-note", "Federated route body.", scope="federated")
+    service._upsert_metadata(
+        key="route-note",
+        memory_type="reference",
+        scope="global",
+        scope_id=None,
+        file_path=str(global_path),
+        tags="recall-v2",
+        source_provider=None,
+        source_terminal_id=None,
+        token_estimate=3,
+    )
+    monkeypatch.setattr(main, "_get_memory_service", lambda: service)
+    client = TestClient(main.app, base_url="http://localhost")
+
+    success = client.post(
+        "/internal/memory/get",
+        json={"key": "route-note", "scope": "global", "record_access": False},
+    )
+    ambiguous = client.post("/internal/memory/get", json={"key": "route-note"})
+
+    assert success.status_code == 200
+    assert success.json()["memory"]["content"] == "Global route body."
+    assert ambiguous.status_code == 409
+    assert ambiguous.json()["error_kind"] == "ambiguous_scope"
+    with service._get_db_session() as db:
+        row = db.query(MemoryMetadataModel).filter_by(key="route-note", scope="global").one()
+        assert row.access_count == 0
+
+
 def test_memory_get_returns_headingless_body_and_counts_access(service: MemoryService) -> None:
     path = _topic(
         service,
@@ -190,14 +339,15 @@ def test_memory_get_returns_headingless_body_and_counts_access(service: MemorySe
         assert db.query(MemoryMetadataModel).filter_by(key="visible-now").one().access_count == 1
 
 
-def test_compiled_article_uses_owned_canonical_fact_date(service: MemoryService) -> None:
+def test_compiled_article_keeps_earliest_canonical_fact_date(service: MemoryService) -> None:
     path = _topic(
         service,
         "compiled-dates",
         "<!-- cao-compiled: 2026-11-14T06:00:00Z entries=2 -->\n"
+        "## 2026-11-14T05:54:00Z\n\n"
         "### Entry 2026-10-01T01:02:03Z\nEarlier detail.\n\n"
+        "### Entry 2026-11-14T05:54:00Z\nCurrent detail.\n\n"
         "## Overview\nCurrent compiled article.",
-        timestamps=(("2026-11-14T05:54:00Z", ""),),
     )
     entry = {
         "key": "compiled-dates",
@@ -210,7 +360,7 @@ def test_compiled_article_uses_owned_canonical_fact_date(service: MemoryService)
     memory = service._parse_wiki_file(path, path.read_text(encoding="utf-8"), entry)
 
     assert memory is not None
-    assert memory.fact_date == datetime(2026, 11, 14, 5, 54, tzinfo=timezone.utc)
+    assert memory.fact_date == datetime(2026, 10, 1, 1, 2, 3, tzinfo=timezone.utc)
     assert memory.edited_at == datetime(2026, 11, 14, 5, 54, tzinfo=timezone.utc)
     assert memory.earlier_entries == 0
     assert memory.content_truncated is False
@@ -321,6 +471,52 @@ def test_memory_get_history_is_newest_first_and_capped(service: MemoryService) -
     assert result["history"][0]["date"] == "2026-11-14T05:54:00Z"
     assert result["earlier_entries"] == 1
     assert result["content_truncated"] is True
+
+
+def test_memory_get_complete_history_is_not_truncated(service: MemoryService) -> None:
+    _topic(
+        service,
+        "complete-history",
+        "",
+        timestamps=(
+            ("2026-10-01T01:02:03Z", "Earlier entry body."),
+            ("2026-11-14T05:54:00Z", "Current entry body."),
+        ),
+    )
+
+    result = asyncio.run(
+        service.get_memory(
+            "complete-history",
+            scope="global",
+            include_history=True,
+            max_chars=8000,
+        )
+    )
+
+    assert len(result["history"]) == 2
+    assert result["content_truncated"] is False
+
+
+def test_memory_get_does_not_read_unrelated_topic_files(
+    service: MemoryService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wanted = _topic(service, "wanted-note", "Wanted body.")
+    unrelated = _topic(service, "unrelated-note", "Unrelated body.")
+    original_read_text = Path.read_text
+    topic_reads: list[Path] = []
+
+    def recording_read_text(path: Path, *args, **kwargs) -> str:
+        if path.suffix == ".md":
+            topic_reads.append(path)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", recording_read_text)
+
+    result = asyncio.run(service.get_memory("wanted-note", scope="global"))
+
+    assert result["content"] == "Wanted body."
+    assert wanted in topic_reads
+    assert unrelated not in topic_reads
 
 
 def test_memory_get_sanitizes_long_key(service: MemoryService) -> None:

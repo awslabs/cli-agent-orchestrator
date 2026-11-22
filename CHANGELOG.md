@@ -55,6 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `memory.recall.v2_fields` setting defaults to `false`; enabling it adds fact
   and edit dates, match reason, status, and visible history truncation. With
   the setting off and full detail, the pinned recall response is unchanged.
+  Exact reads enforce curated scope visibility on local and remote owners,
+  avoid unrelated topic reads, and report complete multi-entry history
+  accurately.
 - **Memory topics without a canonical entry heading are visible again** (#1329). The
   default-on `memory.parser.lenient` parser accepts a valid topic header with body content,
   including minute-precision timestamps; set it to `false` for the legacy behavior. LLM
