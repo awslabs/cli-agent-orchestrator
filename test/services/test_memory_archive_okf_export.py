@@ -266,6 +266,8 @@ class TestConformance:
                 "## 2026-02-01T00:00:00Z (second)\nsecond fact\n\n"
                 "third fact"
             ),
+            "Build notes ## 2026-01-01T00:00:00Z first fact\n\nthird fact",
+            "Build notes ## 2026-01-01T00:00Z first fact\n\nthird fact",
         ],
         ids=[
             "keeps-first-two",
@@ -273,6 +275,8 @@ class TestConformance:
             "newest-first",
             "loose-headings",
             "annotated-headings",
+            "mid-line-token",
+            "no-seconds-token",
         ],
     )
     def test_compiled_topic_round_trips_through_okf_import(
