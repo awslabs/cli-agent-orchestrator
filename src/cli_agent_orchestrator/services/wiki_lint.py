@@ -913,7 +913,6 @@ def _detect_graph_density(
             except Exception:
                 content_targets = []
             for target in content_targets:
-                inverse.setdefault(target, set()).add(r["key"])
                 if target in scope_keys:
                     continue
                 locations = (all_key_scopes or {}).get(target, set())

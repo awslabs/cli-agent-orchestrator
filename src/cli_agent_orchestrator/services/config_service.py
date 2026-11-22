@@ -248,6 +248,11 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_MEMORY_EXPLAIN_ENABLED": ("memory.explain_enabled", "bool", True),
     "CAO_MEMORY_NON_ACCESSING_INSPECTION": ("memory.non_accessing_inspection", "bool", True),
     "CAO_MEMORY_LIFECYCLE_ENABLED": ("memory.lifecycle.enabled", "bool", False),
+    "CAO_MEMORY_RELATIONSHIPS_CONTENT_LINKS": (
+        "memory.relationships.content_links",
+        "bool",
+        True,
+    ),
     "CAO_MEMORY_LINT_ENABLED": ("memory.lint_enabled", "bool", True),
     "CAO_MEMORY_COMPILE_MODE": ("memory.compile_mode", "str", "llm"),
     "CAO_MEMORY_FLUSH_THRESHOLD": ("memory.flush_threshold", "float", 0.85),

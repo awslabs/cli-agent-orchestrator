@@ -239,6 +239,22 @@ def test_remote_non_typed_error_still_raises_http_error(monkeypatch):
         memory_gateway._post("/internal/memory/store", {})
 
 
+def test_remote_related_preserves_structured_read_error(monkeypatch):
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner:9889")
+    response = Mock(status_code=404)
+    response.json.return_value = {
+        "success": False,
+        "error_kind": "not_found",
+        "error": "memory not found: missing",
+    }
+
+    with patch.object(memory_gateway.requests, "post", return_value=response):
+        result = memory_gateway._post("/internal/memory/related", {"key": "missing"})
+
+    assert result["error_kind"] == "not_found"
+    response.raise_for_status.assert_not_called()
+
+
 def test_remote_memory_uses_elastic_gateway_credentials(monkeypatch):
     monkeypatch.setenv("CAO_MEMORY_API_URL", "http://cao-worker-broker:9890")
     monkeypatch.setenv("CAO_ELASTIC_WORKER_ID", "deadbeef")

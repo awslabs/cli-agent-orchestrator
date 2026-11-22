@@ -11396,25 +11396,33 @@ async def internal_memory_recall(
 async def internal_memory_related(
     body: InternalMemoryRelatedRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
-) -> Dict[str, Any]:
+) -> Any:
     """Return relationship neighbours using context resolved by a remote worker."""
     _require_memory_enabled()
-    return cast(
-        Dict[str, Any],
-        await _get_memory_service().related(
-            body.key,
-            scope=body.scope.value if body.scope else None,
-            depth=body.depth,
-            types=body.types,
-            direction=body.direction,
-            limit=body.limit,
-            terminal_context=(
-                body.terminal_context.model_dump(exclude_none=True)
-                if body.terminal_context
-                else None
+    try:
+        result = cast(
+            Dict[str, Any],
+            await _get_memory_service().related(
+                body.key,
+                scope=body.scope.value if body.scope else None,
+                depth=body.depth,
+                types=body.types,
+                direction=body.direction,
+                limit=body.limit,
+                terminal_context=(
+                    body.terminal_context.model_dump(exclude_none=True)
+                    if body.terminal_context
+                    else None
+                ),
             ),
-        ),
-    )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result.get("error_kind") == "not_found":
+        return JSONResponse(status_code=404, content=result)
+    if result.get("error_kind") == "ambiguous_scope":
+        return JSONResponse(status_code=409, content=result)
+    return result
 
 
 @app.post("/internal/memory/forget")

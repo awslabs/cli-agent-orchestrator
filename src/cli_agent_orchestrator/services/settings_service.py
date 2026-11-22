@@ -856,6 +856,14 @@ def get_memory_settings() -> Dict[str, Any]:
             "enabled": env_lifecycle.strip().lower() in ("1", "true", "yes"),
         }
 
+    env_content_links = os.environ.get("CAO_MEMORY_RELATIONSHIPS_CONTENT_LINKS")
+    if env_content_links is not None and env_content_links.strip():
+        relationships = result.get("relationships", {})
+        result["relationships"] = {
+            **(relationships if isinstance(relationships, dict) else {}),
+            "content_links": env_content_links.strip().lower() in ("1", "true", "yes"),
+        }
+
     env_inspection = os.environ.get("CAO_MEMORY_NON_ACCESSING_INSPECTION")
     if env_inspection is not None and env_inspection.strip():
         result["non_accessing_inspection"] = env_inspection.strip().lower() in ("1", "true", "yes")
@@ -1040,7 +1048,7 @@ def is_memory_parser_lenient() -> bool:
 
 
 def is_memory_content_links_enabled() -> bool:
-    """Content-authored relationship edges: nested file value > True."""
+    """Content-authored relationship edges: env > nested file value > True."""
     try:
         relationships = get_memory_settings().get("relationships", {})
         if not isinstance(relationships, dict):

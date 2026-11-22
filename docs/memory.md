@@ -605,7 +605,15 @@ content is also a relationship producer. On store and repair, same-scope
 with `content_link` origin. Missing and cross-scope targets do not create an
 edge; `cao memory lint` reports them as stale claims. Recomputing content links
 replaces only that source/type/origin set and preserves human and other
-producer edges. Set the option to `false` to disable this producer.
+producer edges. CAO's own canonical generated `## See Also` projection is
+excluded from parsing so it cannot make a deleted edge self-sustaining.
+
+Existing notes are indexed after upgrade by running `cao memory repair --apply`.
+Set the option to `false` (or set
+`CAO_MEMORY_RELATIONSHIPS_CONTENT_LINKS=false`) to disable future production.
+Previously produced edges remain until they are removed with
+`cao memory relationships delete <relationship-id>`; list them first with
+`cao memory relationships list --format json`.
 
 Writes are **producer-scoped**: when the compiler or linter recomputes its edges
 for a source memory, it replaces only rows carrying its own origin and type, so a

@@ -1169,6 +1169,7 @@ class MemoryReconciliationService:
             extract_content_link_targets,
         )
         from cli_agent_orchestrator.services.memory_relationship_service import (
+            MAX_EDGES_PER_MUTATION,
             EdgeInput,
             MemoryRelationshipService,
         )
@@ -1181,18 +1182,33 @@ class MemoryReconciliationService:
             return
         if targets is None:
             targets = extract_content_link_targets(
-                topic.file_path.read_text(encoding="utf-8"),
+                MemoryService._strip_generated_see_also(
+                    topic.file_path.read_text(encoding="utf-8")
+                ),
                 MemoryService._sanitize_key,
             )
         audits: list[Any] = []
         with self._get_db_session() as db:
-            MemoryRelationshipService().replace_set(
+            relationships = MemoryRelationshipService()
+            valid_targets = []
+            for target in targets:
+                try:
+                    relationships._assert_endpoint_exists(
+                        db,
+                        topic.identity.scope,
+                        topic.identity.scope_id,
+                        target,
+                    )
+                except ValueError:
+                    continue
+                valid_targets.append(target)
+            relationships.replace_set(
                 topic.identity.scope,
                 topic.identity.scope_id,
                 topic.identity.key,
                 "content_link",
                 "relates_to",
-                [EdgeInput(target) for target in targets],
+                [EdgeInput(target) for target in valid_targets[:MAX_EDGES_PER_MUTATION]],
                 db=db,
                 audit_sink=audits,
             )
@@ -1614,7 +1630,9 @@ class MemoryReconciliationService:
                 for identity, topic in content_topics.items():
                     try:
                         targets = extract_content_link_targets(
-                            topic.file_path.read_text(encoding="utf-8"),
+                            MemoryService._strip_generated_see_also(
+                                topic.file_path.read_text(encoding="utf-8")
+                            ),
                             MemoryService._sanitize_key,
                         )
                         source_identity = (identity.scope, identity.scope_id, identity.key)

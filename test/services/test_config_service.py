@@ -591,6 +591,16 @@ def test_content_links_setting_defaults_on_and_round_trips(_isolated_settings):
     assert saved["memory"]["relationships"]["content_links"] is False
 
 
+def test_content_links_env_override_has_precedence(_isolated_settings, monkeypatch):
+    from cli_agent_orchestrator.services import settings_service
+
+    ConfigService.set("memory.relationships.content_links", True)
+    monkeypatch.setenv("CAO_MEMORY_RELATIONSHIPS_CONTENT_LINKS", "false")
+
+    assert settings_service.is_memory_content_links_enabled() is False
+    assert ConfigService.get("memory.relationships.content_links") is False
+
+
 @pytest.mark.parametrize(
     "saved,env,expected",
     [

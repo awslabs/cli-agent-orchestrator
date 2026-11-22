@@ -49,9 +49,10 @@ def _post(path: str, body: dict[str, Any]) -> dict[str, Any]:
     )
     if response.status_code >= 400:
         try:
-            error = response.json()
+            raw_error = response.json()
         except (TypeError, ValueError):
-            error = {}
+            raw_error = {}
+        error: dict[str, Any] = raw_error if isinstance(raw_error, dict) else {}
         if error.get("error_kind") == MemoryPartialWriteError.error_kind:
             partial = error.get("partial_write")
             if isinstance(partial, dict):
@@ -65,6 +66,11 @@ def _post(path: str, body: dict[str, Any]) -> dict[str, Any]:
                             scope_id=scope_id,
                             file_path=partial["file_path"],
                         )
+        if path == "/internal/memory/related" and error.get("error_kind") in {
+            "not_found",
+            "ambiguous_scope",
+        }:
+            return error
     response.raise_for_status()
     result: dict[str, Any] = response.json()
     return result

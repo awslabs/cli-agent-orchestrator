@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
+from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.api import main as api_main
 from cli_agent_orchestrator.mcp_server import server
 from cli_agent_orchestrator.services import memory_eligibility
+from cli_agent_orchestrator.services.memory_relationship_service import (
+    MemoryRelationshipService,
+)
 from cli_agent_orchestrator.services.memory_service import MemoryService
+from cli_agent_orchestrator.services.vault.reader import MEMORY_MANAGER_PROFILE
 
 
 def _run(coro):
@@ -24,6 +31,16 @@ class _ExcludeTarget:
 
     def excluded(self, request, candidates):
         return {identity: "fixture" for identity in candidates if identity.key == "target"}
+
+
+class _ExcludeHidden:
+    name = "fixture.related-hidden"
+
+    def is_enabled(self):
+        return True
+
+    def excluded(self, request, candidates):
+        return {identity: "fixture" for identity in candidates if identity.key == "a-hidden"}
 
 
 @pytest.fixture
@@ -105,6 +122,167 @@ def test_memory_related_tool_calls_local_service(monkeypatch) -> None:
 
     tool = getattr(server.memory_related, "fn", server.memory_related)
     assert _run(tool("source")) == expected
+
+
+@pytest.mark.parametrize("scope", ["agent", "federated"])
+def test_memory_manager_cannot_read_private_scope_related_locally(service, scope) -> None:
+    context = {"agent_profile": MEMORY_MANAGER_PROFILE}
+    _run(service.store("target hook", scope=scope, key=f"{scope}-target", terminal_context=context))
+    _run(
+        service.store(
+            f"[[{scope}-target]]",
+            scope=scope,
+            key=f"{scope}-source",
+            terminal_context=context,
+        )
+    )
+
+    result = _run(
+        service.related(
+            f"{scope}-source",
+            scope=scope,
+            terminal_context=context,
+        )
+    )
+
+    assert result["success"] is False
+    assert result["error_kind"] == "not_found"
+
+
+@pytest.mark.parametrize("scope", ["agent", "federated"])
+def test_memory_manager_cannot_read_private_scope_related_via_internal_route(
+    service, scope, monkeypatch
+) -> None:
+    context = {"agent_profile": MEMORY_MANAGER_PROFILE}
+    _run(service.store("target hook", scope=scope, key=f"{scope}-target", terminal_context=context))
+    _run(
+        service.store(
+            f"[[{scope}-target]]",
+            scope=scope,
+            key=f"{scope}-source",
+            terminal_context=context,
+        )
+    )
+    monkeypatch.setattr(api_main, "_get_memory_service", lambda: service)
+    body = api_main.InternalMemoryRelatedRequest(
+        key=f"{scope}-source",
+        scope=scope,
+        terminal_context=api_main.InternalMemoryContext(**context),
+    )
+
+    result = _run(api_main.internal_memory_related(body, _scopes=[]))
+    if hasattr(result, "body"):
+        result = json.loads(result.body)
+
+    assert result["success"] is False
+    assert result["error_kind"] == "not_found"
+
+
+def test_related_keeps_superseded_memories_visible_for_explicit_callers(
+    service, isolated_memory_db, monkeypatch
+) -> None:
+    from cli_agent_orchestrator.services import settings_service
+
+    monkeypatch.setattr(settings_service, "is_memory_lifecycle_enabled", lambda: True)
+    _run(service.store("old hook", scope="global", key="old-fact"))
+    _run(service.store("new hook", scope="global", key="new-fact"))
+    relationships = MemoryRelationshipService(sessionmaker(bind=isolated_memory_db))
+    relationships.create(
+        "global",
+        None,
+        "new-fact",
+        "old-fact",
+        "supersedes",
+        "human",
+    )
+
+    from_new = _run(service.related("new-fact", scope="global", types=["supersedes"]))
+    from_old = _run(service.related("old-fact", scope="global", types=["supersedes"]))
+
+    assert from_new["neighbours"] == [
+        {
+            "key": "old-fact",
+            "kind": "project",
+            "hook": "old hook",
+            "status": "superseded",
+        }
+    ]
+    assert from_old["success"] is True
+    assert from_old["key"] == "old-fact"
+
+
+def test_related_keeps_all_edge_types_to_one_neighbour(service, isolated_memory_db) -> None:
+    _run(service.store("target", scope="global", key="target"))
+    _run(service.store("source", scope="global", key="source"))
+    relationships = MemoryRelationshipService(sessionmaker(bind=isolated_memory_db))
+    relationships.create("global", None, "source", "target", "relates_to", "human")
+    relationships.create("global", None, "source", "target", "supersedes", "human")
+
+    result = _run(service.related("source", scope="global"))
+
+    assert {edge["type"] for edge in result["edges"]} == {"relates_to", "supersedes"}
+    assert [neighbour["key"] for neighbour in result["neighbours"]] == ["target"]
+
+
+def test_hidden_neighbour_does_not_consume_visible_limit(service, isolated_memory_db) -> None:
+    for key in ("source", "a-hidden", "b-visible"):
+        _run(service.store(key, scope="global", key=key))
+    relationships = MemoryRelationshipService(sessionmaker(bind=isolated_memory_db))
+    relationships.create("global", None, "source", "a-hidden", "relates_to", "human")
+    relationships.create("global", None, "source", "b-visible", "relates_to", "human")
+    memory_eligibility.register_source(_ExcludeHidden())
+
+    result = _run(
+        service.related(
+            "source",
+            scope="global",
+            limit=1,
+            terminal_context={"agent_profile": MEMORY_MANAGER_PROFILE},
+        )
+    )
+
+    assert [neighbour["key"] for neighbour in result["neighbours"]] == ["b-visible"]
+
+
+def test_related_uses_exact_reads_instead_of_full_recall(service, monkeypatch) -> None:
+    _run(service.store("target", scope="global", key="target"))
+    _run(service.store("[[target]]", scope="global", key="source"))
+
+    async def fail_recall(*args, **kwargs):
+        raise AssertionError("related must not scan the full store")
+
+    monkeypatch.setattr(service, "recall", fail_recall)
+    assert _run(service.related("source", scope="global"))["success"] is True
+
+
+def test_internal_related_maps_validation_and_read_errors(monkeypatch) -> None:
+    class Stub:
+        async def related(self, key, **kwargs):
+            if key == "bad":
+                raise ValueError("bad direction")
+            return {
+                "success": False,
+                "error_kind": "not_found",
+                "error": f"memory not found: {key}",
+            }
+
+    monkeypatch.setattr(api_main, "_get_memory_service", Stub)
+    missing = _run(
+        api_main.internal_memory_related(
+            api_main.InternalMemoryRelatedRequest(key="missing"),
+            _scopes=[],
+        )
+    )
+    assert missing.status_code == 404
+
+    with pytest.raises(api_main.HTTPException) as caught:
+        _run(
+            api_main.internal_memory_related(
+                api_main.InternalMemoryRelatedRequest(key="bad"),
+                _scopes=[],
+            )
+        )
+    assert caught.value.status_code == 422
 
 
 async def _async_result(value):

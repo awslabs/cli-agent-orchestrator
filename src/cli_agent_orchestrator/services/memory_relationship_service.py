@@ -1385,7 +1385,7 @@ class MemoryRelationshipService:
                 for neighbour_key, relative_direction, row in sorted(
                     candidates, key=lambda item: (item[0], item[1], item[2].id)
                 ):
-                    if neighbour_key in visited or row.id in seen_edges:
+                    if row.id in seen_edges:
                         continue
                     walked.append(
                         NeighbourEdgeDTO(

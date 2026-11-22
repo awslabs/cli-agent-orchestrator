@@ -682,6 +682,20 @@ class MemoryService:
         return expected_scope_id is not None and scope_id == expected_scope_id
 
     @staticmethod
+    def _visible_to_caller(
+        memories: Sequence[Memory], terminal_context: Optional[dict]
+    ) -> list[Memory]:
+        """Apply caller-role scope visibility after native/vault discovery."""
+        if (terminal_context or {}).get("agent_profile") == MEMORY_MANAGER_PROFILE:
+            recallable_scopes = {
+                MemoryScope.SESSION.value,
+                MemoryScope.PROJECT.value,
+                MemoryScope.GLOBAL.value,
+            }
+            return [memory for memory in memories if memory.scope in recallable_scopes]
+        return list(memories)
+
+    @staticmethod
     def _sanitize_scope_id(value: str) -> str:
         """Sanitize a scope_id to prevent path traversal.
 
@@ -1064,16 +1078,27 @@ class MemoryService:
                     f"<!-- id: {memory_id} | scope: {scope} | "
                     f"type: {memory_type} | tags: {tags} -->\n"
                 )
-            appended = append_section(
-                existing_content,
-                MemoryAppendEntry(content=content, occurred_at=occurred_at, now=now),
+            duplicate_retry = (
+                is_update
+                and occurred_at is None
+                and self._latest_entry_matches(existing_content, content)
             )
-            new_content = appended.content
-            entry_body = appended.entry_body
-            timestamp = appended.section_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-            timestamp_clamped = appended.timestamp_clamped
-            if not is_update:
-                created_at = appended.first_section_at
+            if duplicate_retry:
+                new_content = existing_content
+                entry_body = content
+                timestamp = existing_ts[-1]
+                timestamp_clamped = False
+            else:
+                appended = append_section(
+                    existing_content,
+                    MemoryAppendEntry(content=content, occurred_at=occurred_at, now=now),
+                )
+                new_content = appended.content
+                entry_body = appended.entry_body
+                timestamp = appended.section_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+                timestamp_clamped = appended.timestamp_clamped
+                if not is_update:
+                    created_at = appended.first_section_at
 
             # Atomic write of the append version: write to tmp then os.replace.
             # This is always the immediate, durable result of store(). LLM
@@ -1109,7 +1134,7 @@ class MemoryService:
             try:
                 from cli_agent_orchestrator.services.settings_service import get_compile_mode
 
-                if is_update and get_compile_mode() == "llm":
+                if is_update and not duplicate_retry and get_compile_mode() == "llm":
                     self._schedule_background_compile(
                         scope=scope,
                         scope_id=scope_id,
@@ -1158,7 +1183,6 @@ class MemoryService:
                     token_estimate=len(content) // 4,
                     last_compiled_at=last_compiled_at,
                 )
-                self._sync_content_link_edges(key, scope, scope_id, new_content)
             except Exception as e:
                 logger.error(
                     "Memory metadata SQLite upsert failed after durable writes "
@@ -1173,6 +1197,13 @@ class MemoryService:
                     scope_id=scope_id,
                     file_path=str(wiki_path),
                 ) from e
+            try:
+                self._sync_content_link_edges(key, scope, scope_id, new_content)
+            except Exception:  # noqa: BLE001 — derived edges are repairable
+                logger.warning(
+                    "Memory content-link sync deferred after durable write " "(scope=%s failed=1)",
+                    scope,
+                )
 
             logger.info(f"Memory {action}: key={key} scope={scope} scope_id={scope_id}")
         finally:
@@ -2027,6 +2058,41 @@ class MemoryService:
         rendered = "\n".join(out).rstrip() + "\n"
         return rendered
 
+    @staticmethod
+    def _strip_generated_see_also(content: str) -> str:
+        """Remove only canonical CAO-rendered See Also projections."""
+        from cli_agent_orchestrator.services.wiki_compiler import SEE_ALSO_LINK_RE
+
+        lines = content.splitlines(keepends=False)
+        out: list[str] = []
+        index = 0
+        while index < len(lines):
+            if lines[index].rstrip() != "## See Also":
+                out.append(lines[index])
+                index += 1
+                continue
+            end = index + 1
+            while end < len(lines) and not lines[end].rstrip().startswith("## "):
+                end += 1
+            section = [line.strip() for line in lines[index + 1 : end] if line.strip()]
+            if section and all(SEE_ALSO_LINK_RE.fullmatch(line) for line in section):
+                index = end
+                continue
+            out.extend(lines[index:end])
+            index = end
+        return "\n".join(out).rstrip() + "\n"
+
+    @classmethod
+    def _latest_entry_matches(cls, file_content: str, content: str) -> bool:
+        """Recognise a consecutive identical write as a retry."""
+        headings = list(_CANONICAL_ENTRY_HEADING_RE.finditer(file_content))
+        if not headings:
+            return False
+        latest = file_content[headings[-1].end() :].strip()
+        authored = cls._strip_existing_see_also(latest).strip()
+        expected = content.strip()
+        return latest == expected or authored == expected
+
     def _sync_content_link_edges(
         self,
         key: str,
@@ -2039,6 +2105,7 @@ class MemoryService:
             extract_content_link_targets,
         )
         from cli_agent_orchestrator.services.memory_relationship_service import (
+            MAX_EDGES_PER_MUTATION,
             EdgeInput,
             MemoryRelationshipService,
         )
@@ -2048,20 +2115,42 @@ class MemoryService:
 
         if not is_memory_content_links_enabled():
             return
-        targets = extract_content_link_targets(file_content, self._sanitize_key)
+        targets = extract_content_link_targets(
+            self._strip_generated_see_also(file_content),
+            self._sanitize_key,
+        )
         audits: list[Callable[[], None]] = []
         with self._get_db_session() as db:
-            MemoryRelationshipService().replace_set(
+            relationships = MemoryRelationshipService()
+            valid_targets = []
+            dangling = 0
+            for target in targets:
+                try:
+                    relationships._assert_endpoint_exists(db, scope, scope_id, target)
+                except ValueError:
+                    dangling += 1
+                else:
+                    valid_targets.append(target)
+            overflow = max(0, len(valid_targets) - MAX_EDGES_PER_MUTATION)
+            valid_targets = valid_targets[:MAX_EDGES_PER_MUTATION]
+            relationships.replace_set(
                 scope,
                 scope_id,
                 key,
                 "content_link",
                 "relates_to",
-                [EdgeInput(target) for target in targets],
+                [EdgeInput(target) for target in valid_targets],
                 db=db,
                 audit_sink=audits,
             )
             db.commit()
+        if dangling or overflow:
+            logger.warning(
+                "Content-link targets dropped (dangling=%d overflow=%d kept=%d)",
+                dangling,
+                overflow,
+                len(valid_targets),
+            )
         for emit_audit in audits:
             emit_audit()
 
@@ -2192,7 +2281,7 @@ class MemoryService:
                 MemoryRelationshipService,
             )
 
-            rel_svc = MemoryRelationshipService()
+            rel_svc = MemoryRelationshipService(self._db_session_factory)
         except Exception:  # pragma: no cover - import guard
             return set()
         groups: dict = {}
@@ -2224,7 +2313,7 @@ class MemoryService:
                 MemoryRelationshipService,
             )
 
-            service = MemoryRelationshipService()
+            service = MemoryRelationshipService(self._db_session_factory)
         except Exception:
             return set(), set(groups)
         snapshot: set = set()
@@ -2660,6 +2749,7 @@ class MemoryService:
                     -memory.updated_at.timestamp(),
                 )
             )
+        results = self._visible_to_caller(results, terminal_context)
 
         from cli_agent_orchestrator.services.settings_service import is_memory_lifecycle_enabled
 
@@ -2910,39 +3000,27 @@ class MemoryService:
         if limit < 1 or limit > 100:
             raise ValueError("limit must be between 1 and 100")
         canonical = self._sanitize_key(key)
-        available = await self.recall(
-            scope=scope,
-            limit=10000,
-            terminal_context=terminal_context,
-            record_access=False,
-        )
-        eligibility = memory_eligibility.begin_check(
-            memory_eligibility.EligibilityRequest.from_context("curated_recall", terminal_context)
-        )
-        if eligibility is not None:
-            reasons = eligibility.reasons(
-                [
-                    memory_eligibility.MemoryIdentity(
-                        memory.key,
-                        memory.scope,
-                        self._effective_scope_id(memory),
-                        memory.source_kind,
-                    )
-                    for memory in available
-                ]
-            )
-            available = [
-                memory
-                for memory in available
-                if memory_eligibility.MemoryIdentity(
-                    memory.key,
-                    memory.scope,
-                    self._effective_scope_id(memory),
-                    memory.source_kind,
-                )
-                not in reasons
+        candidate_scopes = (
+            [scope]
+            if scope is not None
+            else [
+                MemoryScope.SESSION.value,
+                MemoryScope.PROJECT.value,
+                MemoryScope.GLOBAL.value,
+                MemoryScope.AGENT.value,
+                MemoryScope.FEDERATED.value,
             ]
-        matches = [memory for memory in available if memory.key == canonical]
+        )
+        matches = []
+        for candidate_scope in candidate_scopes:
+            memory = await self.read_exact_key(
+                canonical,
+                scope=candidate_scope,
+                terminal_context=terminal_context,
+                record_access=False,
+            )
+            if memory is not None:
+                matches.append(memory)
         if not matches:
             return {
                 "success": False,
@@ -2972,13 +3050,19 @@ class MemoryService:
             direction=direction,
             types=types,
             depth=depth,
-            limit=limit,
+            limit=min(max(limit * 4, 64), 400),
         )
-        available_by_key = {
-            memory.key: memory
-            for memory in available
-            if memory.scope == source.scope and self._effective_scope_id(memory) == source_scope_id
-        }
+        available_by_key = {}
+        for neighbour_key in dict.fromkeys(edge.neighbour_key for edge in walked):
+            memory = await self.read_exact_key(
+                neighbour_key,
+                scope=source.scope,
+                scope_id=source_scope_id,
+                terminal_context=terminal_context,
+                record_access=False,
+            )
+            if memory is not None:
+                available_by_key[memory.key] = memory
         reached = {canonical}
         edges: list[dict[str, Any]] = []
         neighbours: list[dict[str, Any]] = []
@@ -2992,6 +3076,8 @@ class MemoryService:
             )
             neighbour = available_by_key.get(walked_edge.neighbour_key)
             if current_key not in reached or neighbour is None:
+                continue
+            if neighbour.key not in emitted_neighbours and len(emitted_neighbours) >= limit:
                 continue
             reached.add(neighbour.key)
             edges.append(
