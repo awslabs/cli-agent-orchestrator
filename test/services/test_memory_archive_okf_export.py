@@ -255,8 +255,25 @@ class TestConformance:
                 "## 2026-02-01T00:00:00Z\nsecond fact\n\n"
                 "## 2026-01-01T00:00:00Z\nfirst fact"
             ),
+            (
+                "Build cache notes.\n\n"
+                "### 2026-01-01T00:00:00Z\nfirst fact\n\n"
+                "### 2026-02-01T00:00:00Z\nsecond fact\n\n"
+                "third fact"
+            ),
+            (
+                "## 2026-01-01T00:00:00Z (first)\nfirst fact\n\n"
+                "## 2026-02-01T00:00:00Z (second)\nsecond fact\n\n"
+                "third fact"
+            ),
         ],
-        ids=["keeps-first-two", "keeps-all", "newest-first"],
+        ids=[
+            "keeps-first-two",
+            "keeps-all",
+            "newest-first",
+            "loose-headings",
+            "annotated-headings",
+        ],
     )
     def test_compiled_topic_round_trips_through_okf_import(
         self, svc, backend, dest, tmp_path, llm_headings
