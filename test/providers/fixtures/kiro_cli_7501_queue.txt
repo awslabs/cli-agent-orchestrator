@@ -1,0 +1,20 @@
+# Kiro CLI 2.x TUI (engine v2), chat.defaultInterruptBehavior=queue, after an approved permission prompt.
+# Source: tmux capture-pane -e -J of a live terminal whose CAO status had stayed waiting_user_answer for ~50 minutes
+# while a long Shell tool call ran. Only the bottom of the pane is kept. Scrubbed: project paths, profile name, test
+# names and command arguments replaced with neutral values; colour codes kept.
+# Section q is the rendered tail: running Shell tool, its output, "esc to cancel", the status line and the queue-mode
+# working footer ("Type to queue · Ctrl+S to steer"). No OSC 7501 report and no dialog text.
+@@ q
+\x1b[39m\x1b[38;2;0;215;135m•\x1b[39m Shell\x1b[38;2;0;135;255m make test TEST=test/example_test.rb
+\x1b[39m    \x1b[38;2;158;158;158m╰ working_dir=~/project
+\x1b[39m    \x1b[38;2;158;158;158m╰ \x1b[38;2;163;192;163mRun options: -v --seed 1234
+\x1b[39m      \x1b[38;2;163;192;163m# Running:
+\x1b[39m      \x1b[38;2;163;192;163mExampleTest#test_one = 1.04 s = .
+\x1b[39m      \x1b[38;2;163;192;163mExampleTest#test_two = 0.05 s = .
+\x1b[39m      \x1b[38;2;163;192;163mExampleTest#test_three = 1.12 s = .
+\x1b[39m  \x1b[38;2;158;158;158mesc to cancel
+
+\x1b[38;2;38;38;38m────────────────────────────────────────
+\x1b[38;2;175;135;0mdeveloper\x1b[39m \x1b[38;2;128;128;128m·\x1b[39m auto \x1b[38;2;128;128;128m·\x1b[39m \x1b[38;2;0;215;135m◔\x1b[39m \x1b[38;2;0;215;135m20%\x1b[39m \x1b[38;2;193;154;255m~/project\x1b[39m \x1b[38;2;128;128;128m·\x1b[39m \x1b[38;2;128;128;128m(\x1b[39mmain\x1b[38;2;128;128;128m)
+
+\x1b[39m›  \x1b[38;2;158;158;158mKiro is working · 49m 8s · Type to queue · Ctrl+S to steer

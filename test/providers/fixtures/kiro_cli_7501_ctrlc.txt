@@ -1,0 +1,94 @@
+# Kiro CLI 2.x TUI (engine v2), permission prompt answered with Ctrl+C.
+# Source: a captured GET /terminals/{id}/output?mode=full of a Ctrl+C run.
+# Encoding: \x1b = ESC, \x07 = BEL, \r = CR are written as text escapes; every real newline is one \n byte.
+# Normalised (verdict-neutral): window starts at the "Kiro is working · 2s" frame; each line of the Kiro
+# logo art is replaced by "[logo]" (line count kept); every ─ rule is 40 chars (all real rules are >= 28);
+# runs of 20+ spaces are one space. Every other byte is as captured.
+# Sections (concatenate in order): a = prompt open; r = two full-screen redraws, dialog drawn again,
+# no new report; b = Ctrl+C pressed: state=idle report, "Cancelled", idle prompt.
+@@ a
+\x1b[?2026h\r\x1b[2K\x1b[0m\x1b[39m› \x1b[39m\x1b[7m\x1b[27m \x1b[7m\x1b[0m\x1b[38;2;98;98;98mKiro is working · 2s · Type to steer · Ctrl+S to queue\x1b[39m\x1b[0m\x1b[?2026l\x1b[3G\x1b[?25h\x1b[3G\x1b[?25h\x1b[?2026h\x1b[6A\r\x1b[2K\x1b[0m\x1b[38;2;26;26;26m•\x1b[39m \x1b[38;2;26;26;26mS\x1b[39m\x1b[38;2;26;26;26mh\x1b[39m\x1b[38;2;26;26;26me\x1b[39m\x1b[38;2;26;26;26ml\x1b[39m\x1b[38;2;26;26;26ml\x1b[39m\x1b[38;2;0;95;255m touch /tmp/trace-7501-ctrlc\x1b[39m\x1b[0m\x1b[?2026l\x1b[6B\x1b[3G\x1b[?25h\x1b]7501;state=blocked:kind=permission:app=kiro-cli\x07\x1b[?2026h\x1b[6A\r\x1b[2K\x1b[0m\x1b[38;2;128;128;128m↓\x1b[39m \x1b[mShell\x1b[0m\x1b[38;2;0;95;255m touch /tmp/trace-7501-ctrlc\x1b[39m\x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[38;2;238;238;238m────────────────────────────────────────\x1b[39m\x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[0m\r\r
+\x1b[2K\r\r
+\x1b[2K\r\r
+\x1b[2K\r\r
+\x1b[2K\x1b[4A\x1b[?2026l\x1b[?25l\x1b[?2026h\r\x1b[2K\x1b[0m \x1b[39mshell requires approval\x1b[39m\x1b[0m\r\r
+\x1b[2K\x1b[0m \x1b[38;2;255;0;255m\x1b[1m❯\x1b[22m\x1b[39m \x1b[38;2;255;0;255m\x1b[1mYes, single permission             \x1b[22m\x1b[39m\x1b[0m\r\r
+\x1b[2K\x1b[0m   \x1b[39mTrust, always allow in this session\x1b[39m\x1b[0m\r\r
+\x1b[2K\x1b[0m   \x1b[39mNo (Tab to edit)                   \x1b[39m\x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[38;2;238;238;238m────────────────────────────────────────\x1b[39m\x1b[0m\r\r
+\x1b[2K\x1b[0m \x1b[39mesc\x1b[39m \x1b[38;2;128;128;128mto close\x1b[39m\x1b[38;2;128;128;128m · \x1b[39m\x1b[39m↑↓\x1b[39m \x1b[38;2;128;128;128mto navigate\x1b[39m\x1b[38;2;128;128;128m · \x1b[39m\x1b[39m↵\x1b[39m \x1b[38;2;128;128;128mto select\x1b[39m\x1b[38;2;128;128;128m · \x1b[39m\x1b[39mTab\x1b[39m \x1b[38;2;128;128;128mto edit\x1b[39m\x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[0m\x1b[?2026l\x1b[5A\x1b[4G\x1b[?25h
+@@ r
+\x1b[?2004h\x1b[>4;1m\x1b[?25l\x1b[?2026h\x1b[3J\x1b[2J\x1b[H\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m\x1b[38;2;238;238;238m────────────────────────────────────────\x1b[39m\x1b[0m\r\r
+\x1b[0m\x1b[48;2;238;238;238m  \x1b[48;2;238;238;238m\x1b[39mTrace test. Run exactly this as a single shell call, nothing    \x1b[0m\x1b[48;2;238;238;238m\x1b[0m\r\r
+\x1b[0m\x1b[48;2;238;238;238m  \x1b[48;2;238;238;238melse: touch /tmp/trace-7501-ctrlc . Then reply "done" (or "not run" if it was \x1b[0m\x1b[48;2;238;238;238m\x1b[0m\r\r
+\x1b[0m\x1b[48;2;238;238;238m  \x1b[48;2;238;238;238mrefused) and stop. Do not retry if refused.\x1b[39m \x1b[0m\x1b[48;2;238;238;238m\x1b[0m\r\r
+\x1b[0m \x1b[0m\r\r
+\x1b[0m\x1b[38;2;128;128;128m↓\x1b[39m \x1b[mShell\x1b[0m\x1b[38;2;0;95;255m touch /tmp/trace-7501-ctrlc\x1b[39m\x1b[0m\r\r
+\x1b[0m\x1b[0m\r\r
+\x1b[0m\x1b[38;2;238;238;238m────────────────────────────────────────\x1b[39m\x1b[0m\r\r
+\x1b[0m \x1b[39mshell requires approval\x1b[39m\x1b[0m\r\r
+\x1b[0m \x1b[38;2;255;0;255m\x1b[1m❯\x1b[22m\x1b[39m \x1b[38;2;255;0;255m\x1b[1mYes, single permission             \x1b[22m\x1b[39m\x1b[0m\r\r
+\x1b[0m   \x1b[39mTrust, always allow in this session\x1b[39m\x1b[0m\r\r
+\x1b[0m   \x1b[39mNo (Tab to edit)                   \x1b[39m\x1b[0m\r\r
+\x1b[0m\x1b[38;2;238;238;238m────────────────────────────────────────\x1b[39m\x1b[0m\r\r
+\x1b[0m \x1b[39mesc\x1b[39m \x1b[38;2;128;128;128mto close\x1b[39m\x1b[38;2;128;128;128m · \x1b[39m\x1b[39m↑↓\x1b[39m \x1b[38;2;128;128;128mto navigate\x1b[39m\x1b[38;2;128;128;128m · \x1b[39m\x1b[39m↵\x1b[39m \x1b[38;2;128;128;128mto select\x1b[39m\x1b[38;2;128;128;128m · \x1b[39m\x1b[39mTab\x1b[39m \x1b[38;2;128;128;128mto edit\x1b[39m\x1b[0m\r\r
+\x1b[0m\x1b[0m\x1b[?2026l\x1b[5A\x1b[4G\x1b[?25h\x1b[?2004h\x1b[>4;1m\x1b[?25l\x1b[?2026h\x1b[3J\x1b[2J\x1b[H\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m[logo]\x1b[0m\r\r
+\x1b[0m\x1b[38;2;238;238;238m────────────────────────────────────────\x1b[39m\x1b[0m\r\r
+\x1b[0m\x1b[48;2;238;238;238m  \x1b[48;2;238;238;238m\x1b[39mTrace test. Run exactly this as a single shell call, nothing else: touch /tmp/trace-7501-ctrlc . Then reply "done" (or "not run" if it was   \x1b[0m\x1b[48;2;238;238;238m\x1b[0m\r\r
+\x1b[0m\x1b[48;2;238;238;238m  \x1b[48;2;238;238;238mrefused) and stop. Do not retry if refused.\x1b[39m \x1b[0m\x1b[48;2;238;238;238m\x1b[0m\r\r
+\x1b[0m \x1b[0m\r\r
+\x1b[0m\x1b[38;2;128;128;128m↓\x1b[39m \x1b[mShell\x1b[0m\x1b[38;2;0;95;255m touch /tmp/trace-7501-ctrlc\x1b[39m\x1b[0m\r\r
+\x1b[0m\x1b[0m\r\r
+\x1b[0m\x1b[38;2;238;238;238m────────────────────────────────────────\x1b[39m\x1b[0m\r\r
+\x1b[0m \x1b[39mshell requires approval\x1b[39m\x1b[0m\r\r
+\x1b[0m \x1b[38;2;255;0;255m\x1b[1m❯\x1b[22m\x1b[39m \x1b[38;2;255;0;255m\x1b[1mYes, single permission             \x1b[22m\x1b[39m\x1b[0m\r\r
+\x1b[0m   \x1b[39mTrust, always allow in this session\x1b[39m\x1b[0m\r\r
+\x1b[0m   \x1b[39mNo (Tab to edit)                   \x1b[39m\x1b[0m\r\r
+\x1b[0m\x1b[38;2;238;238;238m────────────────────────────────────────\x1b[39m\x1b[0m\r\r
+\x1b[0m \x1b[39mesc\x1b[39m \x1b[38;2;128;128;128mto close\x1b[39m\x1b[38;2;128;128;128m · \x1b[39m\x1b[39m↑↓\x1b[39m \x1b[38;2;128;128;128mto navigate\x1b[39m\x1b[38;2;128;128;128m · \x1b[39m\x1b[39m↵\x1b[39m \x1b[38;2;128;128;128mto select\x1b[39m\x1b[38;2;128;128;128m · \x1b[39m\x1b[39mTab\x1b[39m \x1b[38;2;128;128;128mto edit\x1b[39m\x1b[0m\r\r
+\x1b[0m\x1b[0m\x1b[?2026l\x1b[5A\x1b[4G\x1b[?25h
+@@ b
+\x1b]7501;state=idle:app=kiro-cli\x07\x1b[?2026h\x1b[4A\r\x1b[2K\x1b[0m\x1b[31m•\x1b[39m \x1b[39mCancelled\x1b[39m\x1b[38;2;0;95;255m touch /tmp/trace-7501-ctrlc\x1b[39m\x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[38;2;238;238;238m────────────────────────────────────────\x1b[39m\x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[38;2;95;135;215mdeveloper\x1b[39m \x1b[38;2;128;128;128m·\x1b[39m \x1b[39mauto\x1b[39m \x1b[38;2;128;128;128m·\x1b[39m \x1b[38;2;0;135;95m◔\x1b[39m \x1b[38;2;0;135;95m3%\x1b[39m \x1b[38;2;135;0;255m~/project\x1b[39m \x1b[38;2;128;128;128m·\x1b[39m \x1b[38;2;128;128;128m(\x1b[39m\x1b[39mmain\x1b[39m\x1b[38;2;128;128;128m)\x1b[39m\x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[39m› \x1b[39m\x1b[7m\x1b[27m \x1b[7m\x1b[0m\x1b[38;2;98;98;98mask a question or describe a task ↵\x1b[39m\x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[0m\r\r
+\x1b[2K\r\r
+\x1b[2K\r\r
+\x1b[2K\x1b[3A\x1b[?2026l\x1b[1A\x1b[3G\x1b[?25h\x1b[3G\x1b[?25h\x1b[?2026h\x1b[4A\r\x1b[2K\x1b[0m\x1b[36m•\x1b[39m \x1b[36mCancelled streaming\x1b[39m\x1b[0m\x1b[?2026l\x1b[4B\x1b[3G\x1b[?25h\x1b[?2026h\x1b[4A\r\x1b[2K\x1b[0m \x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[38;2;128;128;128m▸\x1b[39m \x1b[38;2;128;128;128mCredits: turn 0.06 • session 0.06 | Time: 6m 43s\x1b[39m\x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[36m•\x1b[39m \x1b[36mCancelled streaming\x1b[39m\x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[38;2;238;238;238m────────────────────────────────────────\x1b[39m\x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[38;2;95;135;215mdeveloper\x1b[39m \x1b[38;2;128;128;128m·\x1b[39m \x1b[39mauto\x1b[39m \x1b[38;2;128;128;128m·\x1b[39m \x1b[38;2;0;135;95m◔\x1b[39m \x1b[38;2;0;135;95m3%\x1b[39m \x1b[38;2;135;0;255m~/project\x1b[39m \x1b[38;2;128;128;128m·\x1b[39m \x1b[38;2;128;128;128m(\x1b[39m\x1b[39mmain\x1b[39m\x1b[38;2;128;128;128m)\x1b[39m\x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[39m› \x1b[39m\x1b[7m\x1b[27m \x1b[7m\x1b[0m\x1b[38;2;98;98;98mask a question or describe a task ↵\x1b[39m\x1b[0m\r\r
+\x1b[2K\x1b[0m\x1b[0m\x1b[?2026l\x1b[1A\x1b[3G\x1b[?25h\x1b[3G\x1b[?25h\x1b[?2026h\x1b[4A\r\x1b[2K\x1b[0m\x1b[0m\x1b[?2026l\x1b[4B\x1b[3G\x1b[?25h
