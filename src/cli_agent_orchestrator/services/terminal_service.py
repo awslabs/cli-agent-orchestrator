@@ -2841,6 +2841,7 @@ async def _create_terminal_unguarded(
             and "*" not in allowed_tools
         ):
             from cli_agent_orchestrator.utils.tool_mapping import (
+                CAO_CALLBACK_REFS,
                 kiro_agent_tools,
                 kiro_universal_tools,
             )
@@ -2872,7 +2873,13 @@ async def _create_terminal_unguarded(
                     if installed_kiro_agent_is_universal(agent_profile)
                     else kiro_agent_tools(allowed_tools)
                 )
-                wider = [tool for tool in installed if tool not in permitted]
+                # The callback references a Kiro install adds are not wider: the
+                # tool gate allows those tools to every bound terminal.
+                wider = [
+                    tool
+                    for tool in installed
+                    if tool not in permitted and tool not in CAO_CALLBACK_REFS
+                ]
                 if wider:
                     raise InstalledPolicyExceedsAllowlistError(
                         f"Delegation refused: the installed Kiro agent '{agent_profile}' "

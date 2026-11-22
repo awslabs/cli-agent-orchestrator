@@ -460,6 +460,50 @@ def _part_covers(grant_part: str, requested_part: str) -> bool:
     return fnmatch.fnmatchcase(requested_part, grant_part)
 
 
+#: The key of CAO's own MCP server in a profile's ``mcpServers``.
+CAO_MCP_SERVER_NAME = "cao-mcp-server"
+
+#: The CAO MCP tools a worker answers the terminal that created it through. The
+#: tool gate lets a bound terminal call them whatever its allowlist says, because a
+#: restricted worker could not report back without them (``CALLBACK_EXEMPT_TOOLS``
+#: in ``mcp_server/server.py`` is this set). Each answers upward and grants no
+#: authority over another identity.
+CAO_CALLBACK_TOOLS: frozenset[str] = frozenset(
+    {"answer_user_prompt", "complete_assignment", "send_message", "workflow_return"}
+)
+
+#: The same tools as per-tool MCP references, ``@cao-mcp-server/<tool>``.
+CAO_CALLBACK_REFS: frozenset[str] = frozenset(
+    f"@{CAO_MCP_SERVER_NAME}/{tool}" for tool in CAO_CALLBACK_TOOLS
+)
+
+
+def with_cao_callback_tools(allowed: List[str], server_names: Optional[Iterable[str]]) -> List[str]:
+    """``allowed`` plus each CAO callback tool it does not grant yet, for a Kiro install.
+
+    Kiro gives an agent only the tools in its installed ``tools`` list, which
+    ``cao install`` writes from the allowlist. A profile that pins ``allowedTools``
+    without ``@cao-mcp-server`` therefore lost the callback tools on Kiro, though the
+    tool gate allows them: a structured workflow step could not call
+    ``workflow_return``, and an assigned worker could not call ``send_message``.
+
+    Applied only when the profile declares ``cao-mcp-server`` itself, since the
+    tools come from that server. ``*``, and any grant that already covers the whole
+    server, are returned unchanged. The added references follow the profile's own
+    entries in sorted order, so two installs of the same profile write the same bytes.
+    """
+    result = list(allowed)
+    if CAO_MCP_SERVER_NAME not in set(server_names or ()) or "*" in result:
+        return result
+    grants = [entry for entry in result if split_mcp_reference(entry) is not None]
+    if any(mcp_reference_covers(grant, f"@{CAO_MCP_SERVER_NAME}") for grant in grants):
+        return result
+    for ref in sorted(CAO_CALLBACK_REFS):
+        if not any(mcp_reference_covers(grant, ref) for grant in grants):
+            result.append(ref)
+    return result
+
+
 #: Kiro built-ins that ``@builtin`` grants on the ``tools`` axis: the ones that
 #: can neither run commands, write files nor reach the network. On Kiro a bare
 #: ``@builtin`` in ``tools`` means EVERY built-in, shell included, so it must

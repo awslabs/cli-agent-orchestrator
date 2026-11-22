@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Kiro CLI installs keep the CAO callback tools**. A profile that declares
+  `cao-mcp-server` and pins `allowedTools` without `@cao-mcp-server` used to install with a
+  `tools` list that hid `send_message`, `complete_assignment`, `workflow_return` and
+  `answer_user_prompt`, though the CAO tool gate always allows them. An assigned worker could
+  not report back, and a structured workflow step could not return its answer. `cao install`
+  now adds `@cao-mcp-server/<tool>` for each of the four the grant does not cover, and the
+  delegation ceiling treats them as granting nothing new. Reinstall such profiles to pick
+  this up.
+
 - Add the Qwen Code (`qwen_cli`) provider with profile, skill, MCP and model support.
 
 - **kiro_cli (v2 TUI): an open permission dialog reads `waiting_user_answer` in the cases #1426 missed**.

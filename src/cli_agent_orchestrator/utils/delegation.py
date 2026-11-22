@@ -50,7 +50,11 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from cli_agent_orchestrator.constants import ROLE_DELEGATE_DEFAULTS
-from cli_agent_orchestrator.utils.tool_mapping import mcp_reference_covers, split_mcp_reference
+from cli_agent_orchestrator.utils.tool_mapping import (
+    CAO_CALLBACK_REFS,
+    mcp_reference_covers,
+    split_mcp_reference,
+)
 
 UNRESTRICTED = "*"
 FS_GLOB = "fs_*"
@@ -115,6 +119,10 @@ def covers(ceiling: Sequence[str], tool: str) -> bool:
 
     - ``*`` in the ceiling covers everything; ``*`` as the tool needs ``*``.
     - ``@builtin`` grants nothing and is always covered (ignored).
+    - a CAO callback reference (``@cao-mcp-server/workflow_return`` and the other
+      ``CAO_CALLBACK_REFS``) is always covered: the tool gate allows those tools to
+      every bound terminal, so a file that names them grants nothing new. A Kiro
+      install adds them to the agent's ``tools`` (``with_cao_callback_tools``).
     - an MCP reference (``@server``, ``@server/tool``, globs) is covered when some
       ceiling reference covers it under :func:`mcp_reference_covers`, the same
       selector semantics the provider resolvers use to grant servers at launch.
@@ -125,7 +133,7 @@ def covers(ceiling: Sequence[str], tool: str) -> bool:
     """
     if UNRESTRICTED in ceiling:
         return True
-    if tool == BUILTIN_SELECTOR:
+    if tool == BUILTIN_SELECTOR or tool in CAO_CALLBACK_REFS:
         return True
     if tool == UNRESTRICTED:
         return False
