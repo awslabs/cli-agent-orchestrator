@@ -1078,27 +1078,16 @@ class MemoryService:
                     f"<!-- id: {memory_id} | scope: {scope} | "
                     f"type: {memory_type} | tags: {tags} -->\n"
                 )
-            duplicate_retry = (
-                is_update
-                and occurred_at is None
-                and self._latest_entry_matches(existing_content, content)
+            appended = append_section(
+                existing_content,
+                MemoryAppendEntry(content=content, occurred_at=occurred_at, now=now),
             )
-            if duplicate_retry:
-                new_content = existing_content
-                entry_body = content
-                timestamp = existing_ts[-1]
-                timestamp_clamped = False
-            else:
-                appended = append_section(
-                    existing_content,
-                    MemoryAppendEntry(content=content, occurred_at=occurred_at, now=now),
-                )
-                new_content = appended.content
-                entry_body = appended.entry_body
-                timestamp = appended.section_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-                timestamp_clamped = appended.timestamp_clamped
-                if not is_update:
-                    created_at = appended.first_section_at
+            new_content = appended.content
+            entry_body = appended.entry_body
+            timestamp = appended.section_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+            timestamp_clamped = appended.timestamp_clamped
+            if not is_update:
+                created_at = appended.first_section_at
 
             # Atomic write of the append version: write to tmp then os.replace.
             # This is always the immediate, durable result of store(). LLM
@@ -1134,7 +1123,7 @@ class MemoryService:
             try:
                 from cli_agent_orchestrator.services.settings_service import get_compile_mode
 
-                if is_update and not duplicate_retry and get_compile_mode() == "llm":
+                if is_update and get_compile_mode() == "llm":
                     self._schedule_background_compile(
                         scope=scope,
                         scope_id=scope_id,
@@ -2060,7 +2049,7 @@ class MemoryService:
 
     @staticmethod
     def _strip_generated_see_also(content: str) -> str:
-        """Remove only canonical CAO-rendered See Also projections."""
+        """Remove canonical CAO-rendered See Also lines, preserving authored lines."""
         from cli_agent_orchestrator.services.wiki_compiler import SEE_ALSO_LINK_RE
 
         lines = content.splitlines(keepends=False)
@@ -2074,24 +2063,16 @@ class MemoryService:
             end = index + 1
             while end < len(lines) and not lines[end].rstrip().startswith("## "):
                 end += 1
-            section = [line.strip() for line in lines[index + 1 : end] if line.strip()]
-            if section and all(SEE_ALSO_LINK_RE.fullmatch(line) for line in section):
-                index = end
-                continue
-            out.extend(lines[index:end])
+            authored = [
+                line
+                for line in lines[index + 1 : end]
+                if not SEE_ALSO_LINK_RE.fullmatch(line.strip())
+            ]
+            if any(line.strip() for line in authored):
+                out.append(lines[index])
+                out.extend(authored)
             index = end
         return "\n".join(out).rstrip() + "\n"
-
-    @classmethod
-    def _latest_entry_matches(cls, file_content: str, content: str) -> bool:
-        """Recognise a consecutive identical write as a retry."""
-        headings = list(_CANONICAL_ENTRY_HEADING_RE.finditer(file_content))
-        if not headings:
-            return False
-        latest = file_content[headings[-1].end() :].strip()
-        authored = cls._strip_existing_see_also(latest).strip()
-        expected = content.strip()
-        return latest == expected or authored == expected
 
     def _sync_content_link_edges(
         self,

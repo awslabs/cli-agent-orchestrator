@@ -159,6 +159,21 @@ def test_content_links_false_preserves_recall_and_writes_no_edges(
     assert [item for item in after if item["key"] == "target"] == before
 
 
+def test_content_links_false_keeps_identical_stores_as_distinct_entries(
+    tmp_path: Path, isolated_memory_db, monkeypatch
+) -> None:
+    from cli_agent_orchestrator.services import settings_service
+
+    monkeypatch.setattr(settings_service, "is_memory_content_links_enabled", lambda: False)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+
+    stored = _run(service.store("same fact", scope="global", key="source"))
+    _run(service.store("same fact", scope="global", key="source"))
+
+    rendered = Path(stored.file_path).read_text(encoding="utf-8")
+    assert rendered.count("same fact") == 2
+
+
 def test_content_links_flag_does_not_change_recall_shape(
     tmp_path: Path, isolated_memory_db, monkeypatch
 ) -> None:
@@ -203,7 +218,7 @@ def test_store_drops_dangling_targets_before_capping_valid_edges(
     assert set(edges) == set(targets[:MAX_EDGES_PER_MUTATION])
 
 
-def test_edge_sync_failure_is_best_effort_and_identical_retry_is_idempotent(
+def test_edge_sync_failure_is_best_effort_and_retry_is_edge_idempotent(
     tmp_path: Path, isolated_memory_db, monkeypatch
 ) -> None:
     service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
@@ -219,8 +234,30 @@ def test_edge_sync_failure_is_best_effort_and_identical_retry_is_idempotent(
     _run(service.store("[[target]]", scope="global", key="source"))
 
     rendered = Path(stored.file_path).read_text(encoding="utf-8")
-    assert rendered.count("[[target]]") == 1
+    assert rendered.count("[[target]]") == 2
     assert _edges(isolated_memory_db) == {("source", "target", "content_link")}
+
+
+def test_mixed_see_also_strips_generated_lines_but_keeps_authored_links(
+    tmp_path: Path, isolated_memory_db
+) -> None:
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    _run(service.store("generated", scope="global", key="generated"))
+    _run(service.store("authored", scope="global", key="authored"))
+
+    _run(
+        service.store(
+            "## See Also\n"
+            "- [generated](../global/generated.md)\n"
+            "- Authored context for [[authored]]\n",
+            scope="global",
+            key="source",
+        )
+    )
+
+    assert _edges(isolated_memory_db) == {
+        ("source", "authored", "content_link"),
+    }
 
 
 def test_generated_see_also_does_not_become_a_self_sustaining_content_edge(

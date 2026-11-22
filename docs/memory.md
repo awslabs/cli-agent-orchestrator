@@ -606,13 +606,17 @@ with `content_link` origin. Missing and cross-scope targets do not create an
 edge; `cao memory lint` reports them as stale claims. Recomputing content links
 replaces only that source/type/origin set and preserves human and other
 producer edges. CAO's own canonical generated `## See Also` projection is
-excluded from parsing so it cannot make a deleted edge self-sustaining.
+excluded from parsing so it cannot make a deleted edge self-sustaining. Generated
+lines are removed individually from a mixed `## See Also` section, leaving
+hand-authored lines available for parsing. A hand-written bullet in the exact
+generated `- [key](../<scope>/<key>.md)` shape is also treated as generated;
+use `[[key]]` for an authored link.
 
 Existing notes are indexed after upgrade by running `cao memory repair --apply`.
 Set the option to `false` (or set
 `CAO_MEMORY_RELATIONSHIPS_CONTENT_LINKS=false`) to disable future production.
 Previously produced edges remain until they are removed with
-`cao memory relationships delete <relationship-id>`; list them first with
+`cao memory relationships reject <relationship-id>`; list them first with
 `cao memory relationships list --format json`.
 
 Writes are **producer-scoped**: when the compiler or linter recomputes its edges

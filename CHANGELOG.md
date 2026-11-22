@@ -41,6 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and cross-scope targets remain unlinked and are reported by memory lint.
   Run `cao memory repair --apply` once after upgrade to index existing notes.
   Edge sync is bounded and best-effort after durable memory writes.
+  Generated See Also lines are excluded individually while authored lines in a
+  mixed section remain link producers, and repeated identical stores remain
+  distinct history entries.
   The new `memory_related` MCP tool follows active inbound, outbound, or both
   directions to a maximum depth of two, applies recall visibility rules, and
   returns hooks and edge metadata without returning memory bodies.
