@@ -40,9 +40,6 @@ jobs:
 
       - name: Run shuffled unit tests
         run: |
-          test_home="${RUNNER_TEMP}/cao-test-home"
-          mkdir -p "$test_home"
-          export HOME="$test_home"
           while IFS= read -r name; do
             case "$name" in
               CAO_*) unset "$name" ;;
@@ -53,7 +50,7 @@ jobs:
           export CAO_TEST_SHUFFLE_SEED="${{ github.run_id }}"
           # CI intentionally includes integration-marked tests except for the Kiro
           # provider test, which requires an authenticated external CLI.
-          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ \
+          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ examples/remote/ec2/tests/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \
