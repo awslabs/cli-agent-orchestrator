@@ -47,6 +47,9 @@ Filter with `scope=` or `memory_type=` when you know where to look. Recall is fo
 Use `memory_related(key=..., scope=...)` to follow a stored memory's active
 relationships without loading full memory bodies. It returns short hooks and edge
 metadata, follows at most two hops, and does not surface proposed relationships.
+It shows existing human, compiler, and authored content-link edges; the
+opt-in `memory.relationships.content_links` setting only controls future
+authored-link edge production.
 
 ## Store — save anything worth remembering, immediately
 

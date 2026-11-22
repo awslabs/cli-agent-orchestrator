@@ -820,7 +820,7 @@ def get_memory_settings() -> Dict[str, Any]:
         "explain_enabled": True,
         "non_accessing_inspection": True,
         "parser": {"lenient": True},
-        "relationships": {"content_links": True},
+        "relationships": {"content_links": False},
         "lifecycle": {"enabled": False},
         "injection": dict(MEMORY_INJECTION_DEFAULTS),
         "ranking": {"default_sort": "recency"},
@@ -1048,16 +1048,16 @@ def is_memory_parser_lenient() -> bool:
 
 
 def is_memory_content_links_enabled() -> bool:
-    """Content-authored relationship edges: env > nested file value > True."""
+    """Content-authored relationship edges: env > nested file value > False."""
     try:
         relationships = get_memory_settings().get("relationships", {})
         if not isinstance(relationships, dict):
-            return True
-        value = relationships.get("content_links", True)
-        return value if isinstance(value, bool) else True
+            return False
+        value = relationships.get("content_links", False)
+        return value if isinstance(value, bool) else False
     except Exception:
-        logger.warning("Failed to read memory.relationships.content_links; defaulting to True")
-        return True
+        logger.warning("Failed to read memory.relationships.content_links; defaulting to False")
+        return False
 
 
 def is_memory_lifecycle_enabled() -> bool:

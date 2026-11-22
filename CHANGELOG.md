@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/workflows.md` used this shape and now builds a valid id from each file name.
 
 - **Authored memory links now form navigable relationships** (#1329). With the
-  default-on `memory.relationships.content_links` setting, `memory_store` and
+  opt-in `memory.relationships.content_links` setting, `memory_store` and
   `cao memory repair --apply` turn same-scope `[[wikilinks]]` and `## See Also`
   links into active `relates_to` edges with `content_link` provenance. Missing
   and cross-scope targets remain unlinked and are reported by memory lint.

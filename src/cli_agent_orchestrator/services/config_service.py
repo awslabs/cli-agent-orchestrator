@@ -82,7 +82,7 @@ class RankingConfig(BaseModel):
 
 
 class RelationshipsConfig(BaseModel):
-    content_links: bool = True
+    content_links: bool = False
 
 
 class MemoryConfig(BaseModel):

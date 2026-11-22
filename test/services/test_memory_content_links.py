@@ -30,7 +30,24 @@ def _edges(engine) -> set[tuple[str, str, str]]:
         }
 
 
-def test_store_parses_wikilinks_and_authored_see_also(tmp_path: Path, isolated_memory_db) -> None:
+def _enable_content_links(monkeypatch) -> None:
+    from cli_agent_orchestrator.services import settings_service
+
+    monkeypatch.setattr(settings_service, "is_memory_content_links_enabled", lambda: True)
+
+
+def test_fresh_store_does_not_create_content_link_edges(tmp_path: Path, isolated_memory_db) -> None:
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    _run(service.store("target", scope="global", key="target"))
+    _run(service.store("See [[target]].", scope="global", key="source"))
+
+    assert _edges(isolated_memory_db) == set()
+
+
+def test_store_creates_content_link_edges_when_enabled(
+    tmp_path: Path, isolated_memory_db, monkeypatch
+) -> None:
+    _enable_content_links(monkeypatch)
     service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
     _run(service.store("target", scope="global", key="target"))
     _run(service.store("other", scope="global", key="other"))
@@ -50,8 +67,9 @@ def test_store_parses_wikilinks_and_authored_see_also(tmp_path: Path, isolated_m
 
 
 def test_missing_and_cross_scope_links_are_not_edges_and_lint_reports_missing(
-    tmp_path: Path, isolated_memory_db
+    tmp_path: Path, isolated_memory_db, monkeypatch
 ) -> None:
+    _enable_content_links(monkeypatch)
     service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
     _run(service.store("private", scope="global", key="global-only"))
     ctx = {"cwd": str(tmp_path / "project")}
@@ -86,6 +104,7 @@ def test_missing_and_cross_scope_links_are_not_edges_and_lint_reports_missing(
 def test_repair_replaces_deleted_content_link_but_preserves_human_edge(
     tmp_path: Path, isolated_memory_db, monkeypatch
 ) -> None:
+    _enable_content_links(monkeypatch)
     service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
     for key in ("kept-by-human", "deleted-from-text"):
         _run(service.store(key, scope="global", key=key))
@@ -120,8 +139,9 @@ def test_repair_replaces_deleted_content_link_but_preserves_human_edge(
 
 
 def test_fresh_repair_builds_links_after_all_endpoint_metadata(
-    tmp_path: Path, isolated_memory_db
+    tmp_path: Path, isolated_memory_db, monkeypatch
 ) -> None:
+    _enable_content_links(monkeypatch)
     service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
     _run(service.store("target", scope="global", key="target"))
     _run(service.store("[[target]]", scope="global", key="source"))
@@ -198,8 +218,9 @@ def test_content_links_flag_does_not_change_recall_shape(
 
 
 def test_store_drops_dangling_targets_before_capping_valid_edges(
-    tmp_path: Path, isolated_memory_db
+    tmp_path: Path, isolated_memory_db, monkeypatch
 ) -> None:
+    _enable_content_links(monkeypatch)
     service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
     targets = [f"target-{index:02d}" for index in range(MAX_EDGES_PER_MUTATION + 1)]
     for target in targets:
@@ -221,6 +242,7 @@ def test_store_drops_dangling_targets_before_capping_valid_edges(
 def test_edge_sync_failure_is_best_effort_and_retry_is_edge_idempotent(
     tmp_path: Path, isolated_memory_db, monkeypatch
 ) -> None:
+    _enable_content_links(monkeypatch)
     service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
     _run(service.store("target", scope="global", key="target"))
     original_sync = service._sync_content_link_edges
@@ -239,8 +261,9 @@ def test_edge_sync_failure_is_best_effort_and_retry_is_edge_idempotent(
 
 
 def test_mixed_see_also_strips_generated_lines_but_keeps_authored_links(
-    tmp_path: Path, isolated_memory_db
+    tmp_path: Path, isolated_memory_db, monkeypatch
 ) -> None:
+    _enable_content_links(monkeypatch)
     service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
     _run(service.store("generated", scope="global", key="generated"))
     _run(service.store("authored", scope="global", key="authored"))
@@ -263,6 +286,7 @@ def test_mixed_see_also_strips_generated_lines_but_keeps_authored_links(
 def test_generated_see_also_does_not_become_a_self_sustaining_content_edge(
     tmp_path: Path, isolated_memory_db, monkeypatch
 ) -> None:
+    _enable_content_links(monkeypatch)
     service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
     _run(service.store("target", scope="global", key="target"))
     source = _run(service.store("source", scope="global", key="source"))

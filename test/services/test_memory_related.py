@@ -45,7 +45,10 @@ class _ExcludeHidden:
 
 @pytest.fixture
 def service(tmp_path: Path, isolated_memory_db, monkeypatch) -> MemoryService:
+    from cli_agent_orchestrator.services import settings_service
+
     monkeypatch.setattr(memory_eligibility, "_SOURCES", {})
+    monkeypatch.setattr(settings_service, "is_memory_content_links_enabled", lambda: True)
     return MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
 
 

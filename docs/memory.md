@@ -287,7 +287,10 @@ same recall visibility and eligibility rules at every hop, so a hidden memory
 cannot appear or bridge two visible memories. Only active edges participate;
 proposals are neither followed nor returned. An omitted scope returns
 `ambiguous_scope` when more than one visible memory has the key, and an absent
-key returns `not_found`.
+key returns `not_found`. `memory_related` shows existing active edges from any
+producer, including human, compiler, and `content_link`; the
+`memory.relationships.content_links` setting controls only future authored-link
+edge production.
 
 ### `memory_forget`
 
@@ -599,8 +602,8 @@ read time. Each edge records its `origin` — `compiler`, `wiki_lint`, `human`,
 `legacy_related_keys`, `external_import`, `vault`, or `content_link` — and a
 `status`.
 
-With `memory.relationships.content_links=true` (the default), native topic
-content is also a relationship producer. On store and repair, same-scope
+With `memory.relationships.content_links=true` (opt-in), native topic content
+is also a relationship producer. On store and repair, same-scope
 `[[wikilinks]]` and links under `## See Also` become active `relates_to` edges
 with `content_link` origin. Missing and cross-scope targets do not create an
 edge; `cao memory lint` reports them as stale claims. Recomputing content links
@@ -612,12 +615,13 @@ hand-authored lines available for parsing. A hand-written bullet in the exact
 generated `- [key](../<scope>/<key>.md)` shape is also treated as generated;
 use `[[key]]` for an authored link.
 
-Existing notes are indexed after upgrade by running `cao memory repair --apply`.
-Set the option to `false` (or set
-`CAO_MEMORY_RELATIONSHIPS_CONTENT_LINKS=false`) to disable future production.
+Existing notes can be indexed after opting in by running `cao memory repair --apply`.
+Set the option to `true` (or set
+`CAO_MEMORY_RELATIONSHIPS_CONTENT_LINKS=true`) to enable future production.
 Previously produced edges remain until they are removed with
 `cao memory relationships reject <relationship-id>`; list them first with
-`cao memory relationships list --format json`.
+`cao memory relationships list --format json`. `memory_related` continues to
+show those and other existing active edges while content links are disabled.
 
 Writes are **producer-scoped**: when the compiler or linter recomputes its edges
 for a source memory, it replaces only rows carrying its own origin and type, so a
