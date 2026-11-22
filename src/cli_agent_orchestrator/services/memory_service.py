@@ -4705,13 +4705,19 @@ class MemoryService:
             return [first_match], [first_time], len(matches)
 
         def _parseable_entry_count(matches: list[re.Match[str]], group: int | str) -> int:
+            # Validate the calendar fields directly: a strptime call per heading would
+            # make the parse cost grow with the number of entries.
             count = 0
             for match in matches:
                 value = match.group(group)
                 try:
-                    datetime.strptime(
-                        value if len(value) == 20 else value.replace("Z", ":00Z"),
-                        "%Y-%m-%dT%H:%M:%SZ",
+                    datetime(
+                        int(value[0:4]),
+                        int(value[5:7]),
+                        int(value[8:10]),
+                        int(value[11:13]),
+                        int(value[14:16]),
+                        int(value[17:19]) if len(value) == 20 else 0,
                     )
                 except ValueError:
                     continue
