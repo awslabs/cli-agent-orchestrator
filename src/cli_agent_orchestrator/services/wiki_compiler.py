@@ -53,6 +53,7 @@ ELISION_MARKER = "[... earlier content elided by CAO compiler — see git histor
 _SENTINEL_STRIP_RE = re.compile(r"<<<CAO_(NEW_OBSERVATION|EXISTING_ARTICLE)_(BEGIN|END)_v\d+>>>")
 _ID_HEADER_RE = re.compile(r"^<!--\s*id:\s*([^\s>][^>]*?)\s*-->")
 _ENTRY_HEADING_RE = re.compile(r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)$", re.MULTILINE)
+_TIMESTAMP_TOKEN_RE = re.compile(r"#{2,}( \d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)")
 _LOOSE_ENTRY_HEADING_RE = re.compile(
     r"^#{2,} [^\n]*?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)[^\n]*$",
     re.MULTILINE,
@@ -274,8 +275,7 @@ def _postprocess_compiled(
     for line in compiled.splitlines():
         if _COMPILED_MARKER_RE.fullmatch(line):
             continue
-        heading = _ENTRY_HEADING_RE.fullmatch(line)
-        lines.append(f"### Entry {heading.group(1)}" if heading is not None else line)
+        lines.append(_TIMESTAMP_TOKEN_RE.sub(r"### Entry\1", line))
 
     # The header block is the leading H1/id-comment pair (either order), with
     # surrounding blank lines. Insert metadata immediately after it.
