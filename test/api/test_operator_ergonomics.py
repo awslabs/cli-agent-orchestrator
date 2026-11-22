@@ -4,6 +4,7 @@ folder listing, per-session display labels, and the ``X-Server-Time`` header.
 """
 
 import asyncio
+import importlib
 import os
 import threading
 import time
@@ -438,22 +439,35 @@ class TestSessionLabelEndpoint:
 class TestSettingsWritersStayOffTheEventLoop:
     """plauzy, #724 review, blocking item 2: the label endpoint ran a tmux
     subprocess and a lock-polling settings write inline on the event loop, so
-    with another writer holding the settings lock a 10 ms heartbeat task on
-    the same loop ticked once in 1.8 s -- ``/health`` and every SSE stream
-    froze with it. ``POST /settings/agent-dirs`` and ``/skill-dirs`` inherited
-    the same wait once their writers went through ``_mutate``.
+    with another writer holding the settings lock it froze ``/health`` and
+    every SSE stream. ``POST /settings/agent-dirs`` and ``/skill-dirs``
+    inherited the same wait once their writers went through ``_mutate``.
 
-    Driven over ASGI directly (not the sync TestClient, which runs the app on
-    its own portal thread and cannot observe the request loop) with a
-    heartbeat coroutine on the SAME loop as the request. The settings lock is
-    held by a plain thread for half a second; a handler that waits for it on
-    the loop stalls the heartbeat, one that waits on a worker thread does not.
+    Pin the thread boundary directly. A heartbeat-count assertion originally
+    used here could report zero under CI scheduler starvation even though the
+    writer ran on a worker thread; recording the writer's thread identity
+    tests the property without depending on elapsed time or loop scheduling.
     """
 
     _WRITES = [
-        pytest.param("/sessions/cao-demo/label", {"label": "Run"}, id="label"),
-        pytest.param("/settings/agent-dirs", {"extra_dirs": ["/x"]}, id="agent-dirs"),
-        pytest.param("/settings/skill-dirs", {"extra_dirs": ["/x"]}, id="skill-dirs"),
+        pytest.param(
+            "/sessions/cao-demo/label",
+            {"label": "Run"},
+            "cli_agent_orchestrator.api.main._set_session_label_locked",
+            id="label",
+        ),
+        pytest.param(
+            "/settings/agent-dirs",
+            {"extra_dirs": ["/x"]},
+            "cli_agent_orchestrator.services.settings_service.set_extra_agent_dirs",
+            id="agent-dirs",
+        ),
+        pytest.param(
+            "/settings/skill-dirs",
+            {"extra_dirs": ["/x"]},
+            "cli_agent_orchestrator.services.settings_service.set_extra_skill_dirs",
+            id="skill-dirs",
+        ),
     ]
 
     @staticmethod
@@ -466,9 +480,9 @@ class TestSettingsWritersStayOffTheEventLoop:
             release.wait(5)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("url,body", _WRITES)
+    @pytest.mark.parametrize("url,body,writer_path", _WRITES)
     async def test_a_held_settings_lock_does_not_freeze_the_loop(
-        self, settings_file, backend, url, body
+        self, settings_file, backend, url, body, writer_path
     ):
         from cli_agent_orchestrator.api.main import app
         from cli_agent_orchestrator.plugins import PluginRegistry
@@ -478,31 +492,41 @@ class TestSettingsWritersStayOffTheEventLoop:
         holder.start()
         assert holding.wait(5), "lock holder never started"
 
-        ticks = 0
+        writer_started = threading.Event()
+        writer_thread = None
+        module_name, writer_name = writer_path.rsplit(".", 1)
+        real_writer = getattr(importlib.import_module(module_name), writer_name)
 
-        async def heartbeat() -> None:
-            nonlocal ticks
-            while True:
-                await asyncio.sleep(0.01)
-                ticks += 1
+        def recording_writer(*args, **kwargs):
+            nonlocal writer_thread
+            writer_thread = threading.get_ident()
+            writer_started.set()
+            return real_writer(*args, **kwargs)
 
-        pulse = asyncio.create_task(heartbeat())
-        # Scheduled ON the loop: if the handler blocks the loop this never
-        # fires, the holder times out after 5 s instead, and the tick count
-        # exposes the stall either way.
-        asyncio.get_running_loop().call_later(0.5, release.set)
+        def release_after_writer_starts() -> None:
+            writer_started.wait(5)
+            # Give the real writer time to reach the already-held file lock.
+            time.sleep(0.05)
+            release.set()
+
+        releaser = threading.Thread(target=release_after_writer_starts)
+        releaser.start()
         try:
             app.state.plugin_registry = PluginRegistry()
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app), base_url="http://localhost"
-            ) as client:
-                resp = await client.post(url, json=body)
+            with patch(writer_path, side_effect=recording_writer):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://localhost"
+                ) as client:
+                    resp = await client.post(url, json=body)
         finally:
             release.set()
-            pulse.cancel()
             holder.join(5)
+            releaser.join(5)
         assert resp.status_code == 200, resp.text
-        assert ticks >= 20, f"the loop ticked {ticks} times while the writer waited for the lock"
+        assert writer_started.is_set(), "settings writer was not called"
+        assert (
+            writer_thread != threading.get_ident()
+        ), "settings writer ran on the event-loop thread"
 
     @pytest.mark.asyncio
     async def test_label_write_waits_for_a_teardown_holding_the_lifecycle_lock(
