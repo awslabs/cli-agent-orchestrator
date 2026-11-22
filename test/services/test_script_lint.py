@@ -16,7 +16,6 @@ aimed at a different failure mode is not a safety net for this one.
 
 import ast
 import re
-import time
 from pathlib import Path
 
 import pytest
@@ -25,6 +24,7 @@ from hypothesis import strategies as st
 
 from cli_agent_orchestrator.constants import SCRIPT_LINT_MAX_SOURCE_CHARS, WORKFLOW_NAME_RE
 from cli_agent_orchestrator.models.workflow import LintFinding, ScriptValidationResult
+from cli_agent_orchestrator.services import script_lint as script_lint_module
 from cli_agent_orchestrator.services.script_lint import lint_script
 
 
@@ -878,9 +878,9 @@ class TestSyntaxRuleIdIsNotBorrowed:
 
 
 class TestPerformanceSanity:
-    def test_thousand_line_script_under_one_second(self):
-        # The proportionate bound from performance-requirements.md: a sanity
-        # ceiling against an accidental quadratic re-walk, not a tuned budget.
+    def test_thousand_line_script_is_walked_once(self, monkeypatch):
+        # The linter's performance contract is one AST walk. Count that work
+        # directly: a wall-clock ceiling measures CI scheduling delays too.
         lines = []
         for i in range(250):
             lines.append(f"import json  # block {i}")
@@ -889,8 +889,24 @@ class TestPerformanceSanity:
             lines.append(f"v_{i} = f_{i}({i})")
         source = "\n".join(lines) + "\n"
         assert source.count("\n") == 1000
-        start = time.monotonic()
-        result = lint_script(source, "big.py")
-        elapsed = time.monotonic() - start
+
+        original_walk = ast.walk
+        walk_calls = 0
+        nodes_yielded = 0
+
+        def counting_walk(root):
+            nonlocal walk_calls, nodes_yielded
+            walk_calls += 1
+            for node in original_walk(root):
+                nodes_yielded += 1
+                yield node
+
+        # Restore ast.walk before assertions so a deliberate failure cannot
+        # interfere with pytest's own traceback rendering.
+        with monkeypatch.context() as context:
+            context.setattr(script_lint_module.ast, "walk", counting_walk)
+            result = lint_script(source, "big.py")
+
         assert result.status == "pass"
-        assert elapsed < 1.0
+        assert walk_calls == 1
+        assert nodes_yielded == sum(1 for _ in original_walk(ast.parse(source)))
