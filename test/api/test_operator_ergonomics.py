@@ -8,6 +8,7 @@ import importlib
 import os
 import threading
 import time
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -471,13 +472,15 @@ class TestSettingsWritersStayOffTheEventLoop:
     ]
 
     @staticmethod
-    def _hold_settings_lock(release: threading.Event, holding: threading.Event) -> None:
+    def _hold_settings_lock(
+        release: threading.Event, holding: threading.Event, outcome: list[bool]
+    ) -> None:
         from cli_agent_orchestrator.utils import atomic_file
 
         lock_path = atomic_file._lock_path_for(settings_service.SETTINGS_FILE)
         with atomic_file._file_lock(lock_path, timeout=5):
             holding.set()
-            release.wait(5)
+            outcome.append(release.wait(5))
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("url,body,writer_path", _WRITES)
@@ -488,7 +491,8 @@ class TestSettingsWritersStayOffTheEventLoop:
         from cli_agent_orchestrator.plugins import PluginRegistry
 
         release, holding = threading.Event(), threading.Event()
-        holder = threading.Thread(target=self._hold_settings_lock, args=(release, holding))
+        outcome: list[bool] = []
+        holder = threading.Thread(target=self._hold_settings_lock, args=(release, holding, outcome))
         holder.start()
         assert holding.wait(5), "lock holder never started"
 
@@ -503,14 +507,12 @@ class TestSettingsWritersStayOffTheEventLoop:
             writer_started.set()
             return real_writer(*args, **kwargs)
 
-        def release_after_writer_starts() -> None:
-            writer_started.wait(5)
-            # Give the real writer time to reach the already-held file lock.
-            time.sleep(0.05)
+        async def release_after_writer_starts() -> None:
+            while not writer_started.is_set():
+                await asyncio.sleep(0.01)
             release.set()
 
-        releaser = threading.Thread(target=release_after_writer_starts)
-        releaser.start()
+        releaser = asyncio.create_task(release_after_writer_starts())
         try:
             app.state.plugin_registry = PluginRegistry()
             with patch(writer_path, side_effect=recording_writer):
@@ -521,9 +523,13 @@ class TestSettingsWritersStayOffTheEventLoop:
         finally:
             release.set()
             holder.join(5)
-            releaser.join(5)
+            if not releaser.done():
+                releaser.cancel()
+            with suppress(asyncio.CancelledError):
+                await releaser
         assert resp.status_code == 200, resp.text
         assert writer_started.is_set(), "settings writer was not called"
+        assert outcome == [True]
         assert (
             writer_thread != threading.get_ident()
         ), "settings writer ran on the event-loop thread"
