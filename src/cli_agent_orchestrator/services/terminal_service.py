@@ -4611,7 +4611,14 @@ def attach_output_pipeline(
         get_backend().stop_pipe_pane(s, w)
         get_backend().pipe_pane(s, w, p)
 
-    fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
+    created = fifo_manager.create_reader(
+        terminal_id,
+        pane_probe=_probe_pane,
+        rearm=_rearm_pipe,
+        cold_start_check=not replace_existing,
+    )
+    if created is False:
+        return
     try:
         if replace_existing:
             get_backend().stop_pipe_pane(session_name, window_name)

@@ -7,7 +7,10 @@ import errno
 import fcntl
 import logging
 import os
+import shutil
+import subprocess
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from test.api.test_lifespan_inbox import _patched_lifespan
 from unittest.mock import MagicMock, patch
@@ -18,7 +21,11 @@ from cli_agent_orchestrator.api import main
 from cli_agent_orchestrator.api.main import app, lifespan
 from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome, TerminalCleanupResult
 from cli_agent_orchestrator.clients import database as db
-from cli_agent_orchestrator.constants import PIPE_LIVENESS_TAIL_LINES
+from cli_agent_orchestrator.constants import (
+    PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS,
+    PIPE_LIVENESS_STALL_CHECKS,
+    PIPE_LIVENESS_TAIL_LINES,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import ephemeral_service, fifo_reader
 from cli_agent_orchestrator.services import terminal_service as ts
@@ -163,8 +170,83 @@ class TestAttachOutputPipeline:
             ts.attach_output_pipeline("term-3", "cao-s", "win-3", replace_existing=True)
 
         fake_fifo.create_reader.assert_called_once()
+        assert fake_fifo.create_reader.call_args.kwargs["cold_start_check"] is False
         backend.stop_pipe_pane.assert_called_once_with("cao-s", "win-3")
         fake_fifo.stop_reader.assert_called_once_with("term-3")
+
+    def test_replace_existing_disables_cold_start_check_and_create_enables_it(
+        self, monkeypatch, tmp_path
+    ):
+        fifo_dir = tmp_path / "fifos"
+        fifo_dir.mkdir()
+        monkeypatch.setattr(ts, "FIFO_DIR", fifo_dir)
+
+        fake_fifo = MagicMock()
+        monkeypatch.setattr(ts, "fifo_manager", fake_fifo)
+        monkeypatch.setattr(ts, "get_backend", lambda: MagicMock())
+
+        ts.attach_output_pipeline("term-new", "cao-s", "win-1", replace_existing=False)
+        assert fake_fifo.create_reader.call_args.kwargs["cold_start_check"] is True
+
+        fake_fifo.create_reader.reset_mock()
+        ts.attach_output_pipeline("term-surv", "cao-s", "win-2", replace_existing=True)
+        assert fake_fifo.create_reader.call_args.kwargs["cold_start_check"] is False
+
+    def test_redundant_attach_does_not_toggle_pipe_or_stop_existing_reader(
+        self, monkeypatch, tmp_path
+    ):
+        """P3-1: when create_reader finds an existing reader, skip pipe_pane and stop_reader."""
+        fifo_dir = tmp_path / "fifos"
+        fifo_dir.mkdir()
+        monkeypatch.setattr(fifo_reader, "FIFO_DIR", fifo_dir)
+        monkeypatch.setattr(ts, "FIFO_DIR", fifo_dir)
+
+        fresh_fifo = FifoManager()
+        monkeypatch.setattr(ts, "fifo_manager", fresh_fifo)
+
+        backend = MagicMock()
+        monkeypatch.setattr(ts, "get_backend", lambda: backend)
+
+        try:
+            # First attach creates the reader and opens pipe-pane once.
+            ts.attach_output_pipeline("term-dup", "cao-s", "win-dup", replace_existing=False)
+            assert backend.pipe_pane.call_count == 1
+            assert "term-dup" in fresh_fifo._readers
+
+            # Redundant attach (even if pipe_pane would fail) must be a no-op:
+            # no pipe_pane toggle, no stop_pipe_pane, and no stop_reader.
+            backend.pipe_pane.reset_mock()
+            backend.stop_pipe_pane.reset_mock()
+            backend.pipe_pane.side_effect = RuntimeError("must not be called")
+
+            ts.attach_output_pipeline("term-dup", "cao-s", "win-dup", replace_existing=False)
+            ts.attach_output_pipeline("term-dup", "cao-s", "win-dup", replace_existing=True)
+
+            backend.pipe_pane.assert_not_called()
+            backend.stop_pipe_pane.assert_not_called()
+            assert "term-dup" in fresh_fifo._readers
+        finally:
+            fresh_fifo.stop_reader("term-dup")
+            fresh_fifo.stop_watchdog()
+
+    def test_failure_during_pipe_pane_preserves_error_if_stop_reader_raises(
+        self, monkeypatch, tmp_path
+    ):
+        fifo_dir = tmp_path / "fifos"
+        fifo_dir.mkdir()
+        monkeypatch.setattr(ts, "FIFO_DIR", fifo_dir)
+
+        fake_fifo = MagicMock()
+        fake_fifo.create_reader.return_value = True
+        fake_fifo.stop_reader.side_effect = OSError("cleanup failed")
+        monkeypatch.setattr(ts, "fifo_manager", fake_fifo)
+
+        backend = MagicMock()
+        backend.pipe_pane.side_effect = RuntimeError("original attach error")
+        monkeypatch.setattr(ts, "get_backend", lambda: backend)
+
+        with pytest.raises(RuntimeError, match="original attach error"):
+            ts.attach_output_pipeline("term-err", "cao-s", "win-err")
 
 
 class TestReattachSurvivingTerminals:
@@ -307,6 +389,29 @@ class TestReattachSurvivingTerminals:
         with caplog.at_level(logging.WARNING, logger=ts.__name__):
             assert ts.reattach_surviving_terminals() == 0
         assert "db locked" in caplog.text
+
+    def test_backend_unavailable_skips_reattach(self, monkeypatch, caplog):
+        monkeypatch.setattr(ts, "get_backend", MagicMock(side_effect=RuntimeError("no backend")))
+
+        with caplog.at_level(logging.WARNING, logger=ts.__name__):
+            assert ts.reattach_surviving_terminals() == 0
+        assert "backend unavailable" in caplog.text
+
+    def test_skips_rows_missing_identity_or_tmux_coords(self, monkeypatch):
+        backend = _make_pipe_backend(live_ids={"term-ok"})
+        monkeypatch.setattr(ts, "get_backend", lambda: backend)
+        monkeypatch.setattr(
+            ts,
+            "list_all_terminals",
+            lambda: [
+                {"id": "", "tmux_session": "s", "tmux_window": "w"},
+                {"id": "term-no-sess", "tmux_session": "", "tmux_window": "w"},
+                {"id": "term-no-win", "tmux_session": "s", "tmux_window": ""},
+            ],
+        )
+
+        assert ts.reattach_surviving_terminals() == 0
+        backend.cleanup_terminal_exact.assert_not_called()
 
 
 class TestViewportSeeding:
@@ -459,6 +564,66 @@ class TestViewportSeeding:
             mock_pm.get_provider.return_value = provider
             assert sm.seed_from_viewport("t4", "cao-s", "win-4") is None
             assert sm.get_status("t4") == TerminalStatus.COMPLETED
+
+    def test_seed_from_viewport_skips_when_status_already_known(self):
+        sm = StatusMonitor()
+        sm._last_status["t-known"] = TerminalStatus.IDLE
+        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm:
+            assert sm.seed_from_viewport("t-known", "cao-s", "win") is None
+            mock_pm.get_provider.assert_not_called()
+
+    def test_seed_from_viewport_handles_missing_or_failing_provider_and_empty_viewport(self):
+        sm = StatusMonitor()
+        backend = _make_pipe_backend(viewport="")
+
+        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm:
+            mock_pm.get_provider.side_effect = RuntimeError("no provider")
+            assert sm.seed_from_viewport("t-p1", "cao-s", "win") is None
+
+            mock_pm.get_provider.side_effect = None
+            mock_pm.get_provider.return_value = None
+            assert sm.seed_from_viewport("t-p2", "cao-s", "win") is None
+
+            provider = MagicMock()
+            mock_pm.get_provider.return_value = provider
+            with patch(
+                "cli_agent_orchestrator.backends.registry.get_backend", return_value=backend
+            ):
+                assert sm.seed_from_viewport("t-empty", "cao-s", "win") is None
+                provider.get_status.assert_not_called()
+
+    def test_seed_from_viewport_uses_probe_and_handles_detection_error(self):
+        sm = StatusMonitor()
+        backend = _make_pipe_backend(viewport="approval prompt")
+
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        provider.probe_stale_processing_capture = MagicMock(
+            return_value=TerminalStatus.WAITING_USER_ANSWER
+        )
+        with (
+            patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm,
+        ):
+            mock_pm.get_provider.return_value = provider
+            assert (
+                sm.seed_from_viewport("t-probe", "cao-s", "win")
+                == TerminalStatus.WAITING_USER_ANSWER
+            )
+            provider.probe_stale_processing_capture.assert_called_once_with("approval prompt")
+            provider.get_status.assert_not_called()
+
+        provider_err = MagicMock()
+        provider_err.supports_screen_detection = False
+        provider_err.probe_stale_processing_capture = None
+        provider_err.get_status.side_effect = ValueError("parse boom")
+        with (
+            patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm,
+        ):
+            mock_pm.get_provider.return_value = provider_err
+            assert sm.seed_from_viewport("t-det-err", "cao-s", "win") is None
+            assert sm.get_status("t-det-err") == TerminalStatus.UNKNOWN
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs require a POSIX platform")
@@ -618,3 +783,190 @@ class TestLifespanReattachWiring:
 
         assert served
         assert "surviving terminal re-attach failed" in caplog.text
+
+
+class TestIdleSurvivorWatchdog:
+    """P2-1: re-attached idle survivors must not trigger cold-start 5x replay or watchdog drop."""
+
+    def test_idle_survivor_no_cold_start_replay_stays_watched_and_catches_real_stall(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        fifo_dir = tmp_path / "fifos"
+        fifo_dir.mkdir()
+        monkeypatch.setattr(fifo_reader, "FIFO_DIR", fifo_dir)
+        monkeypatch.setattr(ts, "FIFO_DIR", fifo_dir)
+        monkeypatch.setattr(fifo_reader, "PIPE_LIVENESS_COLD_START_GRACE_S", 0.0)
+
+        fresh_fifo = FifoManager()
+        monkeypatch.setattr(ts, "fifo_manager", fresh_fifo)
+        # Prevent background watchdog thread from racing with deterministic ticks.
+        monkeypatch.setattr(fresh_fifo, "_ensure_watchdog", lambda: None)
+
+        pane_content = "> ready at prompt\n"
+        backend = _make_pipe_backend(live_ids={"term-idle"})
+        backend.get_history.side_effect = lambda *a, **k: pane_content
+        monkeypatch.setattr(ts, "get_backend", lambda: backend)
+
+        published: list[dict] = []
+        monkeypatch.setattr(
+            fifo_reader.bus, "publish", lambda topic, payload: published.append(payload)
+        )
+
+        try:
+            with caplog.at_level(logging.WARNING, logger=fifo_reader.__name__):
+                ts.attach_output_pipeline("term-idle", "cao-s", "win-idle", replace_existing=True)
+
+                # Reset mocks after the initial replace_existing stop+pipe setup.
+                backend.stop_pipe_pane.reset_mock()
+                backend.pipe_pane.reset_mock()
+
+                # Run more ticks than PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS while pane is idle.
+                for _ in range(PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS + 3):
+                    fresh_fifo._check_pipe_liveness("term-idle")
+
+                assert published == []
+                backend.stop_pipe_pane.assert_not_called()
+                backend.pipe_pane.assert_not_called()
+                assert caplog.records == []
+                assert "term-idle" in fresh_fifo._pane_probe
+
+                # Now simulate a real stall: pane changes while FIFO delivers nothing.
+                pane_content = "> working on new task\n"
+                for _ in range(PIPE_LIVENESS_STALL_CHECKS):
+                    fresh_fifo._check_pipe_liveness("term-idle")
+
+                backend.stop_pipe_pane.assert_called_once_with("cao-s", "win-idle")
+                backend.pipe_pane.assert_called_once_with(
+                    "cao-s", "win-idle", str(fifo_dir / "term-idle.fifo")
+                )
+                assert published == [{"data": "> working on new task\r\n"}]
+                assert "term-idle" in fresh_fifo._pane_probe
+        finally:
+            fresh_fifo.stop_reader("term-idle")
+
+
+@pytest.mark.integration
+class TestRealTmuxReattach:
+    """Real tmux + FIFO tests for P2-1 (idle survivor) and P3-1 (duplicate attach)."""
+
+    def test_real_tmux_idle_survivor_and_duplicate_attach_non_toggle(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        if not shutil.which("tmux"):
+            pytest.skip("tmux not installed")
+
+        import libtmux
+
+        from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+        socket_name = f"cao-test-reattach-{uuid.uuid4().hex[:12]}"
+        subprocess.run(["tmux", "-L", socket_name, "kill-server"], capture_output=True)
+
+        fifo_dir = tmp_path / "fifos"
+        fifo_dir.mkdir()
+        monkeypatch.setattr(fifo_reader, "FIFO_DIR", fifo_dir)
+        monkeypatch.setattr(ts, "FIFO_DIR", fifo_dir)
+        monkeypatch.setattr(fifo_reader, "PIPE_LIVENESS_COLD_START_GRACE_S", 0.0)
+
+        client = TmuxClient()
+        client.server = libtmux.Server(socket_name=socket_name)
+        backend = TmuxBackend(client=client)
+        monkeypatch.setattr(ts, "get_backend", lambda: backend)
+
+        fresh_fifo = FifoManager()
+        monkeypatch.setattr(ts, "fifo_manager", fresh_fifo)
+        monkeypatch.setattr(fresh_fifo, "_ensure_watchdog", lambda: None)
+
+        published: list[str] = []
+        monkeypatch.setattr(
+            fifo_reader.bus,
+            "publish",
+            lambda topic, payload: published.append(payload.get("data", "")),
+        )
+
+        tid = "term-real-reattach"
+        sess = "cao-reattach-test"
+        try:
+            win = client.create_session(sess, "win1", tid, str(tmp_path))
+            # Produce pre-restart content in the pane and wait for it to settle idle.
+            subprocess.run(
+                [
+                    "tmux",
+                    "-L",
+                    socket_name,
+                    "send-keys",
+                    "-t",
+                    f"{sess}:{win}",
+                    "echo SURVIVOR_PRE_RESTART",
+                    "Enter",
+                ],
+                check=True,
+            )
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if "SURVIVOR_PRE_RESTART" in backend.get_history(sess, win):
+                    break
+                time.sleep(0.05)
+            time.sleep(0.2)
+
+            # Re-attach survivor pipeline (as cao-server startup does).
+            with caplog.at_level(logging.WARNING, logger=fifo_reader.__name__):
+                ts.attach_output_pipeline(tid, sess, win, replace_existing=True)
+
+                def _pane_pipe_flag() -> str:
+                    res = subprocess.run(
+                        [
+                            "tmux",
+                            "-L",
+                            socket_name,
+                            "display-message",
+                            "-t",
+                            f"{sess}:{win}",
+                            "-p",
+                            "#{pane_pipe}",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    return res.stdout.strip()
+
+                assert _pane_pipe_flag() == "1"
+
+                # P3-1: redundant attach must NOT toggle #{pane_pipe} off to "0".
+                ts.attach_output_pipeline(tid, sess, win, replace_existing=False)
+                assert _pane_pipe_flag() == "1"
+
+                # P2-1: idle survivor must NOT trigger cold-start replays or drop from watchdog.
+                published.clear()
+                for _ in range(PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS + 2):
+                    fresh_fifo._check_pipe_liveness(tid)
+
+                assert published == []
+                assert caplog.records == []
+                assert tid in fresh_fifo._pane_probe
+
+            # Real post-reattach output still flows through the real tmux pipe + FIFO.
+            subprocess.run(
+                [
+                    "tmux",
+                    "-L",
+                    socket_name,
+                    "send-keys",
+                    "-t",
+                    f"{sess}:{win}",
+                    "echo POST_REATTACH_LIVE",
+                    "Enter",
+                ],
+                check=True,
+            )
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if "POST_REATTACH_LIVE" in "".join(published):
+                    break
+                time.sleep(0.05)
+            assert "POST_REATTACH_LIVE" in "".join(published)
+        finally:
+            fresh_fifo.stop_reader(tid)
+            subprocess.run(["tmux", "-L", socket_name, "kill-server"], capture_output=True)
