@@ -87,6 +87,8 @@ jobs:
       github.repository == 'awslabs/cli-agent-orchestrator' &&
       needs.preflight.outputs.should_release == 'true'
     runs-on: ubuntu-latest
+    # The key lives in the release-deploy environment (policy: main and v* tags).
+    environment: release-deploy
     permissions:
       contents: write
     steps:

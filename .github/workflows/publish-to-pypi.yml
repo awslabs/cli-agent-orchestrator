@@ -546,6 +546,8 @@ jobs:
     # could then not stop the push to `main`.
     if: ${{ !cancelled() && needs.publish-pypi.result == 'success' }}
     runs-on: ubuntu-latest
+    # The key lives in the release-deploy environment (policy: main and v* tags).
+    environment: release-deploy
     permissions:
       contents: write
     steps:
