@@ -1396,35 +1396,53 @@ class TestMiscInterface:
         # <CAO_HOME_DIR>/tmp. Since cursor_cli binds CAO_HOME_DIR at its own
         # import time, we must reload both constants and cursor_cli.
         import importlib
-        import os
+        import sys
 
-        original_value = os.environ.get("CAO_HOME_DIR")
         override = tmp_path / "cao-home"
         monkeypatch.setenv("CAO_HOME_DIR", str(override))
         monkeypatch.delenv("CAO_TMP_DIR", raising=False)
 
-        import cli_agent_orchestrator.constants as constants_module
+        names = (
+            "cli_agent_orchestrator.constants",
+            "cli_agent_orchestrator.providers.cursor_cli",
+        )
+        saved = {name: sys.modules.get(name) for name in names}
+        for name in names:
+            sys.modules.pop(name, None)
+        package = sys.modules["cli_agent_orchestrator"]
+        providers_package = sys.modules["cli_agent_orchestrator.providers"]
+        package.__dict__.pop("constants", None)
+        providers_package.__dict__.pop("cursor_cli", None)
+        constants_module = importlib.import_module("cli_agent_orchestrator.constants")
 
         importlib.reload(constants_module)
 
-        import cli_agent_orchestrator.providers.cursor_cli as cursor_module
+        cursor_module = importlib.import_module("cli_agent_orchestrator.providers.cursor_cli")
 
         importlib.reload(cursor_module)
 
         try:
-            provider = make_provider()
+            provider = cursor_module.CursorCliProvider(
+                terminal_id="test-tid",
+                session_name="test-session",
+                window_name="window-0",
+            )
             result = provider._cao_tmp_dir()
             resolved_override = override.resolve()
             assert result == resolved_override / "tmp"
             assert result.is_dir()
         finally:
-            # Restore module state so the reload doesn't leak into later tests.
-            if original_value is not None:
-                monkeypatch.setenv("CAO_HOME_DIR", original_value)
-            else:
-                monkeypatch.delenv("CAO_HOME_DIR", raising=False)
-            importlib.reload(constants_module)
-            importlib.reload(cursor_module)
+            # Restore the original module objects so imported exception classes
+            # remain identical for tests that run after this one.
+            for name in names:
+                sys.modules.pop(name, None)
+            sys.modules.update(
+                {name: module for name, module in saved.items() if module is not None}
+            )
+            if saved[names[0]] is not None:
+                package.constants = saved[names[0]]
+            if saved[names[1]] is not None:
+                providers_package.cursor_cli = saved[names[1]]
 
     def test_cao_tmp_dir_env_override_wins(self, tmp_path, monkeypatch):
         # CAO_TMP_DIR takes precedence over the CAO_HOME_DIR-derived fallback.

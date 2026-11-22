@@ -175,6 +175,7 @@ def test_telemetry_fallback_covered_in_process(monkeypatch) -> None:
         ]
 
     saved = {n: sys.modules[n] for n in _tel_modules()}
+    saved_otel = {n: sys.modules[n] for n in _otel_modules()}
     saved_meta = list(sys.meta_path)
 
     class _BlockOtel(MetaPathFinder):
@@ -205,9 +206,10 @@ def test_telemetry_fallback_covered_in_process(monkeypatch) -> None:
             assert span is None
     finally:
         sys.meta_path[:] = saved_meta
-        for n in _tel_modules():
+        for n in _tel_modules() + _otel_modules():
             del sys.modules[n]
         sys.modules.update(saved)
+        sys.modules.update(saved_otel)
 
 
 def test_non_opentelemetry_import_error_is_reraised(monkeypatch) -> None:
