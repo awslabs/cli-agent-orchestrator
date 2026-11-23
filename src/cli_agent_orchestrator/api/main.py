@@ -1912,6 +1912,15 @@ async def lifespan(app: FastAPI):
     delegation_callback_task = asyncio.create_task(delegation_callback_service.run(registry))
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
 
+    # Re-attach FIFO output pipelines for surviving pipe-pane terminals (#1438).
+    # Runs after the deferred-init, initial-delivery, and ephemeral sweeps so
+    # stranded or residue rows are not re-attached, and after bus.set_loop +
+    # consumer startup so StatusMonitor/LogWriter receive output and seeded status.
+    try:
+        await asyncio.to_thread(terminal_service.reattach_surviving_terminals)
+    except Exception:  # noqa: BLE001 — never block startup on terminal re-attach
+        logger.warning("surviving terminal re-attach failed", exc_info=True)
+
     # Start ApprovalBridge when AG-UI surface is enabled
     approval_bridge_task: Optional[asyncio.Task] = None
     from cli_agent_orchestrator.services.agui_enablement import agui_surface_enabled

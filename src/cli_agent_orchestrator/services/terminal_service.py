@@ -66,6 +66,7 @@ from cli_agent_orchestrator.clients.database import (
     get_kept_terminal,
     get_session_incarnation,
     get_terminal_metadata,
+    list_all_terminals,
     list_pending_deferred_init_external_owner_terminal_ids,
     list_pending_initial_delivery_terminal_ids,
     list_siblings_by_group_prefix,
@@ -3424,29 +3425,7 @@ async def _create_terminal_unguarded(
         # socket events and their pipe_pane is a no-op, so skip the FIFO there and
         # rely on the herdr inbox registration below.
         if not get_backend().supports_event_inbox():
-            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
-
-            # Reader must exist BEFORE pipe-pane starts so it captures from the
-            # start. Enroll it in the pipe-pane liveness watchdog (issue #388):
-            # supply a probe for tmux's live pane content and a re-arm that
-            # re-attaches a stalled forwarder. The re-arm does stop-then-start,
-            # NOT a bare pipe_pane() — a stalled pane still reports pane_pipe=1,
-            # so the backend's ``pipe-pane -o`` toggle would just switch the
-            # dead pipe OFF instead of restarting it.
-            def _probe_pane(s=session_name, w=window_name) -> str:
-                return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
-
-            def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
-                get_backend().stop_pipe_pane(s, w)
-                get_backend().pipe_pane(s, w, p)
-
-            fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
-
-            # Configure pipe-pane to stream output to the FIFO. This enables
-            # real-time event-driven processing via StatusMonitor and LogWriter
-            # (LogWriter writes TERMINAL_LOG_DIR/{id}.log from the FIFO). A pane
-            # has a single pipe-pane target, so we pipe ONLY to the FIFO.
-            get_backend().pipe_pane(session_name, window_name, str(fifo_path))
+            attach_output_pipeline(terminal_id, session_name, window_name)
 
             # Nudge the shell so it re-renders its prompt AFTER pipe-pane attaches.
             # pipe-pane only captures output produced after it starts; on a fast
@@ -4612,6 +4591,120 @@ async def recover_interrupted_initial_deliveries() -> bool:
                 "Could not settle interrupted initial delivery for %s: %s", terminal_id, exc
             )
     return complete
+
+
+def attach_output_pipeline(
+    terminal_id: str,
+    session_name: str,
+    window_name: str,
+    *,
+    replace_existing: bool = False,
+) -> None:
+    """Attach the FIFO reader, liveness watchdog, and pipe-pane for a terminal.
+
+    Reader creation runs BEFORE ``pipe-pane`` starts so it captures from the
+    start, and enrolls the terminal in the pipe-pane liveness watchdog (#388).
+    When ``replace_existing=True`` (re-attaching a surviving pane after a
+    ``cao-server`` restart), any existing pipe on the pane is stopped first so
+    ``tmux pipe-pane -o`` does not toggle a stale pipe off instead of
+    restarting it.
+    """
+    fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+    def _probe_pane(s: str = session_name, w: str = window_name) -> str:
+        return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+    def _rearm_pipe(s: str = session_name, w: str = window_name, p: str = str(fifo_path)) -> None:
+        get_backend().stop_pipe_pane(s, w)
+        get_backend().pipe_pane(s, w, p)
+
+    created = fifo_manager.create_reader(
+        terminal_id,
+        pane_probe=_probe_pane,
+        rearm=_rearm_pipe,
+        cold_start_check=not replace_existing,
+    )
+    if created is False:
+        return
+    try:
+        if replace_existing:
+            get_backend().stop_pipe_pane(session_name, window_name)
+        get_backend().pipe_pane(session_name, window_name, str(fifo_path))
+    except Exception:
+        try:
+            fifo_manager.stop_reader(terminal_id)
+        except Exception:  # noqa: BLE001 — preserve original attach failure
+            pass
+        raise
+
+
+def reattach_surviving_terminals() -> int:
+    """Re-attach FIFO readers and pipe-pane for terminals that outlived a server restart (#1438).
+
+    Runs at startup after the deferred-init, initial-delivery, and ephemeral
+    sweeps so stranded tombstones and ephemeral residue are not re-attached.
+    Event-inbox backends are skipped. Kept children (#1225), ERROR/deferred-init
+    rows, ephemeral residue, and terminals whose session/pane is no longer live
+    are skipped. A per-terminal failure is logged and leaves that terminal alone.
+
+    For each re-attached terminal, seeds ``WAITING_USER_ANSWER`` from the live
+    viewport when a blocking dialog is already open (it produces no new output
+    until answered), leaving all other statuses ``UNKNOWN`` for the stream.
+    """
+    try:
+        backend = get_backend()
+        if backend.supports_event_inbox():
+            return 0
+    except Exception as exc:  # noqa: BLE001 — startup remains resilient
+        logger.warning("Skipping surviving terminal re-attach; backend unavailable: %s", exc)
+        return 0
+
+    try:
+        rows = list_all_terminals()
+    except Exception as exc:  # noqa: BLE001 — startup remains resilient
+        logger.warning("Could not list terminals for surviving re-attach: %s", exc)
+        return 0
+
+    reattached = 0
+    for row in rows:
+        terminal_id = row.get("id")
+        session_name = row.get("tmux_session")
+        window_name = row.get("tmux_window")
+        if not terminal_id or not session_name or not window_name:
+            continue
+        tid = str(terminal_id)
+        sess = str(session_name)
+        win = str(window_name)
+        try:
+            if (
+                row.get("deferred_init_external_owner")
+                or row.get("deferred_init_runtime_reclaimed")
+                or get_deferred_init_failure(tid, row.get("deferred_init_failure")) is not None
+            ):
+                continue
+            if row.get("kept_until") is not None:
+                continue
+            if row.get("ephemeral") and not ephemeral_service.is_live_ephemeral_terminal(tid):
+                continue
+
+            exact = backend.cleanup_terminal_exact(tid, sess, win, close=False)
+            if getattr(exact, "outcome", None) != TerminalCleanupOutcome.STILL_PRESENT:
+                continue
+
+            attach_output_pipeline(tid, sess, win, replace_existing=True)
+            reattached += 1
+            status_monitor.seed_from_viewport(tid, sess, win)
+        except Exception as exc:  # noqa: BLE001 — one terminal must not stop the rest
+            logger.warning(
+                "Failed to re-attach surviving terminal %s (%s:%s): %s",
+                tid,
+                sess,
+                win,
+                exc,
+            )
+    if reattached:
+        logger.info("Re-attached output pipeline for %d surviving terminal(s)", reattached)
+    return reattached
 
 
 def _persist_deferred_init_failure(
