@@ -91,7 +91,8 @@ def commit_tag_and_push(root: Path, version: str, remote: str = "origin") -> str
         if state == "??" and not path.startswith("changelog.d/"):
             continue
         if state in (" D", "D ") and FRAGMENT_PATH.fullmatch(path):
-            deletions.append(path)
+            if state == " D":
+                deletions.append(path)
         elif path not in RELEASE_FILES or state == "??":
             stray.append(path)
     stray.sort()

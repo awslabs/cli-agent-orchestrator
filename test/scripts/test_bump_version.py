@@ -442,6 +442,7 @@ class TestFragmentCollection:
     ):
         (tree / "CHANGELOG.md").write_text(
             "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- Hand-written fix.\n\n"
+            "### Security\n\n- Hand-written security note.\n\n"
             "### Other\n\n- Keep other notes.\n\n## [1.0.0] - 2029-01-01\n\n- Old.\n"
         )
         directory = tree / "changelog.d"
@@ -455,6 +456,8 @@ class TestFragmentCollection:
         assert released.index("### Added") < released.index("### Fixed")
         assert released.index("- Hand-written fix.") < released.index("- Fragment fix. (#5)")
         assert released.index("- Fragment fix. (#5)") < released.index("### Other")
+        assert released.count("### Security\n\n") == 1
+        assert "- Hand-written security note." in released
         assert text.endswith("## [1.0.0] - 2029-01-01\n\n- Old.\n")
 
     def test_duplicate_hand_written_headings_collapse_and_exact_pr_number_is_cited(

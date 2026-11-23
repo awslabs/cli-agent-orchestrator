@@ -270,6 +270,37 @@ class TestWhatTheReleaseCommitMayCarry:
         assert rc.main(["--version", "1.0.1", "--repo-root", str(world.clone)]) == 1
         assert f"also changed: changelog.d/{name}" in capsys.readouterr().out
 
+    def test_staged_fragment_deletion_is_included_in_release_commit(self, world):
+        fragment = world.clone / "changelog.d" / "1350.Fixed.md"
+        fragment.parent.mkdir()
+        fragment.write_text("- Fixed.\n")
+        world.git("add", "-A")
+        world.git("commit", "-q", "-m", "add fragment")
+        world.git("push", "-q", "origin", "HEAD:refs/heads/main")
+        world.bump()
+        world.git("rm", "-q", "--", "changelog.d/1350.Fixed.md")
+        assert rc.main(["--version", "1.0.1", "--repo-root", str(world.clone)]) == 0
+        head = world.git("rev-parse", "HEAD")
+        assert world.remote("refs/heads/main") == head
+        assert "D\tchangelog.d/1350.Fixed.md" in world.git(
+            "diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD"
+        )
+
+    def test_renamed_fragment_is_refused_without_parsing_original_path_as_a_change(
+        self, world, capsys
+    ):
+        fragment = world.clone / "changelog.d" / "1350.Fixed.md"
+        fragment.parent.mkdir()
+        fragment.write_text("- Fixed.\n")
+        world.git("add", "-A")
+        world.git("commit", "-q", "-m", "add fragment")
+        world.bump()
+        world.git("mv", "changelog.d/1350.Fixed.md", "changelog.d/1350.Changed.md")
+        assert rc.main(["--version", "1.0.1", "--repo-root", str(world.clone)]) == 1
+        error = capsys.readouterr().out
+        assert "also changed: changelog.d/1350.Changed.md" in error
+        assert error.strip().endswith("also changed: changelog.d/1350.Changed.md")
+
     def test_a_stray_change_is_refused_before_anything_is_committed(self, world, capsys):
         world.bump()
         (world.clone / "README.md").write_text("tampered\n", encoding="utf-8")
