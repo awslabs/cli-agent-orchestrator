@@ -18,6 +18,15 @@ class TerminalBackendError(Exception):
     pass
 
 
+class InputNotSentError(TerminalBackendError):
+    """A delivery failed before any text reached the terminal.
+
+    Resending cannot duplicate it, so a queued message may be retried
+    (reply-delivery-failure D4). Any other failure while sending is treated as
+    "may have arrived".
+    """
+
+
 class TerminalNotFoundError(TerminalBackendError):
     """Raised when a terminal/pane cannot be found or resolved."""
 
