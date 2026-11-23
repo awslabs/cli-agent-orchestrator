@@ -48,7 +48,7 @@ def canonical_root(root: Union[str, Path]) -> Optional[str]:
     try:
         return os.path.realpath(os.path.abspath(raw))
     except (OSError, ValueError) as exc:
-        logger.warning("Could not canonicalize plugin root '%s': %s", root, exc)
+        logger.warning("Could not canonicalize plugin root %r: %s", root, exc)
         return None
 
 
@@ -93,7 +93,7 @@ def resolve_within_root(
         # resolves as far as it can instead of raising.
         candidate_real = os.path.realpath(os.path.abspath(raw))
     except (OSError, ValueError) as exc:
-        logger.debug("Could not canonicalize '%s' under '%s': %s", candidate, root, exc)
+        logger.debug("Could not canonicalize %r under %r: %s", candidate, root, exc)
         return None
 
     if candidate_real == root_real:
