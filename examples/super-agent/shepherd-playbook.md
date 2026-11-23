@@ -68,6 +68,8 @@ The supervisor posts each loop result to your inbox as `WAKE <report> [retry=<re
 (with a `[from tick_supervisor …]` note). A WAKE the inbox refused is kept and posted again later,
 so it can arrive late, and at most once more. Then:
 1. **Lease check** (§Writer lease); on `WAKE … not_writer`, report BLOCKED and stop.
+   On a WAKE that says the supervisor stopped (`LOOP_ERROR`), report `BLOCKED` with its last
+   error to the conductor and stop; never start the loop yourself.
    **Resource line:** `python3 KIT/bin/resource_gate.py --json`; append
    `- <UTC> (shepherd <id>): resources <verdict> <reasons>` to `PB/log.md` (`state_write.py --append`).
 2. **Drain your inbox** (`GET $API/terminals/$CAO_TERMINAL_ID/inbox/messages?status=pending&limit=100`):
@@ -81,8 +83,9 @@ so it can arrive late, and at most once more. Then:
 6. **Triage** what's left (§3). Dispatch, verify and publish under §5.
 7. **Report** one consolidated message to the conductor, or nothing on a no-op. Log the send in
    `PB/log.md` (`state_write.py --append`).
-8. **End the turn. Don't start or restart the loop:** the supervisor restarts it by itself, and a
-   second loop means duplicate wakes. If wakes stop, tell the conductor.
+8. **End the turn. Don't start or restart the loop:** when it is running, the supervisor restarts
+   the loop. A second loop means duplicate wakes. Check `PB/state/tick_supervisor.stopped` for
+   `NOT_WRITER` or `LOOP_ERROR` if the supervisor stops, and tell the conductor.
 
 ## 3. Event → action (our PRs)
 | Event | Action |

@@ -28,6 +28,7 @@ CPB, PSH, CCO = "../conductor-playbook.md", "../agents/pr_shepherd.md.tmpl", "..
 ARM_T = "../templates/automerge-armer.md"
 PWS = "../pr-watch/tick_supervisor.sh"
 PWR = "../pr-watch/README.md"
+PWL = "../pr-watch/tick_loop.sh"
 M = [
     # check_mandate.py
     ("cm_paused", CM, [('if doc.get("paused") is not False:', "if False:")]),
@@ -704,7 +705,16 @@ M = [
     ("pw_sup_newest_first", PWS, [('    print(rows[0])\n', '    print(rows[-1])\n')]),
     ("pw_sup_loop_while_pending", PWS, [('    log "pending WAKE still undelivered; no new loop yet"; pause "${SUPERVISOR_ERROR_SLEEP:-60}"; stop_if_asked; continue\n',
                                          '    log "pending WAKE still undelivered; no new loop yet"; pause "${SUPERVISOR_ERROR_SLEEP:-60}"; stop_if_asked\n')]),
-    ("pw_sup_not_writer_unrecorded", PWS, [('log "$NOTE"; printf \'%s\\n\' "$NOTE" > "$STOPPED"; echo "$NOTE"', 'log "$NOTE"; echo "$NOTE"')]),
+    ("pw_sup_not_writer_unrecorded", PWS, [('NOTE="NOT_WRITER $(date -u +%Y-%m-%dT%H:%M:%SZ): the writer lease moved; supervisor stopped; $WHERE"\n    log "$NOTE"; printf \'%s\\n\' "$NOTE" > "$STOPPED"; echo "$NOTE"',
+                                          'NOTE="NOT_WRITER $(date -u +%Y-%m-%dT%H:%M:%SZ): the writer lease moved; supervisor stopped; $WHERE"\n    log "$NOTE"; echo "$NOTE"')]),
+    ("pw_sup_error_no_backoff", PWS, [('    ERROR_PAUSE=$((ERROR_PAUSE * 2))', '    ERROR_PAUSE=$((ERROR_PAUSE * 1))')]),
+    ("pw_sup_error_no_stop", PWS, [('  if [ "$ERRORS" -ge 5 ]; then\n    if pend check', '  if [ "$ERRORS" -ge 500 ]; then\n    if pend check')]),
+    ("pw_sup_error_stop_twice", PWS, [('    deliver_to "$SENDER" "$NOTE" || log "conductor stop notice could not be delivered"',
+                                         '    deliver_to "$SENDER" "$NOTE" || log "conductor stop notice could not be delivered"\n    deliver_to "$SENDER" "$NOTE"')]),
+    ("pw_sup_error_restart_note", PWS, [('the supervisor stopped; report BLOCKED to the conductor; do NOT start a loop yourself',
+                                           'the loop restarts by itself; do NOT start a loop yourself')]),
+    ("pw_loop_poll_error_zero", PWL, [('case "$REASON" in poll_errors=*) exit 2;; esac', 'case "$REASON" in poll_errors=*) exit 0;; esac')]),
+    ("pw_loop_sleep_inherits_stdout", PWL, [('sleep "$1" >/dev/null 2>&1 & wait $!', 'sleep "$1" & wait $!')]),
     ("doc_pub_rerun_branch_unsourced", PUB, [("14. H=$(gh pr view {pr} -R {repo} --json headRefName --jq .headRefName) || exit 1; ", "14. ")]),
     ("doc_cpb_new_ok_no_tier", CPB, [("a `source`, a `tier` (1, or\n     2 when its use needs a reading of text; a missing tier refuses), and", "a `source`, and")]),
     ("doc_pwr_no_write_ahead", PWR, [("(fsync'd) **before** the first delivery\nattempt", "after the delivery\nattempts fail")]),
@@ -725,7 +735,8 @@ TEST_FOR = {CM: ["test_check_mandate.py", "test_publisher_push.py", "test_holds.
             SS: ST_ALL + ["test_heavy_slots.py"], MJ: ["test_docs.py"], RM: ["test_docs.py"],
             PUB: ["test_docs.py", "test_publisher_push.py"] + REVIEW, SPB: ["test_docs.py"] + REVIEW,
             CPB: ["test_docs.py"], PSH: ["test_docs.py"], CCO: ["test_docs.py"], ARM_T: ["test_docs.py"] + REVIEW,
-            PWS: ["../pr-watch/tests/test_supervisor_deliver.py"], PWR: ["test_docs.py"]}
+            PWS: ["../pr-watch/tests/test_supervisor_deliver.py"], PWR: ["test_docs.py"],
+            PWL: ["../pr-watch/tests/test_loop.py", "../pr-watch/tests/test_supervisor_deliver.py"]}
 DOC_FILES = ("README.md", "conductor-playbook.md", "shepherd-playbook.md")
 DOC_DIRS = ("agents", "templates", "rules")
 

@@ -43,6 +43,10 @@ regular file (a directory, a symlink, unreadable), the supervisor logs one `STOP
 unusable` line, exits 4 and leaves it as it is. On `not_writer` it stops with exit 3 and writes one
 `NOT_WRITER …` line to its log and to `state/tick_supervisor.stopped`; if the inbox was down, that
 line says the notice is waiting in the pending file.
+After five consecutive error exits, the supervisor stops with exit 2, writes one `LOOP_ERROR …`
+line to the same stop file and sends the conductor a stop notice. Error pauses double from 5 seconds
+to the poll interval, resetting after a clean exit. A final error wake tells the shepherd to report
+BLOCKED instead of claiming the loop will restart.
 
 ## The digest
 Quiet updates (activity outside the wake scope) go into `state/digest-pending.json` and
@@ -54,7 +58,8 @@ The conductor starts `tick_supervisor.sh`, after the shepherd reports READY and 
 `pgrep -fl tick_loop.sh` prints nothing (`conductor-playbook.md` §9). The supervisor runs the loop
 detached, so the loop doesn't die with an agent's background job, and a wake isn't lost when an
 agent's turn ends. It writes `state/tick_supervisor.pid` and stops for good on `not_writer` (the
-writer lease moved to another host). To replace the shepherd, stop the supervisor first, then the
+writer lease moved to another host), or on `LOOP_ERROR` (five consecutive error exits). To replace
+the shepherd, stop the supervisor first, then the
 loop. The loop's lock is left in place after a `kill -9`, on purpose: check that its PID no longer
 runs the watcher, then remove the exact `state/tick_loop.lock/pid` file and `rmdir` the lock
 directory.

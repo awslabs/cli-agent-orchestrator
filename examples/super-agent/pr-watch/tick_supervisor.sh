@@ -13,6 +13,8 @@
 # supervisor (exit 4) and is left as it is; blank lines in it are skipped, never posted.
 # Stops for good on not_writer (the lease moved): the notice goes to the shepherd, or waits in the
 # pending file, and one NOT_WRITER line goes to the log and to state/tick_supervisor.stopped.
+# Five consecutive error exits stop the supervisor with one LOOP_ERROR notice. Error pauses double
+# from SUPERVISOR_SLEEP (default 5 seconds) up to INTERVAL, and a clean exit resets the pause.
 # Never prints env values.
 set -u
 PB=$(cd -- "$(dirname -- "$0")" && pwd) || exit 2
@@ -43,8 +45,8 @@ trap 'STOP_REQ=1' TERM INT  # acted on between steps: a WAKE already kept stays 
 stop_if_asked() { if [ "$STOP_REQ" = 1 ]; then rm -f -- "$PIDF"; log "supervisor exit"; exit 0; fi; }
 pause() { sleep "$1" & wait $! 2>/dev/null; }  # a TERM ends the wait at once
 
-deliver() {  # $1 = message; POST to the shepherd's CAO inbox (delivered when it is idle)
-  python3 - "$API" "$SHEPHERD" "$SENDER" "$1" <<'PY' >> "$LOG" 2>&1
+deliver_to() {
+  python3 - "$API" "$1" "$SENDER" "$2" <<'PY' >> "$LOG" 2>&1
 import sys, urllib.parse, urllib.request
 api, to, sender, msg = sys.argv[1:5]
 q = urllib.parse.urlencode({"sender_id": sender, "message": msg})
@@ -54,6 +56,8 @@ with urllib.request.urlopen(req, timeout=15) as r:
     sys.exit(0 if 200 <= r.status < 300 else 1)  # urlopen already raises on any other final status
 PY
 }
+
+deliver() { deliver_to "$SHEPHERD" "$1"; }
 
 pend() {  # the pending file: check | append MSG | first (3: none) | drop. Exit 4 = the path is unusable.
   python3 -I - "$PENDING" "$@" <<'PY'
@@ -148,6 +152,8 @@ flush_pending() {  # 0 when nothing is left pending; oldest line first, each rem
 
 log "supervisor start pid $$ shepherd=$SHEPHERD"
 CYCLE=0
+ERRORS=0
+ERROR_PAUSE="${SUPERVISOR_SLEEP:-5}"
 while true; do
   CYCLE=$((CYCLE + 1))
   if [ "$CYCLES" -gt 0 ] && [ "$CYCLE" -gt "$CYCLES" ]; then rm -f -- "$PIDF"; log "supervisor exit (cycles)"; exit 0; fi
@@ -160,8 +166,20 @@ while true; do
   OUT=$(CAO_TERMINAL_ID="$SHEPHERD" bash "$PB/tick_loop.sh" 2>>"$LOG"); RC=$?
   LINE=$(printf '%s\n' "$OUT" | grep -m1 '^WAKE ' || true)
   log "loop exit rc=$RC ${LINE:-no WAKE line}"
+  if [ "$RC" -ne 0 ]; then
+    ERRORS=$((ERRORS + 1))
+    REASON="${LINE##* :: }"
+    [ -n "$LINE" ] || REASON="exit_status_$RC"
+  else
+    ERRORS=0
+    ERROR_PAUSE="${SUPERVISOR_SLEEP:-5}"
+  fi
   if [ -n "$LINE" ]; then
-    MSG="$LINE  [from tick_supervisor: the loop now runs under the conductor's supervisor and restarts by itself; handle this wake per shepherd-playbook §2 but do NOT start a loop yourself]"
+    if [ "$ERRORS" -ge 5 ]; then
+      MSG="$LINE  [from tick_supervisor: the supervisor stopped; report BLOCKED to the conductor; do NOT start a loop yourself]"
+    else
+      MSG="$LINE  [from tick_supervisor: the loop runs under the conductor's supervisor; handle this wake per shepherd-playbook §2 but do NOT start a loop yourself]"
+    fi
     pend_or_stop append "$MSG" && log "kept WAKE in $PENDING before delivery"  # write-ahead
     flush_pending || log "deliver failed; the WAKE stays kept for the next cycle"
   fi
@@ -171,13 +189,20 @@ while true; do
     log "$NOTE"; printf '%s\n' "$NOTE" > "$STOPPED"; echo "$NOTE"
     rm -f -- "$PIDF"; exit 3;;
   esac
-  if [ "$RC" -ne 0 ] && case "$LINE" in "WAKE none :: "*) true;; *) false;; esac; then
+  if [ "$ERRORS" -ge 5 ]; then
     if pend check 2>/dev/null && [ -f "$PENDING" ]; then WHERE="the error wake waits in $PENDING"; else WHERE="the shepherd was told"; fi
-    NOTE="LOOP_ERROR $(date -u +%Y-%m-%dT%H:%M:%SZ): ${LINE#WAKE none :: }; supervisor stopped; $WHERE"
+    NOTE="LOOP_ERROR $(date -u +%Y-%m-%dT%H:%M:%SZ): $REASON; supervisor stopped; $WHERE"
     log "$NOTE"; printf '%s\n' "$NOTE" > "$STOPPED"; echo "$NOTE"
+    deliver_to "$SENDER" "$NOTE" || log "conductor stop notice could not be delivered"
     rm -f -- "$PIDF"; exit 2
   fi
   stop_if_asked
-  if [ "$RC" -ne 0 ] && [ -z "$LINE" ]; then pause "${SUPERVISOR_ERROR_SLEEP:-60}"; else pause "${SUPERVISOR_SLEEP:-5}"; fi
+  if [ "$RC" -ne 0 ]; then
+    pause "$ERROR_PAUSE"
+    ERROR_PAUSE=$((ERROR_PAUSE * 2))
+    [ "$ERROR_PAUSE" -le "${INTERVAL:-1800}" ] || ERROR_PAUSE="${INTERVAL:-1800}"
+  else
+    pause "${SUPERVISOR_SLEEP:-5}"
+  fi
   stop_if_asked
 done

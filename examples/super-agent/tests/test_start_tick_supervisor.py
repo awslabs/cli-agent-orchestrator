@@ -2,11 +2,37 @@
 import os
 import select
 import signal
+import shutil
 import subprocess
 import sys
 import time
 
 from conftest import KIT
+
+
+def test_launcher_runs_the_real_supervisor_with_its_own_pid_file(tmp_path):
+    pb = tmp_path / 'pr-watch'
+    (pb / 'state').mkdir(parents=True)
+    target = pb / 'tick_supervisor.sh'
+    shutil.copyfile(KIT / 'pr-watch' / 'tick_supervisor.sh', target)
+    target.chmod(0o755)
+    (pb / 'tick_loop.sh').write_text('#!/bin/bash\nexit 0\n')
+    env = os.environ.copy()
+    env.update(CAO_API='http://127.0.0.1:1', SHEPHERD_ID='test-shepherd', SENDER_ID='test-conductor',
+               SUPERVISOR_CYCLES='1', SUPERVISOR_SLEEP='0')
+    result = subprocess.run([sys.executable, str(KIT / 'bin' / 'start_tick_supervisor.py'),
+                             str(target)], env=env, capture_output=True, text=True, timeout=5)
+    assert result.returncode == 0, result.stderr
+    pid_file = pb / 'state' / 'tick_supervisor.pid'
+    log = pb / 'state' / 'tick_supervisor.log'
+    try:
+        end = time.monotonic() + 5
+        while (not log.exists() or 'loop exit rc=0' not in log.read_text()) and time.monotonic() < end:
+            time.sleep(.03)
+        assert log.exists() and 'loop exit rc=0' in log.read_text()
+    finally:
+        if pid_file.exists():
+            os.kill(int(pid_file.read_text()), signal.SIGTERM)
 
 
 def test_launcher_writes_the_pid_then_executes_in_a_new_session(tmp_path):

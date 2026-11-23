@@ -18,7 +18,7 @@ LOCK=state/tick_loop.lock
 trap '"$PYTHON" "$SCRIPT_DIR/config.py" --loop-unlock "$$" >/dev/null 2>&1' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-pause() { sleep "$1" & wait $!; }
+pause() { sleep "$1" >/dev/null 2>&1 & wait $!; }
 
 ts() { date -u +%Y-%m-%dT%H%M%SZ; }
 error_count() {
@@ -38,6 +38,7 @@ emit_wake() {
   # Retire only after emitting the handover; a crash earlier preserves the queue and the wake
   # journal, so the next start replays this WAKE (at most one repeat).
   "$PYTHON" "$SCRIPT_DIR/digest_store.py" --delivered "$FILTER_REPORT" "${1:+${1#*=}}" || exit 2
+  case "$REASON" in poll_errors=*) exit 2;; esac
   exit 0
 }
 replay() {

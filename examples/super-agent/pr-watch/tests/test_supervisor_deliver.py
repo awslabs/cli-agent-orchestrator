@@ -11,6 +11,7 @@ import urllib.parse
 import pytest
 
 from conftest import SOURCE
+from test_loop import setup as setup_loop
 
 WAKE = "WAKE reports/tick-x.json :: pr#9:new own PR"
 NOT_WRITER = "WAKE none :: not_writer"
@@ -156,15 +157,135 @@ def test_a_first_try_success_posts_once_and_keeps_nothing(tmp_path, inbox):
     assert not (pb / "state" / "tick_supervisor.pending").exists()
 
 
-def test_a_start_error_wake_posts_once_then_stops_the_supervisor(tmp_path, inbox):
+def test_five_start_error_wakes_then_stop_the_supervisor(tmp_path, inbox):
     handler, api = inbox
     pb = tree(tmp_path, "WAKE none :: configuration_error", rc=2)
-    r = supervise(pb, api, cycles=4, tries=1)
+    (pb / "tick_loop.sh").write_text('''#!/bin/bash
+echo run >> "$(dirname "$0")/state/stub_runs"
+echo 'WAKE none :: configuration_error'
+exit 2
+''')
+    r = supervise(pb, api, cycles=6, tries=1)
     assert r.returncode == 2, r.stdout + r.stderr
-    assert runs(pb) == 1 and len(messages(handler)) == 1
+    assert runs(pb) == 5 and len(messages(handler)) == 6
+    assert handler.received[-1][0] == f"/terminals/{env_for(api, 0, 1)['SENDER_ID']}/inbox/messages"
+    assert messages(handler)[-1].startswith("LOOP_ERROR ")
     stopped = (pb / "state" / "tick_supervisor.stopped").read_text()
     assert "LOOP_ERROR " in stopped and "configuration_error" in stopped
     assert not (pb / "state" / "tick_supervisor.pid").exists()
+
+
+def test_error_wakes_back_off_then_stop_with_one_notice(tmp_path, inbox):
+    handler, api = inbox
+    pb = tree(tmp_path, "WAKE reports/retry.wake.json :: poll_errors=1/1", rc=2)
+    (pb / "tick_loop.sh").write_text('''#!/bin/bash
+echo run >> "$(dirname "$0")/state/stub_runs"
+echo 'WAKE reports/retry.wake.json :: poll_errors=1/1'
+exit 2
+''')
+    sleep_dir = tmp_path / "bin"
+    sleep_dir.mkdir()
+    (sleep_dir / "sleep").write_text(f'#!/bin/bash\necho "$1" >> "{tmp_path}/pauses"\n')
+    (sleep_dir / "sleep").chmod(0o755)
+    env = env_for(api, 6, 1)
+    env.update(PATH=f"{sleep_dir}:/usr/bin:/bin", SUPERVISOR_SLEEP="5", INTERVAL="40")
+    result = subprocess.run(["bash", str(pb / "tick_supervisor.sh")], env=env,
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert runs(pb) == 5
+    assert [message.split("  [")[0] for message in messages(handler)[:5]] == [
+        "WAKE reports/retry.wake.json :: poll_errors=1/1"] * 5
+    assert len([message for message in messages(handler) if message.startswith("LOOP_ERROR")]) == 1
+    assert (tmp_path / "pauses").read_text().splitlines() == ["5", "10", "20", "40"]
+    assert "supervisor stopped; report BLOCKED" in messages(handler)[4]
+
+
+def test_a_clean_exit_resets_the_error_backoff(tmp_path, inbox):
+    _, api = inbox
+    pb = tree(tmp_path)
+    (pb / "tick_loop.sh").write_text('''#!/bin/bash
+S="$(dirname "$0")/state"; echo run >> "$S/stub_runs"
+case "$(wc -l < "$S/stub_runs")" in
+1|2|4) echo 'WAKE reports/error.json :: rule_error'; exit 2;;
+esac
+exit 0
+''')
+    sleep_dir = tmp_path / "bin"
+    sleep_dir.mkdir()
+    (sleep_dir / "sleep").write_text(f'#!/bin/bash\necho "$1" >> "{tmp_path}/pauses"\n')
+    (sleep_dir / "sleep").chmod(0o755)
+    env = env_for(api, 5, 1)
+    env.update(PATH=f"{sleep_dir}:/usr/bin:/bin", SUPERVISOR_SLEEP="5", INTERVAL="40")
+    result = subprocess.run(["bash", str(pb / "tick_supervisor.sh")], env=env,
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "pauses").read_text().splitlines() == ["5", "10", "5", "5", "5"]
+
+
+def test_real_loop_with_failing_gh_stops_after_five_wakes(tmp_path, inbox):
+    handler, api = inbox
+    pb = tree(tmp_path)
+    env = setup_loop(pb, [{"errors": [{"error": "unauthorized"}]}])
+    shutil.copyfile(SOURCE / "tick_supervisor.sh", pb / "tick_supervisor.sh")
+    helper = pb.parent / "bin"
+    helper.mkdir()
+    for name in ("writer_lease.py", "workplace.py"):
+        shutil.copyfile(SOURCE.parent / "bin" / name, helper / name)
+    shutil.copyfile(SOURCE.parent / "workplace.json", pb.parent / "workplace.json")
+    (pb / "poll.py").write_text('''import json, subprocess
+result = subprocess.run(['gh', 'api', 'user'], capture_output=True)
+print(json.dumps({'polled_at': '2026-11-09T00:00Z',
+                  'errors': [{'error': 'unauthorized'}] if result.returncode else []}))
+''')
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    (stubs / "gh").write_text('#!/bin/sh\nexit 1\n')
+    (stubs / "sleep").write_text(f'#!/bin/sh\necho "$1" >> "{tmp_path}/pauses"\n')
+    for name in ("gh", "sleep"):
+        (stubs / name).chmod(0o755)
+    env.update(env_for(api, 6, 1))
+    env.update(PATH=f"{stubs}:/usr/bin:/bin", INTERVAL="40", RETRY_DELAY="0",
+               SUPERVISOR_SLEEP="5")
+    result = subprocess.run(["bash", str(pb / "tick_supervisor.sh")], env=env,
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert len([message for message in messages(handler) if message.startswith("WAKE") and
+                "poll_errors=1/1" in message]) == 5
+    assert len([message for message in messages(handler) if message.startswith("LOOP_ERROR")]) == 1
+    assert (tmp_path / "pauses").read_text().splitlines().count("5") == 1
+    assert [pause for pause in (tmp_path / "pauses").read_text().splitlines() if pause != "0"] == [
+        "5", "10", "20", "40"]
+
+
+def test_supervisor_and_loop_stop_during_interval_sleep(tmp_path, inbox):
+    _, api = inbox
+    pb = tree(tmp_path)
+    env = setup_loop(pb, [{"polled_at": "2026-11-09T00:00Z", "errors": []}])
+    shutil.copyfile(SOURCE / "tick_supervisor.sh", pb / "tick_supervisor.sh")
+    helper = pb.parent / "bin"
+    helper.mkdir()
+    for name in ("writer_lease.py", "workplace.py"):
+        shutil.copyfile(SOURCE.parent / "bin" / name, helper / name)
+    shutil.copyfile(SOURCE.parent / "workplace.json", pb.parent / "workplace.json")
+    env.update(env_for(api, 0, 1))
+    env.update(INTERVAL="8", RETRY_DELAY="0")
+    proc = subprocess.Popen(["bash", str(pb / "tick_supervisor.sh")], env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    loop_pid = None
+    try:
+        lock_pid = pb / "state" / "tick_loop.lock" / "pid"
+        assert wait_for(lambda: lock_pid.exists())
+        loop_pid = int(lock_pid.read_text().strip())
+        assert wait_for(lambda: subprocess.run(["pgrep", "-P", str(loop_pid), "-x", "sleep"],
+                                               capture_output=True).returncode == 0)
+        proc.terminate()
+        os.kill(loop_pid, signal.SIGTERM)
+        assert wait_for(lambda: proc.poll() is not None and
+                        not (pb / "state" / "tick_supervisor.pid").exists(), timeout=3)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait(timeout=15)
 
 
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGKILL])

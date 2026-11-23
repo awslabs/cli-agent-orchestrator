@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 
-SOURCE=Path(__file__).resolve().parents[1]
+SOURCE=Path(os.environ.get('PR_WATCH_SOURCE',Path(__file__).resolve().parents[1]))
 
 def setup(tmp_path, reports):
     for name in ['tick_loop.sh','config.py','digest_store.py','wake_rules.py']:
@@ -70,7 +70,12 @@ def test_term_during_the_interval_sleep_exits_without_waiting_for_the_interval(t
         end=time.monotonic()+5
         while not lock.exists() and time.monotonic() < end: time.sleep(.02)
         assert lock.exists()
-        time.sleep(.2)
+        end=time.monotonic()+5
+        while time.monotonic() < end:
+            children=subprocess.run(['pgrep','-P',str(p.pid),'-x','sleep'],capture_output=True,text=True)
+            if children.returncode == 0: break
+            time.sleep(.02)
+        assert children.returncode == 0
         p.terminate()
         p.wait(timeout=3)
     finally:
@@ -94,11 +99,49 @@ def test_retry_preserves_both_reports_and_digest(tmp_path):
 
 def test_persistent_poll_errors_wake(tmp_path):
     env=setup(tmp_path,[{'polled_at':'2026-11-09T00:00Z','errors':[{'error':'partial'}]}])
-    p=run(tmp_path,env);assert p.returncode==0;assert 'poll_errors=1/1' in p.stdout
+    p=run(tmp_path,env);assert p.returncode==2;assert 'poll_errors=1/1' in p.stdout
+
+def test_every_error_wake_exits_nonzero(tmp_path):
+    for reason, replacement in [('filter_error', 'digest_store.py'), ('rule_error', 'wake_rules.py'),
+                                ('delivered_error', 'digest_store.py')]:
+        case=tmp_path/reason/'pr-watch';(case/'state').mkdir(parents=True)
+        helper=case.parent/'bin';helper.mkdir()
+        shutil.copyfile(SOURCE.parent/'bin/writer_lease.py',helper/'writer_lease.py')
+        shutil.copyfile(SOURCE.parent/'bin/workplace.py',helper/'workplace.py')
+        shutil.copyfile(SOURCE.parent/'workplace.json',case.parent/'workplace.json')
+        env=setup(case,[{'polled_at':'2026-11-09T00:00Z','errors':[],
+                         'new_issues':[{'number':1}]},
+                        {'polled_at':'2026-11-09T01:00Z','errors':[],
+                         'unwatched_open_prs':[{'number':2,'author':'your-login'}]}])
+        original=case/replacement
+        original.rename(case/(replacement+'.original'))
+        if reason in ('delivered_error', 'filter_error'):
+            failure = "'--delivered' in sys.argv" if reason == 'delivered_error' else "not any(a.startswith('--') for a in sys.argv[1:])"
+            original.write_text(f'''import subprocess,sys
+if {failure}: sys.exit(2)
+sys.exit(subprocess.call([sys.executable,{str(case/(replacement+'.original'))!r},*sys.argv[1:]]))
+''')
+        elif reason == 'rule_error':
+            original.write_text(f'''import sys
+if __name__ == '__main__': sys.exit(2)
+exec(compile(open({str(case/(replacement+'.original'))!r}).read(), {str(case/(replacement+'.original'))!r}, 'exec'))
+''')
+        else:
+            original.write_text('import sys\nsys.exit(2)\n')
+        result=run(case,env)
+        assert result.returncode == 2 and reason.replace('delivered_error','WAKE') in result.stdout
 
 def test_bad_configuration_reports_error(tmp_path):
     env=setup(tmp_path,[]);(tmp_path/'config.json').write_text('bad json')
     p=run(tmp_path,env);assert p.returncode==2;assert 'configuration_error' in p.stdout
+
+def test_lock_replaces_a_live_pid_that_is_not_a_loop(tmp_path):
+    env=setup(tmp_path,[]);lock=tmp_path/'state/tick_loop.lock';lock.mkdir(parents=True)
+    (lock/'pid').write_text(f'{os.getpid()}\n')
+    result=subprocess.run([sys.executable,str(tmp_path/'config.py'),'--loop-lock','42'],
+                          env=env,capture_output=True,text=True,timeout=5)
+    assert result.returncode == 0 and 'removed stale tick loop lock' in result.stdout
+    assert (lock/'pid').read_text() == '42\n'
 
 def test_24h_catchup_delivers_once(tmp_path):
     env=setup(tmp_path,[{'polled_at':'2026-11-09T01:00Z','errors':[]}]);(tmp_path/'state').mkdir(exist_ok=True)

@@ -186,12 +186,14 @@ outside state first, so no action runs twice.
 6. Make sure the shepherd is alive; if it isn't, replace it (§9). If only the supervisor is gone,
    check `PB/state/tick_loop.lock`: if its PID is not a live `tick_loop.sh`, run
    `python3 PB/config.py --loop-lock <checked pid>` then `--loop-unlock <checked pid>` to clear the stale lock,
-   and start the supervisor again (§9 First start step 4), unless its log says `not_writer`: then the lease moved (§Writer lease).
+   and start the supervisor again (§9 First start step 4), unless its stopped file says `NOT_WRITER`
+   (the lease moved; §Writer lease) or `LOOP_ERROR` (inspect the last error and fix the cause first).
 
 ## 9. Starting the shepherd and its tick supervisor
 You own the tick loop, not the shepherd. `PB/tick_supervisor.sh` runs `tick_loop.sh` detached, posts
 each WAKE to the shepherd's inbox and restarts the loop itself; it is keyed to `SHEPHERD_ID`, writes
-`PB/state/tick_supervisor.pid` and stops for good on `not_writer`. Why: a loop run as an agent's
+`PB/state/tick_supervisor.pid` and stops for good on `not_writer` or after five consecutive error
+exits (`LOOP_ERROR` in `PB/state/tick_supervisor.stopped`). Why: a loop run as an agent's
 background job dies with that job, or loses its wake when the agent's turn ends.
 
 **First start:**
@@ -206,7 +208,7 @@ background job dies with that job, or loses its wake when the agent's turn ends.
 4. After `SHEPHERD READY <id> …`, start the supervisor from a **script file** in `KIT/work/` (an
    inline guard matches its own command text):
    `env -i HOME="$HOME" USER="$USER" LOGNAME="$LOGNAME" LANG="$LANG" PATH="$PATH" SHEPHERD_ID=<shepherd id> SENDER_ID=$CAO_TERMINAL_ID python3 KIT/bin/start_tick_supervisor.py PB/tick_supervisor.sh`.
-   Check the pid file names a live `tick_supervisor.sh`; if no pid file appears, read
+   Check the pid file names a live `tick_supervisor.sh`; if it does not, read
    `PB/state/tick_supervisor.launch.log`, fix the reported error, and do not retry blindly. Tell the user the shepherd's window name;
    expect quiet until a real event.
 
@@ -214,6 +216,7 @@ background job dies with that job, or loses its wake when the agent's turn ends.
 1. Ask the old shepherd, if alive, to write its state and a handover file. It rightly refuses to
    stop the loop: it didn't start it.
 2. `kill -TERM` the supervisor (the pid file's pid, args checked), then the loop (its `pgrep` pid,
-   args checked). Bash defers TERM until the running `poll.py` ends (up to about 2 min). Confirm the
+   args checked). TERM ends an interval sleep promptly, but a running `poll.py` can take about
+   2 minutes to finish. Confirm the
    pid file and `PB/state/tick_loop.lock` are gone and `pgrep` prints nothing.
 3. `delete_terminal` the old shepherd (§7), then First start steps 3–4 with `--from <old shepherd id>`.

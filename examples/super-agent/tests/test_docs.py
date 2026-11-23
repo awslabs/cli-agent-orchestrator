@@ -1,5 +1,6 @@
 """Contract checks on the profiles, playbooks and templates."""
 import json
+from pathlib import Path
 import re
 import subprocess
 
@@ -63,11 +64,20 @@ def test_shepherd_setup_order():
 def test_supervisor_start_uses_the_portable_launcher_and_checks_stale_locks():
     start = section(text("conductor-playbook.md"), "## 9. Starting the shepherd")
     assert "start_tick_supervisor.py" in start and "setsid" not in start
-    assert "tick_loop.lock" in start and "no pid file appears" in start
+    assert "tick_loop.lock" in start and "if it does not, read" in start
+
+
+def test_supervisor_stop_is_explained_to_both_agents():
+    conductor = text("conductor-playbook.md")
+    shepherd = section(text("shepherd-playbook.md"), "## 2. On each wake")
+    assert "LOOP_ERROR" in conductor and "LOOP_ERROR" in shepherd
+    assert "report `BLOCKED`" in shepherd
+    assert "TERM ends an interval sleep promptly" in conductor
+    assert "if it does not, read" in conductor
 
 
 def test_blog_names_the_real_automerge_gate_and_the_missing_dashboard():
-    blog = (KIT.parents[1] / "docusaurus/blog/2026-11-09-dark-factory-with-cao/index.md").read_text()
+    blog = (Path(__file__).resolve().parents[3] / "docusaurus/blog/2026-11-09-dark-factory-with-cao/index.md").read_text()
     assert "Gated by `automerge_gate.py`." in blog
     assert "cao-box dashboard" in blog and "isn't in the sample yet" in blog
 
