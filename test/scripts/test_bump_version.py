@@ -363,14 +363,14 @@ class TestMainRestoresTheLockWhenWritingTheChangelogFails:
             for rel in ("pyproject.toml", "uv.lock", FEATURE, "CHANGELOG.md")
         }
         new_changelog = bv.promoted_changelog(bv.bump("patch", _current(tree)))
-        write_bytes = Path.write_bytes
+        write_changelog = bv._write_changelog
 
-        def fail_only_the_new_changelog(path, data):
-            if path == bv.CHANGELOG and data == new_changelog:
+        def fail_only_the_new_changelog(data):
+            if data == new_changelog:
                 raise OSError("disk full")
-            return write_bytes(path, data)
+            return write_changelog(data)
 
-        monkeypatch.setattr(Path, "write_bytes", fail_only_the_new_changelog)
+        monkeypatch.setattr(bv, "_write_changelog", fail_only_the_new_changelog)
         uv = FakeUv(tree / "uv.lock", _moves_version(bv.bump("patch", _current(tree))))
         real = bv.update_uv_lock
         monkeypatch.setattr(bv, "update_uv_lock", lambda old, new: real(old, new, run=uv))
@@ -381,6 +381,120 @@ class TestMainRestoresTheLockWhenWritingTheChangelogFails:
 
         for rel, before in originals.items():
             assert (tree / rel).read_bytes() == before, rel
+
+
+class TestFragmentCollection:
+    def _run(self, tree, monkeypatch):
+        new = bv.bump("patch", _current(tree))
+        uv = FakeUv(tree / "uv.lock", _moves_version(new))
+        real = bv.update_uv_lock
+        with monkeypatch.context() as patch:
+            patch.setattr(bv, "update_uv_lock", lambda old, version: real(old, version, run=uv))
+            patch.setattr(sys, "argv", ["bump_version.py", "patch"])
+            bv.main()
+
+    def test_real_bump_collects_all_types_and_preserves_handwritten_notes(self, tree, monkeypatch):
+        directory = tree / "changelog.d"
+        directory.mkdir()
+        (directory / "README.md").write_text("Documentation.\n")
+        for kind in bv.FRAGMENT_TYPES:
+            for number in (20, 3):
+                (directory / f"{number}.{kind}.md").write_text(f"- {kind} #{number}.\n")
+        self._run(tree, monkeypatch)
+        text = (tree / "CHANGELOG.md").read_text()
+        assert text.count("- Hand-written release note.") == 1
+        positions = [
+            text.index(f"- {kind} #{number}.") for kind in bv.FRAGMENT_TYPES for number in (3, 20)
+        ]
+        assert positions == sorted(positions)
+        assert text.count("## [Unreleased]") == 1
+        assert sorted(path.name for path in directory.iterdir()) == ["README.md"]
+
+        self._run(tree, monkeypatch)
+        text = (tree / "CHANGELOG.md").read_text()
+        assert text.count("- Added #3.") == 1
+        assert text.count("- Hand-written release note.") == 1
+
+    @pytest.mark.parametrize("name", ["not-a-fragment.md", "14.Other.md", "14.Fixed.txt"])
+    def test_invalid_name_or_type_refuses_without_changes(self, tree, monkeypatch, name):
+        directory = tree / "changelog.d"
+        directory.mkdir()
+        (directory / name).write_text("- Note.\n")
+        before = {
+            path: path.read_bytes()
+            for path in (
+                tree / "CHANGELOG.md",
+                tree / "uv.lock",
+                tree / "pyproject.toml",
+                tree / FEATURE,
+                directory / name,
+            )
+        }
+        with pytest.raises(bv.ChangelogError, match="expected <PR>.<type>.md"):
+            self._run(tree, monkeypatch)
+        assert all(path.read_bytes() == content for path, content in before.items())
+
+    def test_invalid_content_refuses_without_changes(self, tree, monkeypatch):
+        directory = tree / "changelog.d"
+        directory.mkdir()
+        fragment = directory / "3.Fixed.md"
+        fragment.write_text("- First.\n- Second.\n")
+        before = {
+            path: path.read_bytes()
+            for path in (
+                tree / "CHANGELOG.md",
+                tree / "uv.lock",
+                tree / "pyproject.toml",
+                tree / FEATURE,
+                fragment,
+            )
+        }
+        with pytest.raises(bv.ChangelogError, match="expected one '- ' entry"):
+            self._run(tree, monkeypatch)
+        assert all(path.read_bytes() == content for path, content in before.items())
+
+    @pytest.mark.parametrize("failure", ["write", "replace", "delete"])
+    def test_midway_failure_restores_changelog_and_every_fragment(self, tree, monkeypatch, failure):
+        directory = tree / "changelog.d"
+        directory.mkdir()
+        fragments = [directory / "3.Added.md", directory / "4.Fixed.md"]
+        for fragment in fragments:
+            fragment.write_text("- Note.\n")
+        before = {
+            path: path.read_bytes()
+            for path in (
+                tree / "CHANGELOG.md",
+                tree / "uv.lock",
+                tree / "pyproject.toml",
+                tree / FEATURE,
+                *fragments,
+            )
+        }
+        if failure == "write":
+
+            def fail_write(content):
+                raise OSError("disk full")
+
+            monkeypatch.setattr(bv, "_write_changelog", fail_write)
+        elif failure == "replace":
+
+            def fail_replace(source, destination):
+                raise OSError("cannot replace changelog")
+
+            monkeypatch.setattr(bv.os, "replace", fail_replace)
+        else:
+            unlink = Path.unlink
+
+            def fail_second_fragment(path, *args, **kwargs):
+                if path == fragments[1]:
+                    raise OSError("cannot delete fragment")
+                return unlink(path, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "unlink", fail_second_fragment)
+        with pytest.raises(OSError):
+            self._run(tree, monkeypatch)
+        assert all(path.read_bytes() == content for path, content in before.items())
+        assert not list(tree.glob(".CHANGELOG-*"))
 
 
 class TestMainRefusesInvalidChangelogBeforeWriting:

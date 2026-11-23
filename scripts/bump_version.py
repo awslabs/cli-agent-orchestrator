@@ -3,7 +3,7 @@
 
 Bumps every place that carries the version, together: ``pyproject.toml``, ``uv.lock`` (the
 project's own entry) and the devcontainer feature, then promotes the hand-written
-``CHANGELOG.md`` Unreleased section.
+``CHANGELOG.md`` Unreleased section and collects ``changelog.d`` fragments.
 ``publish-to-pypi.yml``'s ``verify-release-version`` job refuses a tag unless all three
 agree (``scripts/assert_release_version.py``). ``release.yml`` used to skip ``uv.lock``,
 which is why 2.5.3 and 2.5.4 had to be bumped by hand in a PR (#899, #946).
@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import date
 from pathlib import Path
 from typing import Callable, Optional
@@ -27,6 +28,9 @@ PACKAGE = "cli-agent-orchestrator"
 
 REVISION_LINE = re.compile(r"(?m)^revision = \d+$")
 UNRELEASED_HEADING = re.compile(rb"(?m)^## \[Unreleased\](?P<newline>\r?\n|$)")
+NEXT_HEADING = re.compile(rb"(?m)^## \[")
+FRAGMENT_NAME = re.compile(r"([1-9][0-9]*)\.(Added|Changed|Deprecated|Removed|Fixed|Security)\.md")
+FRAGMENT_TYPES = ("Added", "Changed", "Deprecated", "Removed", "Fixed", "Security")
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
@@ -140,8 +144,40 @@ def _release_date() -> str:
     return date.today().isoformat()
 
 
-def promoted_changelog(new_version: str) -> bytes:
-    """Return the promoted hand-written Unreleased section without rewriting its contents."""
+def read_fragments() -> dict[Path, bytes]:
+    """Validate all fragments before changing any version carrier."""
+    directory = ROOT / "changelog.d"
+    fragments: dict[Path, bytes] = {}
+    if not directory.exists():
+        return fragments
+    for path in directory.iterdir():
+        if path.name == "README.md":
+            continue
+        match = FRAGMENT_NAME.fullmatch(path.name)
+        if match is None or not path.is_file():
+            raise ChangelogError(
+                f"Invalid changelog fragment {path.name!r}; expected <PR>.<type>.md "
+                f"with type in {', '.join(FRAGMENT_TYPES)}"
+            )
+        content = path.read_bytes()
+        try:
+            lines = content.decode("utf-8").strip().splitlines()
+        except UnicodeDecodeError as exc:
+            raise ChangelogError(
+                f"Invalid changelog fragment {path.name!r}: expected UTF-8"
+            ) from exc
+        if len(lines) != 1 or not re.fullmatch(r"- \S.*", lines[0]):
+            raise ChangelogError(
+                f"Invalid changelog fragment {path.name!r}: expected one '- ' entry"
+            )
+        fragments[path] = content
+    return fragments
+
+
+def promoted_changelog(new_version: str, fragments: Optional[dict[Path, bytes]] = None) -> bytes:
+    """Promote Unreleased and append fragments in type and PR order."""
+    if fragments is None:
+        fragments = read_fragments()
     before = CHANGELOG.read_bytes()
     matches = list(UNRELEASED_HEADING.finditer(before))
     if len(matches) != 1:
@@ -151,14 +187,48 @@ def promoted_changelog(new_version: str) -> bytes:
 
     match = matches[0]
     newline = match.group("newline") or b"\n"
+    next_heading = NEXT_HEADING.search(before, match.end())
+    section_end = next_heading.start() if next_heading else len(before)
+    section = before[match.end() : section_end]
+    if fragments:
+        entries: dict[str, list[tuple[int, bytes]]] = {kind: [] for kind in FRAGMENT_TYPES}
+        for path, content in fragments.items():
+            fragment_match = FRAGMENT_NAME.fullmatch(path.name)
+            assert fragment_match is not None
+            number, kind = fragment_match.groups()
+            entries[kind].append((int(number), content.decode("utf-8").strip().encode("utf-8")))
+        additions = b"".join(
+            b"### "
+            + kind.encode("ascii")
+            + newline
+            + newline.join(entry for _, entry in sorted(entries[kind]))
+            + newline
+            + newline
+            for kind in FRAGMENT_TYPES
+            if entries[kind]
+        )
+        section = section.rstrip(b"\r\n") + newline + newline + additions
     released = f"## [{new_version}] - {_release_date()}".encode("ascii")
     replacement = b"## [Unreleased]" + newline + newline + released + match.group("newline")
-    return before[: match.start()] + replacement + before[match.end() :]
+    return before[: match.start()] + replacement + section + before[section_end:]
+
+
+def _write_changelog(content: bytes) -> None:
+    """Replace the changelog only after a complete temporary write succeeds."""
+    descriptor, name = tempfile.mkstemp(dir=CHANGELOG.parent, prefix=".CHANGELOG-")
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+        os.chmod(temporary, CHANGELOG.stat().st_mode)
+        os.replace(temporary, CHANGELOG)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def generate_changelog(new_version: str) -> None:
-    """Promote the single hand-written Unreleased section without rewriting its contents."""
-    CHANGELOG.write_bytes(promoted_changelog(new_version))
+    """Promote the single Unreleased section (the release entry point is ``main``)."""
+    _write_changelog(promoted_changelog(new_version))
 
 
 def main() -> None:
@@ -169,34 +239,36 @@ def main() -> None:
 
     old = get_version()
     new = bump(sys.argv[1], old)
-    new_changelog = promoted_changelog(new)
+    fragments = read_fragments()
+    new_changelog = promoted_changelog(new, fragments)
     old_changelog = CHANGELOG.read_bytes()
 
-    originals = {path: path.read_text() for path in (PYPROJECT, DEVCONTAINER_FEATURE)}
-    update_pyproject(new)
-    update_devcontainer_feature(new)
+    originals = {path: path.read_bytes() for path in (PYPROJECT, DEVCONTAINER_FEATURE, UV_LOCK)}
     try:
-        CHANGELOG.write_bytes(new_changelog)
+        update_pyproject(new)
+        update_devcontainer_feature(new)
         update_uv_lock(old, new)
-    except LockDrift as exc:
-        for path, text in originals.items():
-            path.write_text(text)
-        CHANGELOG.write_bytes(old_changelog)
-        print(f"ERROR: {exc}", file=sys.stderr)
-        sys.exit(1)
-    except BaseException:
-        # A missing or failing `uv`, or Ctrl-C, raises something other than LockDrift here.
-        # update_uv_lock already restored uv.lock on any exception; restore the other two
-        # files it does not touch so a re-run starts from an unbumped tree, not a split one.
-        for path, text in originals.items():
-            path.write_text(text)
-        CHANGELOG.write_bytes(old_changelog)
+        _write_changelog(new_changelog)
+        for path in fragments:
+            path.unlink()
+    except BaseException as exc:
+        for path, content in originals.items():
+            if path.read_bytes() != content:
+                path.write_bytes(content)
+        if CHANGELOG.read_bytes() != old_changelog:
+            CHANGELOG.write_bytes(old_changelog)
+        for path, content in fragments.items():
+            if not path.exists():
+                path.write_bytes(content)
+        if isinstance(exc, LockDrift):
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
         raise
 
     print(f"Bumped {old} -> {new}")
     print("\nNext steps:")
     print(
-        f"  1. git add pyproject.toml uv.lock CHANGELOG.md {DEVCONTAINER_FEATURE.relative_to(ROOT)}"
+        f"  1. git add pyproject.toml uv.lock CHANGELOG.md changelog.d {DEVCONTAINER_FEATURE.relative_to(ROOT)}"
     )
     print(f"  2. git commit -m 'chore: release v{new}'")
     print(f"  3. git tag v{new}")

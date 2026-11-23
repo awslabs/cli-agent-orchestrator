@@ -40,6 +40,17 @@ GitHub provides additional document on [forking a repository](https://help.githu
 [creating a pull request](https://help.github.com/articles/creating-a-pull-request/).
 
 
+## Changelog entries
+
+For a notable change, add `changelog.d/<PR>.<type>.md` with the pull request number,
+one of `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, or `Security`, and a
+single Markdown bullet on one line. For example, `changelog.d/1350.Changed.md`
+could contain `- Collect pull-request changelog fragments at release time.`
+See [`changelog.d/README.md`](changelog.d/README.md) for the format. The release
+bump collects these fragments alongside any hand-written `[Unreleased]` notes;
+you do not need to edit `CHANGELOG.md` in your pull request.
+
+
 ## Type checking: the mypy ratchet
 
 CI's **Code Quality** job runs `uv run python scripts/mypy_ratchet.py` instead of a bare
