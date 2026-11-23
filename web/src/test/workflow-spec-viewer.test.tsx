@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { createRef } from 'react'
 import { api, WorkflowSpec } from '../api'
 import { WorkflowLauncher } from '../components/workflow/WorkflowLauncher'
@@ -76,6 +76,25 @@ describe('WorkflowSpecViewer', () => {
     expect(view).toHaveFocus()
   })
 
+  it('opens the dialog immediately and shows loading while the fetch is in flight', async () => {
+    localStorage.clear()
+    vi.spyOn(api, 'listWorkflows').mockResolvedValue([DEF])
+    let resolveSpec!: (spec: WorkflowSpec) => void
+    const pendingSpec = new Promise<WorkflowSpec>(resolve => { resolveSpec = resolve })
+    const getSpec = vi.spyOn(api, 'getWorkflowSpec')
+      .mockResolvedValueOnce({ name: 'review_flow', inputs: {} })
+      .mockReturnValueOnce(pendingSpec)
+    render(<WorkflowLauncher />)
+    fireEvent.click(screen.getByRole('button', { name: /Run a workflow/ }))
+    const view = await screen.findByRole('button', { name: 'View spec' })
+    await waitFor(() => expect(getSpec).toHaveBeenCalledTimes(1))
+    fireEvent.click(view)
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('Loading workflow spec…')
+    resolveSpec(SPEC)
+    expect(await screen.findByTestId('spec-code-scroll')).toBeInTheDocument()
+  })
+
   it('closes on Escape and locks body scrolling while open', () => {
     const { onClose, unmount, returnButton } = renderViewer()
     expect(document.body.style.overflow).toBe('hidden')
@@ -84,6 +103,13 @@ describe('WorkflowSpecViewer', () => {
     unmount()
     expect(document.body.style.overflow).toBe('')
     expect(returnButton).toHaveFocus()
+  })
+
+  it('leaves native full screen with Escape without closing the dialog', () => {
+    Object.defineProperty(document, 'fullscreenElement', { configurable: true, value: document.body })
+    const { onClose } = renderViewer()
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(onClose).not.toHaveBeenCalled()
   })
 
   it('offers real full screen when enabled and hides the toggle otherwise', async () => {
@@ -95,6 +121,12 @@ describe('WorkflowSpecViewer', () => {
     renderViewer()
     fireEvent.click(screen.getByRole('button', { name: 'Full screen' }))
     await waitFor(() => expect(requestFullscreen).toHaveBeenCalledOnce())
+  })
+
+  it('includes full-screen styling on the dialog', () => {
+    const { getByRole } = renderViewer()
+    expect(getByRole('dialog').className).toContain('[&:fullscreen]:h-screen')
+    expect(getByRole('dialog').className).toContain('[&:fullscreen]:rounded-none')
   })
 
   it('resyncs the full screen label when reopened after Exit', async () => {
@@ -153,6 +185,19 @@ describe('WorkflowSpecViewer', () => {
     expect(screen.getByTestId('spec-line-1').className).not.toContain('bg-amber-500/10')
   })
 
+  it('clamps an out-of-range finding line to the available source', () => {
+    renderViewer({ ...SPEC, findings: [{ line: 99, severity: 'warning', rule_id: 'demo-rule', message: 'Check this call' }] })
+    fireEvent.click(screen.getByRole('button', { name: /line 99.*demo-rule/i }))
+    expect(screen.getByTestId('spec-line-3').className).toContain('bg-amber-500/10')
+  })
+
+  it('applies wrapping classes when Wrap lines is enabled', () => {
+    renderViewer()
+    fireEvent.click(screen.getByRole('button', { name: 'Wrap lines' }))
+    expect(screen.getByTestId('spec-line-code-1').className).toContain('whitespace-pre-wrap')
+    expect(screen.getByTestId('spec-line-code-1').className).toContain('break-all')
+  })
+
   it('preserves source exactly when token rows are joined with newlines', () => {
     const source = 'def example():\n    return """one\ntwo"""\n'
     const lines = tokensByLine(tokenizePython(source))
@@ -168,6 +213,19 @@ describe('WorkflowSpecViewer', () => {
     expect(first).toHaveFocus()
     fireEvent.keyDown(window, { key: 'Tab', shiftKey: true })
     expect(last).toHaveFocus()
+  })
+
+  it('skips a control that the browser does not render', () => {
+    renderViewer()
+    const copy = screen.getByRole('button', { name: 'Copy content hash' })
+    Object.defineProperty(copy, 'checkVisibility', { configurable: true, value: () => false })
+    const exit = screen.getByRole('button', { name: 'Exit' })
+    const region = screen.getByTestId('spec-code-scroll')
+    exit.focus()
+    fireEvent.keyDown(window, { key: 'Tab', shiftKey: true })
+    expect(region).toHaveFocus()
+    fireEvent.keyDown(window, { key: 'Tab' })
+    expect(exit).toHaveFocus()
   })
 
   it('tabs from Wrap lines to the labelled code scroll region', () => {
@@ -214,6 +272,56 @@ describe('WorkflowSpecViewer', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('network unavailable')
   })
 
+  it('opens immediately for a second click while a previous request is loading', async () => {
+    localStorage.clear()
+    vi.spyOn(api, 'listWorkflows').mockResolvedValue([DEF])
+    let resolveFirst!: (spec: WorkflowSpec) => void
+    const first = new Promise<WorkflowSpec>(resolve => { resolveFirst = resolve })
+    const getSpec = vi.spyOn(api, 'getWorkflowSpec')
+      .mockResolvedValueOnce({ name: 'review_flow', inputs: {} })
+      .mockReturnValueOnce(first)
+      .mockResolvedValueOnce(SPEC)
+    render(<WorkflowLauncher />)
+    fireEvent.click(screen.getByRole('button', { name: /Run a workflow/ }))
+    const view = await screen.findByRole('button', { name: 'View spec' })
+    await waitFor(() => expect(getSpec).toHaveBeenCalledTimes(1))
+    fireEvent.click(view)
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Exit' }))
+    fireEvent.click(view)
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    resolveFirst({ ...SPEC, source: 'old source' })
+    await waitFor(() => expect(renderedSource()).toBe(PYTHON_SOURCE))
+  })
+
+  it('keeps only the newest View spec response', async () => {
+    localStorage.clear()
+    vi.spyOn(api, 'listWorkflows').mockResolvedValue([DEF])
+    let resolveFirst!: (spec: WorkflowSpec) => void
+    let resolveSecond!: (spec: WorkflowSpec) => void
+    const first = new Promise<WorkflowSpec>(resolve => { resolveFirst = resolve })
+    const second = new Promise<WorkflowSpec>(resolve => { resolveSecond = resolve })
+    const getSpec = vi.spyOn(api, 'getWorkflowSpec')
+      .mockResolvedValueOnce({ name: 'review_flow', inputs: {} })
+      .mockReturnValueOnce(first)
+      .mockReturnValueOnce(second)
+    render(<WorkflowLauncher />)
+    fireEvent.click(screen.getByRole('button', { name: /Run a workflow/ }))
+    const view = await screen.findByRole('button', { name: 'View spec' })
+    await waitFor(() => expect(getSpec).toHaveBeenCalledTimes(1))
+    fireEvent.click(view)
+    fireEvent.click(view)
+    await act(async () => { resolveSecond({ ...SPEC, source: 'new source' }) })
+    await waitFor(() => expect(renderedSource()).toBe('new source'))
+    await act(async () => { resolveFirst({ ...SPEC, source: 'old source' }) })
+    expect(renderedSource()).toBe('new source')
+  })
+
+  it('groups workflow findings under their accessible name', () => {
+    renderViewer()
+    expect(screen.getByRole('group', { name: 'Workflow findings' })).toBeInTheDocument()
+  })
+
   it('colours Python spans, but leaves a JSON fallback plain', () => {
     const { unmount } = renderViewer()
     const python = screen.getByTestId('spec-code-scroll')
@@ -227,5 +335,14 @@ describe('WorkflowSpecViewer', () => {
     expect(fallback.querySelector('[data-testid^="spec-line-code-"] > span[class]')).toBeNull()
     expect(renderedSource()).toContain('<img src=x onerror=alert(1)>')
     expect(fallback.querySelector('img')).toBeNull()
+  })
+
+  it('leaves a string-source YAML spec plain', () => {
+    renderViewer({ ...SPEC, path: '/wf/yaml_flow.yaml', source: 'steps:\n  - run: echo hello\n' })
+    const yaml = screen.getByTestId('spec-code-scroll')
+    const tokens = yaml.querySelectorAll('[data-testid^="spec-line-code-"] > span')
+    expect(tokens).toHaveLength(2)
+    expect([...tokens].every(token => token.className === '')).toBe(true)
+    expect(yaml.querySelector('.text-fuchsia-300')).toBeNull()
   })
 })

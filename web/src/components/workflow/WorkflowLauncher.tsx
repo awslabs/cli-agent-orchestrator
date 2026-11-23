@@ -184,19 +184,27 @@ export function WorkflowLauncher({ reloadKey = 0, focus = null, onEdit }: Workfl
   const [specError, setSpecError] = useState<string | null>(null)
   const [loadingSpec, setLoadingSpec] = useState(false)
   const viewSpecRef = useRef<HTMLButtonElement>(null)
-  useEffect(() => { setSpec(null); setSpecError(null) }, [selected])
+  const specRequest = useRef(0)
+  useEffect(() => {
+    specRequest.current++
+    setSpec(null)
+    setSpecError(null)
+    setLoadingSpec(false)
+  }, [selected])
   const viewSpec = async () => {
-    if (!selected || loadingSpec) return
+    if (!selected) return
+    const request = ++specRequest.current
     setSpecOpen(true)
     setSpec(null)
     setSpecError(null)
     setLoadingSpec(true)
     try {
-      setSpec(await api.getWorkflowSpec(selected))
+      const result = await api.getWorkflowSpec(selected)
+      if (request === specRequest.current) setSpec(result)
     } catch (e: any) {
-      setSpecError(e?.detail || e?.message || 'Failed to load the workflow spec')
+      if (request === specRequest.current) setSpecError(e?.detail || e?.message || 'Failed to load the workflow spec')
     } finally {
-      setLoadingSpec(false)
+      if (request === specRequest.current) setLoadingSpec(false)
     }
   }
 

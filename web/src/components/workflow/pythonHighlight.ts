@@ -46,7 +46,7 @@ const isOperator = (c: string | undefined) => !!c && '+-*/%@<>=!&|^~:;,.()[]{}'.
 const softKeywordEndsPattern = (source: string, afterWord: number) => {
   let index = afterWord
   while (source[index] === ' ' || source[index] === '\t') index++
-  if ('=.( [,'.includes(source[index] ?? '')) return false
+  if ('=. ,'.includes(source[index] ?? '')) return false
 
   let lastCodeCharacter = ''
   while (index < source.length && source[index] !== '\n' && source[index] !== '#') {
@@ -71,10 +71,16 @@ export function tokenizePython(source: string): PythonToken[] {
   let i = 0
   let expectDefinition = false
   let atLogicalLineStart = true
+  let bracketDepth = 0
   const push = (type: PythonTokenType, start: number, end: number) => {
     tokens.push({ type, text: source.slice(start, end) })
     for (let index = start; index < end; index++) {
-      if (source[index] === '\n') atLogicalLineStart = true
+      const character = source[index]
+      if (type !== 'string' && type !== 'comment') {
+        if ('([{'.includes(character)) bracketDepth++
+        else if (')]}'.includes(character)) bracketDepth = Math.max(0, bracketDepth - 1)
+      }
+      if (character === '\n') atLogicalLineStart = bracketDepth === 0
       else if (source[index] !== ' ' && source[index] !== '\t' && source[index] !== '\r') atLogicalLineStart = false
     }
   }

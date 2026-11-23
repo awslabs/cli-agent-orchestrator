@@ -78,7 +78,8 @@ export function WorkflowSpecViewer({
       if (event.key === 'Tab' && viewerRef.current) {
         const focusable = Array.from(viewerRef.current.querySelectorAll<HTMLElement>(
           'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-        )).filter(element => element.getAttribute('aria-hidden') !== 'true')
+        )).filter(element => element.getAttribute('aria-hidden') !== 'true'
+          && (typeof element.checkVisibility !== 'function' || element.checkVisibility()))
         if (!focusable.length) return
         const first = focusable[0]
         const last = focusable[focusable.length - 1]
@@ -196,7 +197,7 @@ export function WorkflowSpecViewer({
         {!loading && !error && spec && (
           <>
             {(spec.findings ?? []).length > 0 && (
-              <div className="flex shrink-0 gap-2 overflow-x-auto border-b border-gray-800 px-4 py-2" aria-label="Workflow findings">
+              <div className="flex shrink-0 gap-2 overflow-x-auto border-b border-gray-800 px-4 py-2" role="group" aria-label="Workflow findings">
                 {(spec.findings ?? []).map((finding, index) => (
                   <button
                     key={`${finding.line}-${finding.rule_id}-${index}`}
