@@ -3,7 +3,6 @@
 import tomllib
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 OWNER = "@awslabs/multiq"
 BLOCK_HEADER = "# Gate policy, release scripts, and trust-boundary code (#1350)"
