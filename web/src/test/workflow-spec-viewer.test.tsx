@@ -3,7 +3,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { createRef } from 'react'
 import { api, WorkflowSpec } from '../api'
 import { WorkflowLauncher } from '../components/workflow/WorkflowLauncher'
-import { WorkflowSpecViewer } from '../components/workflow/WorkflowSpecViewer'
+import { tokensByLine, WorkflowSpecViewer } from '../components/workflow/WorkflowSpecViewer'
+import { tokenizePython } from '../components/workflow/pythonHighlight'
 
 const DEF = {
   name: 'review_flow', source_path: '/wf/review_flow.py', mode: 'script',
@@ -39,11 +40,15 @@ function renderViewer(spec: WorkflowSpec = SPEC, extra: Partial<React.ComponentP
   return { ...result, onClose, returnButton }
 }
 
+const renderedSource = () =>
+  screen.getAllByTestId(/^spec-line-code-/).map(line => line.textContent ?? '').join('\n')
+
 describe('WorkflowSpecViewer', () => {
   beforeEach(() => {
     Object.defineProperty(document, 'fullscreenEnabled', { configurable: true, value: false })
     Object.defineProperty(document, 'fullscreenElement', { configurable: true, value: null })
-    HTMLElement.prototype.scrollTo = vi.fn()
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined })
+    HTMLElement.prototype.scrollIntoView = vi.fn()
   })
   afterEach(() => {
     cleanup()
@@ -64,7 +69,7 @@ describe('WorkflowSpecViewer', () => {
 
     const dialog = await screen.findByRole('dialog')
     expect(dialog).toBeInTheDocument()
-    expect(screen.getByLabelText('Workflow spec source').textContent).toBe(PYTHON_SOURCE)
+    expect(renderedSource()).toBe(PYTHON_SOURCE)
     expect(screen.getByRole('button', { name: 'Exit' })).toHaveFocus()
     fireEvent.click(screen.getByRole('button', { name: 'Exit' }))
     expect(screen.queryByRole('dialog')).toBeNull()
@@ -92,11 +97,52 @@ describe('WorkflowSpecViewer', () => {
     await waitFor(() => expect(requestFullscreen).toHaveBeenCalledOnce())
   })
 
-  it('scrolls to and marks a finding line', () => {
+  it.each([false, true])('keeps each number with its code and marks/scrolls a finding row (wrap=%s)', wrap => {
     renderViewer()
+    if (wrap) fireEvent.click(screen.getByRole('button', { name: 'Wrap lines' }))
+    for (const lineNumber of [1, 2, 3]) {
+      const row = screen.getByTestId(`spec-line-${lineNumber}`)
+      expect(row).toContainElement(screen.getByTestId(`spec-line-number-${lineNumber}`))
+      expect(row).toContainElement(screen.getByTestId(`spec-line-code-${lineNumber}`))
+    }
     fireEvent.click(screen.getByRole('button', { name: /line 2.*demo-rule/i }))
-    expect(HTMLElement.prototype.scrollTo).toHaveBeenCalledWith(expect.objectContaining({ top: 0 }))
-    expect(screen.getByLabelText('Marked line 2')).toBeInTheDocument()
+    expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalledWith({ block: 'center' })
+    expect(screen.getByTestId('spec-line-2').className).toContain('bg-amber-500/10')
+    expect(screen.getByTestId('spec-line-1').className).not.toContain('bg-amber-500/10')
+  })
+
+  it('preserves source exactly when token rows are joined with newlines', () => {
+    const source = 'def example():\n    return """one\ntwo"""\n'
+    const lines = tokensByLine(tokenizePython(source))
+    expect(lines.map(line => line.map(token => token.text).join('')).join('\n')).toBe(source)
+  })
+
+  it('traps Tab and Shift+Tab within the dialog', () => {
+    renderViewer()
+    const first = screen.getByRole('button', { name: 'Copy content hash' })
+    const last = screen.getByRole('button', { name: 'Wrap lines' })
+    last.focus()
+    fireEvent.keyDown(window, { key: 'Tab' })
+    expect(first).toHaveFocus()
+    fireEvent.keyDown(window, { key: 'Tab', shiftKey: true })
+    expect(last).toHaveFocus()
+  })
+
+  it('shows copied only after clipboard writeText succeeds', async () => {
+    renderViewer()
+    const copy = screen.getByRole('button', { name: 'Copy content hash' })
+    fireEvent.click(copy)
+    expect(copy.querySelector('.text-emerald-400')).toBeNull()
+
+    const writeText = vi.fn().mockRejectedValue(new Error('denied'))
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    fireEvent.click(copy)
+    await waitFor(() => expect(writeText).toHaveBeenCalledOnce())
+    expect(copy.querySelector('.text-emerald-400')).toBeNull()
+
+    writeText.mockResolvedValue(undefined)
+    fireEvent.click(copy)
+    await waitFor(() => expect(copy.querySelector('.text-emerald-400')).not.toBeNull())
   })
 
   it('shows a fetch failure inside the already-open dialog', async () => {
@@ -115,16 +161,16 @@ describe('WorkflowSpecViewer', () => {
 
   it('colours Python spans, but leaves a JSON fallback plain', () => {
     const { unmount } = renderViewer()
-    const python = screen.getByLabelText('Workflow spec source')
+    const python = screen.getByTestId('spec-code-scroll')
     expect(python.querySelector('.text-fuchsia-300')).toHaveTextContent('def')
     expect(python.querySelector('.text-blue-300')).toHaveTextContent('greet')
     unmount()
 
     const jsonSpec = { name: 'yaml_flow', path: '/wf/yaml_flow.yaml', source: { unsafe: '<img src=x onerror=alert(1)>' } } as unknown as WorkflowSpec
     renderViewer(jsonSpec)
-    const fallback = screen.getByLabelText('Workflow spec source')
-    expect(fallback.querySelector('span[class]')).toBeNull()
-    expect(fallback.textContent).toContain('<img src=x onerror=alert(1)>')
+    const fallback = screen.getByTestId('spec-code-scroll')
+    expect(fallback.querySelector('[data-testid^="spec-line-code-"] > span[class]')).toBeNull()
+    expect(renderedSource()).toContain('<img src=x onerror=alert(1)>')
     expect(fallback.querySelector('img')).toBeNull()
   })
 })
