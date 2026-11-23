@@ -1176,13 +1176,33 @@ def _roll_back_cancelled_create(
     between the worker's commit and this compensation, and killing by name
     then would destroy the replacement and clear its forwarded env. Under the
     lock, kill the session/window only if this call's row still belongs to the
-    current incarnation. Always drop this terminal's own row: no provider or
-    deferred-init task has been started yet, so retaining the pending row would
-    leave an UNKNOWN terminal that nobody can finish initializing.
+    current incarnation.
+
+    The worker also registered this terminal's FIFO reader and provider before
+    it returned (#1458 moved that registration inside the locked section), so
+    those are undone too, in ``_roll_back_failed_create``'s order: reader and
+    status buffer first, then the backend, then the provider. The row is then
+    dropped, because no deferred-init task has been started and a retained
+    pending row would be an UNKNOWN terminal nobody can finish initializing,
+    UNLESS a cleanup is incomplete: the provider deferred it, or ``stop_reader``
+    returned ``False`` (its reader thread is still alive or its FIFO is still on
+    disk, and fifo_manager keeps it tracked for a retry). Then the row is the
+    only retry handle and is kept, as ``dismantle_terminal_runtime`` keeps it.
+    For both, only an explicit ``False`` counts: a raised error does not keep
+    the row (the provider's error is logged; the reader's is ignored).
 
     Best-effort like its sibling: the cancellation is already propagating and
     is what the caller must see.
     """
+    reader_complete = True
+    try:
+        reader_complete = fifo_manager.stop_reader(terminal_id) is not False
+    except Exception:
+        pass  # Ignore cleanup errors
+    try:
+        status_monitor.clear_terminal(terminal_id)
+    except Exception:
+        pass  # Ignore cleanup errors
     with session_lifecycle_lock(session_name):
         if _still_owns_incarnation(session_name, terminal_id):
             _roll_back_backend_create_locked(
@@ -1191,6 +1211,26 @@ def _roll_back_cancelled_create(
                 created_session=created_session,
                 terminal_id=terminal_id,
             )
+        # Under the lock, as ``delete_session`` releases a provider: only this
+        # call's own registration is touched, keyed by its terminal id.
+        try:
+            cleanup_complete = provider_manager.cleanup_provider(terminal_id) is not False
+        except Exception:
+            cleanup_complete = True
+        if not cleanup_complete:
+            logger.warning(
+                "Cancelled-create rollback deferred provider cleanup for %s; "
+                "retaining terminal metadata for retry",
+                terminal_id,
+            )
+            return
+        if not reader_complete:
+            logger.warning(
+                "Cancelled-create rollback could not stop the FIFO reader for %s; "
+                "retaining terminal metadata for retry",
+                terminal_id,
+            )
+            return
         try:
             db_delete_terminal(terminal_id, end_reason="launch_failed")
         except Exception:
@@ -1208,7 +1248,7 @@ def _roll_back_backend_create_if_still_ours(
 ) -> None:
     """Undo a create that failed AFTER the locked transaction committed.
 
-    Provider initialisation, FIFO setup and the rest of ``create_terminal`` run
+    Provider initialisation and the rest of ``create_terminal`` run
     after the lifecycle lock was released, so by the time their failure reaches
     the outer handler another caller may have torn the name down and rebuilt it
     (``delete_session`` then a fresh ``new_session=True`` create, or the reverse
@@ -3155,6 +3195,38 @@ async def _create_terminal_unguarded(
                 f"unrestricted until `cao install {agent_profile} --provider kiro_cli` is re-run."
             )
 
+        # Step 6 inputs: the provider is created and registered inside the
+        # critical section below (#1458) and initialized after it.
+        # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
+        # Only runtime-prompt providers (Claude Code, Codex, Kimi) receive
+        # the skill catalog here; Kiro (skill:// resources) and OpenCode
+        # (OPENCODE_CONFIG_DIR/skills symlink) discover skills natively;
+        # Copilot gets the catalog baked at install time.
+        #
+        # Issue #1082 (provisional): a fresh (non-resume) Claude Code launch
+        # gets a CAO-generated session id, stored on the launch record so a
+        # later usage adapter can join provider-native session logs to this
+        # terminal without CAO reading any transcript itself. Only Claude Code
+        # exposes a caller-chosen session id today; every other provider's
+        # stored id stays None.
+        fresh_claude_session_id: Optional[str] = (
+            str(uuid.uuid4())
+            if provider == ProviderType.CLAUDE_CODE.value and not resume_session_id
+            else None
+        )
+        # Only a Kiro helper passes its launch, and only a Claude Code helper the
+        # ephemeral flag, so every other call is unchanged. The flag is the bind
+        # above, the fact that marks this terminal ephemeral, never the profile
+        # text, and it keys on the provider that actually runs.
+        provider_launch_options: dict[str, Any] = (
+            {"kiro_launch": kiro_launch} if kiro_launch is not None else {}
+        )
+        if (
+            provider == ProviderType.CLAUDE_CODE.value
+            and ephemeral_state.bound_terminal_id == terminal_id
+        ):
+            provider_launch_options["ephemeral"] = True
+
         # Step 3c: Create the tmux session/window and its registry row as ONE
         # atomic step, under the per-session-name lifecycle lock (#498). This
         # merges what used to be two separate steps -- the tmux create and the
@@ -3186,6 +3258,11 @@ async def _create_terminal_unguarded(
         # Why the section ends here: provider.initialize() below can take tens
         # of seconds, and a teardown of this name must never queue behind an
         # agent launch. Everything inside is short, synchronous state mutation.
+
+        # Set by the critical section: the registered provider, or the error a
+        # registration step raised (re-raised below so the ordinary rollback runs).
+        registered_provider: Any = None
+        registration_error: Optional[Exception] = None
         deferred_delete_on_failure: bool | None = None
         session_incarnation_id: str | None = None
 
@@ -3232,6 +3309,7 @@ async def _create_terminal_unguarded(
             name goes free -> free with no observable intermediate state.
             """
             nonlocal deferred_delete_on_failure, session_incarnation_id, created_terminal_facts
+            nonlocal registered_provider, registration_error
             assert session_name is not None  # narrowed by the caller
             with session_lifecycle_lock(session_name):
                 if new_session:
@@ -3391,6 +3469,59 @@ async def _create_terminal_unguarded(
                         created_session=created_session,
                     )
                     raise
+                # Steps 4/5/6: register the FIFO reader and the provider while
+                # STILL holding the lock that made the row visible (#1458). They
+                # used to run after the lock was released, so a same-name
+                # ``delete_session`` that had been waiting on it could run in the
+                # gap: it saw the new row, stopped a reader and cleaned up a
+                # provider that did not exist yet, and returned, after which the
+                # create registered both for a row that was gone. Held across,
+                # the teardown waits for the registrations and then dismantles
+                # them. Only registration is under the lock (reader thread
+                # start, pipe-pane attach, one key, a provider constructor);
+                # ``provider.initialize()``, which can take tens of seconds, runs
+                # after release, so a teardown never queues behind an agent
+                # launch.
+                try:
+                    # Step 4/5: Set up the FIFO event-driven output pipeline for
+                    # pipe-pane backends (tmux). Event-inbox backends (herdr)
+                    # deliver via their own socket events and their pipe_pane is
+                    # a no-op, so skip the FIFO there and rely on the herdr inbox
+                    # registration below.
+                    if not get_backend().supports_event_inbox():
+                        # Reader first, then pipe-pane, with the liveness watchdog
+                        # (#388). The helper stops the reader again if pipe-pane
+                        # raises, and the error then reaches the handler below.
+                        attach_output_pipeline(terminal_id, session_name, created_window_name)
+
+                        # Nudge the shell so it re-renders its prompt AFTER pipe-pane attaches.
+                        # pipe-pane only captures output produced after it starts; on a fast
+                        # shell the initial prompt is drawn before the pipe attaches, leaving
+                        # the StatusMonitor buffer empty so wait_for_shell() times out. A bare
+                        # Enter produces a fresh prompt line that flows through the pipe.
+                        get_backend().send_special_key(session_name, created_window_name, "Enter")
+
+                    registered_provider = provider_manager.create_provider(
+                        provider,
+                        terminal_id,
+                        session_name,
+                        created_window_name,
+                        agent_profile,
+                        allowed_tools,
+                        skill_prompt=skill_prompt,
+                        model=launch_model,
+                        effort=launch_effort,
+                        engine=resolved_engine,
+                        resume_session_id=resume_session_id,
+                        session_id=fresh_claude_session_id,
+                        **provider_launch_options,
+                    )
+                except Exception as exc:
+                    # Hand the failure out with the created-flags, so the caller
+                    # re-raises it into the same rollback
+                    # (``_roll_back_failed_create``) that handled a registration
+                    # failure before this step moved under the lock.
+                    registration_error = exc
                 return created_window_name, created_session, created_window
 
         # The worker is UN-CANCELLABLE once dispatched: cancelling this await
@@ -3408,6 +3539,8 @@ async def _create_terminal_unguarded(
         try:
             window_name, session_created, window_created = await asyncio.shield(create_worker)
             rollback_window_name = window_name
+            if registration_error is not None:
+                raise registration_error
         except asyncio.CancelledError:
             if not create_worker.cancelled():
                 compensator = asyncio.ensure_future(
@@ -3424,69 +3557,15 @@ async def _create_terminal_unguarded(
             _clear_identity_check_in_flight(terminal_id)
             raise
 
-        # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
-        # backends (tmux). Event-inbox backends (herdr) deliver via their own
-        # socket events and their pipe_pane is a no-op, so skip the FIFO there and
-        # rely on the herdr inbox registration below.
-        if not get_backend().supports_event_inbox():
-            attach_output_pipeline(terminal_id, session_name, window_name)
+        # Steps 4/5/6 (the FIFO reader, pipe-pane and the provider registration)
+        # already ran under the lifecycle lock, inside the critical section above
+        # (#1458). Only ``provider.initialize()`` is left outside it.
+        provider_instance = registered_provider
 
-            # Nudge the shell so it re-renders its prompt AFTER pipe-pane attaches.
-            # pipe-pane only captures output produced after it starts; on a fast
-            # shell the initial prompt is drawn before the pipe attaches, leaving
-            # the StatusMonitor buffer empty so wait_for_shell() times out. A bare
-            # Enter produces a fresh prompt line that flows through the pipe.
-            get_backend().send_special_key(session_name, window_name, "Enter")
-
-        # Step 6: Create and initialize the CLI provider
-        # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
-        # Only runtime-prompt providers (Claude Code, Codex, Kimi) receive
-        # the skill catalog here; Kiro (skill:// resources) and OpenCode
-        # (OPENCODE_CONFIG_DIR/skills symlink) discover skills natively;
-        # Copilot gets the catalog baked at install time.
-        #
-        # Issue #1082 (provisional): a fresh (non-resume) Claude Code launch
-        # gets a CAO-generated session id, stored on the launch record so a
-        # later usage adapter can join provider-native session logs to this
-        # terminal without CAO reading any transcript itself. Only Claude Code
-        # exposes a caller-chosen session id today; every other provider's
-        # stored id stays None.
-        fresh_claude_session_id: Optional[str] = (
-            str(uuid.uuid4())
-            if provider == ProviderType.CLAUDE_CODE.value and not resume_session_id
-            else None
-        )
-        # Only a Kiro helper passes its launch, and only a Claude Code helper the
-        # ephemeral flag, so every other call is unchanged. The flag is the bind
-        # above, the fact that marks this terminal ephemeral, never the profile
-        # text, and it keys on the provider that actually runs.
-        provider_launch_options: dict[str, Any] = (
-            {"kiro_launch": kiro_launch} if kiro_launch is not None else {}
-        )
-        if (
-            provider == ProviderType.CLAUDE_CODE.value
-            and ephemeral_state.bound_terminal_id == terminal_id
-        ):
-            provider_launch_options["ephemeral"] = True
-        provider_instance = provider_manager.create_provider(
-            provider,
-            terminal_id,
-            session_name,
-            window_name,
-            agent_profile,
-            allowed_tools,
-            skill_prompt=skill_prompt,
-            model=launch_model,
-            effort=launch_effort,
-            engine=resolved_engine,
-            resume_session_id=resume_session_id,
-            session_id=fresh_claude_session_id,
-            **provider_launch_options,
-        )
         # Interactive prompt-capable providers have no CAO first message, so
-        # inject memory through their launch prompt. Resolve after provider
-        # registration: context lookup can involve a remote owner and must not
-        # widen the row-visible/runtime-missing teardown race. Initialization
+        # inject memory through their launch prompt. Resolve after the locked
+        # section: context lookup can involve a remote owner and must not run
+        # while the session lifecycle lock is held. Initialization
         # has not started yet, so updating the prompt here still precedes command
         # construction. Immediate orchestrated launches retain the task-aware
         # first-message path (and workflow frozen-memory semantics).

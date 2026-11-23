@@ -956,6 +956,286 @@ def test_teardown_blocked_by_in_flight_create_same_name(real_db, runtime):
     assert runtime.is_fully_gone(new_id)
 
 
+def test_teardown_cannot_slip_between_create_lock_release_and_runtime_registration(
+    real_db, runtime, monkeypatch
+):
+    """#1458 -- a same-name teardown must not run between a create's locked block
+    and its FIFO reader / provider registration.
+
+    The create's row is committed inside the lifecycle lock, but the reader and
+    the provider used to be registered after the lock was released. A
+    ``delete_session`` that had been waiting on the lock could then run in that
+    gap: it saw the new row, stopped a reader that did not exist yet, cleaned up
+    a provider that did not exist yet, and returned -- after which the create
+    registered both for a terminal whose row was gone.
+
+    The race is made deterministic by pausing the create at the first
+    registration call (``fifo_manager.create_reader``), with no CPU load and no
+    sleeps. The referee releases the create once the teardown has either
+    finished (the bug: it ran inside the gap) or is provably parked on the lock
+    the create holds (the fix). Either way the create then completes, and the
+    invariant is the one the sibling test states: after both finish, nothing of
+    the new terminal is left in either store.
+    """
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+
+    reader_reached = threading.Event()
+    reader_release = threading.Event()
+    teardown_started = threading.Event()
+    teardown_finished = threading.Event()
+
+    def _paused_create_reader(terminal_id, **kwargs):
+        reader_reached.set()
+        assert reader_release.wait(DEADLOCK_TIMEOUT), "reader gate never released"
+        runtime.fifo_readers.add(terminal_id)
+
+    monkeypatch.setattr(terminal_service.fifo_manager, "create_reader", _paused_create_reader)
+
+    def _waiters(name):
+        with session_lock._registry_guard:
+            entry = session_lock._session_locks.get(name)
+        return 0 if entry is None else entry[1]
+
+    def _create():
+        return _create_in_thread("cao-race-1458")
+
+    def _teardown():
+        assert reader_reached.wait(DEADLOCK_TIMEOUT), "create never reached registration"
+        teardown_started.set()
+        try:
+            return session_service.delete_session("cao-race-1458")
+        finally:
+            teardown_finished.set()
+
+    def _referee():
+        try:
+            assert teardown_started.wait(DEADLOCK_TIMEOUT), "teardown thread never started"
+            deadline = time.monotonic() + DEADLOCK_TIMEOUT
+            # The create holds the lock when the fix is in (one holder, one
+            # waiter = 2), so "finished or contended" is reached either way.
+            while not teardown_finished.wait(0.005):
+                if _waiters("cao-race-1458") >= 2:
+                    break
+                assert time.monotonic() < deadline, "teardown neither finished nor blocked"
+        finally:
+            reader_release.set()
+
+    results = _run_threads([_create, _teardown, _referee])
+    create_result, teardown_result, referee_result = results
+
+    assert create_result[0] == "ok", f"create failed: {create_result[1]!r}"
+    assert referee_result[0] == "ok", f"referee failed: {referee_result[1]!r}"
+    assert teardown_result[0] == "ok", f"teardown failed: {teardown_result[1]!r}"
+
+    new_id = create_result[1].id
+    assert backend.session_exists("cao-race-1458") is False
+    assert database.list_terminals_by_session("cao-race-1458") == []
+    assert database.get_terminal_metadata(new_id) is None
+    assert runtime.is_fully_gone(
+        new_id
+    ), "a same-name teardown ran between the create's lock release and its registration"
+
+
+class PipePaneFailsBackend(FakeTmuxBackend):
+    """``pipe_pane`` raises, as a tmux error on attach would."""
+
+    def pipe_pane(self, session_name, window_name, target) -> None:
+        raise RuntimeError("pipe-pane boom")
+
+
+@pytest.mark.parametrize("new_session", [True, False], ids=["session", "window"])
+def test_a_pipe_pane_failure_under_the_lock_rolls_the_create_back(
+    real_db, runtime, monkeypatch, new_session
+):
+    """#1458 moved ``attach_output_pipeline`` inside the lifecycle lock.
+
+    If its ``pipe_pane`` raises, the helper stops the reader it just started,
+    and the error leaves the locked section with the created-flags set, so
+    ``_roll_back_failed_create`` runs exactly as it did when this step ran
+    after the lock: the session (or only the new window) is killed, the row is
+    dropped, and no reader, status buffer or provider is left. The name's lock
+    entry is released.
+    """
+    import asyncio
+
+    backend = PipePaneFailsBackend()
+    set_backend(backend)
+    name = "cao-pipe-fail"
+    if not new_session:
+        _seed(backend, name, [("t-peer", "w-peer")], runtime)
+
+    created_ids: List[str] = []
+    real_create_reader = terminal_service.fifo_manager.create_reader
+
+    def _recording_create_reader(tid, **kwargs):
+        created_ids.append(tid)
+        return real_create_reader(tid, **kwargs)
+
+    monkeypatch.setattr(terminal_service.fifo_manager, "create_reader", _recording_create_reader)
+
+    with pytest.raises(RuntimeError, match="pipe-pane boom"):
+        asyncio.run(
+            terminal_service.create_terminal(
+                provider="claude_code",
+                agent_profile="developer",
+                session_name=name,
+                new_session=new_session,
+            )
+        )
+
+    assert len(created_ids) == 1, "the reader was started before pipe-pane"
+    tid = created_ids[0]
+    assert runtime.is_fully_gone(tid)
+    assert database.get_terminal_metadata(tid) is None
+    if new_session:
+        assert backend.session_exists(name) is False
+        assert database.list_terminals_by_session(name) == []
+    else:
+        assert backend.windows(name) == {"w-peer"}
+        assert runtime.is_fully_live("t-peer")
+    assert session_lock._session_locks == {}
+
+
+def _seed_cancelled_creator(backend, runtime, name, tid="t-cancel", window="w-cancel"):
+    """What a cancelled create's worker leaves when it returned: its own session
+    and window, its committed row as the current incarnation, and (since #1458)
+    its reader, status buffer and provider registration."""
+    backend.add_session(name, {window})
+    database.create_terminal(
+        terminal_id=tid,
+        tmux_session=name,
+        tmux_window=window,
+        provider="claude_code",
+        agent_profile="developer",
+        session_incarnation_id=f"inc-{tid}",
+        new_session_incarnation=True,
+    )
+    runtime.register(tid)
+    return tid, window
+
+
+def test_cancelled_create_rollback_survives_a_failing_reader_stop(real_db, runtime, monkeypatch):
+    """A raising ``stop_reader`` must not skip the rest of the compensation:
+    the status buffer is still cleared, the session killed, the provider
+    released and the row dropped."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-cancel-stop-raises"
+    tid, window = _seed_cancelled_creator(backend, runtime, name)
+
+    def _boom(terminal_id):
+        raise OSError("fifo already gone")
+
+    monkeypatch.setattr(terminal_service.fifo_manager, "stop_reader", _boom)
+
+    terminal_service._roll_back_cancelled_create(name, tid, window, created_session=True)
+
+    assert tid not in runtime.status_buffers
+    assert tid not in runtime.providers
+    assert backend.session_exists(name) is False
+    assert database.get_terminal_metadata(tid) is None
+    assert session_lock._session_locks == {}
+
+
+def test_cancelled_create_rollback_survives_a_failing_status_buffer_clear(
+    real_db, runtime, monkeypatch
+):
+    """A raising ``status_monitor.clear_terminal`` must not skip the rest of the
+    compensation either: the reader is still stopped, the session killed, the
+    provider released and the row dropped."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-cancel-clear-raises"
+    tid, window = _seed_cancelled_creator(backend, runtime, name)
+
+    def _boom(terminal_id):
+        raise RuntimeError("status buffer already gone")
+
+    monkeypatch.setattr(terminal_service.status_monitor, "clear_terminal", _boom)
+
+    terminal_service._roll_back_cancelled_create(name, tid, window, created_session=True)
+
+    assert tid not in runtime.fifo_readers
+    assert tid not in runtime.providers
+    assert backend.session_exists(name) is False
+    assert database.get_terminal_metadata(tid) is None
+    assert session_lock._session_locks == {}
+
+
+def test_cancelled_create_rollback_keeps_the_row_when_the_reader_does_not_stop(
+    real_db, runtime, monkeypatch, caplog
+):
+    """``stop_reader`` returning False means the reader thread is still alive or
+    the FIFO file is still there; fifo_manager keeps it tracked for a retry.
+    The row is the retry handle (a later delete calls stop_reader again), so it is
+    kept, as ``dismantle_terminal_runtime`` keeps it. The backend, the status
+    buffer and the provider are still undone."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-cancel-reader-stuck"
+    tid, window = _seed_cancelled_creator(backend, runtime, name)
+    monkeypatch.setattr(terminal_service.fifo_manager, "stop_reader", lambda terminal_id: False)
+
+    with caplog.at_level("WARNING"):
+        terminal_service._roll_back_cancelled_create(name, tid, window, created_session=True)
+
+    assert database.get_terminal_metadata(tid) is not None
+    assert "FIFO reader" in caplog.text and tid in caplog.text
+    assert backend.session_exists(name) is False
+    assert tid not in runtime.status_buffers
+    assert tid not in runtime.providers
+    assert session_lock._session_locks == {}
+
+
+def test_cancelled_create_rollback_drops_the_row_when_provider_cleanup_raises(
+    real_db, runtime, monkeypatch
+):
+    """An unexpected ``cleanup_provider`` error is not a Grok deferral, so the
+    row is dropped, as ``_roll_back_failed_create`` does."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-cancel-cleanup-raises"
+    tid, window = _seed_cancelled_creator(backend, runtime, name)
+
+    def _boom(terminal_id):
+        raise RuntimeError("provider cleanup boom")
+
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", _boom)
+
+    terminal_service._roll_back_cancelled_create(name, tid, window, created_session=True)
+
+    assert backend.session_exists(name) is False
+    assert database.get_terminal_metadata(tid) is None
+    assert tid not in runtime.fifo_readers
+    assert session_lock._session_locks == {}
+
+
+def test_cancelled_create_rollback_keeps_the_row_when_provider_cleanup_is_deferred(
+    real_db, runtime, monkeypatch, caplog
+):
+    """An explicit ``False`` from ``cleanup_provider`` means the provider kept
+    private state to retry; the row is the only retry handle, so it is kept
+    and the deferral is logged. The backend and the reader are still undone."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-cancel-cleanup-deferred"
+    tid, window = _seed_cancelled_creator(backend, runtime, name)
+    cleanup = MagicMock(return_value=False)
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", cleanup)
+
+    with caplog.at_level("WARNING"):
+        terminal_service._roll_back_cancelled_create(name, tid, window, created_session=True)
+
+    cleanup.assert_called_once_with(tid)
+    assert database.get_terminal_metadata(tid) is not None
+    assert "deferred provider cleanup" in caplog.text and tid in caplog.text
+    assert backend.session_exists(name) is False
+    assert tid not in runtime.fifo_readers
+    assert tid not in runtime.status_buffers
+    assert session_lock._session_locks == {}
+
+
 class OverlapDetectingBackend(FakeTmuxBackend):
     """Detects two teardowns of the same name inside their critical sections.
 
@@ -1767,6 +2047,12 @@ def test_cancelled_create_rolls_back_worker_blocked_in_row_write(real_db, runtim
     assert backend.session_exists("cao-cancel-row") is False
     assert database.list_terminals_by_session("cao-cancel-row") == []
     assert session_lock._session_locks == {}
+    # #1458: the worker registers the FIFO reader and the provider before it
+    # returns, so the compensator must also undo those, or a cancelled create
+    # leaves a reader and a provider for a row that is gone.
+    assert runtime.fifo_readers == set()
+    assert runtime.status_buffers == set()
+    assert runtime.providers == set()
 
 
 # ---------------------------------------------------------------------------
@@ -1949,16 +2235,17 @@ def test_cancelled_failure_rollback_clears_external_owner_and_retains_cleanup_re
 
     holder = threading.Thread(target=_hold_lock, daemon=True)
 
-    def _fail_before_scheduling(provider, tid, *args, **kwargs):
+    # The first step after the create releases the lifecycle lock (#1458 moved
+    # provider construction inside it, so a failure there can no longer let
+    # the holder in): fail as the deferred init is about to be scheduled.
+    def _fail_before_scheduling(provider_instance, tid, *args, **kwargs):
         captured["terminal_id"] = tid
         assert terminal_service._is_deferred_init_external_owner_active(tid)
         holder.start()
         assert lock_held.wait(DEADLOCK_TIMEOUT)
         raise RuntimeError("provider construction boom")
 
-    monkeypatch.setattr(
-        terminal_service.provider_manager, "create_provider", _fail_before_scheduling
-    )
+    monkeypatch.setattr(terminal_service, "_schedule_deferred_init", _fail_before_scheduling)
     cleanup = MagicMock(return_value=False)
     monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", cleanup)
 
@@ -2034,15 +2321,27 @@ def test_post_commit_failure_rollback_waits_for_the_lock_off_the_event_loop(
 
     holder = threading.Thread(target=_hold_lock, daemon=True)
 
-    def _boom_with_the_lock_taken(provider, terminal_id, *args, **kwargs):
-        # The create transaction has committed and released the lock by now
-        # (provider init runs outside it), so the holder acquires promptly.
-        holder.start()
-        assert lock_held.wait(DEADLOCK_TIMEOUT), "holder never took the lock"
-        raise RuntimeError("provider init boom")
+    def _provider_whose_init_fails_with_the_lock_taken(provider, terminal_id, *args, **kwargs):
+        runtime.status_buffers.add(terminal_id)
+        runtime.providers.add(terminal_id)
+        stub = MagicMock()
+        stub.shell_baseline = None
+
+        async def _init():
+            # The create transaction and the runtime registration have
+            # committed and released the lock by now (provider init runs
+            # outside it), so the holder acquires promptly.
+            holder.start()
+            assert lock_held.wait(DEADLOCK_TIMEOUT), "holder never took the lock"
+            raise RuntimeError("provider init boom")
+
+        stub.initialize = _init
+        return stub
 
     monkeypatch.setattr(
-        terminal_service.provider_manager, "create_provider", _boom_with_the_lock_taken
+        terminal_service.provider_manager,
+        "create_provider",
+        _provider_whose_init_fails_with_the_lock_taken,
     )
 
     loop_still_turning = threading.Event()
