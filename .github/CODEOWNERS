@@ -21,6 +21,9 @@
 /trivy-secret.yaml @awslabs/multiq
 /ruff.toml @awslabs/multiq
 /.ruff.toml @awslabs/multiq
+# Nested ruff configs are owned even though CI ignores them.
+**/ruff.toml @awslabs/multiq
+**/.ruff.toml @awslabs/multiq
 /tui/deny.toml @awslabs/multiq
 /.coverage-baseline.json @awslabs/multiq
 /mypy-baseline.json @awslabs/multiq

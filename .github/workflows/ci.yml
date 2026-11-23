@@ -438,8 +438,9 @@ jobs:
       # still an unread binding, and ruff has nothing to say about formatting so
       # the broader scope costs no churn. Rule selection and the deliberately
       # deferred rules (F811, ARG, B) are documented in pyproject.toml.
+      # Pin the root config because ruff otherwise uses the closest config per file.
       - name: Lint for dead code with ruff
-        run: uv run ruff check src/ test/ examples/
+        run: uv run ruff check --config pyproject.toml src/ test/ examples/
 
       - name: Run type checker with mypy (ratchet)
         # Issue #1005. This step used to be `uv run mypy src/` with

@@ -5,6 +5,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 OWNER = "@awslabs/multiq"
@@ -55,6 +56,8 @@ EXPECTED_PATHS = {
     "/trivy-secret.yaml",
     "/ruff.toml",
     "/.ruff.toml",
+    "**/ruff.toml",
+    "**/.ruff.toml",
 }
 RESERVED_ABSENT = {
     "/.gitleaksignore",  # secret-scan.yml:73-79 loads root gitleaks ignore files.
@@ -63,6 +66,8 @@ RESERVED_ABSENT = {
     "/trivy-secret.yaml",  # ci.yml:1111-1148 loads root Trivy secret config.
     "/ruff.toml",  # ci.yml:442 loads root ruff config files.
     "/.ruff.toml",  # ci.yml:442 loads root ruff config files.
+    "**/ruff.toml",  # ci.yml:442 pins the config despite nested ruff config files.
+    "**/.ruff.toml",  # ci.yml:442 pins the config despite nested ruff config files.
 }
 
 
@@ -81,6 +86,14 @@ def test_gate_settings_are_pinned():
         "target-version": "py311",
         "lint": {"select": ["F401", "F821", "F822", "F841"]},
     }
+
+
+def test_ruff_gate_uses_root_config():
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["lint"]["steps"]
+    ruff_steps = [step for step in steps if "ruff check" in step.get("run", "")]
+    assert len(ruff_steps) == 1
+    assert ruff_steps[0]["run"] == "uv run ruff check --config pyproject.toml src/ test/ examples/"
 
 
 def test_live_mypy_settings_are_pinned():
