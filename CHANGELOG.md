@@ -8,8 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - **Code-owner review protects CI policy, release scripts, and trust-boundary code** (#1350).
-  Tests pin the owned paths, mypy strict mode, and the ruff rule selection so policy
-  changes cannot silently weaken these gates.
+  Tests pin the owned paths, the active `mypy.ini` settings, and the full ruff
+  configuration; root gate configuration files are owned before they exist.
 
 - **Workflow specs open in a large, readable viewer**. The Workflows page now shows
   Python syntax colouring, line numbers and lint findings in a near-window-size dialog,
