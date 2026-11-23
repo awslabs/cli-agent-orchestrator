@@ -530,7 +530,7 @@ def test_connect_loads_snapshot_reconciles_and_names(env, monkeypatch):
     reconciled = []
 
     async def fake_sleep(s):
-        await svc.drain()
+        await asyncio.shield(svc.drain())
         raise asyncio.CancelledError
 
     monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)

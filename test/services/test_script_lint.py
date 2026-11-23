@@ -16,6 +16,7 @@ aimed at a different failure mode is not a safety net for this one.
 
 import ast
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -910,3 +911,38 @@ class TestPerformanceSanity:
         assert result.status == "pass"
         assert walk_calls == 1
         assert nodes_yielded == sum(1 for _ in original_walk(ast.parse(source)))
+
+    def test_linter_work_scales_linearly(self):
+        """Count total Python calls so helpers cannot hide a quadratic loop."""
+
+        def source_with_blocks(blocks):
+            lines = []
+            for i in range(blocks):
+                lines.append(f"import json  # block {i}")
+                lines.append(f"def f_{i}(x):")
+                lines.append(f"    return x + {i}")
+                lines.append(f"v_{i} = f_{i}({i})")
+            return "\n".join(lines) + "\n"
+
+        def lint_with_call_count(source):
+            calls = 0
+
+            def count_calls(frame, event, arg):
+                nonlocal calls
+                if event == "call":
+                    calls += 1
+
+            original_profile = sys.getprofile()
+            sys.setprofile(count_calls)
+            try:
+                result = lint_script(source, "big.py")
+            finally:
+                sys.setprofile(original_profile)
+            return result, calls
+
+        small_result, small_calls = lint_with_call_count(source_with_blocks(125))
+        large_result, large_calls = lint_with_call_count(source_with_blocks(250))
+
+        assert small_result.status == "pass"
+        assert large_result.status == "pass"
+        assert large_calls / small_calls <= 2.5
