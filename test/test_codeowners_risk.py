@@ -1,4 +1,4 @@
-"""Pin code-owner coverage of release and security policy, and mypy strict mode."""
+"""Pin code-owner coverage of release and security policy, and CI gate settings."""
 
 import tomllib
 from pathlib import Path
@@ -29,9 +29,12 @@ EXPECTED_PATHS = {
 }
 
 
-def test_mypy_strict_mode_is_enabled():
+def test_gate_settings_are_pinned():
     with (ROOT / "pyproject.toml").open("rb") as config:
-        assert tomllib.load(config)["tool"]["mypy"]["strict"] is True
+        tools = tomllib.load(config)["tool"]
+    assert tools["mypy"]["strict"] is True
+    assert set(tools["ruff"]["lint"]["select"]) == {"F401", "F821", "F822", "F841"}
+    assert len(tools["ruff"]["lint"]["select"]) == 4
 
 
 def test_new_codeowner_paths_exist():
