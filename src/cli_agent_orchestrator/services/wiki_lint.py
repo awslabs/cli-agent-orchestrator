@@ -910,13 +910,26 @@ def _detect_graph_density(
                     if is_memory_content_links_enabled()
                     else []
                 )
+                cross_scope_targets = (
+                    extract_content_link_targets(
+                        r.get("content", ""),
+                        MemoryService._sanitize_key,
+                        scope,
+                        cross_scope_only=True,
+                    )
+                    if is_memory_content_links_enabled()
+                    else []
+                )
             except Exception:
                 content_targets = []
-            for target in content_targets:
-                if target in scope_keys:
+                cross_scope_targets = []
+            for target in dict.fromkeys([*content_targets, *cross_scope_targets]):
+                if target in scope_keys and target not in cross_scope_targets:
                     continue
                 locations = (all_key_scopes or {}).get(target, set())
-                cross_scope = any(location != (scope, scope_id) for location in locations)
+                cross_scope = target in cross_scope_targets or any(
+                    location != (scope, scope_id) for location in locations
+                )
                 description = (
                     f"content link crosses scope: {target}"
                     if cross_scope

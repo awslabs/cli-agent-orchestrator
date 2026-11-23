@@ -939,5 +939,5 @@ def test_compile_prompt_is_unchanged_unless_content_links_are_on(fake_llm, monke
     assert prompts[False] == wiki_compiler._PROMPT_SYSTEM.replace("{topic_key}", "prefer-pytest")
     assert old_line in prompts[False]
     assert "Preserve hand-authored" not in prompts[False]
-    assert old_line not in prompts[True]
-    assert "Preserve hand-authored `## See Also` lines verbatim." in prompts[True]
+    assert prompts[True] == prompts[False]
+    assert old_line in prompts[True]

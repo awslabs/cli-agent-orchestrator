@@ -11317,8 +11317,8 @@ class InternalMemoryRecallRequest(BaseModel):
 
 
 class InternalMemoryRelatedRequest(BaseModel):
-    key: LenientMemoryKey
-    scope: Optional[MemoryScope] = None
+    key: str
+    scope: Optional[str] = None
     depth: int = Field(default=1, ge=1)
     types: Optional[List[str]] = None
     direction: str = "both"
@@ -11406,7 +11406,7 @@ async def internal_memory_related(
             Dict[str, Any],
             await _get_memory_service().related(
                 body.key,
-                scope=body.scope.value if body.scope else None,
+                scope=body.scope,
                 depth=body.depth,
                 types=body.types,
                 direction=body.direction,

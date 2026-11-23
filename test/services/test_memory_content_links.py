@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 from sqlalchemy.orm import sessionmaker
 
@@ -87,6 +89,184 @@ def test_see_also_parser_ignores_non_memory_reference_shapes() -> None:
 """
 
     assert extract_content_link_targets(content, MemoryService._sanitize_key) == []
+
+
+@pytest.mark.parametrize(
+    "bullet", ["- ...", "- —", "* * *", "- -->", "- ???", "+ !!", "- 参考資料"]
+)
+def test_keyless_bullet_does_not_hide_following_target(bullet) -> None:
+    content = f"## See Also\n{bullet}\n- [[target]]\n"
+    assert extract_content_link_targets(content, MemoryService._sanitize_key) == ["target"]
+
+
+def test_see_also_boundaries_and_tilde_fences() -> None:
+    content = "## see also\n- [[first]]\n~~~\n[[hidden]]\n~~~\n# Next\n- [[outside]]\n"
+    assert extract_content_link_targets(content, MemoryService._sanitize_key) == [
+        "first",
+        "outside",
+    ]
+    assert MemoryService._authored_see_also_lines(content) == ["- [[first]]"]
+    assert "## see also" not in MemoryService._strip_existing_see_also(content)
+
+
+def test_unclosed_fence_does_not_erase_earlier_section_links() -> None:
+    content = "## See Also\n- [[first]]\n~~~\n[[hidden]]\n"
+    assert extract_content_link_targets(content, MemoryService._sanitize_key) == ["first"]
+
+
+def test_markdown_link_title_and_cross_scope_are_not_misread() -> None:
+    content = '## See Also\n- [Design](design.md "Design doc")\n- [Fed](../federated/foo.md)\n'
+    assert extract_content_link_targets(content, MemoryService._sanitize_key, "global") == [
+        "design"
+    ]
+
+
+def test_cross_scope_link_does_not_resolve_same_named_local_note(
+    tmp_path, isolated_memory_db, monkeypatch
+) -> None:
+    _enable_content_links(monkeypatch)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    _run(service.store("local", scope="global", key="foo"))
+    _run(service.store("remote", scope="federated", key="foo"))
+    _run(service.store("## See Also\n- [Fed](../federated/foo.md)", scope="global", key="source"))
+    assert _edges(isolated_memory_db) == set()
+    issues = _run(
+        run_lint(
+            "fixture", scope="global", max_pairs=0, base_dir=tmp_path, db_engine=isolated_memory_db
+        )
+    )
+    assert any(issue.description == "content link crosses scope: foo" for issue in issues)
+
+
+@pytest.mark.parametrize(
+    "bullet", ["- ...", "- —", "* * *", "- -->", "- ???", "+ !!", "- 参考資料"]
+)
+def test_keyless_bullet_keeps_store_repair_lint_and_compile_working(
+    tmp_path, isolated_memory_db, monkeypatch, bullet
+) -> None:
+    _enable_content_links(monkeypatch)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    monkeypatch.setattr(service, "_schedule_background_compile", lambda **kwargs: None)
+    _run(service.store("target", scope="global", key="target"))
+    stored = _run(
+        service.store(
+            f"[[ghost]]\n\n## See Also\n{bullet}\n- [[target]]\n", scope="global", key="source"
+        )
+    )
+    assert ("source", "target", "content_link") in _edges(isolated_memory_db)
+    MemoryReconciliationService(tmp_path, isolated_memory_db).apply()
+    assert ("source", "target", "content_link") in _edges(isolated_memory_db)
+    issues = _run(
+        run_lint(
+            "fixture", scope="global", max_pairs=0, base_dir=tmp_path, db_engine=isolated_memory_db
+        )
+    )
+    assert any(
+        "content link references missing key: ghost" == issue.description for issue in issues
+    )
+    _identity_compile_stubs(service, monkeypatch, isolated_memory_db)
+    assert _run(service.compact(key="source"))["source"] == "applied"
+    assert bullet in Path(stored.file_path).read_text(encoding="utf-8")
+
+
+def test_markdown_link_pattern_is_linear_on_open_brackets() -> None:
+    from cli_agent_orchestrator.services.memory_content_links import _MARKDOWN_LINK
+
+    assert r"[^\[\]\n]" in _MARKDOWN_LINK.pattern
+    assert (
+        extract_content_link_targets("## See Also\n- " + "[a" * 50000, MemoryService._sanitize_key)
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "bullet",
+    [
+        "- [Other](../global/other.md)",
+        "* [Other notes](../global/other.md)",
+        "- [[other]]",
+        "- Context for [[other]]",
+    ],
+)
+@pytest.mark.parametrize("model_action", ["keep", "drop", "alter"])
+def test_real_compile_keeps_authored_lines_out_of_model_input(
+    tmp_path, isolated_memory_db, monkeypatch, bullet, model_action
+) -> None:
+    from cli_agent_orchestrator.services import wiki_compiler
+
+    _enable_content_links(monkeypatch)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    monkeypatch.setattr(service, "_schedule_background_compile", lambda **kwargs: None)
+    monkeypatch.setattr(wiki_compiler, "_build_llm_client", lambda *args, **kwargs: object())
+
+    async def model(client, system, user, *, timeout_s):
+        assert bullet not in user
+        assert "## See Also" not in user
+        identifier = re.search(r"<!-- id: [^>]+ -->", user)
+        assert identifier is not None
+        body = {
+            "keep": "Fact about other.",
+            "drop": "A compiled fact about other.",
+            "alter": "An updated fact about other.",
+        }[model_action]
+        return f"# source\n{identifier.group()}\n\n{body}\n"
+
+    async def no_related(*args, **kwargs):
+        return RelatedResult([], False, "disabled", 0)
+
+    monkeypatch.setattr(wiki_compiler, "_llm_call", model)
+    monkeypatch.setattr(wiki_compiler, "find_related", no_related)
+    _run(service.store("Other fact", scope="global", key="other"))
+    stored = _run(
+        service.store(
+            "Fact about other.\n\n## See Also\n" + bullet + "\n", scope="global", key="source"
+        )
+    )
+    assert _run(service.compact(key="source"))["source"] == "applied"
+    assert bullet in Path(stored.file_path).read_text(encoding="utf-8")
+
+
+def test_real_compile_with_content_links_off_uses_original_input_and_drops_authored_lines(
+    tmp_path, isolated_memory_db, monkeypatch
+) -> None:
+    from cli_agent_orchestrator.services import settings_service, wiki_compiler
+
+    monkeypatch.setattr(settings_service, "is_memory_content_links_enabled", lambda: False)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    monkeypatch.setattr(service, "_schedule_background_compile", lambda **kwargs: None)
+    monkeypatch.setattr(wiki_compiler, "_build_llm_client", lambda *args, **kwargs: object())
+    bullet = "- [Other](../global/other.md)"
+
+    async def model(client, system, user, *, timeout_s):
+        assert bullet in user
+        identifier = re.search(r"<!-- id: [^>]+ -->", user)
+        assert identifier is not None
+        return f"# source\n{identifier.group()}\n\nThe compiled fact.\n"
+
+    async def no_related(*args, **kwargs):
+        return RelatedResult([], False, "disabled", 0)
+
+    monkeypatch.setattr(wiki_compiler, "_llm_call", model)
+    monkeypatch.setattr(wiki_compiler, "find_related", no_related)
+    stored = _run(service.store("Fact.\n\n## See Also\n" + bullet, scope="global", key="source"))
+    assert _run(service.compact(key="source"))["source"] == "applied"
+    assert bullet not in Path(stored.file_path).read_text(encoding="utf-8")
+
+
+def test_authored_target_is_not_rendered_twice_when_related_edge_is_active(
+    tmp_path, isolated_memory_db, monkeypatch
+) -> None:
+    _enable_content_links(monkeypatch)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    _identity_compile_stubs(service, monkeypatch, isolated_memory_db, related_keys=("other",))
+    _run(service.store("Other", scope="global", key="other"))
+    stored = _run(
+        service.store("## See Also\n- Context for [[other]]", scope="global", key="source")
+    )
+    assert _run(service.compact(key="source"))["source"] == "applied"
+    section = _see_also_section(stored.file_path)
+    assert section.count("[[other]]") == 1
+    assert "- [other](../global/other.md)" not in section
 
 
 def test_see_also_parser_rejects_each_non_memory_rule() -> None:

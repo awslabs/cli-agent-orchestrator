@@ -127,6 +127,67 @@ def test_memory_related_tool_calls_local_service(monkeypatch) -> None:
     assert _run(tool("source")) == expected
 
 
+def test_memory_related_tool_uses_remote_gateway(monkeypatch) -> None:
+    from cli_agent_orchestrator.services import memory_gateway
+
+    expected = {"success": True, "key": "remote", "edges": [], "neighbours": []}
+    monkeypatch.setattr(memory_gateway, "remote_memory_url", lambda: "http://localhost")
+
+    async def remote(**kwargs):
+        assert kwargs["key"] == "source"
+        return expected
+
+    monkeypatch.setattr(memory_gateway, "related_memory", remote)
+    monkeypatch.setattr(MemoryService, "related", lambda *args, **kwargs: pytest.fail("local read"))
+    tool = getattr(server.memory_related, "fn", server.memory_related)
+    assert _run(tool("source")) == expected
+
+
+def test_related_does_not_record_access(service, isolated_memory_db) -> None:
+    from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+
+    _run(service.store("target", scope="global", key="target"))
+    _run(service.store("source", scope="global", key="source"))
+    MemoryRelationshipService(sessionmaker(bind=isolated_memory_db)).create(
+        "global", None, "source", "target", "relates_to", "human"
+    )
+    with sessionmaker(bind=isolated_memory_db)() as db:
+        before = {row.key: row.access_count for row in db.query(MemoryMetadataModel).all()}
+    _run(service.related("source", scope="global"))
+    with sessionmaker(bind=isolated_memory_db)() as db:
+        after = {row.key: row.access_count for row in db.query(MemoryMetadataModel).all()}
+    assert after == before
+
+
+def test_vault_neighbour_hook_uses_latest_entry_body(
+    service, monkeypatch, isolated_memory_db
+) -> None:
+    _run(service.store("target", scope="global", key="target"))
+    _run(service.store("source", scope="global", key="source"))
+    MemoryRelationshipService(sessionmaker(bind=isolated_memory_db)).create(
+        "global", None, "source", "target", "relates_to", "human"
+    )
+    original = service.read_exact_key
+
+    async def vault_read(key, **kwargs):
+        memory = await original(key, **kwargs)
+        if key == "target" and memory:
+            return memory.model_copy(
+                update={
+                    "source_kind": "vault",
+                    "content": "## 2026-11-23T10:28:26Z\nold entry\n\n## 2026-11-23T10:29:26Z\n"
+                    + "new entry " * 30,
+                }
+            )
+        return memory
+
+    monkeypatch.setattr(service, "read_exact_key", vault_read)
+    assert (
+        _run(service.related("source", scope="global"))["neighbours"][0]["hook"]
+        == ("new entry " * 30).strip()[:160]
+    )
+
+
 @pytest.mark.parametrize("scope", ["agent", "federated"])
 def test_memory_manager_cannot_read_private_scope_related_locally(service, scope) -> None:
     context = {"agent_profile": MEMORY_MANAGER_PROFILE}
@@ -384,6 +445,22 @@ def test_remote_related_end_to_end_through_the_gateway_and_the_route(service, mo
     assert ambiguous["error_kind"] == "ambiguous_scope"
     assert invalid["error_kind"] == "invalid_argument"
     assert "direction must be one of" in invalid["error"]
+
+    for payload, message in (
+        ({"key": "source", "scope": "bogus-SECRET"}, "invalid memory scope"),
+        ({"key": "..."}, "key is empty after sanitization"),
+    ):
+        response = client.post("/internal/memory/related", json=payload)
+        assert response.status_code == 422
+        assert response.json() == {
+            "success": False,
+            "error_kind": "invalid_argument",
+            "error": message,
+        }
+        assert "SECRET" not in response.text
+
+    response = client.post("/internal/memory/related", json={"key": "dup"})
+    assert response.status_code == 409
 
 
 @pytest.mark.parametrize(

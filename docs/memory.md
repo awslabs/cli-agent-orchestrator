@@ -6,8 +6,8 @@ CAO's memory system gives agents persistent, cross-session storage. Agents store
 ## Capabilities
 
 - **Five scopes** (`global`, `project`, `session`, `agent`, `federated`) and four type labels.
-- **Store** via the `memory_store` MCP tool; **recall / related / forget** via
-  MCP tools, and store / recall / forget via the `cao memory` CLI.
+- **Store / recall / related / forget** via MCP tools; **list / show / delete** via
+  the `cao memory` CLI.
 - **Markdown wiki storage** with a SQLite metadata index.
 - **Search**: keyword (BM25), recency, or hybrid; results ranked by recency, a
   composite 3-factor score (BM25 + recency + usage), or usage.

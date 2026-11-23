@@ -432,6 +432,7 @@ class InvalidRelatedArgument(ValueError):
         "type": "invalid relationship type",
         "limit": "limit must be between 1 and 100",
         "key": "key is empty after sanitization",
+        "scope": "invalid memory scope",
     }
 
     def __init__(self, code: str) -> None:
@@ -1655,7 +1656,10 @@ class MemoryService:
         "fallback:<reason>") — background callers ignore it; the sweep reports it.
         """
         from cli_agent_orchestrator.services import wiki_compiler
-        from cli_agent_orchestrator.services.settings_service import get_compile_timeout_s
+        from cli_agent_orchestrator.services.settings_service import (
+            get_compile_timeout_s,
+            is_memory_content_links_enabled,
+        )
 
         def _audit(event_type: str, summary: str, **fields: str) -> None:
             try:
@@ -1668,11 +1672,25 @@ class MemoryService:
                 logger.debug(f"compile audit write failed (key={key}): {e}")
 
         wiki_path = self.get_wiki_path(scope, scope_id, key)
+        content_links_enabled = is_memory_content_links_enabled()
+        authored_lines = (
+            self._authored_see_also_lines(pre_append_content, new_entry)
+            if content_links_enabled
+            else []
+        )
+        model_existing = (
+            self._strip_existing_see_also(pre_append_content)
+            if content_links_enabled
+            else pre_append_content
+        )
+        model_entry = (
+            self._strip_existing_see_also(new_entry) if content_links_enabled else new_entry
+        )
 
         try:
             result = await wiki_compiler.compile(
-                pre_append_content,
-                new_entry,
+                model_existing,
+                model_entry,
                 topic_key=key,
                 timeout_s=get_compile_timeout_s(),
                 provider_hint=provider_hint,
@@ -1702,6 +1720,7 @@ class MemoryService:
         # metadata upsert leaves any prior value intact; ``""`` on
         # success-with-empty is written (prevents endless retries).
         related_keys_value: Optional[str] = None
+        see_also_targets: list[str] = []
         try:
             cands = self._candidate_keys_for_topic(scope, scope_id, key)
             related_result = await wiki_compiler.find_related(
@@ -1748,42 +1767,6 @@ class MemoryService:
                         pass
                 except Exception as e:  # noqa: BLE001 — non-blocking; marker already written
                     logger.warning(f"relationship replace_set (compiler) failed, ignoring: {e}")
-                if see_also_targets:
-                    from cli_agent_orchestrator.services.settings_service import (
-                        is_memory_content_links_enabled,
-                    )
-
-                    # Authored lines are link producers only with memory.content_links on;
-                    # with it off the compile output stays exactly as before.
-                    authored_lines: list[str] = []
-                    authored_targets: set[str] = set()
-                    if is_memory_content_links_enabled():
-                        from cli_agent_orchestrator.services.memory_content_links import (
-                            extract_content_link_targets,
-                        )
-
-                        authored_lines = self._authored_see_also_lines(
-                            pre_append_content, new_entry
-                        )
-                        authored_targets = set(
-                            extract_content_link_targets(
-                                "## See Also\n" + "\n".join(authored_lines),
-                                self._sanitize_key,
-                            )
-                        )
-                    see_also = self._render_see_also(
-                        [target for target in see_also_targets if target not in authored_targets],
-                        topic_scope=scope,
-                        topic_scope_id=scope_id,
-                    )
-                    stripped = self._strip_existing_see_also(compiled_content)
-                    if authored_lines:
-                        rendered = ["## See Also", *authored_lines]
-                        if see_also:
-                            rendered.extend(see_also.splitlines()[1:])
-                        compiled_content = stripped + "\n" + "\n".join(rendered) + "\n"
-                    else:
-                        compiled_content = stripped + "\n" + see_also if see_also else stripped
             else:
                 logger.info("find_related_fallback reason=%s", related_result.fallback_reason)
             _audit(
@@ -1794,6 +1777,33 @@ class MemoryService:
             )
         except Exception as e:  # noqa: BLE001 — non-blocking promise
             logger.warning(f"find_related raised, ignoring: {e}")
+
+        if content_links_enabled:
+            from cli_agent_orchestrator.services.memory_content_links import (
+                extract_content_link_targets,
+            )
+
+            authored_targets = set(
+                extract_content_link_targets(
+                    "## See Also\n" + "\n".join(authored_lines), self._sanitize_key, scope
+                )
+            )
+        else:
+            authored_targets = set()
+        if authored_lines or see_also_targets:
+            see_also = self._render_see_also(
+                [target for target in see_also_targets if target not in authored_targets],
+                topic_scope=scope,
+                topic_scope_id=scope_id,
+            )
+            stripped = self._strip_existing_see_also(compiled_content)
+            if authored_lines:
+                rendered = ["## See Also", *authored_lines]
+                if see_also:
+                    rendered.extend(see_also.splitlines()[1:])
+                compiled_content = stripped + "\n" + "\n".join(rendered) + "\n"
+            else:
+                compiled_content = stripped + "\n" + see_also if see_also else stripped
 
         topic_lock_path = wiki_path.parent / f".{wiki_path.stem}.lock"
         try:
@@ -2075,19 +2085,13 @@ class MemoryService:
         ``## See Also`` to the next ``##`` heading or EOF. Trailing
         whitespace is normalised.
         """
-        lines = content.splitlines(keepends=False)
-        out: list = []
-        skip = False
-        for line in lines:
-            stripped = line.rstrip()
-            if stripped == "## See Also":
-                skip = True
-                continue
-            if skip and stripped.startswith("## "):
-                skip = False
-            if skip:
-                continue
-            out.append(line)
+        from cli_agent_orchestrator.services.memory_content_links import see_also_sections
+
+        lines = content.splitlines()
+        excluded = {
+            index for start, end, _ in see_also_sections(lines) for index in range(start, end)
+        }
+        out = [line for index, line in enumerate(lines) if index not in excluded]
         # Drop trailing empty lines created by the strip; reproduce a
         # single trailing newline shape compatible with append-mode bytes.
         rendered = "\n".join(out).rstrip() + "\n"
@@ -2096,23 +2100,23 @@ class MemoryService:
     @staticmethod
     def _strip_generated_see_also(content: str) -> str:
         """Remove canonical CAO-rendered See Also lines, preserving authored lines."""
+        from cli_agent_orchestrator.services.memory_content_links import see_also_sections
         from cli_agent_orchestrator.services.wiki_compiler import SEE_ALSO_LINK_RE
 
         lines = content.splitlines(keepends=False)
         out: list[str] = []
+        sections = {start: (end, body) for start, end, body in see_also_sections(lines)}
         index = 0
         while index < len(lines):
-            if lines[index].rstrip() != "## See Also":
+            if index not in sections:
                 out.append(lines[index])
                 index += 1
                 continue
-            end = index + 1
-            while end < len(lines) and not lines[end].rstrip().startswith("## "):
-                end += 1
+            end, body = sections[index]
             authored = [
                 line
-                for line in lines[index + 1 : end]
-                if not SEE_ALSO_LINK_RE.fullmatch(line.strip())
+                for line_index, line in enumerate(lines[index + 1 : end], index + 1)
+                if line_index not in body or not SEE_ALSO_LINK_RE.fullmatch(line.strip())
             ]
             if any(line.strip() for line in authored):
                 out.append(lines[index])
@@ -2123,21 +2127,18 @@ class MemoryService:
     @staticmethod
     def _authored_see_also_lines(*contents: str) -> list[str]:
         """Collect non-canonical See Also lines without changing their text."""
+        from cli_agent_orchestrator.services.memory_content_links import see_also_sections
         from cli_agent_orchestrator.services.wiki_compiler import SEE_ALSO_LINK_RE
 
         lines: list[str] = []
         seen: set[str] = set()
         for content in contents:
-            in_see_also = False
-            for line in content.splitlines():
+            content_lines = content.splitlines()
+            indices = {index for _, _, body in see_also_sections(content_lines) for index in body}
+            for index, line in enumerate(content_lines):
                 stripped = line.rstrip()
-                if stripped == "## See Also":
-                    in_see_also = True
-                    continue
-                if in_see_also and stripped.startswith("## "):
-                    in_see_also = False
                 if (
-                    in_see_also
+                    index in indices
                     and line.strip()
                     and not SEE_ALSO_LINK_RE.fullmatch(line.strip())
                     and stripped not in seen
@@ -2171,6 +2172,7 @@ class MemoryService:
         targets = extract_content_link_targets(
             self._strip_generated_see_also(file_content),
             self._sanitize_key,
+            scope,
         )
         audits: list[Callable[[], None]] = []
         with self._get_db_session() as db:
@@ -3049,7 +3051,10 @@ class MemoryService:
         if not _is_memory_enabled():
             return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
         if scope is not None:
-            MemoryScope(scope)
+            try:
+                MemoryScope(scope)
+            except ValueError:
+                raise InvalidRelatedArgument("scope") from None
         if limit < 1 or limit > 100:
             raise InvalidRelatedArgument("limit")
         if direction not in {"in", "out", "both"}:
@@ -3155,7 +3160,11 @@ class MemoryService:
                     "depth": walked_edge.depth,
                 }
             )
-            hook = re.sub(r"\s+", " ", neighbour.content).strip()
+            hook_content = neighbour.content
+            if neighbour.source_kind == "vault":
+                entry = re.split(r"(?m)^##\s+\d{4}-\d{2}-\d{2}T[^\n]+\n", hook_content)
+                hook_content = entry[-1]
+            hook = re.sub(r"\s+", " ", hook_content).strip()
             if neighbour.key not in emitted_neighbours:
                 neighbours.append(
                     {
