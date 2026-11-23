@@ -18,7 +18,7 @@ the committed pin lags by one release by construction.
 Skills:
 
 - `cao-provider`
-- `cao-plugin`
+- `cao-event-plugin`
 - `cao-contributing`
 
 Excluded: every operator-facing skill (they belong in the `cao` package), and the adjacent-feature and vendored skills excluded there for the same reasons.

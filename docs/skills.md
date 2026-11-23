@@ -26,7 +26,7 @@ python-testing/
 └── SKILL.md
 ```
 
-A skill may also carry a `references/` folder of Markdown pages that `SKILL.md` links to, for detail the agent reads only when it needs it. `cao-provider`, `cao-plugin` and `cao-contributing` are built-in skills that do this. `cao skills add` copies the whole folder, so these pages install with the skill.
+A skill may also carry a `references/` folder of Markdown pages that `SKILL.md` links to, for detail the agent reads only when it needs it. `cao-provider`, `cao-event-plugin` and `cao-contributing` are built-in skills that do this. `cao skills add` copies the whole folder, so these pages install with the skill.
 
 `SKILL.md` has two required frontmatter fields — `name` and `description` — followed by the skill content in Markdown:
 
@@ -92,6 +92,17 @@ After removal, all providers pick up the change automatically — Copilot CLI ag
 ### Builtin skill seeding
 
 Builtin skills are auto-seeded when `cao-server` starts — no manual step required. If a skill with the same name already exists, it is skipped — preserving any edits you've made. After a CAO upgrade, restarting the server will seed any new builtin skills without overwriting your changes. You can also run `cao init` to seed them manually.
+
+**Renamed built-in skills.** The event-plugin authoring skill `cao-plugin` is now `cao-event-plugin`. On upgrade, `cao init` (and a `cao-server` start) removes the old `cao-plugin` folder when nobody edited it: when it matches the current skill, or matches a copy that a release shipped, apart from its frontmatter `name:` line. Every install that v2.3.0 to v2.5.5 seeded holds such a copy, so the old folder goes away on upgrade. A folder that matches neither may hold local edits, so it is kept with a warning, and both folders then appear in the catalog until you remove the old one (`cao skills remove cao-plugin`). An agent profile that lists the skill by exact name (`skills: ["cao-plugin"]`) must change to `cao-event-plugin`; a glob such as `cao-*` still matches.
+
+**Refreshing a built-in skill you did not edit.** Seeding never overwrites an installed skill, so an installed copy keeps the text of the release that first seeded it. After the rename above, that text can still point agents at `cao-plugin`. This affects `cao-contributing` on any install that v2.3.0 to v2.5.5 seeded, and `cao-agent-plugin-creator` and `cao-agent-plugin-audit` on an install that v2.5.5 seeded. To take the current text of a skill you have not edited, remove it and seed it again:
+
+```bash
+cao skills remove cao-contributing
+cao init
+```
+
+`cao init` seeds only missing skills, so it restores the removed one with the current text and leaves every other skill as it is. Do not do this for a skill you edited: removing it deletes your edits.
 
 CAO ships with built-in skills including:
 
