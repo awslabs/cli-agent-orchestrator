@@ -97,6 +97,48 @@ describe('WorkflowSpecViewer', () => {
     await waitFor(() => expect(requestFullscreen).toHaveBeenCalledOnce())
   })
 
+  it('resyncs the full screen label when reopened after Exit', async () => {
+    Object.defineProperty(document, 'fullscreenEnabled', { configurable: true, value: true })
+    let fullscreenElement: Element | null = null
+    Object.defineProperty(document, 'fullscreenElement', {
+      configurable: true,
+      get: () => fullscreenElement,
+    })
+    HTMLElement.prototype.requestFullscreen = vi.fn().mockImplementation(async function (this: HTMLElement) {
+      fullscreenElement = this
+      document.dispatchEvent(new Event('fullscreenchange'))
+    })
+    const { rerender } = renderViewer()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Full screen' }))
+    expect(await screen.findByRole('button', { name: 'Leave full screen' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Exit' }))
+    fullscreenElement = null
+    rerender(
+      <WorkflowSpecViewer
+        open={false}
+        workflowName="review_flow"
+        spec={SPEC}
+        loading={false}
+        error={null}
+        onClose={vi.fn()}
+        returnFocusRef={createRef<HTMLButtonElement>()}
+      />,
+    )
+    rerender(
+      <WorkflowSpecViewer
+        open
+        workflowName="review_flow"
+        spec={SPEC}
+        loading={false}
+        error={null}
+        onClose={vi.fn()}
+        returnFocusRef={createRef<HTMLButtonElement>()}
+      />,
+    )
+    expect(screen.getByRole('button', { name: 'Full screen' })).toBeInTheDocument()
+  })
+
   it.each([false, true])('keeps each number with its code and marks/scrolls a finding row (wrap=%s)', wrap => {
     renderViewer()
     if (wrap) fireEvent.click(screen.getByRole('button', { name: 'Wrap lines' }))
@@ -120,12 +162,25 @@ describe('WorkflowSpecViewer', () => {
   it('traps Tab and Shift+Tab within the dialog', () => {
     renderViewer()
     const first = screen.getByRole('button', { name: 'Copy content hash' })
-    const last = screen.getByRole('button', { name: 'Wrap lines' })
+    const last = screen.getByTestId('spec-code-scroll')
     last.focus()
     fireEvent.keyDown(window, { key: 'Tab' })
     expect(first).toHaveFocus()
     fireEvent.keyDown(window, { key: 'Tab', shiftKey: true })
     expect(last).toHaveFocus()
+  })
+
+  it('tabs from Wrap lines to the labelled code scroll region', () => {
+    renderViewer()
+    const wrap = screen.getByRole('button', { name: 'Wrap lines' })
+    const scroller = screen.getByTestId('spec-code-scroll')
+    wrap.focus()
+    fireEvent.keyDown(window, { key: 'Tab' })
+    expect(scroller).toHaveFocus()
+    expect(scroller).toHaveAttribute('role', 'region')
+    expect(scroller).toHaveAttribute('tabindex', '0')
+    expect(scroller).toHaveAccessibleName('Workflow spec source')
+    expect(scroller).toContainElement(screen.getByTestId('spec-line-1'))
   })
 
   it('shows copied only after clipboard writeText succeeds', async () => {

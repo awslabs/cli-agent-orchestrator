@@ -85,6 +85,9 @@ export function WorkflowSpecViewer({
         if (event.shiftKey && (document.activeElement === first || !viewerRef.current.contains(document.activeElement))) {
           event.preventDefault()
           last.focus()
+        } else if (!event.shiftKey && document.activeElement === focusable[focusable.length - 2]) {
+          event.preventDefault()
+          last.focus()
         } else if (!event.shiftKey && (document.activeElement === last || !viewerRef.current.contains(document.activeElement))) {
           event.preventDefault()
           first.focus()
@@ -92,6 +95,7 @@ export function WorkflowSpecViewer({
       }
     }
     const fullscreenChange = () => setFullscreen(!!document.fullscreenElement)
+    setFullscreen(!!document.fullscreenElement)
     window.addEventListener('keydown', keydown)
     document.addEventListener('fullscreenchange', fullscreenChange)
     return () => {
@@ -217,7 +221,9 @@ export function WorkflowSpecViewer({
             </div>
             <div
               ref={codeScrollRef}
+              role="region"
               aria-label="Workflow spec source"
+              tabIndex={0}
               className="relative min-h-0 flex-1 overflow-auto bg-[#080b10]"
               data-testid="spec-code-scroll"
             >

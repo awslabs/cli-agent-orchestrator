@@ -18,6 +18,23 @@ describe('tokenizePython', () => {
     expect(text(source, 'operator').join('')).toContain('():')
   })
 
+  it('colours soft keywords and decorators only in their syntactic positions', () => {
+    const cases = [
+      { source: 'match = re.match(p, s)', keywords: [], decorators: [], operators: ['=', '.', '(', ',', ')'] },
+      { source: 'match x:', keywords: ['match'], decorators: [], operators: [':'] },
+      { source: 'case 1:', keywords: ['case'], decorators: [], operators: [':'] },
+      { source: 'y = a @ b', keywords: [], decorators: [], operators: ['=', '@'] },
+      { source: 'y = a @b', keywords: [], decorators: [], operators: ['=', '@'] },
+      { source: '    @dataclass', keywords: [], decorators: ['@dataclass'], operators: [] },
+    ]
+    for (const { source, keywords, decorators, operators } of cases) {
+      expect(joined(source)).toBe(source)
+      expect(text(source, 'keyword')).toEqual(keywords)
+      expect(text(source, 'decorator')).toEqual(decorators)
+      expect(text(source, 'operator')).toEqual(expect.arrayContaining(operators))
+    }
+  })
+
   it('keeps triple docstrings, f-strings and mixed-case prefixed strings intact', () => {
     const source = '"""one\n# still text\ntwo"""\nRF"value={value}"\nbrU\'bytes-ish\''
     expect(text(source, 'string')).toEqual([

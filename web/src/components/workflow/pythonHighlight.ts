@@ -18,9 +18,9 @@ export const PYTHON_HIGHLIGHT_SIZE_CAP = 500 * 1024
 
 const KEYWORDS = new Set([
   'False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break',
-  'case', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except',
+  'class', 'continue', 'def', 'del', 'elif', 'else', 'except',
   'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda',
-  'match', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return', 'try', 'while',
+  'nonlocal', 'not', 'or', 'pass', 'raise', 'return', 'try', 'while',
   'with', 'yield',
 ])
 
@@ -43,6 +43,20 @@ const isHexDigit = (c: string | undefined) => !!c && /[0-9a-fA-F]/.test(c)
 const isPrefixLetter = (c: string | undefined) => !!c && /[rRbBfFuU]/.test(c)
 const isOperator = (c: string | undefined) => !!c && '+-*/%@<>=!&|^~:;,.()[]{}'.includes(c)
 
+const softKeywordEndsPattern = (source: string, afterWord: number) => {
+  let index = afterWord
+  while (source[index] === ' ' || source[index] === '\t') index++
+  if ('=.( [,'.includes(source[index] ?? '')) return false
+
+  let lastCodeCharacter = ''
+  while (index < source.length && source[index] !== '\n' && source[index] !== '#') {
+    const character = source[index]
+    if (character !== ' ' && character !== '\t' && character !== '\r') lastCodeCharacter = character
+    index++
+  }
+  return lastCodeCharacter === ':'
+}
+
 /**
  * A deliberately small, recovery-friendly Python lexer for display only.
  * Every loop consumes at least one character and every character is visited a
@@ -56,8 +70,13 @@ export function tokenizePython(source: string): PythonToken[] {
   const tokens: PythonToken[] = []
   let i = 0
   let expectDefinition = false
+  let atLogicalLineStart = true
   const push = (type: PythonTokenType, start: number, end: number) => {
     tokens.push({ type, text: source.slice(start, end) })
+    for (let index = start; index < end; index++) {
+      if (source[index] === '\n') atLogicalLineStart = true
+      else if (source[index] !== ' ' && source[index] !== '\t' && source[index] !== '\r') atLogicalLineStart = false
+    }
   }
 
   while (i < source.length) {
@@ -96,7 +115,7 @@ export function tokenizePython(source: string): PythonToken[] {
       continue
     }
 
-    if (c === '@' && isIdentifierStart(source[i + 1])) {
+    if (c === '@' && atLogicalLineStart && isIdentifierStart(source[i + 1])) {
       i += 2
       while (isIdentifierPart(source[i]) || source[i] === '.') i++
       push('decorator', start, i)
@@ -134,12 +153,15 @@ export function tokenizePython(source: string): PythonToken[] {
     }
 
     if (isIdentifierStart(c)) {
+      const startsLogicalLine = atLogicalLineStart
       i++
       while (isIdentifierPart(source[i])) i++
       const word = source.slice(start, i)
       const type = expectDefinition
         ? 'definition'
-        : KEYWORDS.has(word)
+        : (word === 'match' || word === 'case') && startsLogicalLine && softKeywordEndsPattern(source, i)
+          ? 'keyword'
+          : KEYWORDS.has(word)
           ? 'keyword'
           : BUILTINS.has(word)
             ? 'builtin'
