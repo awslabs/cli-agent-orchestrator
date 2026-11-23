@@ -10,6 +10,7 @@ import {
   Layout,
   PaneCount,
   closePane,
+  fillEmptyPanes,
   focusPane,
   openInFocused,
   openInSplit,
@@ -58,6 +59,7 @@ interface WorkspaceState {
   open: (sessionName: string, terminalId: string, mode?: 'focused' | 'split') => void
   closePane: (index: number) => void
   focusPane: (index: number) => void
+  /** Change the pane count, then fill empty panes with the session's other agents. */
   setPaneCount: (count: PaneCount) => void
   /** Clear flags for whatever is on screen now (call when the page becomes visible). */
   markVisibleViewed: () => void
@@ -175,7 +177,11 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
 
     closePane: (index) => updateLayout(l => closePane(l, index)),
     focusPane: (index) => updateLayout(l => focusPane(l, index)),
-    setPaneCount: (count) => updateLayout(l => setPaneCount(l, count)),
+    setPaneCount: (count) => {
+      const { selectedSession, details } = get()
+      const ids = (selectedSession && details[selectedSession]?.terminals.map(t => t.id)) || []
+      updateLayout(l => fillEmptyPanes(setPaneCount(l, count), ids))
+    },
 
     markVisibleViewed: () => set({ attention: withoutFlags(get().attention, viewedTerminals(get())) }),
 
