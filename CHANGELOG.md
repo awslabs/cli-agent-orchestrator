@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Code-owner review protects CI policy, release scripts, and trust-boundary code** (#1350).
+  Tests pin the owned paths and mypy strict mode so policy changes cannot silently
+  weaken these gates.
+
 - **Workflow specs open in a large, readable viewer**. The Workflows page now shows
   Python syntax colouring, line numbers and lint findings in a near-window-size dialog,
   with line wrapping, real browser full screen, and clear Exit/Esc controls.
