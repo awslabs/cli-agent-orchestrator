@@ -66,6 +66,12 @@ _LEGACY_INBOX_DDL = (
 )
 
 
+def _short_wait_transaction(conn):
+    """closing_transaction over a connection that gives up on a lock at once."""
+    conn.execute("PRAGMA busy_timeout = 0")
+    return closing_transaction(conn)
+
+
 def _columns(path, table):
     with closing_transaction(sqlite3.connect(path)) as conn:
         return [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
@@ -207,6 +213,34 @@ class TestMigration:
         with closing_transaction(sqlite3.connect(path)) as conn:
             tables = conn.execute("SELECT name FROM sqlite_master").fetchall()
         assert tables == []
+
+    def test_a_failed_migration_is_logged_as_an_error_that_stops_the_inbox(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # Arrange: a legacy DB whose ALTER cannot run (a second writer holds it).
+        path = tmp_path / "locked.db"
+        self._legacy(path)
+        monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
+        holder = sqlite3.connect(path, timeout=0.05)
+        holder.execute("BEGIN IMMEDIATE")
+        monkeypatch.setattr(database, "closing_transaction", _short_wait_transaction)
+
+        # Act
+        try:
+            with caplog.at_level("WARNING", logger=database.logger.name):
+                database._migrate_delivery_failure_columns()
+        finally:
+            holder.rollback()
+            holder.close()
+
+        # Assert
+        (record,) = [r for r in caplog.records if "delivery failure columns" in r.getMessage()]
+        assert record.levelname == "ERROR"
+        text = record.getMessage()
+        assert "inbox will not work" in text
+        assert "restart" in text
+        assert "database is locked" in text, "keeps the cause"
+        assert "is_system_notice" not in _columns(path, "inbox"), "nothing half-applied"
 
     def test_a_table_that_exists_is_migrated_when_the_other_does_not(self, tmp_path, monkeypatch):
         # Arrange

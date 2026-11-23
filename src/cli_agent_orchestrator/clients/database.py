@@ -1535,8 +1535,13 @@ def _migrate_delivery_failure_columns() -> None:
                         conn.execute(ddl)
                         logger.info(f"Migration: added {column} column to {table}")
     except Exception as e:
-        # Delivery cannot record failures or replies without the columns.
-        logger.warning(f"Migration check for delivery failure columns failed: {e}")
+        # The ORM selects these columns on every inbox read, so without them the
+        # whole inbox fails, not only the failure bookkeeping. Not fatal, like
+        # the other migrations: the server still starts, and a restart retries.
+        logger.error(
+            f"Migration check for delivery failure columns failed: {e}. The inbox will not "
+            "work until the migration succeeds and the server is restarted."
+        )
 
 
 _PROVIDER_ROUTE_COLUMNS = {
