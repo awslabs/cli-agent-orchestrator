@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Workflow specs open in a large, readable viewer**. The Workflows page now shows
+  Python syntax colouring, line numbers and lint findings in a near-window-size dialog,
+  with line wrapping, real browser full screen, and clear Exit/Esc controls.
+
 - **Kiro CLI installs keep the CAO callback tools**. A profile that declares
   `cao-mcp-server` and pins `allowedTools` without `@cao-mcp-server` used to install with a
   `tools` list that hid `send_message`, `complete_assignment`, `workflow_return` and
