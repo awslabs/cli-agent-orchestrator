@@ -1470,3 +1470,104 @@ def _set_status_of(message_id):
     from cli_agent_orchestrator.clients.database import get_inbox_message
 
     return get_inbox_message(message_id).status.value
+
+
+class TestReplyLostNoticeWording:
+    """The reply-lost notice says whether the reply may already be there, and names no profile.
+
+    The worker's row is gone when it is written, so no profile can be read.
+    """
+
+    def _lost(self, live, *, uncertain):
+        from cli_agent_orchestrator.clients.database import delete_terminal
+
+        _armed(S, W)
+        _send(W, S, "final reply text")
+        svc.handle_worker_ended(W, "was deleted")
+        delete_terminal(W, end_reason="deleted")
+        live.paste.dispatch_input.side_effect = (
+            RuntimeError("herdr-core lost terminal.send")
+            if uncertain
+            else _not_sent("herdr-core lost terminal.read")
+        )
+        for _ in range(3):  # a failure before typing is retried before it is final
+            _attempt(S)
+        (notice,) = _failure_notices(S)
+        return notice.message
+
+    def test_a_failure_before_typing_says_the_reply_could_not_be_delivered(self, live):
+        text = self._lost(live, uncertain=False)
+
+        assert "could not be delivered" in text
+        assert "may already" not in text
+        assert "final reply text" in text
+
+    def test_an_uncertain_failure_says_the_reply_may_already_be_there(self, live):
+        text = self._lost(live, uncertain=True)
+
+        assert "may not have been delivered" in text
+        assert "Some or all of it may already be above" in text
+        assert "final reply text" in text
+
+    @pytest.mark.parametrize("uncertain", [False, True], ids=["failed", "uncertain"])
+    def test_no_profile_is_printed(self, live, uncertain):
+        text = self._lost(live, uncertain=uncertain)
+
+        assert "profile" not in text
+        assert W in text, "names the worker"
+
+
+class TestNoticeForAGoneReceiver:
+    """A sender is not told to send again to a terminal that no longer exists."""
+
+    def test_the_notice_says_the_terminal_no_longer_exists(self, live):
+        svc.handle_messages_failed(
+            GONE,
+            [_msg(id=7, sender=W, receiver=GONE)],
+            "TerminalRowMissingError: no row for gggg0009",
+            uncertain=False,
+        )
+
+        (notice,) = _failure_notices(W)
+        assert f"Terminal {GONE} no longer exists" in notice.message
+        assert "Send it again" not in notice.message
+        assert "7" in notice.message, "names the message id"
+        assert "no row for" in notice.message, "names the error"
+
+    def test_an_uncertain_failure_to_a_gone_receiver_does_not_say_to_send_again_either(self, live):
+        svc.handle_messages_failed(
+            GONE, [_msg(id=7, sender=W, receiver=GONE)], "lost terminal.send", uncertain=True
+        )
+
+        (notice,) = _failure_notices(W)
+        assert f"Terminal {GONE} no longer exists" in notice.message
+        assert "send it again" not in notice.message.lower()
+
+    def test_a_receiver_that_exists_keeps_the_old_text(self, live):
+        svc.handle_messages_failed(S, [_msg(id=7)], "lost", uncertain=False)
+
+        (notice,) = _failure_notices(W)
+        assert "Send it again when you are ready." in notice.message
+        assert "no longer exists" not in notice.message
+
+    def test_an_uncertain_failure_to_a_receiver_that_exists_keeps_the_old_text(self, live):
+        svc.handle_messages_failed(S, [_msg(id=7)], "lost", uncertain=True)
+
+        (notice,) = _failure_notices(W)
+        assert "Check the receiver's terminal before you send it again." in notice.message
+        assert "no longer exists" not in notice.message
+
+    def test_a_delivery_to_a_receiver_deleted_after_queueing_tells_the_sender(self, live):
+        from cli_agent_orchestrator.clients.database import delete_terminal
+        from cli_agent_orchestrator.services.terminal_service import TerminalRowMissingError
+
+        message_id = _send(W, C, "status update")
+        delete_terminal(C, end_reason="deleted")
+        live.paste.dispatch_input.side_effect = TerminalRowMissingError(f"no row for {C}")
+
+        _attempt(C)
+
+        (notice,) = _failure_notices(W)
+        assert str(message_id) in notice.message
+        assert "no longer exists" in notice.message
+        assert "Send it again" not in notice.message

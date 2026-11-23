@@ -156,9 +156,19 @@ def build_delivery_failed_message(
 
 
 def build_message_not_delivered_message(
-    receiver_id: str, message_id: int, reason: str, uncertain: bool
+    receiver_id: str, message_id: int, reason: str, uncertain: bool, receiver_gone: bool = False
 ) -> str:
-    """The notice for a sender whose queued message failed for good (design D6)."""
+    """The notice for a sender whose queued message failed for good (design D6).
+
+    ``receiver_gone`` is for a receiver whose row no longer exists: sending
+    again could only fail, so the notice says so instead of asking for it.
+    """
+    if receiver_gone:
+        arrived = " Some or all of it may have arrived before it ended." if uncertain else ""
+        return (
+            f"[CAO delivery failed] Your message {message_id} to terminal {receiver_id} "
+            f"was not delivered: {reason}. Terminal {receiver_id} no longer exists.{arrived}"
+        )
     if uncertain:
         return (
             f"[CAO delivery failed] Your message {message_id} to terminal {receiver_id} "
@@ -173,13 +183,23 @@ def build_message_not_delivered_message(
 
 
 def build_reply_lost_message(
-    worker_id: str, profile: Optional[str], reason: str, reply: Optional[str]
+    worker_id: str, reason: str, reply: Optional[str], *, uncertain: bool = False
 ) -> str:
-    """The notice for a caller whose ended worker's reply failed for good (design D7)."""
+    """The notice for a caller whose ended worker's reply failed for good (design D7).
+
+    The worker's row is gone by now, so no profile is named. ``uncertain`` says
+    the failure came while sending, so the reply may already be in the
+    caller's terminal.
+    """
+    outcome = (
+        f"the reply may not have been delivered ({reason}), and the worker has ended. "
+        "Some or all of it may already be above. "
+        if uncertain
+        else f"the reply could not be delivered ({reason}), and the worker has ended. "
+    )
     return (
-        f"[CAO delivery failed] Worker {worker_id} (profile {profile or 'unknown'}) "
-        f"replied, but the reply could not be delivered ({reason}), and the worker has "
-        "ended. Its reply, from the stored message:\n"
+        f"[CAO delivery failed] Worker {worker_id} replied, but {outcome}"
+        "Its reply, from the stored message:\n"
         "---\n"
         f"{reply if reply else _UNREADABLE}"
     )
@@ -494,14 +514,22 @@ def handle_messages_failed(
     by_id = {m.id: m for m in messages}
     for edge in clear_reply_in_flight(ids):
         reply = by_id.get(edge.reply_message_id) if edge.reply_message_id is not None else None
-        _tell_caller_if_replier_ended(edge, reason, reply.message if reply else None, registry)
+        _tell_caller_if_replier_ended(
+            edge, reason, reply.message if reply else None, registry, uncertain=uncertain
+        )
 
     for message in messages:
         if message.id in reported or message.id in told or message.is_system_notice:
             continue
         if get_terminal_metadata(message.sender_id) is None:
             continue
-        notice = build_message_not_delivered_message(receiver_id, message.id, reason, uncertain)
+        notice = build_message_not_delivered_message(
+            receiver_id,
+            message.id,
+            reason,
+            uncertain,
+            receiver_gone=get_terminal_metadata(receiver_id) is None,
+        )
         try:
             create_inbox_message(receiver_id, message.sender_id, notice, is_system_notice=True)
         except ValueError:
@@ -510,7 +538,12 @@ def handle_messages_failed(
 
 
 def _tell_caller_if_replier_ended(
-    edge: DelegationEdge, reason: str, reply: Optional[str], registry: PluginRegistry | None
+    edge: DelegationEdge,
+    reason: str,
+    reply: Optional[str],
+    registry: PluginRegistry | None,
+    *,
+    uncertain: bool = False,
 ) -> None:
     """For a reply mark just cleared: if its sender has ended, close the edge and tell the caller.
 
@@ -520,7 +553,7 @@ def _tell_caller_if_replier_ended(
     """
     if get_terminal_metadata(edge.worker_id) is not None:
         return
-    text = build_reply_lost_message(edge.worker_id, None, reason, reply)
+    text = build_reply_lost_message(edge.worker_id, reason, reply, uncertain=uncertain)
     if _close_and_notify(edge, EdgeState.WORKER_ENDED, edge.worker_id, text):
         _deliver(edge.caller_id, edge.worker_id, registry)
 
@@ -560,7 +593,11 @@ def _settle_reply_mark(
         cleared = clear_reply_in_flight([message_id])
     reason = (message.last_error if message else None) or "the reply was not delivered"
     for edge in cleared:
-        _tell_caller_if_replier_ended(edge, reason, message.message if message else None, registry)
+        # The kind of failure is not recorded with the message, so assume the
+        # text may have arrived rather than tell the caller it did not.
+        _tell_caller_if_replier_ended(
+            edge, reason, message.message if message else None, registry, uncertain=True
+        )
 
 
 def settle_stale_reply_marks(registry: PluginRegistry | None = None) -> None:
