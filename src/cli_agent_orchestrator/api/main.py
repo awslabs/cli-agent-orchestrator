@@ -11398,6 +11398,8 @@ async def internal_memory_related(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Any:
     """Return relationship neighbours using context resolved by a remote worker."""
+    from cli_agent_orchestrator.services.memory_service import InvalidRelatedArgument
+
     _require_memory_enabled()
     try:
         result = cast(
@@ -11416,10 +11418,24 @@ async def internal_memory_related(
                 ),
             ),
         )
-    except ValueError as exc:
+    except InvalidRelatedArgument as exc:
+        # A fixed literal per cause: the caller's value is never echoed back.
         return JSONResponse(
             status_code=422,
-            content={"success": False, "error_kind": "invalid_argument", "error": str(exc)},
+            content={
+                "success": False,
+                "error_kind": "invalid_argument",
+                "error": InvalidRelatedArgument.MESSAGES[exc.code],
+            },
+        )
+    except ValueError:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "success": False,
+                "error_kind": "invalid_argument",
+                "error": "invalid related-memory argument",
+            },
         )
     if result.get("error_kind") == "not_found":
         return JSONResponse(status_code=404, content=result)

@@ -15,7 +15,7 @@ from cli_agent_orchestrator.services import memory_eligibility
 from cli_agent_orchestrator.services.memory_relationship_service import (
     MemoryRelationshipService,
 )
-from cli_agent_orchestrator.services.memory_service import MemoryService
+from cli_agent_orchestrator.services.memory_service import InvalidRelatedArgument, MemoryService
 from cli_agent_orchestrator.services.vault.reader import MEMORY_MANAGER_PROFILE
 
 
@@ -307,7 +307,9 @@ def test_internal_related_maps_validation_and_read_errors(monkeypatch) -> None:
     class Stub:
         async def related(self, key, **kwargs):
             if key == "bad":
-                raise ValueError("bad direction")
+                raise InvalidRelatedArgument("direction")
+            if key == "other":
+                raise ValueError("secret detail that must not be echoed")
             return {
                 "success": False,
                 "error_kind": "not_found",
@@ -333,8 +335,16 @@ def test_internal_related_maps_validation_and_read_errors(monkeypatch) -> None:
     assert json.loads(invalid.body) == {
         "success": False,
         "error_kind": "invalid_argument",
-        "error": "bad direction",
+        "error": "direction must be one of: in, out, both",
     }
+    other = _run(
+        api_main.internal_memory_related(
+            api_main.InternalMemoryRelatedRequest(key="other"),
+            _scopes=[],
+        )
+    )
+    assert other.status_code == 422
+    assert json.loads(other.body)["error"] == "invalid related-memory argument"
 
 
 async def _async_result(value):
@@ -374,3 +384,47 @@ def test_remote_related_end_to_end_through_the_gateway_and_the_route(service, mo
     assert ambiguous["error_kind"] == "ambiguous_scope"
     assert invalid["error_kind"] == "invalid_argument"
     assert "direction must be one of" in invalid["error"]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"direction": "sideways-SECRET"}, "direction must be one of: in, out, both"),
+        ({"types": ["bogus-SECRET"]}, "invalid relationship type"),
+        ({"limit": 101}, "limit must be between 1 and 100"),
+    ],
+)
+def test_related_rejects_bad_arguments_with_fixed_messages_that_never_echo_the_value(
+    service, kwargs, message
+) -> None:
+    _run(service.store("a note", scope="global", key="source"))
+
+    with pytest.raises(InvalidRelatedArgument) as raised:
+        _run(service.related("source", **kwargs))
+
+    assert str(raised.value) == message
+    assert "SECRET" not in str(raised.value)
+
+
+def test_internal_related_422_returns_only_the_fixed_literal(service, monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+
+    _run(service.store("a note", scope="global", key="source"))
+    monkeypatch.setattr(api_main, "_get_memory_service", lambda: service)
+    client = TestClient(api_main.app, base_url="http://localhost")
+
+    bad_direction = client.post(
+        "/internal/memory/related", json={"key": "source", "direction": "sideways-SECRET"}
+    )
+    bad_type = client.post(
+        "/internal/memory/related", json={"key": "source", "types": ["bogus-SECRET"]}
+    )
+
+    assert bad_direction.status_code == bad_type.status_code == 422
+    assert bad_direction.json() == {
+        "success": False,
+        "error_kind": "invalid_argument",
+        "error": "direction must be one of: in, out, both",
+    }
+    assert bad_type.json()["error"] == "invalid relationship type"
+    assert "SECRET" not in bad_direction.text + bad_type.text

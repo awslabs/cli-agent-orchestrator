@@ -421,6 +421,24 @@ def resolve_project_id(cwd: Optional[Path]) -> str:
     )
 
 
+class InvalidRelatedArgument(ValueError):
+    """An invalid ``memory_related`` argument; the text is always one fixed literal.
+
+    The message never echoes the caller's value, so the internal route can return it as is.
+    """
+
+    MESSAGES = {
+        "direction": "direction must be one of: in, out, both",
+        "type": "invalid relationship type",
+        "limit": "limit must be between 1 and 100",
+        "key": "key is empty after sanitization",
+    }
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(self.MESSAGES[code])
+
+
 class MemoryService:
     """Memory service backed by wiki markdown files and SQLite metadata.
 
@@ -3033,8 +3051,18 @@ class MemoryService:
         if scope is not None:
             MemoryScope(scope)
         if limit < 1 or limit > 100:
-            raise ValueError("limit must be between 1 and 100")
-        canonical = self._sanitize_key(key)
+            raise InvalidRelatedArgument("limit")
+        if direction not in {"in", "out", "both"}:
+            raise InvalidRelatedArgument("direction")
+        if types is not None:
+            from cli_agent_orchestrator.services.memory_relationship_service import VALID_TYPES
+
+            if any(type_ not in VALID_TYPES for type_ in types):
+                raise InvalidRelatedArgument("type")
+        try:
+            canonical = self._sanitize_key(key)
+        except ValueError:
+            raise InvalidRelatedArgument("key") from None
         candidate_scopes = (
             [scope]
             if scope is not None
