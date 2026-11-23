@@ -1,9 +1,7 @@
 name: Docs site
 
-# Builds the Docusaurus site on every pull request so reviewers get a build
-# signal, and additionally deploys to GitHub Pages when the change lands on
-# main. The deploy job is gated on the event type so pull requests never
-# publish.
+# Builds and deploys the Docusaurus site when a change lands on main.
+# Pull-request and merge-queue builds run in ci.yml under the aggregate gate.
 #
 # The deploy job is ALSO gated so it never runs on a fork by default: forks
 # don't have GitHub Pages enabled (and publish to the fork owner's own Pages
@@ -19,16 +17,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'docusaurus/**'
-      - 'patches/**'
-      - 'vendor/**'
-      - 'scripts/test-braces-security.cjs'
-      # The physical AI blog posts embed these images.
-      - 'examples/robotics/cross-zone-transport/images/**'
-      - 'examples/robotics/hierarchical-factory/images/**'
-      - '.github/workflows/gh-pages.yml'
-  pull_request:
     paths:
       - 'docusaurus/**'
       - 'patches/**'

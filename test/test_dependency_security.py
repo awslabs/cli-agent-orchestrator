@@ -640,7 +640,9 @@ def test_mitigation_step_checks_all_projects_and_preserves_failures(tmp_path, fa
 def test_shared_patch_and_tests_trigger_the_docs_build():
     workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "gh-pages.yml").read_text())
     events = workflow.get("on", workflow.get(True))
-    for event in ("push", "pull_request"):
-        assert {"patches/**", "vendor/**", "scripts/test-braces-security.cjs"} <= set(
-            events[event]["paths"]
-        )
+    assert {"patches/**", "vendor/**", "scripts/test-braces-security.cjs"} <= set(
+        events["push"]["paths"]
+    )
+    from scripts.ci_changed_paths import FILTERS
+
+    assert {"patches/**", "vendor/**", "scripts/test-braces-security.cjs"} <= set(FILTERS["docs"])

@@ -1075,12 +1075,10 @@ class TestOtherPrGatingWorkflowsAreDocumented:
 
     def test_docs_trigger_summary_lists_every_input_path(self):
         spec = yaml.safe_load((WORKFLOWS_DIR / "gh-pages.yml").read_text())
-        file_cell, _, runs_on, _ = _other_workflow_rows()[spec["name"]]
-        documented = set(re.findall(r"`([^`]+)`", runs_on))
-        documented.add(f".github/workflows/{file_cell}")
-        trigger = _pull_request_trigger(spec)
-        assert isinstance(trigger, dict)
-        assert documented == set(trigger["paths"])
+        assert _pull_request_trigger(spec) is _NO_PR
+        from scripts.ci_changed_paths import FILTERS
+
+        assert set(spec.get("on", spec.get(True))["push"]["paths"]) <= set(FILTERS["docs"])
 
     @pytest.mark.parametrize("workflow", sorted(_pr_gating_workflows()))
     def test_the_verdict_matches_job_level_continue_on_error(self, workflow: str):

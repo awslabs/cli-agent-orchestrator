@@ -31,6 +31,7 @@ name: cargo-deny
 on:
   pull_request:
     branches: [main]
+  merge_group:
   schedule:
     # Mondays 07:30 UTC — half an hour after secret-scan.yml's 07:00 gitleaks sweep, so the
     # two weekly jobs do not contend for runners.

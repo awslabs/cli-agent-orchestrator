@@ -17,7 +17,7 @@ env:
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ develop ]
     paths:
       - 'src/cli_agent_orchestrator/providers/antigravity_cli.py'
       # Globbed, not a per-file list: a single hardcoded filename meant every
@@ -29,7 +29,7 @@ on:
       - 'pyproject.toml'
       - '.github/workflows/test-antigravity-cli-provider.yml'
   pull_request:
-    branches: [ main, develop ]
+    branches: [ develop ]
     paths:
       - 'src/cli_agent_orchestrator/providers/antigravity_cli.py'
       # Globbed, not a per-file list: a single hardcoded filename meant every

@@ -32,8 +32,16 @@ def _gate_python(workflow: Path = CI_WORKFLOW) -> str:
     return program
 
 
+def _filtered_python(workflow: Path = CI_WORKFLOW) -> str:
+    run = _ci_jobs(workflow)["filtered-gate"]["steps"][0]["run"]
+    return run.split("python3 - <<'PY'\n", 1)[1].split("\nPY", 1)[0]
+
+
 def _gate_exit_code(
-    needs: dict[str, str], event_name: str, repository: str, workflow: Path = CI_WORKFLOW
+    needs: dict[str, str],
+    event_name: str,
+    repository: str,
+    workflow: Path = CI_WORKFLOW,
 ) -> int:
     """Run the gate program against the supplied GitHub Actions inputs."""
     environment = {
@@ -52,7 +60,31 @@ def _gate_exit_code(
     return result.returncode
 
 
-def _expected_exit_code(needs: dict[str, str], event_name: str, repository: str) -> int:
+def _filtered_exit_code(needs: dict[str, str], paths: dict[str, str]) -> int:
+    outcomes = {
+        "changed-paths": {"result": needs.get("changed-paths", "success"), "outputs": paths},
+        **{
+            job_id: {"result": result}
+            for job_id, result in needs.items()
+            if job_id != "changed-paths"
+        },
+    }
+    result = subprocess.run(
+        [sys.executable, "-"],
+        input=_filtered_python(),
+        text=True,
+        env={**os.environ, "NEEDS_JSON": json.dumps(outcomes)},
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode
+
+
+def _expected_exit_code(
+    needs: dict[str, str],
+    event_name: str,
+    repository: str,
+) -> int:
     """The documented gate rule, deliberately separate from ci.yml's program."""
     for job_id, result in needs.items():
         dependency_review_skip_is_allowed = (
@@ -74,6 +106,8 @@ GATE_CASE_DATA = [
         for result in ("failure", "cancelled", "timed_out", "skipped")
     ],
     ({"test": "skipped"}, "push", UPSTREAM_REPOSITORY),
+    ({"filtered-gate": "success"}, "merge_group", UPSTREAM_REPOSITORY),
+    ({"filtered-gate": "failure"}, "merge_group", UPSTREAM_REPOSITORY),
     *[
         ({"dependency-review": result}, event_name, repository)
         for result in ("success", "failure", "cancelled", "timed_out", "skipped")
@@ -90,20 +124,27 @@ def test_ci_gate_needs_every_other_ci_job():
     """A newly added job must not silently escape the aggregate verdict."""
     jobs = _ci_jobs()
     gate = jobs["ci-gate"]
-    assert set(gate["needs"]) == set(jobs) - {"ci-gate"}
+    filtered = set(jobs["filtered-gate"]["needs"]) - {"changed-paths"}
+    assert set(gate["needs"]) == set(jobs) - filtered - {"ci-gate"}
+    assert filtered == {
+        job_id for job_id, job in jobs.items() if job.get("needs") == "changed-paths"
+    }
+    assert len(gate["needs"]) <= 20
+    assert len(jobs["filtered-gate"]["needs"]) <= 20
 
 
 def test_ci_gate_must_run_with_minimal_permissions_and_no_checkout():
     """A required future gate must still report after a failed or cancelled job."""
-    gate = _ci_jobs()["ci-gate"]
-    assert gate["if"] == "${{ always() }}"
-    assert gate["permissions"] == {}
-    assert all(
-        not step.get("uses", "").startswith("actions/checkout@")
-        for step in gate["steps"]
-        if isinstance(step, dict)
-    )
-    assert "${{" not in gate["steps"][0]["run"]
+    for gate_id in ("ci-gate", "filtered-gate"):
+        gate = _ci_jobs()[gate_id]
+        assert gate["if"] == "${{ always() }}"
+        assert gate["permissions"] == {}
+        assert all(
+            not step.get("uses", "").startswith("actions/checkout@")
+            for step in gate["steps"]
+            if isinstance(step, dict)
+        )
+        assert "${{" not in gate["steps"][0]["run"]
 
 
 @pytest.mark.parametrize(("needs", "event_name", "repository"), GATE_CASE_DATA)
@@ -112,6 +153,31 @@ def test_ci_gate_exit_code_matches_the_documented_rule(
 ):
     assert _gate_exit_code(needs, event_name, repository) == _expected_exit_code(
         needs, event_name, repository
+    )
+
+
+@pytest.mark.parametrize(
+    ("result", "path_value", "expected"),
+    [
+        ("success", "true", 0),
+        ("failure", "true", 1),
+        ("skipped", "false", 0),
+        ("skipped", "true", 1),
+        ("skipped", "", 1),
+        ("failure", "false", 1),
+        ("cancelled", "false", 1),
+    ],
+)
+def test_filtered_job_verdict(result: str, path_value: str, expected: int):
+    assert _filtered_exit_code({"docs-build": result}, {"docs": path_value}) == expected
+
+
+def test_changed_paths_failure_never_allows_a_skip():
+    assert (
+        _filtered_exit_code(
+            {"changed-paths": "failure", "docs-build": "skipped"}, {"docs": "false"}
+        )
+        == 1
     )
 
 
@@ -131,8 +197,8 @@ def test_ci_gate_exit_code_matches_the_documented_rule(
         ),
         (
             "only dependency-review may skip",
-            'and job_id == "dependency-review"',
-            "and True",
+            'job_id == "dependency-review"',
+            "True",
         ),
         ("always gate condition is retained", "if: ${{ always() }}", ""),
         (
@@ -146,8 +212,9 @@ def test_ci_gate_mutants_fail_the_gate_contract(tmp_path: Path, name: str, befor
     """Each review mutant must violate an assertion above on a scratch workflow."""
     mutant = tmp_path / f"{name}.yml"
     source = CI_WORKFLOW.read_text()
-    assert source.count(before) == 1
-    mutant.write_text(source.replace(before, after))
+    prefix, separator, gate_source = source.partition("  ci-gate:\n")
+    assert separator and gate_source.count(before) == 1
+    mutant.write_text(prefix + separator + gate_source.replace(before, after))
 
     if name.startswith("always gate"):
         assert _ci_jobs(mutant)["ci-gate"].get("if") != "${{ always() }}"
