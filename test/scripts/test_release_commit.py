@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +33,17 @@ def _load():
 
 
 rc = _load()
+
+
+def _load_bump():
+    spec = importlib.util.spec_from_file_location(
+        "release_chain_bump_version", REPO_ROOT / "scripts" / "bump_version.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _env(home: Path) -> Dict[str, str]:
@@ -172,6 +184,92 @@ class TestTheAtomicPush:
 
 
 class TestWhatTheReleaseCommitMayCarry:
+    def test_real_bump_and_release_commit_push_fragment_deletion(self, world, monkeypatch, capsys):
+        bump_version = _load_bump()
+        feature = Path(".devcontainer/features/cao/devcontainer-feature.json")
+        for relative in (Path("pyproject.toml"), Path("uv.lock"), feature):
+            shutil.copyfile(REPO_ROOT / relative, world.clone / relative)
+        changelog = world.clone / "CHANGELOG.md"
+        changelog.write_text(
+            "# Changelog\n\n## [Unreleased]\n\n- Hand-written.\n\n"
+            "## [2.5.3] - 2029-01-01\n\n- Old.\n"
+        )
+        fragment = world.clone / "changelog.d" / "1350.Changed.md"
+        fragment.parent.mkdir()
+        fragment.write_text("- Fragment note.\n")
+        world.git("add", "-A")
+        world.git("commit", "-q", "-m", "chore: prepare release")
+        world.git("push", "-q", "origin", "HEAD:refs/heads/main")
+        baseline = world.git("rev-parse", "HEAD")
+
+        monkeypatch.setattr(bump_version, "ROOT", world.clone)
+        monkeypatch.setattr(bump_version, "PYPROJECT", world.clone / "pyproject.toml")
+        monkeypatch.setattr(bump_version, "UV_LOCK", world.clone / "uv.lock")
+        monkeypatch.setattr(bump_version, "DEVCONTAINER_FEATURE", world.clone / feature)
+        monkeypatch.setattr(bump_version, "CHANGELOG", changelog)
+        old = bump_version.get_version()
+        version = bump_version.bump("patch", old)
+        actual_lock = bump_version.update_uv_lock
+
+        def fake_uv(argv, **kwargs):
+            if argv == ["uv", "lock"]:
+                lock = bump_version.UV_LOCK
+                lock.write_text(bump_version.expected_lock(lock.read_text(), old, version))
+            return subprocess.CompletedProcess(argv, 0)
+
+        monkeypatch.setattr(
+            bump_version,
+            "update_uv_lock",
+            lambda previous, next_version: actual_lock(previous, next_version, run=fake_uv),
+        )
+        monkeypatch.setattr(sys, "argv", ["bump_version.py", "patch"])
+        bump_version.main()
+        assert not fragment.exists()
+        assert rc.main(["--version", version, "--repo-root", str(world.clone)]) == 0
+        head = world.git("rev-parse", "HEAD")
+        assert world.remote("refs/heads/main") == head != baseline
+        assert world.remote(f"refs/tags/v{version}^{{commit}}") == head
+        assert (
+            world.git("diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD").count(
+                "D\tchangelog.d/1350.Changed.md"
+            )
+            == 1
+        )
+        assert "CHANGELOG.md" in world.git(
+            "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"
+        )
+        assert "- Fragment note. (#1350)" in world.git("show", "HEAD:CHANGELOG.md")
+        assert world.git("status", "--porcelain") == ""
+
+    @pytest.mark.parametrize("change", ["modified", "staged-added", "untracked", "readme"])
+    def test_non_deletion_in_changelog_directory_is_refused(self, world, capsys, change):
+        fragment = world.clone / "changelog.d" / "1350.Fixed.md"
+        fragment.parent.mkdir()
+        if change == "modified":
+            fragment.write_text("- Before.\n")
+            world.git("add", "-A")
+            world.git("commit", "-q", "-m", "add fragment")
+        world.bump()
+        fragment.write_text("- After.\n")
+        if change == "staged-added":
+            world.git("add", "--", "changelog.d/1350.Fixed.md")
+        if change == "readme":
+            (fragment.parent / "README.md").write_text("Untracked README.\n")
+        assert rc.main(["--version", "1.0.1", "--repo-root", str(world.clone)]) == 1
+        assert "also changed: changelog.d/" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("name", ["1350.Other.md", "README.md", "1350.Fixed.txt"])
+    def test_non_fragment_deletion_is_refused(self, world, capsys, name):
+        path = world.clone / "changelog.d" / name
+        path.parent.mkdir()
+        path.write_text("- Before.\n")
+        world.git("add", "-A")
+        world.git("commit", "-q", "-m", "add non-fragment")
+        world.bump()
+        path.unlink()
+        assert rc.main(["--version", "1.0.1", "--repo-root", str(world.clone)]) == 1
+        assert f"also changed: changelog.d/{name}" in capsys.readouterr().out
+
     def test_a_stray_change_is_refused_before_anything_is_committed(self, world, capsys):
         world.bump()
         (world.clone / "README.md").write_text("tampered\n", encoding="utf-8")

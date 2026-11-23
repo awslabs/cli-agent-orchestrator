@@ -394,6 +394,12 @@ class TestFragmentCollection:
             bv.main()
 
     def test_real_bump_collects_all_types_and_preserves_handwritten_notes(self, tree, monkeypatch):
+        version = bv.bump("patch", _current(tree))
+        monkeypatch.setattr(bv, "_release_date", lambda: "2030-04-05")
+        (tree / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## [Unreleased]\n\n- Hand-written release note.\n\n"
+            "## [1.0.0] - 2029-01-01\n\n- Old release.\n"
+        )
         directory = tree / "changelog.d"
         directory.mkdir()
         (directory / "README.md").write_text("Documentation.\n")
@@ -409,11 +415,81 @@ class TestFragmentCollection:
         assert positions == sorted(positions)
         assert text.count("## [Unreleased]") == 1
         assert sorted(path.name for path in directory.iterdir()) == ["README.md"]
+        assert "## [1.0.0] - 2029-01-01\n\n- Old release.\n" in text
+        released = text.split("## [Unreleased]\n\n", 1)[1].split("## [1.0.0]", 1)[0]
+        assert released.index("- Hand-written release note.") < released.index("### Added")
+        for kind in bv.FRAGMENT_TYPES:
+            assert released.count(f"### {kind}\n\n") == 1
+        assert released.index("### Added") < released.index("### Changed")
+        assert released.endswith("### Security\n\n- Security #3.\n- Security #20.\n\n")
+        expected = (
+            f"# Changelog\n\n## [Unreleased]\n\n## [{version}] - 2030-04-05\n\n"
+            "- Hand-written release note.\n\n"
+            + "".join(
+                f"### {kind}\n\n- {kind} #3.\n- {kind} #20.\n\n" for kind in bv.FRAGMENT_TYPES
+            )
+            + "## [1.0.0] - 2029-01-01\n\n- Old release.\n"
+        )
+        assert text == expected
 
         self._run(tree, monkeypatch)
         text = (tree / "CHANGELOG.md").read_text()
         assert text.count("- Added #3.") == 1
         assert text.count("- Hand-written release note.") == 1
+
+    def test_merges_matching_heading_without_duplicate_and_inserts_new_heading_in_order(
+        self, tree, monkeypatch
+    ):
+        (tree / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- Hand-written fix.\n\n"
+            "### Other\n\n- Keep other notes.\n\n## [1.0.0] - 2029-01-01\n\n- Old.\n"
+        )
+        directory = tree / "changelog.d"
+        directory.mkdir()
+        (directory / "5.Fixed.md").write_text("- Fragment fix.\n")
+        (directory / "6.Added.md").write_text("- Fragment addition.\n")
+        self._run(tree, monkeypatch)
+        text = (tree / "CHANGELOG.md").read_text()
+        released = text.split("## [Unreleased]\n\n", 1)[1].split("## [1.0.0]", 1)[0]
+        assert released.count("### Fixed") == 1
+        assert released.index("### Added") < released.index("### Fixed")
+        assert released.index("- Hand-written fix.") < released.index("- Fragment fix. (#5)")
+        assert released.index("- Fragment fix. (#5)") < released.index("### Other")
+        assert text.endswith("## [1.0.0] - 2029-01-01\n\n- Old.\n")
+
+    def test_duplicate_hand_written_headings_collapse_and_exact_pr_number_is_cited(
+        self, tree, monkeypatch
+    ):
+        (tree / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## [Unreleased]\n\n### Changed\n\n- First change.\n\n"
+            "### Changed\n\n- Second change.\n\n## [1.0.0] - 2029-01-01\n\n- Old.\n"
+        )
+        directory = tree / "changelog.d"
+        directory.mkdir()
+        (directory / "5.Changed.md").write_text("- Mentions #50 but not this PR.\n")
+        self._run(tree, monkeypatch)
+        text = (tree / "CHANGELOG.md").read_text()
+        released = text.split("## [Unreleased]\n\n", 1)[1].split("## [1.0.0]", 1)[0]
+        assert released.count("### Changed") == 1
+        assert released.index("- First change.") < released.index("- Second change.")
+        assert released.index("- Second change.") < released.index(
+            "- Mentions #50 but not this PR. (#5)"
+        )
+
+    def test_empty_handwritten_section_has_one_blank_line_after_release_heading(
+        self, tree, monkeypatch
+    ):
+        (tree / "CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n\n")
+        directory = tree / "changelog.d"
+        directory.mkdir()
+        (directory / "5.Fixed.md").write_text("- Fix.\n")
+        monkeypatch.setattr(bv, "_release_date", lambda: "2030-04-05")
+        version = bv.bump("patch", _current(tree))
+        self._run(tree, monkeypatch)
+        assert (tree / "CHANGELOG.md").read_text() == (
+            f"# Changelog\n\n## [Unreleased]\n\n## [{version}] - 2030-04-05\n\n"
+            "### Fixed\n\n- Fix. (#5)\n\n"
+        )
 
     @pytest.mark.parametrize("name", ["not-a-fragment.md", "14.Other.md", "14.Fixed.txt"])
     def test_invalid_name_or_type_refuses_without_changes(self, tree, monkeypatch, name):
@@ -453,7 +529,103 @@ class TestFragmentCollection:
             self._run(tree, monkeypatch)
         assert all(path.read_bytes() == content for path, content in before.items())
 
-    @pytest.mark.parametrize("failure", ["write", "replace", "delete"])
+    @pytest.mark.parametrize(
+        ("content", "message"),
+        [
+            (b"Note.\n", "expected one '- ' entry"),
+            (b"-Note.\n", "expected one '- ' entry"),
+            (b"\xff", "expected UTF-8"),
+            (b"\xef\xbb\xbf- Note.\n", "UTF-8 BOM is not allowed"),
+        ],
+    )
+    def test_malformed_fragment_is_refused_before_any_carrier_changes(
+        self, tree, monkeypatch, content, message
+    ):
+        directory = tree / "changelog.d"
+        directory.mkdir()
+        fragment = directory / "5.Fixed.md"
+        fragment.write_bytes(content)
+        before = {
+            path: path.read_bytes()
+            for path in (
+                tree / "CHANGELOG.md",
+                tree / "uv.lock",
+                tree / "pyproject.toml",
+                tree / FEATURE,
+                fragment,
+            )
+        }
+        with pytest.raises(bv.ChangelogError, match=message):
+            self._run(tree, monkeypatch)
+        assert all(path.read_bytes() == data for path, data in before.items())
+
+    @pytest.mark.parametrize("kind", ["directory", "symlink"])
+    def test_fragment_that_is_not_regular_file_is_refused(self, tree, monkeypatch, kind):
+        directory = tree / "changelog.d"
+        directory.mkdir()
+        fragment = directory / "5.Fixed.md"
+        if kind == "directory":
+            fragment.mkdir()
+        else:
+            target = tree / "note.txt"
+            target.write_text("- Note.\n")
+            fragment.symlink_to(target)
+        before = (tree / "CHANGELOG.md").read_bytes()
+        with pytest.raises(bv.ChangelogError, match="expected <PR>.<type>.md"):
+            self._run(tree, monkeypatch)
+        assert (tree / "CHANGELOG.md").read_bytes() == before
+        if kind == "directory":
+            assert fragment.is_dir()
+        else:
+            assert fragment.is_symlink()
+
+    def test_link_references_stay_after_generated_sections(self, tree, monkeypatch):
+        changelog = tree / "CHANGELOG.md"
+        changelog.write_text(
+            "# Changelog\n\n## [Unreleased]\n\n[latest]: https://example.invalid/latest\n"
+        )
+        directory = tree / "changelog.d"
+        directory.mkdir()
+        (directory / "5.Fixed.md").write_text("- Fix.\n")
+        self._run(tree, monkeypatch)
+        text = changelog.read_text()
+        assert text.index("### Fixed") < text.index("[latest]:")
+        assert text.endswith("[latest]: https://example.invalid/latest\n")
+
+    def test_failed_restore_does_not_hide_original_error_or_skip_other_restores(
+        self, tree, monkeypatch, capsys
+    ):
+        directory = tree / "changelog.d"
+        directory.mkdir()
+        first = directory / "3.Added.md"
+        second = directory / "4.Fixed.md"
+        first.write_text("- First.\n")
+        second.write_text("- Second.\n")
+        before = {
+            path: path.read_bytes()
+            for path in (tree / "CHANGELOG.md", tree / "uv.lock", tree / FEATURE, first, second)
+        }
+        unlink = Path.unlink
+        write_bytes = Path.write_bytes
+
+        def fail_second_unlink(path, *args, **kwargs):
+            if path == second:
+                raise OSError("original delete failure")
+            return unlink(path, *args, **kwargs)
+
+        def fail_pyproject_restore(path, content):
+            if path == bv.PYPROJECT:
+                raise OSError("restore failure")
+            return write_bytes(path, content)
+
+        monkeypatch.setattr(Path, "unlink", fail_second_unlink)
+        monkeypatch.setattr(Path, "write_bytes", fail_pyproject_restore)
+        with pytest.raises(OSError, match="original delete failure"):
+            self._run(tree, monkeypatch)
+        assert "restore failure" in capsys.readouterr().err
+        assert all(path.read_bytes() == content for path, content in before.items())
+
+    @pytest.mark.parametrize("failure", ["write", "chmod", "replace", "delete"])
     def test_midway_failure_restores_changelog_and_every_fragment(self, tree, monkeypatch, failure):
         directory = tree / "changelog.d"
         directory.mkdir()
@@ -476,6 +648,12 @@ class TestFragmentCollection:
                 raise OSError("disk full")
 
             monkeypatch.setattr(bv, "_write_changelog", fail_write)
+        elif failure == "chmod":
+
+            def fail_chmod(path, mode):
+                raise OSError("cannot set mode")
+
+            monkeypatch.setattr(bv.os, "chmod", fail_chmod)
         elif failure == "replace":
 
             def fail_replace(source, destination):

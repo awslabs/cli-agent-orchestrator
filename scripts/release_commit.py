@@ -15,7 +15,7 @@ neither.
 WHAT IS REFUSED BEFORE ANYTHING IS COMMITTED
 --------------------------------------------
 * A version that is not ``MAJOR.MINOR.PATCH``.
-* Any changed tracked file outside the release files. This commit is pushed to ``main``
+* Any changed tracked file outside the release files or valid fragment deletions. This commit is pushed to ``main``
   with the release deploy key, and both rulesets on ``main`` (``protect-main`` and ``branch
   protection``) list deploy keys as an ``always`` bypass actor; the key is write-enabled
   (read 2026-11-02). So it lands with no PR and no review, and may carry the bump and
@@ -42,6 +42,9 @@ RELEASE_FILES = (
     "uv.lock",
     "CHANGELOG.md",
     ".devcontainer/features/cao/devcontainer-feature.json",
+)
+FRAGMENT_PATH = re.compile(
+    r"changelog\.d/[1-9][0-9]*\.(?:Added|Changed|Deprecated|Removed|Fixed|Security)\.md\Z"
 )
 VERSION = re.compile(r"^\d+\.\d+\.\d+$")
 BRANCH_REF = "refs/heads/main"
@@ -73,17 +76,32 @@ def push_command(remote: str, version: str) -> List[str]:
 def commit_tag_and_push(root: Path, version: str, remote: str = "origin") -> str:
     if not VERSION.match(version):
         raise Refused(f"{version!r} is not a MAJOR.MINOR.PATCH version")
-    changed = {
-        line[3:].strip()
-        for line in _git(root, "status", "--porcelain", "--untracked-files=no").splitlines()
-        if line.strip()
-    }
-    stray = sorted(changed - set(RELEASE_FILES))
+    status = _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all").split("\0")
+    stray = []
+    deletions = []
+    position = 0
+    while position < len(status):
+        entry = status[position]
+        position += 1
+        if not entry:
+            continue
+        state, path = entry[:2], entry[3:]
+        if "R" in state or "C" in state:
+            position += 1
+        if state == "??" and not path.startswith("changelog.d/"):
+            continue
+        if state in (" D", "D ") and FRAGMENT_PATH.fullmatch(path):
+            deletions.append(path)
+        elif path not in RELEASE_FILES or state == "??":
+            stray.append(path)
+    stray.sort()
     if stray:
         raise Refused(
             "the release commit may only carry the version bump; also changed: " + ", ".join(stray)
         )
     _git(root, "add", "--", *RELEASE_FILES)
+    if deletions:
+        _git(root, "add", "-A", "--", *deletions)
     if not _git(root, "diff", "--cached", "--name-only").strip():
         raise Refused("nothing to commit: the bump changed no release file")
 

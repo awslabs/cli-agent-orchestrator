@@ -31,6 +31,8 @@ UNRELEASED_HEADING = re.compile(rb"(?m)^## \[Unreleased\](?P<newline>\r?\n|$)")
 NEXT_HEADING = re.compile(rb"(?m)^## \[")
 FRAGMENT_NAME = re.compile(r"([1-9][0-9]*)\.(Added|Changed|Deprecated|Removed|Fixed|Security)\.md")
 FRAGMENT_TYPES = ("Added", "Changed", "Deprecated", "Removed", "Fixed", "Security")
+TYPE_HEADING = re.compile(rb"(?m)^### (?P<type>[^\r\n]+)\r?\n")
+LINK_REFERENCE = re.compile(rb"(?m)^\[[^\]\r\n]+\]:")
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
@@ -154,18 +156,23 @@ def read_fragments() -> dict[Path, bytes]:
         if path.name == "README.md":
             continue
         match = FRAGMENT_NAME.fullmatch(path.name)
-        if match is None or not path.is_file():
+        if match is None or path.is_symlink() or not path.is_file():
             raise ChangelogError(
                 f"Invalid changelog fragment {path.name!r}; expected <PR>.<type>.md "
                 f"with type in {', '.join(FRAGMENT_TYPES)}"
             )
         content = path.read_bytes()
         try:
-            lines = content.decode("utf-8").strip().splitlines()
+            text = content.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ChangelogError(
                 f"Invalid changelog fragment {path.name!r}: expected UTF-8"
             ) from exc
+        if text.startswith("\ufeff"):
+            raise ChangelogError(
+                f"Invalid changelog fragment {path.name!r}: UTF-8 BOM is not allowed"
+            )
+        lines = text.strip().splitlines()
         if len(lines) != 1 or not re.fullmatch(r"- \S.*", lines[0]):
             raise ChangelogError(
                 f"Invalid changelog fragment {path.name!r}: expected one '- ' entry"
@@ -191,23 +198,51 @@ def promoted_changelog(new_version: str, fragments: Optional[dict[Path, bytes]] 
     section_end = next_heading.start() if next_heading else len(before)
     section = before[match.end() : section_end]
     if fragments:
+        link_references = b""
+        references = LINK_REFERENCE.search(section)
+        if references:
+            link_references = section[references.start() :]
+            section = section[: references.start()]
         entries: dict[str, list[tuple[int, bytes]]] = {kind: [] for kind in FRAGMENT_TYPES}
         for path, content in fragments.items():
             fragment_match = FRAGMENT_NAME.fullmatch(path.name)
             assert fragment_match is not None
             number, kind = fragment_match.groups()
-            entries[kind].append((int(number), content.decode("utf-8").strip().encode("utf-8")))
-        additions = b"".join(
-            b"### "
-            + kind.encode("ascii")
-            + newline
-            + newline.join(entry for _, entry in sorted(entries[kind]))
-            + newline
-            + newline
-            for kind in FRAGMENT_TYPES
-            if entries[kind]
-        )
-        section = section.rstrip(b"\r\n") + newline + newline + additions
+            entry = content.decode("utf-8").strip()
+            if not re.search(rf"(?<![0-9])#{number}(?![0-9])", entry):
+                entry += f" (#{number})"
+            entries[kind].append((int(number), entry.encode("utf-8")))
+        headings = list(TYPE_HEADING.finditer(section))
+        preamble = section[: headings[0].start() if headings else len(section)].strip(b"\r\n")
+        known: dict[str, list[bytes]] = {kind: [] for kind in FRAGMENT_TYPES}
+        present: set[str] = set()
+        unknown = []
+        for index, heading in enumerate(headings):
+            end = headings[index + 1].start() if index + 1 < len(headings) else len(section)
+            body = section[heading.end() : end].strip(b"\r\n")
+            kind = heading.group("type").decode("utf-8")
+            if kind in known:
+                present.add(kind)
+                if body:
+                    known[kind].append(body)
+            else:
+                unknown.append((heading.group(0).rstrip(b"\r\n"), body))
+        parts = [preamble] if preamble else []
+        for kind in FRAGMENT_TYPES:
+            if kind not in present and not entries[kind]:
+                continue
+            body = newline.join(entry for _, entry in sorted(entries[kind]))
+            parts.append(
+                b"### "
+                + kind.encode("ascii")
+                + newline
+                + newline
+                + (newline + newline).join([*known[kind], *([body] if body else [])])
+            )
+        parts.extend(header + newline + newline + body for header, body in unknown)
+        section = newline + (newline + newline).join(parts) + newline + newline
+        if link_references:
+            section += link_references.lstrip(b"\r\n")
     released = f"## [{new_version}] - {_release_date()}".encode("ascii")
     replacement = b"## [Unreleased]" + newline + newline + released + match.group("newline")
     return before[: match.start()] + replacement + section + before[section_end:]
@@ -253,13 +288,22 @@ def main() -> None:
             path.unlink()
     except BaseException as exc:
         for path, content in originals.items():
-            if path.read_bytes() != content:
-                path.write_bytes(content)
-        if CHANGELOG.read_bytes() != old_changelog:
-            CHANGELOG.write_bytes(old_changelog)
+            try:
+                if path.read_bytes() != content:
+                    path.write_bytes(content)
+            except BaseException as restore_error:
+                print(f"ERROR: could not restore {path}: {restore_error}", file=sys.stderr)
+        try:
+            if CHANGELOG.read_bytes() != old_changelog:
+                CHANGELOG.write_bytes(old_changelog)
+        except BaseException as restore_error:
+            print(f"ERROR: could not restore {CHANGELOG}: {restore_error}", file=sys.stderr)
         for path, content in fragments.items():
-            if not path.exists():
-                path.write_bytes(content)
+            try:
+                if not path.exists():
+                    path.write_bytes(content)
+            except BaseException as restore_error:
+                print(f"ERROR: could not restore {path}: {restore_error}", file=sys.stderr)
         if isinstance(exc, LockDrift):
             print(f"ERROR: {exc}", file=sys.stderr)
             sys.exit(1)
