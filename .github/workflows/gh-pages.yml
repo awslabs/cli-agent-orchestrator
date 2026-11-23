@@ -41,9 +41,9 @@ on:
 
 permissions: {}
 
-# Never cancel an in-flight production deployment; queue behind it instead.
+# Isolate PR builds from production Pages deployments; never cancel a running deploy.
 concurrency:
-  group: pages
+  group: ${{ github.event_name == 'pull_request' && format('docs-pr-{0}', github.ref) || 'pages' }}
   cancel-in-progress: false
 
 jobs:

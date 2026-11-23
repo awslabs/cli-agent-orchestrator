@@ -46,6 +46,23 @@ def test_changes_to_detector_or_ci_trigger_every_filtered_job():
     assert all(matching_filters([".github/workflows/ci.yml"]).values())
 
 
+def test_changed_paths_detector_requires_workflow_code_owner_review():
+    entries = [
+        line.split("#", 1)[0].split()
+        for line in (WORKFLOWS.parent / "CODEOWNERS").read_text().splitlines()
+    ]
+    assert ["/.github/workflows/", "@awslabs/multiq"] in entries
+    assert ["/scripts/ci_changed_paths.py", "@awslabs/multiq"] in entries
+
+
+def test_docs_pr_build_does_not_share_production_deploy_concurrency_group():
+    doc = yaml.safe_load((WORKFLOWS / "gh-pages.yml").read_text())
+    assert doc["concurrency"]["group"] == (
+        "${{ github.event_name == 'pull_request' && format('docs-pr-{0}', github.ref) || 'pages' }}"
+    )
+    assert doc["concurrency"]["cancel-in-progress"] is False
+
+
 def test_merge_group_uses_group_commit_range():
     assert changed_revisions(
         "merge_group", {"merge_group": {"base_sha": "base", "head_sha": "group"}}
