@@ -239,19 +239,30 @@ def test_remote_non_typed_error_still_raises_http_error(monkeypatch):
         memory_gateway._post("/internal/memory/store", {})
 
 
-def test_remote_related_preserves_structured_read_error(monkeypatch):
+@pytest.mark.parametrize(
+    ("status_code", "error_kind", "error"),
+    [
+        (404, "not_found", "memory not found: missing"),
+        (409, "ambiguous_scope", "memory key is present in multiple scopes: duplicate"),
+        (422, "invalid_argument", "direction must be one of: in, out, both"),
+    ],
+)
+def test_remote_related_preserves_structured_read_error(
+    monkeypatch, status_code, error_kind, error
+):
     monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner:9889")
-    response = Mock(status_code=404)
+    response = Mock(status_code=status_code)
     response.json.return_value = {
         "success": False,
-        "error_kind": "not_found",
-        "error": "memory not found: missing",
+        "error_kind": error_kind,
+        "error": error,
     }
 
     with patch.object(memory_gateway.requests, "post", return_value=response):
         result = memory_gateway._post("/internal/memory/related", {"key": "missing"})
 
-    assert result["error_kind"] == "not_found"
+    assert result["error_kind"] == error_kind
+    assert result["error"] == error
     response.raise_for_status.assert_not_called()
 
 

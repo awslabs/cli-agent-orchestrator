@@ -7,7 +7,7 @@ CAO's memory system gives agents persistent, cross-session storage. Agents store
 
 - **Five scopes** (`global`, `project`, `session`, `agent`, `federated`) and four type labels.
 - **Store** via the `memory_store` MCP tool; **recall / related / forget** via
-  MCP tools or the `cao memory` CLI.
+  MCP tools, and store / recall / forget via the `cao memory` CLI.
 - **Markdown wiki storage** with a SQLite metadata index.
 - **Search**: keyword (BM25), recency, or hybrid; results ranked by recency, a
   composite 3-factor score (BM25 + recency + usage), or usage.
@@ -276,11 +276,12 @@ memory_related(
   depth=1,                         # optional: 1 or 2
   types=["relates_to"],            # optional relationship-type filter
   direction="both",                # "in", "out", or "both"
-  limit=20                         # optional, total returned edge limit
+  limit=20                         # optional, maximum returned neighbours
 )
 ```
 
-The result contains deterministic `edges` plus deduplicated `neighbours`.
+The result contains deterministic `edges` plus deduplicated `neighbours`; it
+includes each walked edge to a returned neighbour.
 Neighbour records carry identity, type, status, and a short content-derived
 `hook`; full memory content is deliberately omitted. Traversal applies the
 same recall visibility and eligibility rules at every hop, so a hidden memory

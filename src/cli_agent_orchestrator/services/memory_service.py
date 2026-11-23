@@ -1731,13 +1731,41 @@ class MemoryService:
                 except Exception as e:  # noqa: BLE001 — non-blocking; marker already written
                     logger.warning(f"relationship replace_set (compiler) failed, ignoring: {e}")
                 if see_also_targets:
+                    from cli_agent_orchestrator.services.settings_service import (
+                        is_memory_content_links_enabled,
+                    )
+
+                    # Authored lines are link producers only with memory.content_links on;
+                    # with it off the compile output stays exactly as before.
+                    authored_lines: list[str] = []
+                    authored_targets: set[str] = set()
+                    if is_memory_content_links_enabled():
+                        from cli_agent_orchestrator.services.memory_content_links import (
+                            extract_content_link_targets,
+                        )
+
+                        authored_lines = self._authored_see_also_lines(
+                            pre_append_content, new_entry
+                        )
+                        authored_targets = set(
+                            extract_content_link_targets(
+                                "## See Also\n" + "\n".join(authored_lines),
+                                self._sanitize_key,
+                            )
+                        )
                     see_also = self._render_see_also(
-                        see_also_targets,
+                        [target for target in see_also_targets if target not in authored_targets],
                         topic_scope=scope,
                         topic_scope_id=scope_id,
                     )
                     stripped = self._strip_existing_see_also(compiled_content)
-                    compiled_content = stripped + "\n" + see_also if see_also else stripped
+                    if authored_lines:
+                        rendered = ["## See Also", *authored_lines]
+                        if see_also:
+                            rendered.extend(see_also.splitlines()[1:])
+                        compiled_content = stripped + "\n" + "\n".join(rendered) + "\n"
+                    else:
+                        compiled_content = stripped + "\n" + see_also if see_also else stripped
             else:
                 logger.info("find_related_fallback reason=%s", related_result.fallback_reason)
             _audit(
@@ -2073,6 +2101,32 @@ class MemoryService:
                 out.extend(authored)
             index = end
         return "\n".join(out).rstrip() + "\n"
+
+    @staticmethod
+    def _authored_see_also_lines(*contents: str) -> list[str]:
+        """Collect non-canonical See Also lines without changing their text."""
+        from cli_agent_orchestrator.services.wiki_compiler import SEE_ALSO_LINK_RE
+
+        lines: list[str] = []
+        seen: set[str] = set()
+        for content in contents:
+            in_see_also = False
+            for line in content.splitlines():
+                stripped = line.rstrip()
+                if stripped == "## See Also":
+                    in_see_also = True
+                    continue
+                if in_see_also and stripped.startswith("## "):
+                    in_see_also = False
+                if (
+                    in_see_also
+                    and line.strip()
+                    and not SEE_ALSO_LINK_RE.fullmatch(line.strip())
+                    and stripped not in seen
+                ):
+                    seen.add(stripped)
+                    lines.append(line)
+        return lines
 
     def _sync_content_link_edges(
         self,

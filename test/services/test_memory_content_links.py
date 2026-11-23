@@ -5,16 +5,20 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from click.testing import CliRunner
 from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.cli.commands.memory import repair_cmd
 from cli_agent_orchestrator.clients.database import MemoryRelationshipModel
 from cli_agent_orchestrator.services import memory_relationship_service as relationship_module
+from cli_agent_orchestrator.services.memory_content_links import extract_content_link_targets
 from cli_agent_orchestrator.services.memory_reconciliation import MemoryReconciliationService
 from cli_agent_orchestrator.services.memory_relationship_service import (
     MAX_EDGES_PER_MUTATION,
     MemoryRelationshipService,
 )
 from cli_agent_orchestrator.services.memory_service import MemoryService
+from cli_agent_orchestrator.services.wiki_compiler import CompileResult, RelatedResult
 from cli_agent_orchestrator.services.wiki_lint import run_lint
 
 
@@ -64,6 +68,41 @@ def test_store_creates_content_link_edges_when_enabled(
         ("source", "other", "content_link"),
         ("source", "target", "content_link"),
     }
+
+
+def test_see_also_parser_ignores_non_memory_reference_shapes() -> None:
+    content = """\
+## See Also
+- [Design doc](https://example.test/docs/design.md)
+- https://example.test/guides/setup/
+- [Upstream README](mailto:docs@example.test)
+- See the testing guide in the wiki
+**bold**
+```markdown
+## See Also
+- target
+```
+## Next
+- later
+"""
+
+    assert extract_content_link_targets(content, MemoryService._sanitize_key) == []
+
+
+def test_see_also_parser_rejects_each_non_memory_rule() -> None:
+    cases = (
+        "- [External](https://example.test/key.md)",
+        "- [Mail](mailto:docs@example.test)",
+        "- [Absolute](/docs/key.md)",
+        "-not-a-bullet",
+        "```markdown\n## See Also\n- target\n```",
+        "- prose words are not a key",
+        "- [[../target]]",
+    )
+
+    for bullet in cases:
+        content = f"## See Also\n{bullet}\n"
+        assert extract_content_link_targets(content, MemoryService._sanitize_key) == []
 
 
 def test_missing_and_cross_scope_links_are_not_edges_and_lint_reports_missing(
@@ -155,6 +194,24 @@ def test_fresh_repair_builds_links_after_all_endpoint_metadata(
     MemoryReconciliationService(tmp_path, isolated_memory_db).apply()
 
     assert _edges(isolated_memory_db) == {("source", "target", "content_link")}
+
+
+def test_repair_strips_generated_see_also_lines_from_content_link_edges(
+    tmp_path: Path, isolated_memory_db, monkeypatch
+) -> None:
+    _enable_content_links(monkeypatch)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    _run(service.store("target", scope="global", key="target"))
+    source = _run(service.store("plain text", scope="global", key="source"))
+    path = Path(source.file_path)
+    path.write_text(
+        path.read_text(encoding="utf-8") + "\n## See Also\n- [target](../global/target.md)\n",
+        encoding="utf-8",
+    )
+
+    MemoryReconciliationService(tmp_path, isolated_memory_db).apply()
+
+    assert _edges(isolated_memory_db) == set()
 
 
 def test_content_links_false_preserves_recall_and_writes_no_edges(
@@ -283,6 +340,71 @@ def test_mixed_see_also_strips_generated_lines_but_keeps_authored_links(
     }
 
 
+def test_compact_preserves_authored_see_also_links_through_store_and_repair(
+    tmp_path: Path, isolated_memory_db, monkeypatch
+) -> None:
+    """Identity compile must not turn authored See Also links into generated-only links."""
+    _enable_content_links(monkeypatch)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    monkeypatch.setattr(service, "_schedule_background_compile", lambda **kwargs: None)
+    monkeypatch.setattr(
+        relationship_module,
+        "SessionLocal",
+        sessionmaker(bind=isolated_memory_db),
+    )
+
+    async def identity_compile(existing, new_entry, **kwargs):
+        return CompileResult(
+            compiled_content=existing if not new_entry else f"{existing}\n{new_entry}",
+            used_llm=True,
+            fallback_reason=None,
+            elapsed_ms=0,
+        )
+
+    async def no_related(*args, **kwargs):
+        return RelatedResult([], True, None, 0)
+
+    from cli_agent_orchestrator.services import wiki_compiler
+
+    monkeypatch.setattr(wiki_compiler, "compile", identity_compile)
+    monkeypatch.setattr(wiki_compiler, "find_related", no_related)
+    for key in ("authored", "body-link", "plain-key"):
+        _run(service.store(key, scope="global", key=key))
+    stored = _run(
+        service.store(
+            "[[body-link]]\n\n## See Also\n"
+            "- Authored context for [[authored]]\n"
+            "- plain-key\n",
+            scope="global",
+            key="source",
+        )
+    )
+    expected = {
+        ("source", "authored", "content_link"),
+        ("source", "body-link", "content_link"),
+        ("source", "plain-key", "content_link"),
+    }
+    assert _edges(isolated_memory_db) == expected
+
+    assert _run(service.compact(key="source"))["source"] == "applied"
+    assert "Authored context for [[authored]]" in Path(stored.file_path).read_text(encoding="utf-8")
+    assert _edges(isolated_memory_db) == expected
+
+    _run(service.store("second entry", scope="global", key="source"))
+    assert _edges(isolated_memory_db) == expected
+    assert _run(service.compact(key="source"))["source"] == "applied"
+
+    reconciliation = MemoryReconciliationService(tmp_path, isolated_memory_db)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.memory_reconciliation.MemoryReconciliationService",
+        lambda: reconciliation,
+    )
+    result = CliRunner().invoke(repair_cmd, ["--apply"])
+
+    assert result.exit_code == 0, result.output
+    assert _edges(isolated_memory_db) == expected
+
+
 def test_generated_see_also_does_not_become_a_self_sustaining_content_edge(
     tmp_path: Path, isolated_memory_db, monkeypatch
 ) -> None:
@@ -313,3 +435,101 @@ def test_generated_see_also_does_not_become_a_self_sustaining_content_edge(
 
     assert relationships.active_targets("global", None, "source") == []
     assert not any(origin == "content_link" for _, _, origin in _edges(isolated_memory_db))
+
+
+def _identity_compile_stubs(service, monkeypatch, isolated_memory_db, related_keys=()) -> None:
+    from cli_agent_orchestrator.services import wiki_compiler
+
+    monkeypatch.setattr(service, "_schedule_background_compile", lambda **kwargs: None)
+    monkeypatch.setattr(relationship_module, "SessionLocal", sessionmaker(bind=isolated_memory_db))
+
+    async def identity_compile(existing, new_entry, **kwargs):
+        return CompileResult(
+            compiled_content=existing if not new_entry else f"{existing}\n{new_entry}",
+            used_llm=True,
+            fallback_reason=None,
+            elapsed_ms=0,
+        )
+
+    async def related(*args, **kwargs):
+        return RelatedResult(list(related_keys), True, None, 0)
+
+    monkeypatch.setattr(wiki_compiler, "compile", identity_compile)
+    monkeypatch.setattr(wiki_compiler, "find_related", related)
+
+
+def _see_also_section(path: str) -> str:
+    text = Path(path).read_text(encoding="utf-8")
+    return text.split("## See Also", 1)[1] if "## See Also" in text else ""
+
+
+def test_authored_see_also_lines_are_deduped_in_first_seen_order_and_skip_blanks() -> None:
+    first = (
+        "# k\n\n## See Also\n- Authored context for [[a]]\n\n"
+        "- [b](../global/b.md)\n   \n- plain-key\n"
+    )
+    second = "## See Also\n- plain-key\n- Authored context for [[a]]\n- another [[c]]\n"
+
+    lines = MemoryService._authored_see_also_lines(first, second)
+
+    assert lines == ["- Authored context for [[a]]", "- plain-key", "- another [[c]]"]
+
+
+def test_repeated_compiles_do_not_grow_the_authored_see_also_section(
+    tmp_path: Path, isolated_memory_db, monkeypatch
+) -> None:
+    _enable_content_links(monkeypatch)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    _identity_compile_stubs(service, monkeypatch, isolated_memory_db)
+    for key in ("authored", "body-link", "plain-key"):
+        _run(service.store(key, scope="global", key=key))
+    stored = _run(
+        service.store(
+            "[[body-link]]\n\n## See Also\n"
+            "- Authored context for [[authored]]\n\n"
+            "- plain-key\n",
+            scope="global",
+            key="source",
+        )
+    )
+    expected = {
+        ("source", "authored", "content_link"),
+        ("source", "body-link", "content_link"),
+        ("source", "plain-key", "content_link"),
+    }
+    sections = []
+    for cycle in range(3):
+        assert _run(service.compact(key="source"))["source"] == "applied"
+        sections.append(_see_also_section(stored.file_path))
+        assert _edges(isolated_memory_db) == expected
+        _run(service.store(f"entry {cycle}", scope="global", key="source"))
+
+    assert sections[1] == sections[2]
+    assert sections[0].count("\n") == sections[2].count("\n")
+    assert sections[2].count("Authored context for [[authored]]") == 1
+    assert sections[2].count("- plain-key") == 1
+
+
+def test_compile_with_content_links_off_replaces_authored_see_also_as_before(
+    tmp_path: Path, isolated_memory_db, monkeypatch
+) -> None:
+    from cli_agent_orchestrator.services import settings_service
+
+    monkeypatch.setattr(settings_service, "is_memory_content_links_enabled", lambda: False)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    _identity_compile_stubs(service, monkeypatch, isolated_memory_db, related_keys=["target"])
+    _run(service.store("target", scope="global", key="target"))
+    stored = _run(
+        service.store(
+            "body\n\n## See Also\n- Authored context for [[target]]\n- plain-key\n",
+            scope="global",
+            key="source",
+        )
+    )
+
+    assert _run(service.compact(key="source"))["source"] == "applied"
+
+    text = Path(stored.file_path).read_text(encoding="utf-8")
+    assert "Authored context" not in text
+    assert "plain-key" not in text
+    assert "- [target](../global/target.md)" in text

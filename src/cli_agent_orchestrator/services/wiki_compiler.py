@@ -119,6 +119,15 @@ _PROMPT_SYSTEM = (
     "- Keep article length under 32 KiB and under 4× the input article size.\n"
 )
 
+# With memory.content_links on, authored `## See Also` lines are link producers that the
+# compile must keep; every other compile sends the prompt above unchanged.
+_PROMPT_SYSTEM_CONTENT_LINKS = _PROMPT_SYSTEM.replace(
+    "- Do NOT include any markdown links. (U2 will reintroduce a `## See Also`\n"
+    "  section with controlled links.)\n",
+    "- Preserve hand-authored `## See Also` lines verbatim. Do NOT add markdown\n"
+    "  links elsewhere; CAO owns canonical links in that section.\n",
+)
+
 
 # -----------------------------------------------------------------------------
 # Logging redactor (T9) — exported for U5 audit-log reuse
@@ -716,7 +725,11 @@ async def compile(
             "deduplicate, resolve contradictions (newest fact wins), and\n"
             "reorganise for clarity. Return the updated article only.\n"
         )
-    system_prompt = _PROMPT_SYSTEM.replace("{topic_key}", topic_key)
+    from cli_agent_orchestrator.services.settings_service import is_memory_content_links_enabled
+
+    system_prompt = (
+        _PROMPT_SYSTEM_CONTENT_LINKS if is_memory_content_links_enabled() else _PROMPT_SYSTEM
+    ).replace("{topic_key}", topic_key)
 
     try:
         raw = await _llm_call(client, system_prompt, user_prompt, timeout_s=timeout_s)

@@ -69,6 +69,7 @@ def _post(path: str, body: dict[str, Any]) -> dict[str, Any]:
         if path == "/internal/memory/related" and error.get("error_kind") in {
             "not_found",
             "ambiguous_scope",
+            "invalid_argument",
         }:
             return error
     response.raise_for_status()

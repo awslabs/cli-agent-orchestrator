@@ -11417,7 +11417,10 @@ async def internal_memory_related(
             ),
         )
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return JSONResponse(
+            status_code=422,
+            content={"success": False, "error_kind": "invalid_argument", "error": str(exc)},
+        )
     if result.get("error_kind") == "not_found":
         return JSONResponse(status_code=404, content=result)
     if result.get("error_kind") == "ambiguous_scope":

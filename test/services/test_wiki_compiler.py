@@ -919,3 +919,25 @@ class TestNFRLatency:
         elapsed_ms.sort()
         p95 = elapsed_ms[int(0.95 * (N - 1))]
         assert p95 < 5_000, f"compile() p95={p95}ms exceeds 5s target (samples={elapsed_ms})"
+
+
+def test_compile_prompt_is_unchanged_unless_content_links_are_on(fake_llm, monkeypatch):
+    """The See Also instruction changes only with memory.content_links on."""
+    from cli_agent_orchestrator.services import settings_service
+
+    fake_llm.set_response(lambda system, user: EXISTING_BODY + "\nfact\n")
+    old_line = (
+        "- Do NOT include any markdown links. (U2 will reintroduce a `## See Also`\n"
+        "  section with controlled links.)\n"
+    )
+    prompts = {}
+    for enabled in (False, True):
+        monkeypatch.setattr(settings_service, "is_memory_content_links_enabled", lambda: enabled)
+        _run(wiki_compiler.compile(EXISTING_BODY, NEW_ENTRY, topic_key="prefer-pytest"))
+        prompts[enabled] = fake_llm.calls[-1]["system"]
+
+    assert prompts[False] == wiki_compiler._PROMPT_SYSTEM.replace("{topic_key}", "prefer-pytest")
+    assert old_line in prompts[False]
+    assert "Preserve hand-authored" not in prompts[False]
+    assert old_line not in prompts[True]
+    assert "Preserve hand-authored `## See Also` lines verbatim." in prompts[True]

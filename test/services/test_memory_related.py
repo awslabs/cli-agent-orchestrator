@@ -221,10 +221,55 @@ def test_related_keeps_all_edge_types_to_one_neighbour(service, isolated_memory_
     relationships.create("global", None, "source", "target", "relates_to", "human")
     relationships.create("global", None, "source", "target", "supersedes", "human")
 
-    result = _run(service.related("source", scope="global"))
+    result = _run(service.related("source", scope="global", limit=1))
 
     assert {edge["type"] for edge in result["edges"]} == {"relates_to", "supersedes"}
     assert [neighbour["key"] for neighbour in result["neighbours"]] == ["target"]
+
+
+def test_hidden_middle_cannot_bridge_visible_memories(service, isolated_memory_db) -> None:
+    for key in ("source", "a-hidden", "target"):
+        _run(service.store(key, scope="global", key=key))
+    relationships = MemoryRelationshipService(sessionmaker(bind=isolated_memory_db))
+    relationships.create("global", None, "source", "a-hidden", "relates_to", "human")
+    relationships.create("global", None, "a-hidden", "target", "relates_to", "human")
+    memory_eligibility.register_source(_ExcludeHidden())
+
+    result = _run(
+        service.related(
+            "source",
+            scope="global",
+            depth=2,
+            terminal_context={"agent_profile": MEMORY_MANAGER_PROFILE},
+        )
+    )
+
+    assert result["edges"] == []
+    assert result["neighbours"] == []
+
+
+def test_related_ignores_rejected_and_deleted_edges(service, isolated_memory_db) -> None:
+    for key in ("source", "rejected", "deleted"):
+        _run(service.store(key, scope="global", key=key))
+    relationships = MemoryRelationshipService(sessionmaker(bind=isolated_memory_db))
+    rejected = relationships.create("global", None, "source", "rejected", "relates_to", "human")
+    deleted = relationships.create("global", None, "source", "deleted", "relates_to", "human")
+    relationships.reject(rejected.id)
+    relationships.soft_delete(deleted.id)
+
+    result = _run(service.related("source", scope="global"))
+
+    assert result["edges"] == []
+    assert result["neighbours"] == []
+
+
+def test_related_hook_is_clipped_to_160_characters(service) -> None:
+    _run(service.store("x" * 200, scope="global", key="target"))
+    _run(service.store("[[target]]", scope="global", key="source"))
+
+    result = _run(service.related("source", scope="global"))
+
+    assert result["neighbours"][0]["hook"] == "x" * 160
 
 
 def test_hidden_neighbour_does_not_consume_visible_limit(service, isolated_memory_db) -> None:
@@ -278,15 +323,54 @@ def test_internal_related_maps_validation_and_read_errors(monkeypatch) -> None:
     )
     assert missing.status_code == 404
 
-    with pytest.raises(api_main.HTTPException) as caught:
-        _run(
-            api_main.internal_memory_related(
-                api_main.InternalMemoryRelatedRequest(key="bad"),
-                _scopes=[],
-            )
+    invalid = _run(
+        api_main.internal_memory_related(
+            api_main.InternalMemoryRelatedRequest(key="bad"),
+            _scopes=[],
         )
-    assert caught.value.status_code == 422
+    )
+    assert invalid.status_code == 422
+    assert json.loads(invalid.body) == {
+        "success": False,
+        "error_kind": "invalid_argument",
+        "error": "bad direction",
+    }
 
 
 async def _async_result(value):
     return value
+
+
+def test_remote_related_end_to_end_through_the_gateway_and_the_route(service, monkeypatch) -> None:
+    """The gateway's _post talks to the real route: success, 404, 409 and 422 keep their reasons."""
+    from fastapi.testclient import TestClient
+
+    from cli_agent_orchestrator.services import memory_gateway
+
+    _run(service.store("target body", scope="global", key="target"))
+    _run(service.store("Source hook. [[target]]", scope="global", key="source"))
+    _run(service.store("first copy", scope="global", key="dup"))
+    _run(service.store("second copy", scope="federated", key="dup"))
+    client = TestClient(api_main.app, base_url="http://localhost")
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://localhost")
+    monkeypatch.setattr(api_main, "_get_memory_service", lambda: service)
+    monkeypatch.setattr(
+        memory_gateway.requests,
+        "post",
+        lambda url, json=None, headers=None, timeout=None: client.post(
+            url.removeprefix("http://localhost"), json=json
+        ),
+    )
+
+    ok = memory_gateway._post("/internal/memory/related", {"key": "source"})
+    missing = memory_gateway._post("/internal/memory/related", {"key": "missing"})
+    ambiguous = memory_gateway._post("/internal/memory/related", {"key": "dup"})
+    invalid = memory_gateway._post(
+        "/internal/memory/related", {"key": "source", "direction": "sideways"}
+    )
+
+    assert [edge["key"] for edge in ok["neighbours"]] == ["target"]
+    assert missing["error_kind"] == "not_found"
+    assert ambiguous["error_kind"] == "ambiguous_scope"
+    assert invalid["error_kind"] == "invalid_argument"
+    assert "direction must be one of" in invalid["error"]
