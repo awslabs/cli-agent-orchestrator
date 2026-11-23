@@ -413,12 +413,58 @@ class TestReplyInFlight:
         assert database.close_edges_replied_by([]) == 0
         assert find_open_edge("sup", "w1") is not None
 
-    def test_delivery_of_a_replaced_reply_closes_nothing(self, db):
+    def test_delivery_of_an_unknown_message_closes_no_replaced_mark(self, db):
         edge = create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
         database.mark_reply_in_flight(edge.id, 41)
         database.mark_reply_in_flight(edge.id, 42)
         assert database.close_edges_replied_by([41]) == 0
         assert find_open_edge("sup", "w1").reply_message_id == 42
+
+    def test_delivery_of_an_earlier_reply_closes_an_edge_marked_with_a_later_one(self, db):
+        create_terminal("sup", "cao-s", "sup", "claude_code")
+        edge = create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
+        first = create_inbox_message("w1", "sup", "answer")
+        second = create_inbox_message("w1", "sup", "p.s.")
+        database.mark_reply_in_flight(edge.id, first.id)
+        database.mark_reply_in_flight(edge.id, second.id)
+        assert database.close_edges_replied_by([first.id]) == 1
+        assert find_any_edge("sup", "w1").state == EdgeState.REPLIED
+
+    def test_delivery_of_a_message_to_someone_else_closes_nothing(self, db):
+        create_terminal("sup", "cao-s", "sup", "claude_code")
+        create_terminal("other", "cao-s", "other", "claude_code")
+        edge = create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
+        stray = create_inbox_message("w1", "other", "not for sup")
+        database.mark_reply_in_flight(edge.id, 999)
+        assert database.close_edges_replied_by([stray.id]) == 0
+        assert find_open_edge("sup", "w1") is not None
+
+    def test_delivery_never_closes_an_edge_with_no_reply_in_flight(self, db):
+        create_terminal("sup", "cao-s", "sup", "claude_code")
+        older = create_inbox_message("w1", "sup", "an older reply")
+        edge = create_delegation_edge("sup", "w1", EdgeSource.SEND_MESSAGE)  # a follow-up's edge
+        assert edge.reply_message_id is None
+        assert database.close_edges_replied_by([older.id]) == 0
+        assert find_open_edge("sup", "w1") is not None
+
+    def test_a_message_older_than_the_edge_closes_nothing(self, db):
+        create_terminal("sup", "cao-s", "sup", "claude_code")
+        older = create_inbox_message("w1", "sup", "sent before the edge opened")
+        edge = create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
+        database.mark_reply_in_flight(edge.id, 999)
+        assert database.close_edges_replied_by([older.id]) == 0
+        assert find_open_edge("sup", "w1").reply_message_id == 999
+
+    def test_the_sweep_helper_closes_only_when_a_reply_was_delivered(self, db):
+        create_terminal("sup", "cao-s", "sup", "claude_code")
+        edge = create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)
+        first = create_inbox_message("w1", "sup", "answer")
+        second = create_inbox_message("w1", "sup", "p.s.")
+        database.mark_reply_in_flight(edge.id, second.id)
+        assert database.close_edges_with_delivered_reply("sup", second.id) == 0
+        database.update_message_status(first.id, MessageStatus.DELIVERED)
+        assert database.close_edges_with_delivered_reply("sup", second.id) == 1
+        assert find_any_edge("sup", "w1").state == EdgeState.REPLIED
 
     def test_second_delivery_of_the_same_reply_counts_nothing(self, db):
         edge = create_delegation_edge("sup", "w1", EdgeSource.ASSIGN)

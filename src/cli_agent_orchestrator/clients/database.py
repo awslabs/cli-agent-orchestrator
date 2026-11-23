@@ -28,6 +28,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    and_,
     create_engine,
     exists,
     func,
@@ -4453,22 +4454,40 @@ def mark_reply_in_flight(edge_id: int, message_id: int) -> bool:
 
 
 def close_edges_replied_by(message_ids: List[int]) -> int:
-    """Close as replied the OPEN edges whose reply in flight is one of ``message_ids``.
+    """Close as replied the OPEN edges that a just-delivered message answers.
+
+    A delivered message from a worker to the caller waiting on it ends that
+    wait, as on ``main``: an OPEN edge ``caller -> worker`` with a reply in
+    flight is closed when any message from the worker to the caller, sent
+    after the edge opened, is delivered, even when the mark now names a later
+    reply. An edge with no reply in flight is left open: it was opened by a
+    follow-up, which an older reply must not answer. An edge whose mark is
+    one of ``message_ids`` is closed too, whoever sent that message.
 
     Args:
         message_ids: Inbox ids of messages just delivered.
 
     Returns:
-        The number of edges this call closed. An edge whose mark was replaced
-        by a newer reply is not closed by the older one.
+        The number of edges this call closed.
     """
     if not message_ids:
         return 0
     with SessionLocal() as db:
+        marked_by_these = DelegationEdgeModel.reply_message_id.in_(message_ids)
+        delivered = db.query(InboxModel).filter(InboxModel.id.in_(message_ids)).all()
+        answered_by_these = [
+            and_(
+                DelegationEdgeModel.worker_id == message.sender_id,
+                DelegationEdgeModel.caller_id == message.receiver_id,
+                DelegationEdgeModel.reply_message_id.isnot(None),
+                DelegationEdgeModel.created_at <= message.created_at,
+            )
+            for message in delivered
+        ]
         count = (
             db.query(DelegationEdgeModel)
             .filter(
-                DelegationEdgeModel.reply_message_id.in_(message_ids),
+                or_(marked_by_these, *answered_by_these),
                 DelegationEdgeModel.state == EdgeState.OPEN.value,
             )
             .update(
@@ -4481,6 +4500,48 @@ def close_edges_replied_by(message_ids: List[int]) -> int:
         )
         db.commit()
         return count
+
+
+def close_edges_with_delivered_reply(caller_id: str, message_id: int) -> int:
+    """Close as replied the OPEN edges marked ``message_id`` whose worker already got a reply through.
+
+    The sweep's counterpart of ``close_edges_replied_by``, for a delivery whose
+    settling was lost (a restart between the paste and the settlement). An
+    edge ``caller_id -> worker`` whose mark names ``message_id`` is closed when
+    some message from the worker to the caller, sent after the edge opened, is
+    DELIVERED.
+
+    Returns:
+        The number of edges this call closed.
+    """
+    with SessionLocal() as db:
+        edges = (
+            db.query(DelegationEdgeModel)
+            .filter(
+                DelegationEdgeModel.caller_id == caller_id,
+                DelegationEdgeModel.reply_message_id == message_id,
+                DelegationEdgeModel.state == EdgeState.OPEN.value,
+            )
+            .all()
+        )
+        closed = 0
+        for edge in edges:
+            replied = (
+                db.query(InboxModel.id)
+                .filter(
+                    InboxModel.sender_id == edge.worker_id,
+                    InboxModel.receiver_id == caller_id,
+                    InboxModel.status == MessageStatus.DELIVERED.value,
+                    InboxModel.created_at >= edge.created_at,
+                )
+                .first()
+            )
+            if replied is not None:
+                edge.state = EdgeState.REPLIED.value
+                edge.closed_at = _utcnow()
+                closed += 1
+        db.commit()
+        return closed
 
 
 def clear_reply_in_flight(message_ids: List[int]) -> List[DelegationEdge]:

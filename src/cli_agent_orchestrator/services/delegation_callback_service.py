@@ -19,6 +19,7 @@ from cli_agent_orchestrator.clients.database import (
     close_delegation_edge,
     close_delegation_edge_with_message,
     close_edges_replied_by,
+    close_edges_with_delivered_reply,
     close_open_edges_for_terminal,
     create_delegation_edge,
     create_inbox_message,
@@ -543,6 +544,10 @@ def _settle_reply_mark(
     """
     with inbox_service.hold_delivery_if_idle(caller_id) as held:
         if not held:
+            return
+        # A delivered message from the worker already answered the caller, even
+        # when the mark now names a later reply that is still pending or failed.
+        if close_edges_with_delivered_reply(caller_id, message_id):
             return
         message = get_inbox_message(message_id)
         if message is not None and message.status == MessageStatus.PENDING:

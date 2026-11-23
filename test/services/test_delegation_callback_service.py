@@ -928,16 +928,17 @@ class TestReplySettlement:
         assert svc.evaluate_completion(W) == 0, "W is not auto-forwarded on its next IDLE"
         assert live.delivered == []
 
-    def test_delivery_of_a_replaced_reply_keeps_the_edge_open_until_the_latest(self, live):
+    def test_delivery_of_a_replaced_reply_closes_the_edge_at_the_first_delivery(self, live):
+        """Any delivered message from the worker answers its caller, as on main."""
         from cli_agent_orchestrator.clients.database import find_any_edge
 
         self._assign(S, W)
         _send(W, S, "first reply")
-        latest = _send(W, S, "second reply")
+        _send(W, S, "second reply")
 
         _attempt(S)  # one message per attempt, oldest first: the replaced reply
 
-        assert find_open_edge(S, W).reply_message_id == latest
+        assert find_any_edge(S, W).state == EdgeState.REPLIED
         _attempt(S)
         assert find_any_edge(S, W).state == EdgeState.REPLIED
 
@@ -1367,3 +1368,105 @@ class TestPermanentRefusalOfAQueuedMessage:
         assert live.paste.dispatch_input.call_count == 1, "never retried"
         (notice,) = _failure_notices(W)
         assert re.search(rf"\b{message_id}\b", notice.message)
+
+
+class TestDeliveredReplyIsNotUndoneByALaterMessage:
+    """Any delivered message from the worker to its waiting caller ends the wait.
+
+    A later reply replaces the mark, but the earlier reply, once delivered,
+    already answered the caller: a later message that fails must not reopen the
+    edge and bring an extra ``[CAO auto-forward]``.
+    """
+
+    @staticmethod
+    def _auto_forwards(receiver_id):
+        return [m for m in _inbox(receiver_id) if m.message.startswith("[CAO auto-forward]")]
+
+    def test_first_reply_delivered_then_the_second_fails_for_good(self, live):
+        # Arrange: W replies twice to a busy S; the second reply holds the mark.
+        _armed(S, W)
+        _send(W, S, "the real answer")
+        second = _send(W, S, "p.s. one more thing")
+
+        # Act: the first is delivered, then the second fails for good.
+        _attempt(S)
+        live.paste.dispatch_input.side_effect = RuntimeError("herdr-core lost terminal.send")
+        _attempt(S)
+
+        # Assert
+        assert _edge_state(S, W).state == EdgeState.REPLIED
+        assert _set_status_of(second) == "failed"
+        assert svc.evaluate_completion(W) == 0
+        assert self._auto_forwards(S) == []
+
+    def test_first_reply_delivered_closes_the_edge_though_the_mark_names_the_second(self, live):
+        _armed(S, W)
+        _send(W, S, "the real answer")
+        _send(W, S, "p.s. one more thing")
+
+        _attempt(S)  # one message per attempt, oldest first
+
+        assert _edge_state(S, W).state == EdgeState.REPLIED
+
+    def test_a_single_reply_is_unchanged(self, live):
+        _armed(S, W)
+        _send(W, S, "final reply")
+        assert find_open_edge(S, W) is not None, "still open while only stored"
+
+        _attempt(S)
+
+        assert _edge_state(S, W).state == EdgeState.REPLIED
+
+    def test_an_older_reply_delivered_later_does_not_close_a_follow_up_edge(self, live):
+        # Arrange: two replies close the first edge at the first delivery.
+        _armed(S, W)
+        _send(W, S, "first reply")
+        _send(W, S, "second reply")
+        _attempt(S)
+        assert _edge_state(S, W).state == EdgeState.REPLIED
+        # S follows up with W: a new edge, with no reply in flight.
+        _send(S, W, "follow-up", expect_reply=True)
+        follow_up = find_open_edge(S, W)
+        assert follow_up is not None and follow_up.reply_message_id is None
+
+        # Act: the older reply is delivered now.
+        _attempt(S)
+
+        # Assert
+        still_open = find_open_edge(S, W)
+        assert still_open is not None and still_open.id == follow_up.id
+
+    def test_sweep_closes_the_edge_when_an_earlier_reply_was_delivered_before_a_restart(self, live):
+        # Arrange: reply 1 typed, reply 2 failed, the server died before settling reply 1.
+        live.monitor.get_status.return_value = TerminalStatus.PROCESSING
+        _armed(S, W)
+        first = _send(W, S, "the real answer")
+        second = _send(W, S, "p.s. one more thing")
+        _set_status(first, "delivered")
+        _set_status(second, "failed")
+
+        # Act
+        svc.sweep()
+
+        # Assert
+        assert _edge_state(S, W).state == EdgeState.REPLIED
+        assert self._auto_forwards(S) == []
+        assert _failure_notices(S) == []
+
+    def test_sweep_leaves_an_edge_open_when_no_reply_was_delivered(self, live):
+        live.monitor.get_status.return_value = TerminalStatus.PROCESSING
+        _armed(S, W)
+        _send(W, S, "the real answer")
+        second = _send(W, S, "p.s. one more thing")
+        _set_status(second, "failed")
+
+        svc.sweep()
+
+        edge = find_open_edge(S, W)
+        assert edge is not None and edge.reply_message_id is None, "cleared, still waiting"
+
+
+def _set_status_of(message_id):
+    from cli_agent_orchestrator.clients.database import get_inbox_message
+
+    return get_inbox_message(message_id).status.value
