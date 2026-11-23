@@ -106,25 +106,24 @@ def _resolve_path(source: PluginSource, dest: Path) -> tuple[Path, None]:
     happily accept it, because by then it genuinely is inside. Preserving links
     keeps the escape visible to ``containment.resolve_within_root``.
     """
-    raw = os.path.expanduser(source.location.strip())
-    if not raw:
-        raise ResolverError("Plugin source path is empty")
-
     try:
+        raw = os.path.expanduser(source.location.strip())
+        if not raw:
+            raise ResolverError("Plugin source path is empty")
         origin = Path(raw).resolve() if not os.path.isabs(raw) else Path(os.path.realpath(raw))
         exists = origin.exists()
         is_dir = origin.is_dir() if exists else False
     except (OSError, ValueError) as exc:
         raise ResolverError(f"Plugin source path is not valid {source.location!r}: {exc}") from exc
     if not exists:
-        raise ResolverError(f"Plugin source path does not exist: {source.location}")
+        raise ResolverError(f"Plugin source path does not exist: {source.location!r}")
     if not is_dir:
-        raise ResolverError(f"Plugin source path is not a directory: {source.location}")
+        raise ResolverError(f"Plugin source path is not a directory: {source.location!r}")
 
     staged = dest / _STAGE_DIRNAME
     try:
         shutil.copytree(origin, staged, symlinks=True)
-    except (OSError, shutil.Error) as exc:
+    except OSError as exc:
         raise ResolverError(f"Could not copy plugin source {source.location!r}: {exc}") from exc
     return staged, None
 
@@ -338,6 +337,8 @@ def _run_git(args: List[str], *, what: str, cwd: Optional[Path] = None) -> str:
         raise ResolverError(
             "git executable not found on PATH; a git plugin source needs it"
         ) from exc
+    except ValueError as exc:
+        raise ResolverError(f"git {what} could not start: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
         raise ResolverError(f"git {what} timed out after {GIT_TIMEOUT_S}s") from exc
     except subprocess.CalledProcessError as exc:
