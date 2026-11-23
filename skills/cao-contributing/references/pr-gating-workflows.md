@@ -20,9 +20,11 @@ job-level `continue-on-error`, so every check they run is blocking.
 | **Test Codex CLI Provider** (`test-codex-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs to `develop` touching that provider, **any** of its `test/providers/test_<provider>_*.py` tests (globbed since #1005 — it used to be one hardcoded filename) or fixtures, `pyproject.toml`, or the workflow | **Yes** |
 | **Test Kiro CLI Provider** (`test-kiro-cli-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs to `develop` touching that provider, **any** of its `test/providers/test_<provider>_*.py` tests (globbed since #1005 — it used to be one hardcoded filename) or fixtures, `pyproject.toml`, or the workflow | **Yes** |
 | **Actions Security** (`zizmor.yml`) | `zizmor` | every PR to `main` | **Yes** — zizmor 1.30.1 over `.github/` at Medium or higher; locally, `uvx zizmor==1.30.1 --collect=all --min-severity medium --offline --config .github/zizmor.yml .github/`. Accepted findings and their reasons live in `.github/zizmor.yml`; fix the workflow or add a reasoned entry there, never an inline ignore |
+| **Docs site** (`gh-pages.yml`) | `build` | only PRs to non-main branches touching `docusaurus/**`, `patches/**`, `vendor/**`, `scripts/test-braces-security.cjs`, `examples/robotics/cross-zone-transport/images/**`, `examples/robotics/hierarchical-factory/images/**`, or the workflow | **Yes** — deploy is push-only; PRs to `main` use CI's docs-build |
 
-> **Two checks can share a name.** Each provider workflow has its own `Unit Tests` and
-> `Code Quality`, so a PR that touches `pyproject.toml` shows those names more than once.
+> **On PRs to `develop`, checks can share a name.** Each provider workflow has its own
+> `Unit Tests` and `Code Quality`, so a PR that touches `pyproject.toml` shows those names
+> more than once. PRs to `main` instead see uniquely named provider jobs inside CI.
 > Read the workflow name next to a failing check before assuming it is the CI one —
 > `gh pr checks <number>` lists every workflow, whereas `gh run list --workflow CI` sees
 > only `ci.yml`.

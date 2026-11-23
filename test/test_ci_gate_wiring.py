@@ -1,5 +1,6 @@
 """Keep the advisory CI aggregate wired to every job it summarizes."""
 
+import ast
 import json
 import os
 import subprocess
@@ -8,6 +9,8 @@ from pathlib import Path
 
 import pytest
 import yaml
+
+from scripts.ci_changed_paths import FILTERS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
@@ -133,6 +136,67 @@ def test_ci_gate_needs_every_other_ci_job():
     assert len(jobs["filtered-gate"]["needs"]) <= 20
 
 
+def _filtered_jobs_mapping() -> dict[str, str]:
+    program = ast.parse(_filtered_python())
+    return next(
+        ast.literal_eval(statement.value)
+        for statement in program.body
+        if isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "filtered_jobs"
+            for target in statement.targets
+        )
+    )
+
+
+def test_every_filtered_condition_and_gate_mapping_refer_to_the_same_filter():
+    jobs = _ci_jobs()
+    mapping = _filtered_jobs_mapping()
+    expected = {
+        **{
+            job_id: name
+            for name in ("antigravity", "claude", "codex", "kiro")
+            for job_id in (f"provider-{name}", f"provider-{name}-lint")
+        },
+        "robotics-transport": "transport",
+        "robotics-factory": "factory",
+        "docs-build": "docs",
+    }
+    assert mapping == expected
+    assert set(jobs["filtered-gate"]["needs"]) == set(mapping) | {"changed-paths"}
+    assert set(jobs["changed-paths"]["outputs"]) == set(FILTERS)
+    for job_id, filter_name in mapping.items():
+        assert jobs[job_id]["if"] == (
+            "${{ needs.changed-paths.outputs." + filter_name + " == 'true' }}"
+        )
+
+
+def test_all_new_jobs_hold_only_the_permissions_they_need():
+    jobs = _ci_jobs()
+    for job_id in _filtered_jobs_mapping() | {"changed-paths": ""}:
+        assert jobs[job_id]["permissions"] == {"contents": "read"}
+    for gate_id in ("filtered-gate", "ci-gate"):
+        assert jobs[gate_id]["permissions"] == {}
+
+
+@pytest.mark.parametrize(
+    ("job_id", "target"),
+    [
+        ("provider-antigravity", "test/providers/test_antigravity_cli_*.py"),
+        ("provider-claude", "test/providers/test_claude_code_*.py"),
+        ("provider-claude", "test/providers/test_busy_pattern_settled_output_guard.py"),
+        ("provider-codex", "test/providers/test_codex_*.py"),
+        ("provider-kiro", "test/providers/test_kiro_cli_*.py"),
+        ("robotics-transport", "examples/robotics/cross-zone-transport"),
+        ("robotics-factory", "examples/robotics/hierarchical-factory"),
+    ],
+)
+def test_moved_jobs_keep_the_filtered_test_targets(job_id: str, target: str):
+    job = _ci_jobs()[job_id]
+    runs = "\n".join(str(step.get("run", "")) for step in job["steps"])
+    assert target in runs or any(step.get("working-directory") == target for step in job["steps"])
+
+
 def test_ci_gate_must_run_with_minimal_permissions_and_no_checkout():
     """A required future gate must still report after a failed or cancelled job."""
     for gate_id in ("ci-gate", "filtered-gate"):
@@ -156,9 +220,9 @@ def test_ci_gate_exit_code_matches_the_documented_rule(
     )
 
 
-@pytest.mark.parametrize(
-    ("result", "path_value", "expected"),
-    [
+@pytest.mark.parametrize("job_id, filter_name", _filtered_jobs_mapping().items())
+def test_filtered_job_verdict(job_id: str, filter_name: str):
+    for result, path_value, expected in (
         ("success", "true", 0),
         ("failure", "true", 1),
         ("skipped", "false", 0),
@@ -166,10 +230,8 @@ def test_ci_gate_exit_code_matches_the_documented_rule(
         ("skipped", "", 1),
         ("failure", "false", 1),
         ("cancelled", "false", 1),
-    ],
-)
-def test_filtered_job_verdict(result: str, path_value: str, expected: int):
-    assert _filtered_exit_code({"docs-build": result}, {"docs": path_value}) == expected
+    ):
+        assert _filtered_exit_code({job_id: result}, {filter_name: path_value}) == expected
 
 
 def test_changed_paths_failure_never_allows_a_skip():

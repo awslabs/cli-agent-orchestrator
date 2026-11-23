@@ -2,6 +2,7 @@
 /.github/actions/ @awslabs/multiq
 /.github/CODEOWNERS @awslabs/multiq
 /scripts/dependency_security.py @awslabs/multiq
+/scripts/ci_changed_paths.py @awslabs/multiq
 /scripts/test-braces-security.cjs @awslabs/multiq
 /patches/ @awslabs/multiq
 /vendor/ @awslabs/multiq

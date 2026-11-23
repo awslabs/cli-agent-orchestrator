@@ -1727,6 +1727,7 @@ jobs:
               skipped_is_allowed = (
                   result == "skipped"
                   and job_id == "dependency-review"
+                  # Mirrors dependency-review's job-level `if:` condition.
                   and (event_name != "pull_request"
                        or repository != "awslabs/cli-agent-orchestrator")
               )

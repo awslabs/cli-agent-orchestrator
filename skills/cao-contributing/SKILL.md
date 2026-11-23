@@ -91,7 +91,7 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 | **CodeQL** | GitHub Actions, JavaScript/TypeScript, Python, and Rust analysis and upload in the same CI run, including forks after required workflow approval | **Yes** — no project build; the hosted scan/status rules remain as documented in `SECURITY.md` |
 | **Dependency Security** | Full locked npm, Bun, uv, and Cargo inventories, including development dependencies and unfixed advisories, classified against a shipped set measured from the builds; independent clean-install mitigation checks | **Yes** — every HIGH/CRITICAL finding in the shipped set (wheel runtime closure, bundled web/MCP App/docs packages, TUI crates, the decision-model-host CDK app's runtime packages), a malware advisory anywhere, a toolchain HIGH/CRITICAL with a fix that the PR adds or changes, or any scan, completeness or shipped-set error, fails; other toolchain-only findings are listed and do not block; locally, build the bundles first, then `scripts/security-scan.sh dependencies` with Trivy installed |
 | **Dependency Review** | `actions/dependency-review-action` over the PR's dependency delta: `fail-on-severity: high` plus denied licences `GPL-3.0`/`AGPL-3.0` | **Yes** — CI-only; there is nothing to run locally, and it is skipped on forks (`if: github.repository == 'awslabs/cli-agent-orchestrator'`), so a green run on your fork has not exercised it |
-| **Changed paths for filtered jobs** | compare the event base and tested head; fail closed on a missing diff | **Yes** |
+| **Changed paths for filtered jobs** | compare the event's base with its tested head; fail closed if the diff cannot be read | **Yes** |
 | **Antigravity provider tests** | provider tests (3.11 / 3.12), path-selected | **Yes** when selected |
 | **Antigravity provider lint** | formatting and type checks, path-selected | **Yes** when selected |
 | **Claude provider tests** | provider tests (3.11 / 3.12), path-selected | **Yes** when selected |
@@ -102,9 +102,9 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 | **Kiro provider lint** | formatting and type checks, path-selected | **Yes** when selected |
 | **Transport simulator** | transport example (3.11 / 3.12), path-selected | **Yes** when selected |
 | **Factory simulator** | factory example (3.11 / 3.12), path-selected | **Yes** when selected |
-| **Docs site build** | Docusaurus typecheck and build, path-selected | **Yes** when selected |
+| **Docs site build** | Docusaurus typecheck and build when docs paths change; production Pages deployment stays separate | **Yes** when selected |
 | **Filtered jobs gate** | validates every path-selected job: only a no-match path result allows a skip | **Yes** |
-| **CI gate (advisory)** | one verdict over all CI jobs; filtered jobs skip only when changed paths succeeds and does not select them; `Dependency Review` skips outside upstream PRs | **Yes** — not yet required by ruleset (#1350 step 6). |
+| **CI gate (advisory)** | one pass/fail verdict over every other `ci.yml` job; filtered jobs may skip only when changed paths succeeded and did not select them; `Dependency Review` may skip outside upstream PRs | **Yes** — like the jobs above, a failure fails the CI run. No ruleset requires it yet (#1350 step 6). |
 
 CodeQL's four language jobs are part of `ci.yml`, so **Re-run all jobs** includes
 them. The standalone `codeql.yml` is only for weekly and manual scans; both use

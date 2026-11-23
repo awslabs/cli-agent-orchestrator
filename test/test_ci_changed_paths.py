@@ -1,6 +1,7 @@
 """Keep the path-aware gate's change range and filters trustworthy."""
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -31,13 +32,13 @@ def test_filters_cover_original_workflow_paths(name: str, filename: str):
 
 @pytest.mark.parametrize("name", ("transport", "factory"))
 def test_robotics_filters_cover_example_and_shared_sources(name: str):
-    assert any(
-        pattern.startswith(
-            f"examples/robotics/{'cross-zone-transport' if name == 'transport' else 'hierarchical-factory'}/"
-        )
-        for pattern in FILTERS[name]
-    )
-    assert "src/cli_agent_orchestrator/models/provider.py" in FILTERS[name]
+    example = "cross-zone-transport" if name == "transport" else "hierarchical-factory"
+    assert {
+        f"examples/robotics/{example}/**",
+        "src/cli_agent_orchestrator/models/provider.py",
+        "src/cli_agent_orchestrator/schemas/agent_profile.schema.json",
+        "src/cli_agent_orchestrator/utils/enforcement.py",
+    } <= set(FILTERS[name])
 
 
 def test_changes_to_detector_or_ci_trigger_every_filtered_job():
@@ -68,7 +69,20 @@ def test_filter_matches_nested_docs_and_does_not_match_unrelated():
     assert not any(matching_filters(["README.md"]).values())
 
 
-@pytest.mark.parametrize("filename", ("ci.yml", "secret-scan.yml", "zizmor.yml", "cargo-deny.yml"))
+def _required_workflow_files() -> set[str]:
+    skill = WORKFLOWS.parents[1] / "skills/cao-contributing/references/pr-gating-workflows.md"
+    rows = dict(
+        re.findall(
+            r"^\| \*\*(Secret Scan|cargo-deny|Actions Security)\*\* \(`([^`]+)`\)",
+            skill.read_text(),
+            re.MULTILINE,
+        )
+    )
+    assert set(rows) == {"Secret Scan", "cargo-deny", "Actions Security"}
+    return {"ci.yml", *rows.values()}
+
+
+@pytest.mark.parametrize("filename", sorted(_required_workflow_files()))
 def test_required_workflows_run_for_merge_groups(filename: str):
     spec = yaml.safe_load((WORKFLOWS / filename).read_text())
     triggers = spec.get("on", spec.get(True))
@@ -91,7 +105,7 @@ def test_merge_group_emits_path_results(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setenv("GITHUB_EVENT_NAME", "merge_group")
 
     def changed_files(command: list[str], **kwargs: object) -> bytes:
-        assert command == ["git", "diff", "--name-only", "-z", "base", "group"]
+        assert command == ["git", "diff", "--name-only", "--no-renames", "-z", "base", "group"]
         return b"docusaurus/src/index.ts\0"
 
     monkeypatch.setattr(ci_changed_paths.subprocess, "check_output", changed_files)
@@ -117,3 +131,49 @@ def test_unreadable_range_does_not_emit_skip_results(
     with pytest.raises(subprocess.CalledProcessError):
         ci_changed_paths.main()
     assert not output.exists()
+
+
+def test_renamed_away_provider_file_still_selects_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    original = tmp_path / "src/cli_agent_orchestrator/providers/codex.py"
+    original.parent.mkdir(parents=True)
+    original.write_text("original provider contents\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    commit = [
+        "git",
+        "-c",
+        "user.name=CI Test",
+        "-c",
+        "user.email=ci@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--quiet",
+        "-m",
+        "test",
+    ]
+    subprocess.run(commit, cwd=tmp_path, check=True)
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=tmp_path).decode().strip()
+    subprocess.run(
+        [
+            "git",
+            "mv",
+            str(original.relative_to(tmp_path)),
+            str(original.with_name("codex_old.py").relative_to(tmp_path)),
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(commit, cwd=tmp_path, check=True)
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=tmp_path).decode().strip()
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps({"merge_group": {"base_sha": base, "head_sha": head}}))
+    output = tmp_path / "output"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "merge_group")
+    ci_changed_paths.main()
+    assert "codex=true\n" in output.read_text()

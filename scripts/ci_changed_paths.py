@@ -87,9 +87,7 @@ def main() -> None:
     if not base or not head or base == "0" * 40:
         raise ValueError("no valid change range; refusing to skip jobs")
     changes = (
-        subprocess.check_output(
-            ["git", "diff", "--name-only", "-z", base, head], stderr=subprocess.STDOUT
-        )
+        subprocess.check_output(["git", "diff", "--name-only", "--no-renames", "-z", base, head])
         .decode()
         .split("\0")
     )
