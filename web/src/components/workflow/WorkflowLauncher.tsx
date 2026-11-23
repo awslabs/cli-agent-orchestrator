@@ -24,6 +24,7 @@ import { Play, Plus, X, Loader2, ChevronDown, ChevronRight, ShieldCheck, ListChe
 import { api, WorkflowDefRow, WorkflowSpec, WorkflowValidation } from '../../api'
 import { useStore } from '../../store'
 import { DeleteWorkflowButton } from './DeleteWorkflowButton'
+import { WorkflowSpecViewer } from './WorkflowSpecViewer'
 
 interface InputRow {
   key: string
@@ -177,14 +178,18 @@ export function WorkflowLauncher({ reloadKey = 0, focus = null, onEdit }: Workfl
   }
 
   // View spec (the `cao workflow get` equivalent): source, content hash, findings.
-  // Toggles; a second click hides it. Cleared when another workflow is picked.
+  // Open the large viewer immediately and fetch its content within the dialog.
+  const [specOpen, setSpecOpen] = useState(false)
   const [spec, setSpec] = useState<WorkflowSpec | null>(null)
   const [specError, setSpecError] = useState<string | null>(null)
   const [loadingSpec, setLoadingSpec] = useState(false)
+  const viewSpecRef = useRef<HTMLButtonElement>(null)
   useEffect(() => { setSpec(null); setSpecError(null) }, [selected])
-  const toggleSpec = async () => {
-    if (spec || specError) { setSpec(null); setSpecError(null); return }
+  const viewSpec = async () => {
     if (!selected || loadingSpec) return
+    setSpecOpen(true)
+    setSpec(null)
+    setSpecError(null)
     setLoadingSpec(true)
     try {
       setSpec(await api.getWorkflowSpec(selected))
@@ -440,30 +445,26 @@ export function WorkflowLauncher({ reloadKey = 0, focus = null, onEdit }: Workfl
                   Validate
                 </button>
                 <button
+                  ref={viewSpecRef}
                   type="button"
-                  onClick={toggleSpec}
-                  disabled={!selected || loadingSpec}
-                  aria-expanded={!!spec}
+                  onClick={viewSpec}
+                  disabled={!selected}
                   className="inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-lg border border-gray-700 px-3 py-1.5 text-sm text-gray-200 hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  {loadingSpec ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <FileCode size={14} aria-hidden="true" />}
-                  {spec ? 'Hide spec' : 'View spec'}
+                  <FileCode size={14} aria-hidden="true" />
+                  View spec
                 </button>
               </div>
 
-              {specError && <p className="text-xs text-red-400" role="alert">{specError}</p>}
-              {spec && (
-                <div className="rounded-lg border border-gray-700 p-2 text-xs" aria-label="Workflow spec">
-                  {spec.path && <p className="break-all font-mono text-gray-400">{spec.path}</p>}
-                  {spec.content_hash && <p className="mt-0.5 break-all font-mono text-gray-500">hash {spec.content_hash}</p>}
-                  {(spec.findings ?? []).map((f, i) => (
-                    <p key={i} className="mt-1 font-mono text-amber-300">line {f.line} [{f.severity}] {f.rule_id}: {f.message}</p>
-                  ))}
-                  <pre className="mt-2 max-h-96 overflow-auto rounded bg-gray-950 p-2 font-mono text-[11px] text-gray-300">
-                    {typeof spec.source === 'string' ? spec.source : JSON.stringify(spec, null, 2)}
-                  </pre>
-                </div>
-              )}
+              <WorkflowSpecViewer
+                open={specOpen}
+                workflowName={selected}
+                spec={spec}
+                loading={loadingSpec}
+                error={specError}
+                onClose={() => setSpecOpen(false)}
+                returnFocusRef={viewSpecRef}
+              />
 
               {validation && (
                 <div
