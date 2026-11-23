@@ -110,17 +110,22 @@ def _resolve_path(source: PluginSource, dest: Path) -> tuple[Path, None]:
     if not raw:
         raise ResolverError("Plugin source path is empty")
 
-    origin = Path(raw).resolve() if not os.path.isabs(raw) else Path(os.path.realpath(raw))
-    if not origin.exists():
+    try:
+        origin = Path(raw).resolve() if not os.path.isabs(raw) else Path(os.path.realpath(raw))
+        exists = origin.exists()
+        is_dir = origin.is_dir() if exists else False
+    except (OSError, ValueError) as exc:
+        raise ResolverError(f"Plugin source path is not valid {source.location!r}: {exc}") from exc
+    if not exists:
         raise ResolverError(f"Plugin source path does not exist: {source.location}")
-    if not origin.is_dir():
+    if not is_dir:
         raise ResolverError(f"Plugin source path is not a directory: {source.location}")
 
     staged = dest / _STAGE_DIRNAME
     try:
         shutil.copytree(origin, staged, symlinks=True)
-    except OSError as exc:
-        raise ResolverError(f"Could not copy plugin source {source.location}: {exc}") from exc
+    except (OSError, shutil.Error) as exc:
+        raise ResolverError(f"Could not copy plugin source {source.location!r}: {exc}") from exc
     return staged, None
 
 
@@ -165,7 +170,9 @@ def _resolve_git(source: PluginSource, dest: Path) -> tuple[Path, Optional[str]]
         # ``--branch`` consumes its value, so a ref beginning with ``-`` could
         # not become an option; refuse it anyway so the argv never carries one
         # and the error names the cause instead of git's "invalid branch name".
-        if source.ref.startswith("-") or any(ch.isspace() for ch in source.ref):
+        if source.ref.startswith("-") or any(
+            ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in source.ref
+        ):
             raise ResolverError(f"Plugin source ref {source.ref!r} is not a valid ref name")
         args += ["--branch", source.ref]
     # `--` so a location beginning with `-` is never read as an option.
@@ -357,6 +364,10 @@ def _apply_subdir(staged_root: Path, subdir: Optional[str]) -> Path:
     candidate = resolve_within_root(staged_root, subdir.strip())
     if candidate is None:
         raise ResolverError(f"Plugin subdirectory escapes the source tree: {subdir!r}")
-    if not candidate.is_dir():
+    try:
+        is_dir = candidate.is_dir()
+    except OSError as exc:
+        raise ResolverError(f"Plugin subdirectory is not accessible {subdir!r}: {exc}") from exc
+    if not is_dir:
         raise ResolverError(f"Plugin subdirectory does not exist in the source: {subdir!r}")
     return candidate
