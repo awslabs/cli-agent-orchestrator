@@ -130,7 +130,11 @@ def test_failure_in_any_pre_send_step_is_not_sent(seams, step):
 
 @pytest.mark.parametrize("step", sorted(_PRE_SEND_STEPS))
 def test_value_error_in_a_pre_send_step_is_not_sent(seams, step):
-    """Only "metadata lookup found no row" stays a ValueError; any other one typed nothing."""
+    """A ValueError before the send typed nothing, and stays a ValueError.
+
+    POST /terminals/{id}/input maps a ValueError to 404, as it did before this
+    change, so the wrapper is both an InputNotSentError and a ValueError.
+    """
     # Arrange
     cause = ValueError(f"{step} rejected its input")
     _PRE_SEND_STEPS[step](seams).side_effect = cause
@@ -141,6 +145,7 @@ def test_value_error_in_a_pre_send_step_is_not_sent(seams, step):
 
     # Assert
     assert raised.value.__cause__ is cause
+    assert isinstance(raised.value, ValueError)
     _assert_nothing_typed(seams)
 
 

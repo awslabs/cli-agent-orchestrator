@@ -6333,11 +6333,12 @@ def _refuse_if_provider_gone(terminal_id: str, provider: Any, metadata: Dict[str
 
 
 class TerminalRowMissingError(InputNotSentError, ValueError):
-    """``dispatch_input`` found no metadata row for the terminal.
+    """``dispatch_input`` found no metadata row, or a step before the send raised ``ValueError``.
 
-    Nothing was typed, and a later attempt cannot find the terminal either, so
-    the inbox fails such a message at once (reply-delivery-failure F5). It is
-    also a ``ValueError``, so POST /terminals/{id}/input still answers 404.
+    Nothing was typed, and a later attempt cannot get past the same rejection,
+    so the inbox fails such a message at once (reply-delivery-failure F5). It
+    is also a ``ValueError``, so POST /terminals/{id}/input still answers 404,
+    as it did before the send was classified.
     """
 
 
@@ -6588,10 +6589,14 @@ def dispatch_input(
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
         # Nothing reached the pane before send_keys (reply-delivery-failure D4).
         # Refusals and an unresolved pane keep their own types: their callers
-        # branch on them. A missing row is already an InputNotSentError.
+        # branch on them. A missing row is already an InputNotSentError. A
+        # ValueError stays one (POST /terminals/{id}/input maps it to 404).
         if not sending and not isinstance(
             e, (TerminalInputBlockedError, TerminalNotFoundError, InputNotSentError)
         ):
+            if isinstance(e, ValueError):
+                # The text is the 404's detail: keep what the ValueError said.
+                raise TerminalRowMissingError(str(e)) from e
             raise InputNotSentError(f"{type(e).__name__}: {e}") from e
         raise
 

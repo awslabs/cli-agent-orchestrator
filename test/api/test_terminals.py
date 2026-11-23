@@ -1108,6 +1108,28 @@ class TestSendInputToAMissingTerminal:
         assert response.status_code == 404
         assert "not found" in response.json()["detail"]
 
+    def test_row_deleted_between_the_two_reads_answers_404(self, client):
+        """get_provider reads the row again; a delete in between is still a 404, not a 500."""
+        meta = {"tmux_session": "cao-s", "tmux_window": "w1", "provider": "claude_code"}
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=meta,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.terminal_input_refusal",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.provider_manager.get_provider",
+                side_effect=ValueError("Terminal abcd1234 not found in database"),
+            ),
+        ):
+            response = client.post("/terminals/abcd1234/input", params={"message": "hello"})
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Terminal abcd1234 not found in database"
+
 
 class TestCreateInboxMessageEndpoint:
     """Test POST /terminals/{receiver_id}/inbox/messages endpoint."""

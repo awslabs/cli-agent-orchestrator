@@ -1041,6 +1041,36 @@ class TestDeliverPending:
         )
         assert mock_update.call_count == 3
 
+    @patch("cli_agent_orchestrator.services.inbox_service.record_delivery_failure", return_value=1)
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_a_value_error_before_the_send_fails_the_message_as_not_sent_at_once(
+        self, mock_get, mock_monitor, mock_update, _record
+    ):
+        """The ValueError dispatch_input keeps for its 404 is still "nothing typed", not "may have"."""
+        from cli_agent_orchestrator.models.inbox import DeliveryOutcome
+
+        meta = {"tmux_session": "cao-s", "tmux_window": "w1", "provider": "claude_code"}
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        outcomes = []
+        ts = "cli_agent_orchestrator.services.terminal_service"
+        with (
+            patch(f"{ts}.get_terminal_metadata", return_value=meta),
+            patch(f"{ts}.terminal_input_refusal", return_value=None),
+            patch(f"{ts}.provider_manager") as pm,
+        ):
+            pm.get_provider.side_effect = ValueError("Terminal term-1 not found in database")
+            result = InboxService().deliver_pending(
+                "term-1", on_outcome=lambda *a: outcomes.append(a)
+            )
+
+        assert [o[1] for o in outcomes] == [DeliveryOutcome.FAILED]
+        assert call(1, MessageStatus.PENDING) not in mock_update.call_args_list, "no retry"
+        assert mock_update.call_args_list[-1] == call(1, MessageStatus.FAILED)
+        assert result == 0
+
     @pytest.mark.parametrize(
         ("pending", "status", "send_effects", "attempts_used", "expected"),
         [
