@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Workspace split panes fill themselves**. Picking 2 or 4 panes in the Workspace tab now
+  shows the session's other agents in the empty panes, in tab order, instead of leaving them
+  blank. Panes already showing an agent keep it, and clicking the current layout again refills
+  any pane you emptied. Shift+click splits and status polling never fill panes, so a pane you
+  close stays empty, and going down to fewer panes (or picking 1 pane) never fills.
+
 - **Code-owner review protects CI policy, release scripts, and trust-boundary code** (#1350).
   Tests pin the owned paths, the active `mypy.ini` settings, and the full ruff
   configuration; root gate configuration files are owned before they exist, and

@@ -277,6 +277,6 @@ digest together:
 
 - Authoring a *new agent skill* (`SKILL.md`, frontmatter, evals) → no shipped skill covers this
   yet; follow the [Agent Skills specification](https://agentskills.io/specification) directly.
-- Building a provider / plugin / MCP-apps view → **cao-provider** / **cao-plugin** /
+- Building a provider / plugin / MCP-apps view → **cao-provider** / **cao-event-plugin** /
   **cao-mcp-apps**.
 - Launching or steering running agent sessions → **cao-session-management**.

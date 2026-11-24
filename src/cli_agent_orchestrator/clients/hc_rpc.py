@@ -61,6 +61,10 @@ class HcProtocolError(TerminalBackendError):
     """The core speaks a protocol generation or method set CAO does not support."""
 
 
+class HcNotSentError(TerminalBackendError):
+    """The request never reached herdr-core: nothing it asked for can have run."""
+
+
 def hc_binary() -> str:
     path = shutil.which("hc") or shutil.which("herdr-core")
     if not path:
@@ -191,18 +195,22 @@ class HcRpcClient:
                 if self._conn is None or not self._conn.alive():
                     self._drop()
                     if self._closed:
-                        raise TerminalBackendError(f"herdr-core client closed before {method}")
-                    self._conn = _Connection(self.session)
+                        raise HcNotSentError(f"herdr-core client closed before {method}")
+                    try:
+                        self._conn = _Connection(self.session)
+                    except TerminalBackendError as exc:
+                        # No `hc connect` child, so the request was never written.
+                        raise HcNotSentError(f"herdr-core unreachable for {method}: {exc}") from exc
                     if self._closed:  # close() ran while the child started
                         self._drop()
-                        raise TerminalBackendError(f"herdr-core client closed before {method}")
+                        raise HcNotSentError(f"herdr-core client closed before {method}")
                 try:
                     self._conn.write(request)
                     break
                 except (BrokenPipeError, OSError, ValueError):
                     self._drop()  # not sent yet, so a resend is safe
                     if attempt:
-                        raise TerminalBackendError(f"herdr-core unreachable for {method}") from None
+                        raise HcNotSentError(f"herdr-core unreachable for {method}") from None
             assert self._conn is not None
             try:
                 while True:

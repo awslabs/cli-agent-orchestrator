@@ -6,7 +6,7 @@
       "command": "uvx",
       "args": [
         "--from",
-        "cli-agent-orchestrator==2.5.3",
+        "cli-agent-orchestrator==2.5.5",
         "cao-ops-mcp-server"
       ]
     }

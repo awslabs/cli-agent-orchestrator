@@ -98,7 +98,7 @@ class TestCrossNodeDeferredFailureNotify:
     def test_local_caller_path_unchanged(self, mock_meta, mock_inbox, mock_requests):
         _notify_caller_of_deferred_failure("feed0002", "boom", registry=None, delete_worker=False)
         mock_inbox.assert_called_once_with(
-            sender_id="feed0002", receiver_id="0badcafe", message="boom"
+            sender_id="feed0002", receiver_id="0badcafe", message="boom", is_system_notice=True
         )
         mock_requests.post.assert_not_called()
 

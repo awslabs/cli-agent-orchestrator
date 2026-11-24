@@ -28,10 +28,10 @@ the same way.
 
 ## Contents
 
-Version `2.5.3`, synced from CAO's package metadata.
+Version `2.5.5`, synced from CAO's package metadata.
 
 - `cao-provider`
-- `cao-plugin`
+- `cao-event-plugin`
 - `cao-contributing`
 
 See [docs/agent-plugins.md](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/agent-plugins.md) for the prerequisites and
