@@ -61,10 +61,6 @@ for name in FILTERS:
 def changed_revisions(event_name: str, event: dict) -> tuple[str, str]:
     if event_name == "pull_request":
         return event["pull_request"]["base"]["sha"], os.environ["GITHUB_SHA"]
-    if event_name == "merge_group":
-        return event["merge_group"]["base_sha"], event["merge_group"]["head_sha"]
-    if event_name == "push":
-        return event["before"], event["after"]
     raise ValueError(f"unsupported event: {event_name}")
 
 
@@ -77,15 +73,20 @@ def matching_filters(paths: list[str]) -> dict[str, bool]:
 
 def main() -> None:
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-    base, head = changed_revisions(os.environ["GITHUB_EVENT_NAME"], event)
-    if not base or not head or base == "0" * 40:
-        raise ValueError("no valid change range; refusing to skip jobs")
-    changes = (
-        subprocess.check_output(["git", "diff", "--name-only", "--no-renames", "-z", base, head])
-        .decode()
-        .split("\0")
-    )
-    results = matching_filters(changes)
+    event_name = os.environ["GITHUB_EVENT_NAME"]
+    if event_name in ("push", "merge_group"):
+        print(f"{event_name}: run every filtered job")
+        results = dict.fromkeys(FILTERS, True)
+    else:
+        base, head = changed_revisions(event_name, event)
+        if not base or not head or base == "0" * 40:
+            raise ValueError("no valid change range; refusing to skip jobs")
+        changes = (
+            subprocess.check_output(["git", "diff", "--name-only", "--no-renames", "-z", base, head])
+            .decode()
+            .split("\0")
+        )
+        results = matching_filters(changes)
     with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
         for name, matched in results.items():
             output.write(f"{name}={str(matched).lower()}\n")

@@ -365,7 +365,7 @@ Runs on pushes to `main`, PRs targeting `main`, and merge queue groups:
 - **Security scan**: Trivy filesystem scan — fails on a committed secret of any severity, or on a fixable CRITICAL, HIGH or UNKNOWN (not yet scored) vulnerability; fixable MEDIUM and LOW vulnerabilities are uploaded to the Security tab without failing (see [SECURITY.md](SECURITY.md#running-security-scans-locally))
 - **Dependency Security**: Full locked npm, Bun, uv, and Cargo graphs, including dev dependencies and unfixed advisories, scanned; every HIGH/CRITICAL finding in the shipped set (measured from the builds) a malware advisory anywhere, a toolchain HIGH/CRITICAL with a fix that the PR adds or changes, or any scan/producer/completeness error blocks, while other toolchain-only findings are reported without blocking. Also verifies the installed dependency mitigations. The Python 3.12 unit job runs a real-Trivy dev-inventory regression; see [SECURITY.md](SECURITY.md#full-dependency-gate).
 - **Dependency review**: License and vulnerability checks on PRs
-- **Path-selected jobs**: Four provider test/lint pairs, both robotics examples, and the docs build run when `changed-paths` selects their files; `filtered-gate` checks their results before `ci-gate`.
+- **Filtered jobs**: On PRs, `changed-paths` selects four provider test/lint pairs, both robotics examples, and the docs build by path. Pushes to `main` and merge queue entries run all of them; `filtered-gate` checks their results before `ci-gate`. Release preflight therefore checks every filtered job on the release commit.
 
 ### Provider-Specific CI Jobs (path-selected)
 

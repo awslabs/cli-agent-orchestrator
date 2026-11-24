@@ -1032,15 +1032,13 @@ class TestOtherPrGatingWorkflowsAreDocumented:
             isinstance(w["trigger"], dict) and w["trigger"].get("paths") for w in found.values()
         )
 
-    def test_merge_queue_requires_non_failing_pull_requests(self):
+    def test_merge_queue_runs_all_filtered_jobs(self):
         reference = (SKILL.parent / "references" / "pr-gating-workflows.md").read_text()
-        assert (
-            "Before enabling the merge queue, turn on **Only merge non-failing pull requests**"
-            in reference
+        assert "pushes to `main` and merge queue entries run every filtered job" in " ".join(
+            reference.split()
         )
-        assert (
-            "a PR that failed a required check could merge on a later entry that skipped that job"
-            in " ".join(reference.split())
+        assert "no later queue entry can skip a previously failing job" in " ".join(
+            reference.split()
         )
 
     def test_every_pr_gating_workflow_has_a_row(self):

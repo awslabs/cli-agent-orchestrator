@@ -102,12 +102,6 @@ def test_docs_pr_build_does_not_share_production_deploy_concurrency_group():
     assert doc["concurrency"]["cancel-in-progress"] is False
 
 
-def test_merge_group_uses_group_commit_range():
-    assert changed_revisions(
-        "merge_group", {"merge_group": {"base_sha": "base", "head_sha": "group"}}
-    ) == ("base", "group")
-
-
 def test_pr_uses_checkout_merge_commit(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("GITHUB_SHA", "merge")
     assert changed_revisions("pull_request", {"pull_request": {"base": {"sha": "base"}}}) == (
@@ -116,13 +110,95 @@ def test_pr_uses_checkout_merge_commit(monkeypatch: pytest.MonkeyPatch):
     )
 
 
-def test_push_uses_before_and_after():
-    assert changed_revisions("push", {"before": "before", "after": "after"}) == ("before", "after")
-
-
 def test_filter_matches_nested_docs_and_does_not_match_unrelated():
     assert matching_filters(["docusaurus/src/index.ts"])["docs"]
     assert not any(matching_filters(["README.md"]).values())
+
+
+@pytest.mark.parametrize(
+    ("event_name", "payload"),
+    [
+        ("push", {"before": "base", "after": "head", "commits": [{"modified": ["README.md"]}]}),
+        ("push", {"before": "0" * 40, "after": "head"}),
+        ("merge_group", {"merge_group": {"base_sha": "base", "head_sha": "head"}}),
+        ("merge_group", {"merge_group": {"head_sha": "head"}}),
+    ],
+)
+def test_non_pr_events_select_all_without_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event_name: str, payload: dict
+):
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps(payload))
+    output = tmp_path / "output"
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", event_name)
+
+    def unexpected_diff(*args: object, **kwargs: object) -> bytes:
+        pytest.fail("push and merge_group must not diff paths")
+
+    monkeypatch.setattr(ci_changed_paths.subprocess, "check_output", unexpected_diff)
+    ci_changed_paths.main()
+    assert output.read_text().splitlines() == [f"{name}=true" for name in FILTERS]
+
+
+def test_pull_request_zero_base_refuses_to_write_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The zero-SHA range guard is reachable only for pull_request events.
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps({"pull_request": {"base": {"sha": "0" * 40}}}))
+    output = tmp_path / "output"
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("GITHUB_SHA", "head")
+    with pytest.raises(ValueError, match="no valid change range"):
+        ci_changed_paths.main()
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("event_name", "payload", "head"),
+    [
+        ("pull_request", {"pull_request": {"base": {"sha": ""}}}, "head"),
+        ("pull_request", {"pull_request": {"base": {"sha": "base"}}}, ""),
+        ("pull_request", {"pull_request": {"base": {}}}, "head"),
+        ("workflow_dispatch", {}, "head"),
+        ("unknown", {}, "head"),
+    ],
+)
+def test_invalid_ranges_and_events_never_emit_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event_name: str, payload: dict, head: str
+):
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps(payload))
+    output = tmp_path / "output"
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", event_name)
+    monkeypatch.setenv("GITHUB_SHA", head)
+    with pytest.raises((ValueError, KeyError)):
+        ci_changed_paths.main()
+    assert not output.exists()
+
+
+def test_deleted_file_selects_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps({"pull_request": {"base": {"sha": "base"}}}))
+    output = tmp_path / "output"
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("GITHUB_SHA", "head")
+    monkeypatch.setattr(
+        ci_changed_paths.subprocess,
+        "check_output",
+        lambda *args, **kwargs: b"src/cli_agent_orchestrator/providers/kiro_cli.py\0",
+    )
+    ci_changed_paths.main()
+    assert "kiro=true\n" in output.read_text()
+    assert "docs=false\n" in output.read_text()
 
 
 def _required_workflow_files() -> set[str]:
@@ -152,16 +228,17 @@ def test_secret_scan_covers_the_merge_group_commit_range():
     assert "github.event_name == 'merge_group'" in scan
 
 
-def test_merge_group_emits_path_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_pull_request_emits_path_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     event = tmp_path / "event.json"
-    event.write_text(json.dumps({"merge_group": {"base_sha": "base", "head_sha": "group"}}))
+    event.write_text(json.dumps({"pull_request": {"base": {"sha": "base"}}}))
     output = tmp_path / "output"
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
     monkeypatch.setenv("GITHUB_OUTPUT", str(output))
-    monkeypatch.setenv("GITHUB_EVENT_NAME", "merge_group")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("GITHUB_SHA", "head")
 
     def changed_files(command: list[str], **kwargs: object) -> bytes:
-        assert command == ["git", "diff", "--name-only", "--no-renames", "-z", "base", "group"]
+        assert command == ["git", "diff", "--name-only", "--no-renames", "-z", "base", "head"]
         return b"docusaurus/src/index.ts\0"
 
     monkeypatch.setattr(ci_changed_paths.subprocess, "check_output", changed_files)
@@ -174,11 +251,12 @@ def test_unreadable_range_does_not_emit_skip_results(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     event = tmp_path / "event.json"
-    event.write_text(json.dumps({"merge_group": {"base_sha": "base", "head_sha": "group"}}))
+    event.write_text(json.dumps({"pull_request": {"base": {"sha": "base"}}}))
     output = tmp_path / "output"
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
     monkeypatch.setenv("GITHUB_OUTPUT", str(output))
-    monkeypatch.setenv("GITHUB_EVENT_NAME", "merge_group")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("GITHUB_SHA", "head")
 
     def unreadable_range(command: list[str], **kwargs: object) -> bytes:
         raise subprocess.CalledProcessError(1, command)
@@ -225,11 +303,12 @@ def test_renamed_away_provider_file_still_selects_provider(
     subprocess.run(commit, cwd=tmp_path, check=True)
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=tmp_path).decode().strip()
     event = tmp_path / "event.json"
-    event.write_text(json.dumps({"merge_group": {"base_sha": base, "head_sha": head}}))
+    event.write_text(json.dumps({"pull_request": {"base": {"sha": base}}}))
     output = tmp_path / "output"
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
     monkeypatch.setenv("GITHUB_OUTPUT", str(output))
-    monkeypatch.setenv("GITHUB_EVENT_NAME", "merge_group")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("GITHUB_SHA", head)
     ci_changed_paths.main()
     assert "codex=true\n" in output.read_text()

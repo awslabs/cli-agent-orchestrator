@@ -5,9 +5,9 @@ Moved out of `SKILL.md`; the table now lives here, and
 directory, pinning every row to the workflow files themselves. Keep the rows
 accurate to what the workflows say.
 
-Before enabling the merge queue, turn on **Only merge non-failing pull requests**:
-each queue entry selects jobs for its own PR only, so without this setting a PR
-that failed a required check could merge on a later entry that skipped that job.
+Pull requests path-select filtered jobs; pushes to `main` and merge queue entries
+run every filtered job. **Only merge non-failing pull requests** is not required
+for these filtered jobs: no later queue entry can skip a previously failing job.
 
 ## Other workflows that gate a PR
 
