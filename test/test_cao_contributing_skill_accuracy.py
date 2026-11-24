@@ -944,7 +944,7 @@ class TestMypyToleranceClaim:
 # Review of #448 found the gate map silently incomplete: ``Secret Scan`` had been
 # split out of ci.yml into its own workflow (#457), so a table pinned to ci.yml
 # alone could never notice it was missing, and neither could cargo-deny or the
-# path-filtered provider workflows. These guards derive the set from every
+# other PR gates. These guards derive the set from every
 # workflow file that triggers on ``pull_request`` instead of from a list, so a
 # new PR-gating workflow fails here until the skill documents it.
 
@@ -1025,11 +1025,22 @@ def _other_workflow_rows() -> dict[str, tuple[str, str, str, str]]:
 
 class TestOtherPrGatingWorkflowsAreDocumented:
     def test_the_guard_has_something_to_check(self):
-        """Non-vacuity: at least Secret Scan, cargo-deny and one path-filtered one."""
+        """Non-vacuity: the external PR gates and the docs path filter exist."""
         found = _pr_gating_workflows()
         assert {"Secret Scan", "cargo-deny"} <= set(found), sorted(found)
         assert any(
             isinstance(w["trigger"], dict) and w["trigger"].get("paths") for w in found.values()
+        )
+
+    def test_merge_queue_requires_non_failing_pull_requests(self):
+        reference = (SKILL.parent / "references" / "pr-gating-workflows.md").read_text()
+        assert (
+            "Before enabling the merge queue, turn on **Only merge non-failing pull requests**"
+            in reference
+        )
+        assert (
+            "a PR that failed a required check could merge on a later entry that skipped that job"
+            in " ".join(reference.split())
         )
 
     def test_every_pr_gating_workflow_has_a_row(self):

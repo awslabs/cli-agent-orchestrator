@@ -93,13 +93,13 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 | **Dependency Review** | `actions/dependency-review-action` over the PR's dependency delta: `fail-on-severity: high` plus denied licences `GPL-3.0`/`AGPL-3.0` | **Yes** — CI-only; there is nothing to run locally, and it is skipped on forks (`if: github.repository == 'awslabs/cli-agent-orchestrator'`), so a green run on your fork has not exercised it |
 | **Changed paths for filtered jobs** | compare the event's base with its tested head; fail closed if the diff cannot be read | **Yes** |
 | **Antigravity provider tests** | provider tests (3.11 / 3.12), path-selected | **Yes** when selected |
-| **Antigravity provider lint** | formatting and type checks, path-selected | **Yes** when selected |
+| **Antigravity provider lint** | black and isort block when selected; mypy is advisory (`continue-on-error`) | **Yes** when selected |
 | **Claude provider tests** | provider tests (3.11 / 3.12), path-selected | **Yes** when selected |
-| **Claude provider lint** | formatting and type checks, path-selected | **Yes** when selected |
+| **Claude provider lint** | black and isort block when selected; mypy is advisory (`continue-on-error`) | **Yes** when selected |
 | **Codex provider tests** | provider tests (3.11 / 3.12), path-selected | **Yes** when selected |
-| **Codex provider lint** | formatting and type checks, path-selected | **Yes** when selected |
+| **Codex provider lint** | black and isort block when selected; mypy is advisory (`continue-on-error`) | **Yes** when selected |
 | **Kiro provider tests** | provider tests (3.11 / 3.12), path-selected | **Yes** when selected |
-| **Kiro provider lint** | formatting and type checks, path-selected | **Yes** when selected |
+| **Kiro provider lint** | black and isort block when selected; mypy is advisory (`continue-on-error`) | **Yes** when selected |
 | **Transport simulator** | transport example (3.11 / 3.12), path-selected | **Yes** when selected |
 | **Factory simulator** | factory example (3.11 / 3.12), path-selected | **Yes** when selected |
 | **Docs site build** | Docusaurus typecheck and build when docs paths change; production Pages deployment stays separate | **Yes** when selected |

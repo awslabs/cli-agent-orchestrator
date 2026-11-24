@@ -12,22 +12,61 @@ from scripts import ci_changed_paths
 from scripts.ci_changed_paths import FILTERS, changed_revisions, matching_filters
 
 WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
-SOURCES = {
+PROVIDER_PATHS = {
+    "antigravity": {
+        "src/cli_agent_orchestrator/providers/antigravity_cli.py",
+        "test/providers/test_antigravity_cli_*.py",
+        "test/providers/fixtures/agy_*.txt",
+        "pyproject.toml",
+    },
+    "claude": {
+        "src/cli_agent_orchestrator/providers/claude_code.py",
+        "test/providers/test_claude_code_*.py",
+        "test/providers/test_busy_pattern_settled_output_guard.py",
+        "pyproject.toml",
+    },
+    "codex": {
+        "src/cli_agent_orchestrator/providers/codex.py",
+        "test/providers/test_codex_*.py",
+        "test/providers/fixtures/codex_*.txt",
+        "pyproject.toml",
+    },
+    "kiro": {
+        "src/cli_agent_orchestrator/providers/kiro_cli.py",
+        "test/providers/test_kiro_cli_*.py",
+        "test/providers/fixtures/kiro_cli_*.txt",
+        "pyproject.toml",
+    },
+}
+PROVIDER_WORKFLOWS = {
     "antigravity": "test-antigravity-cli-provider.yml",
     "claude": "test-claude-code-provider.yml",
     "codex": "test-codex-provider.yml",
     "kiro": "test-kiro-cli-provider.yml",
-    "docs": "gh-pages.yml",
 }
 
 
-@pytest.mark.parametrize(("name", "filename"), SOURCES.items())
-def test_filters_cover_original_workflow_paths(name: str, filename: str):
-    spec = yaml.safe_load((WORKFLOWS / filename).read_text())
-    triggers = spec.get("on", spec.get(True))
-    for trigger in ("push", "pull_request"):
-        if trigger in triggers:
-            assert set(triggers[trigger]["paths"]) <= set(FILTERS[name])
+@pytest.mark.parametrize(("name", "paths"), PROVIDER_PATHS.items())
+def test_provider_filters_cover_source_paths_without_dead_workflows(name: str, paths: set[str]):
+    assert set(FILTERS[name]) == paths | {
+        ".github/workflows/ci.yml",
+        "scripts/ci_changed_paths.py",
+    }
+    assert not (WORKFLOWS / PROVIDER_WORKFLOWS[name]).exists()
+
+
+def test_filters_do_not_reference_deleted_robotics_workflows():
+    assert all(
+        not pattern.endswith(("robotics-transport.yml", "robotics-factory.yml"))
+        for patterns in FILTERS.values()
+        for pattern in patterns
+    )
+
+
+def test_filters_do_not_use_double_star_slash():
+    assert all(
+        "**/" not in pattern for patterns in FILTERS.values() for pattern in patterns
+    ), "GitHub paths treats **/ as zero or more folders, but Python fnmatch does not"
 
 
 @pytest.mark.parametrize("name", ("transport", "factory"))

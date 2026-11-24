@@ -128,16 +128,17 @@ Runs **all tests** in `test/` (excluding provider integration tests), plus secur
 - **Security scan**: Trivy vulnerability scanner (CRITICAL/HIGH)
 - **Dependency review**: License and vulnerability checks on PRs
 
-### Provider-Specific Workflows (path-triggered)
-Each provider has a dedicated workflow that runs only when its files change:
+### Provider-Specific CI Jobs (path-selected)
+Each provider has test and lint jobs in `ci.yml` selected when its files change:
 
-| Workflow | Tests | Trigger Paths |
+| CI job | Tests | Trigger Paths |
 |---|---|---|
-| `test-codex-provider.yml` | `test_codex_provider_unit.py` | `providers/codex.py`, `test/providers/**` |
-| `test-claude-code-provider.yml` | `test_claude_code_unit.py` | `providers/claude_code.py`, `test/providers/**` |
-| `test-kiro-cli-provider.yml` | `test_kiro_cli_unit.py` | `providers/kiro_cli.py`, `test/providers/**` |
+| `provider-antigravity` | `test_antigravity_cli_*.py` | `providers/antigravity_cli.py`, `test/providers/test_antigravity_cli_*.py` |
+| `provider-codex` | `test_codex_*.py` | `providers/codex.py`, `test/providers/test_codex_*.py` |
+| `provider-claude` | `test_claude_code_*.py` | `providers/claude_code.py`, `test/providers/test_claude_code_*.py` |
+| `provider-kiro` | `test_kiro_cli_*.py` | `providers/kiro_cli.py`, `test/providers/test_kiro_cli_*.py` |
 
-Each includes unit tests (Python 3.11/3.12) and code quality checks (black, isort, mypy).
+Each includes unit tests (Python 3.11/3.12) and blocking black/isort checks; mypy is advisory.
 
 ## Writing New Tests
 

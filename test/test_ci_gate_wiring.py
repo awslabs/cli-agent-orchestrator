@@ -132,8 +132,12 @@ def test_ci_gate_needs_every_other_ci_job():
     assert filtered == {
         job_id for job_id, job in jobs.items() if job.get("needs") == "changed-paths"
     }
-    assert len(gate["needs"]) <= 20
-    assert len(jobs["filtered-gate"]["needs"]) <= 20
+    assert (
+        len(gate["needs"]) <= 20
+    ), "Put a new top-level CI job behind an intermediate gate so ci-gate's needs stays bounded and readable."
+    assert (
+        len(jobs["filtered-gate"]["needs"]) <= 20
+    ), "Put a new top-level CI job behind an intermediate gate so ci-gate's needs stays bounded and readable."
 
 
 def _filtered_jobs_mapping() -> dict[str, str]:
