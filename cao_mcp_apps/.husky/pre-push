@@ -9,6 +9,19 @@
 # toolchain exists.
 cd "$(dirname "$0")/.."
 
+# A push from a linked worktree exports GIT_DIR (and the other repository-binding
+# variables) into hooks. The test suite creates throwaway repositories with `git init`,
+# `git config` and `git commit`; with these variables set those commands act on THIS
+# repository instead (a "Test" commit on the pushed branch, core.bare=true, a repo-level
+# user.name). Drop them before anything below runs.
+# `git rev-parse --local-env-vars` is git's own list. The fixed names after it are the
+# fallback for a git without that option (the three CONFIG names are already in git's list).
+for _v in $(git rev-parse --local-env-vars 2>/dev/null) GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
+  GIT_OBJECT_DIRECTORY GIT_COMMON_DIR GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX \
+  GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT; do
+  unset "$_v"
+done
+
 echo "[pre-push] Python unit tests"
 if command -v uv >/dev/null 2>&1; then
   (cd .. && uv run pytest -q --disable-warnings) || exit 1
