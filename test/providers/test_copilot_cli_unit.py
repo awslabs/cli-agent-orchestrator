@@ -410,6 +410,41 @@ class TestCopilotCliProviderCommand:
         assert "--deny-tool" in parts
         assert "shell" in parts
 
+    @pytest.mark.parametrize(
+        ("allowed_tools", "gated"),
+        [
+            ([], True),
+            (["@builtin", "fs_read", "fs_list", "@cao-mcp-server"], True),
+            (["fs_read", "web_fetch", "@cao-mcp-server"], False),
+            (["*"], False),
+            (None, False),
+        ],
+    )
+    @patch("cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._supports_flag")
+    @patch(
+        "cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._build_runtime_mcp_config"
+    )
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    @patch.dict("os.environ", {}, clear=True)
+    def test_grant_without_web_fetch_disables_builtin_mcp_servers(
+        self, mock_tmux, mock_build_mcp, mock_supports_flag, allowed_tools, gated
+    ):
+        """A url rule does not reach MCP tools, so the built-in servers go off too."""
+        mock_supports_flag.return_value = True
+        mock_build_mcp.return_value = '{"mcpServers":{"cao-mcp-server":{"command":"x"}}}'
+        mock_tmux.return_value.get_pane_working_directory.return_value = "/tmp/project"
+
+        provider = CopilotCliProvider(
+            "test1234", "test-session", "window-0", allowed_tools=allowed_tools
+        )
+        parts = shlex.split(provider._command())
+        pairs = list(zip(parts, parts[1:]))
+
+        assert ("--disable-builtin-mcps" in parts) is gated
+        assert (("--disable-mcp-server", "computer-use") in pairs) is gated
+        assert (("--deny-tool", "url") in pairs) is gated
+        assert "--additional-mcp-config" in parts
+
     @patch("cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._supports_flag")
     @patch(
         "cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._build_runtime_mcp_config"

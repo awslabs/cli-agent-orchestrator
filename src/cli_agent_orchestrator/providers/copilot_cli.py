@@ -244,6 +244,14 @@ class CopilotCliProvider(BaseProvider):
             disallowed = get_disallowed_tools("copilot_cli", self._allowed_tools)
             for tool in disallowed:
                 command_parts.extend(["--deny-tool", tool])
+            # A `url` rule does not reach MCP tools, and Copilot's built-in MCP
+            # servers reach GitHub, hosted services, a browser or the desktop.
+            # `--disable-builtin-mcps` does not cover `computer-use` (Copilot
+            # CLI command reference, 1.0.114). An unknown flag stops the launch.
+            if "url" in disallowed:
+                command_parts.extend(
+                    ["--disable-builtin-mcps", "--disable-mcp-server", "computer-use"]
+                )
 
         command_parts.append("--autopilot")
 

@@ -108,6 +108,12 @@ Implementation:
   cannot find the step of a structured workflow step.
 - Pass the merged MCP payload inline as JSON
 
+A grant without `web_fetch` also adds `--disable-builtin-mcps` and
+`--disable-mcp-server computer-use`. A `url` rule does not reach MCP tools, and
+Copilot's built-in MCP servers reach GitHub, hosted services, a browser or the
+desktop. `--disable-builtin-mcps` does not cover `computer-use`. `cao-mcp-server`
+is not a built-in server, so it stays on.
+
 
 ### Agent-plugin MCP working directory
 
@@ -124,14 +130,18 @@ Provider expects these flags in your Copilot CLI:
 - `--additional-mcp-config`
 - `--allow-all`
 - `--autopilot`
+- `--deny-tool`, `--disable-builtin-mcps` and `--disable-mcp-server`, for a restricted grant
 
 When `--additional-mcp-config` is missing from your `copilot --help`, CAO skips MCP config injection.
+An unknown restriction flag stops the launch.
 
 ### Command Shape
 
 ```bash
 copilot --allow-all [--agent <name>] --config-dir ~/.copilot \
-  --add-dir <cwd> --additional-mcp-config '{"mcpServers":{...}}' --autopilot
+  --add-dir <cwd> --additional-mcp-config '{"mcpServers":{...}}' \
+  [--deny-tool <tool> ...] [--disable-builtin-mcps --disable-mcp-server computer-use] \
+  --autopilot
 ```
 
 ### Environment Variables

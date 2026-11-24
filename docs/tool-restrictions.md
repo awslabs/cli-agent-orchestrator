@@ -113,7 +113,7 @@ No `role` is needed — `allowedTools` is the full specification of what tools t
 | `fs_write` | Write/edit files | `Edit`, `Write` | `write` |
 | `fs_list` | Search/list files | `Glob`, `Grep` | `list`, `grep` |
 | `fs_*` | All filesystem ops | All of the above | All of the above |
-| `web_fetch` | Fetch URLs / search the web | `WebFetch`, `WebSearch` | (not mapped) |
+| `web_fetch` | Fetch URLs / search the web | `WebFetch`, `WebSearch` | `url` |
 | `@builtin` | Selector naming the provider's own built-in tool set; **grants nothing by itself** on any provider. Kept in the role defaults for readability; list `fs_*`/`execute_bash` explicitly for the access you want | (no-op) | (no-op) |
 | `@cao-mcp-server` | Every CAO MCP tool: `handoff`, `assign`, `send_message`, Hermes prompt answers via `answer_user_prompt`, memory (`memory_store`/`memory_recall`/`memory_related`/`memory_forget`), workflows, `delete_terminal`, and the rest of the `cao-mcp-server` surface | Same | Same |
 | `@cao-ops-mcp-server` | Every operations control-plane tool: `launch_session`, `install_profile`, `shutdown_session`, `send_session_message`, the session/terminal readers, and the `decisions_*` controls. **Not implied by `@cao-mcp-server`** | Same | Same |
@@ -253,7 +253,7 @@ CAO defines a universal tool vocabulary (`execute_bash`, `fs_read`, `fs_write`, 
 | `fs_read` | `Read`, `LSP` | `read` | `Read`, `NotebookRead` | `read`, `knowledge` (+ alias `fs_read`) |
 | `fs_write` | `Edit`, `Write` | `write` | `Edit`, `Write`, `NotebookEdit` | `write`, `code` (+ alias `fs_write`) |
 | `fs_list` | `Glob`, `Grep` | `list`, `grep` | `Grep`, `Glob` | `glob`, `grep` |
-| `web_fetch` | `WebFetch`, `WebSearch` | (not mapped) | `WebFetch`, `WebSearch` + disabled web search | `web_fetch`, `web_search` |
+| `web_fetch` | `WebFetch`, `WebSearch` | `url` + built-in MCP servers off | `WebFetch`, `WebSearch` + disabled web search | `web_fetch`, `web_search` |
 | `@builtin` | (selector) | (selector) | (selector) | `goal`, `introspect`, `todo_list` only; a bare `@builtin` would mean every built-in, shell included |
 
 **Providers that accept CAO vocabulary directly** — Kimi CLI, MiniMax Code, and Codex use system prompt instructions to enforce restrictions, and CAO passes the `allowedTools` list directly without translation, so no `TOOL_MAPPING` entry exists for them. Kiro CLI *also* accepts the CAO vocabulary in `allowedTools`, but in Kiro that list only names the tools that run *without an approval prompt*; what the agent can use at all is `tools`, so CAO translates the resolved policy into `tools` at install time (see the table above and the Kiro entry below).
@@ -449,8 +449,15 @@ See [Kiro v3 (preview)](kiro-cli.md#kiro-v3-preview).
 
 **Copilot CLI** — Adds `--deny-tool` flags that override `--allow-all`:
 ```bash
-copilot --allow-all --deny-tool shell --deny-tool write
+copilot --allow-all --deny-tool shell --deny-tool url --deny-tool write \
+  --disable-builtin-mcps --disable-mcp-server computer-use
 ```
+
+A grant without `web_fetch` adds `--deny-tool url`. That rule blocks URL access
+by Copilot's web-fetch tool and by the shell commands that Copilot checks for URLs.
+It does not reach MCP tools, so the same grant also turns off Copilot's built-in
+MCP servers, such as `github-mcp-server`. `--disable-builtin-mcps` does not cover
+`computer-use`, so CAO turns that server off by name. `cao-mcp-server` stays on.
 
 **Grok Build CLI** — For a restricted profile, uses deny-by-default
 `--permission-mode dontAsk`, explicitly grants mapped native tools and known

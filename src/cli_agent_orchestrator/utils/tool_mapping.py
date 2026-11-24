@@ -70,6 +70,11 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         "fs_write": ["write"],
         "fs_list": ["list", "grep"],
         "fs_*": ["read", "write", "list", "grep"],
+        # Copilot's `url` permission kind covers URL access by its web-fetch
+        # tool and by shell commands. A bare `--deny-tool url` blocks all of it,
+        # and a deny rule wins over --allow-all (`copilot help permissions`,
+        # Copilot CLI 1.0.114).
+        "web_fetch": ["url"],
     },
     # Official xAI Grok Build CLI permission-rule prefixes. These rules work
     # in the interactive TUI and remain enforced under --always-approve.
