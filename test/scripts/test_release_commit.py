@@ -194,7 +194,7 @@ class TestWhatTheReleaseCommitMayCarry:
             "# Changelog\n\n## [Unreleased]\n\n- Hand-written.\n\n"
             "## [2.5.3] - 2029-01-01\n\n- Old.\n"
         )
-        fragment = world.clone / "changelog.d" / "1350.Changed.md"
+        fragment = world.clone / "changelog.d" / "1469.Changed.md"
         fragment.parent.mkdir()
         fragment.write_text("- Fragment note.\n")
         world.git("add", "-A")
@@ -231,14 +231,14 @@ class TestWhatTheReleaseCommitMayCarry:
         assert world.remote(f"refs/tags/v{version}^{{commit}}") == head
         assert (
             world.git("diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD").count(
-                "D\tchangelog.d/1350.Changed.md"
+                "D\tchangelog.d/1469.Changed.md"
             )
             == 1
         )
         assert "CHANGELOG.md" in world.git(
             "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"
         )
-        assert "- Fragment note. (#1350)" in world.git("show", "HEAD:CHANGELOG.md")
+        assert "- Fragment note. (#1469)" in world.git("show", "HEAD:CHANGELOG.md")
         assert world.git("status", "--porcelain") == ""
 
     @pytest.mark.parametrize("change", ["modified", "staged-added", "untracked", "readme"])
@@ -295,11 +295,11 @@ class TestWhatTheReleaseCommitMayCarry:
         world.git("add", "-A")
         world.git("commit", "-q", "-m", "add fragment")
         world.bump()
-        world.git("mv", "changelog.d/1350.Fixed.md", "changelog.d/1350.Changed.md")
+        world.git("mv", "changelog.d/1350.Fixed.md", "changelog.d/1469.Changed.md")
         assert rc.main(["--version", "1.0.1", "--repo-root", str(world.clone)]) == 1
         error = capsys.readouterr().out
-        assert "also changed: changelog.d/1350.Changed.md" in error
-        assert error.strip().endswith("also changed: changelog.d/1350.Changed.md")
+        assert "also changed: changelog.d/1469.Changed.md" in error
+        assert error.strip().endswith("also changed: changelog.d/1469.Changed.md")
 
     def test_a_stray_change_is_refused_before_anything_is_committed(self, world, capsys):
         world.bump()

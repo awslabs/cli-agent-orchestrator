@@ -6,7 +6,7 @@ where `<PR>` is the pull request number and `<type>` is exactly one of `Added`,
 bullet on one line in each file, for example:
 
 ```text
-changelog.d/1350.Changed.md
+changelog.d/1469.Changed.md
 - Release notes are collected from pull-request fragments.
 ```
 

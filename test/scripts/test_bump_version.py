@@ -39,9 +39,37 @@ def _load(name: str):
 
 bv = _load("bump_version")
 arv = _load("assert_release_version")
+release_commit = _load("release_commit")
 
 FEATURE = Path(".devcontainer") / "features" / "cao" / "devcontainer-feature.json"
 RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
+
+
+def test_repository_fragments_are_valid():
+    bv.read_fragments()
+    bv.promoted_changelog("0.0.0")
+
+
+@pytest.mark.parametrize(
+    ("name", "valid"),
+    [
+        ("1469.Added.md", True),
+        ("3.Changed.md", True),
+        ("25.Deprecated.md", True),
+        ("1.Removed.md", True),
+        ("7.Fixed.md", True),
+        ("10.Security.md", True),
+        ("0.Fixed.md", False),
+        ("07.Fixed.md", False),
+        ("3.fixed.md", False),
+        ("3.Other.md", False),
+        ("3.Fixed.txt", False),
+        ("not-a-fragment.md", False),
+    ],
+)
+def test_fragment_name_rules_agree(name, valid):
+    assert (bv.FRAGMENT_NAME.fullmatch(name) is not None) is valid
+    assert (release_commit.FRAGMENT_PATH.fullmatch(f"changelog.d/{name}") is not None) is valid
 
 
 @pytest.fixture
@@ -394,6 +422,7 @@ class TestFragmentCollection:
             bv.main()
 
     def test_real_bump_collects_all_types_and_preserves_handwritten_notes(self, tree, monkeypatch):
+        kinds = ("Added", "Changed", "Deprecated", "Removed", "Fixed", "Security")
         version = bv.bump("patch", _current(tree))
         monkeypatch.setattr(bv, "_release_date", lambda: "2030-04-05")
         (tree / "CHANGELOG.md").write_text(
@@ -403,14 +432,14 @@ class TestFragmentCollection:
         directory = tree / "changelog.d"
         directory.mkdir()
         (directory / "README.md").write_text("Documentation.\n")
-        for kind in bv.FRAGMENT_TYPES:
+        for kind in kinds:
             for number in (20, 3):
                 (directory / f"{number}.{kind}.md").write_text(f"- {kind} #{number}.\n")
         self._run(tree, monkeypatch)
         text = (tree / "CHANGELOG.md").read_text()
         assert text.count("- Hand-written release note.") == 1
         positions = [
-            text.index(f"- {kind} #{number}.") for kind in bv.FRAGMENT_TYPES for number in (3, 20)
+            text.index(f"- {kind} #{number}.") for kind in kinds for number in (3, 20)
         ]
         assert positions == sorted(positions)
         assert text.count("## [Unreleased]") == 1
@@ -418,7 +447,7 @@ class TestFragmentCollection:
         assert "## [1.0.0] - 2029-01-01\n\n- Old release.\n" in text
         released = text.split("## [Unreleased]\n\n", 1)[1].split("## [1.0.0]", 1)[0]
         assert released.index("- Hand-written release note.") < released.index("### Added")
-        for kind in bv.FRAGMENT_TYPES:
+        for kind in kinds:
             assert released.count(f"### {kind}\n\n") == 1
         assert released.index("### Added") < released.index("### Changed")
         assert released.endswith("### Security\n\n- Security #3.\n- Security #20.\n\n")
@@ -426,7 +455,7 @@ class TestFragmentCollection:
             f"# Changelog\n\n## [Unreleased]\n\n## [{version}] - 2030-04-05\n\n"
             "- Hand-written release note.\n\n"
             + "".join(
-                f"### {kind}\n\n- {kind} #3.\n- {kind} #20.\n\n" for kind in bv.FRAGMENT_TYPES
+                f"### {kind}\n\n- {kind} #3.\n- {kind} #20.\n\n" for kind in kinds
             )
             + "## [1.0.0] - 2029-01-01\n\n- Old release.\n"
         )
@@ -494,7 +523,9 @@ class TestFragmentCollection:
             "### Fixed\n\n- Fix. (#5)\n\n"
         )
 
-    @pytest.mark.parametrize("name", ["not-a-fragment.md", "14.Other.md", "14.Fixed.txt"])
+    @pytest.mark.parametrize(
+        "name", ["not-a-fragment.md", "14.Other.md", "14.Fixed.txt", "0.Fixed.md", "07.Fixed.md"]
+    )
     def test_invalid_name_or_type_refuses_without_changes(self, tree, monkeypatch, name):
         directory = tree / "changelog.d"
         directory.mkdir()
@@ -610,10 +641,14 @@ class TestFragmentCollection:
         }
         unlink = Path.unlink
         write_bytes = Path.write_bytes
+        unlink_count = 0
 
         def fail_second_unlink(path, *args, **kwargs):
-            if path == second:
-                raise OSError("original delete failure")
+            nonlocal unlink_count
+            if path in (first, second):
+                unlink_count += 1
+                if unlink_count == 2:
+                    raise OSError("original delete failure")
             return unlink(path, *args, **kwargs)
 
         def fail_pyproject_restore(path, content):
@@ -665,10 +700,14 @@ class TestFragmentCollection:
             monkeypatch.setattr(bv.os, "replace", fail_replace)
         else:
             unlink = Path.unlink
+            unlink_count = 0
 
             def fail_second_fragment(path, *args, **kwargs):
-                if path == fragments[1]:
-                    raise OSError("cannot delete fragment")
+                nonlocal unlink_count
+                if path in fragments:
+                    unlink_count += 1
+                    if unlink_count == 2:
+                        raise OSError("cannot delete fragment")
                 return unlink(path, *args, **kwargs)
 
             monkeypatch.setattr(Path, "unlink", fail_second_fragment)

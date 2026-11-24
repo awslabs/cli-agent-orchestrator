@@ -152,7 +152,7 @@ def read_fragments() -> dict[Path, bytes]:
     fragments: dict[Path, bytes] = {}
     if not directory.exists():
         return fragments
-    for path in directory.iterdir():
+    for path in sorted(directory.iterdir()):
         if path.name == "README.md":
             continue
         match = FRAGMENT_NAME.fullmatch(path.name)

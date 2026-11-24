@@ -44,7 +44,7 @@ GitHub provides additional document on [forking a repository](https://help.githu
 
 For a notable change, add `changelog.d/<PR>.<type>.md` with the pull request number,
 one of `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, or `Security`, and a
-single Markdown bullet on one line. For example, `changelog.d/1350.Changed.md`
+single Markdown bullet on one line. For example, `changelog.d/1469.Changed.md`
 could contain `- Collect pull-request changelog fragments at release time.`
 See [`changelog.d/README.md`](changelog.d/README.md) for the format. The release
 bump collects these fragments alongside any hand-written `[Unreleased]` notes;
