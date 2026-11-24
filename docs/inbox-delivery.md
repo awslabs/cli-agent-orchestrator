@@ -58,7 +58,7 @@ Cost: a healthy delivery pays one or two status reads. A dropped one holds **tha
 The confirmation does not run in three cases:
 
 - **The setting is off.** Set `CAO_INBOX_SUBMIT_CONFIRMATION=false` before starting `cao-server` to turn the confirmation off; deliveries then behave as before #78 (paste, Enter, done).
-- **Eager deliveries** (see below). The receiver was already PROCESSING or WAITING_USER_ANSWER when the message was sent, so a status that left the ready state proves nothing.
+- **Eager deliveries** (see below). The receiver was already PROCESSING when the message was sent, or in WAITING_USER_ANSWER on a provider that does not set `blocks_orchestrated_input_while_waiting_user_answer` (a provider that sets it has the message held as PENDING instead). A status that left the ready state therefore proves nothing.
 - **The herdr TUI backend.** Its inbox service delivers on herdr events from its asyncio event loop, and the blocking wait would stall event handling for the whole session. The skip is per backend, so it applies to every delivery there, including the immediate attempt and the sweeps. The Herdr app backend delivers on a worker thread and does run the confirmation.
 
 In these cases a swallowed Enter is not detected, and the terminal's delivery lock is released as soon as the send returns.
