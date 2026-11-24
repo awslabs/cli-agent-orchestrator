@@ -410,6 +410,8 @@
     if (name === "subscribe_events")
       return replyResult(winInfo, id, {
         sse_url: "/events",
+        // The harness server is the stream; the view has no address of its own.
+        base_url: window.location.origin,
         history_tool: "cao_fetch_history",
         ring_capacity: 500,
       });

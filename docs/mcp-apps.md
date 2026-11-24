@@ -34,7 +34,9 @@ view bundles** inside an MCP-host iframe with live host data over the same
 postMessage/SSE contract a host uses — drives an operator flow, and records it.
 Regenerate with `cd cao_mcp_apps && npm run build:all && node scripts/record-demo.mjs`
 (the recorder also emits an optimized `mcp-apps-demo.gif` when a gif-capable
-ffmpeg/gifski is on the machine). A true in-host render (Claude Desktop / Cursor /
+ffmpeg/gifski is on the machine). The recorder picks a free port, so it never
+sits on `9889`; set `DEMO_PORT` to choose one. It refuses to start while anything
+answers on `9889`, so a live `cao-server` cannot end up in a recording. A true in-host render (Claude Desktop / Cursor /
 Goose) can't be captured headlessly, so this harness is a faithful stand-in.
 
 ## Enabling

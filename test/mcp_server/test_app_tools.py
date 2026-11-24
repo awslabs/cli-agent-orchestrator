@@ -81,6 +81,7 @@ def test_subscribe_events_descriptor() -> None:
 
     desc = app_tools._subscribe_events_impl()
     assert desc["sse_url"] == "/events"
+    assert desc["base_url"] == app_tools.API_BASE_URL
     assert desc["history_tool"] == "cao_fetch_history"
     assert desc["ring_capacity"] == 500
 

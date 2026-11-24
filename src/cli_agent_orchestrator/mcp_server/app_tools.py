@@ -266,10 +266,12 @@ def _subscribe_events_impl() -> Dict[str, Any]:
 
     The live stream is delivered over the FastAPI ``/events`` SSE route (not the
     tool channel); the iframe backfills gaps via ``cao_fetch_history``.
+    ``base_url`` is where that route lives; the view has no address of its own.
     """
 
     return {
         "sse_url": "/events",
+        "base_url": API_BASE_URL,
         "history_tool": "cao_fetch_history",
         "ring_capacity": 500,
     }
