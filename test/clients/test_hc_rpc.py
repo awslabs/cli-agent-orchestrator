@@ -207,3 +207,95 @@ def test_subscription_snapshot_then_notifications(fake_hc):
     with pytest.raises(TimeoutError):
         sub.next_notification(0.2)
     sub.close()
+
+
+# reply-delivery-failure, inbox-delivery "Delivery failures are classified":
+# HcNotSentError means the request never reached herdr-core, so nothing it
+# asked for can have run. A request that was written and then lost is not that.
+
+
+def test_request_never_written_is_not_sent(fake_hc, monkeypatch):
+    """Spec scenario "Send request never written"."""
+    from cli_agent_orchestrator.clients.hc_rpc import HcNotSentError, _Connection
+
+    def broken(self, message):
+        raise BrokenPipeError()
+
+    monkeypatch.setattr(_Connection, "write", broken)
+    client = HcRpcClient("cao")
+    with pytest.raises(HcNotSentError, match="unreachable for terminal.send") as raised:
+        client.call("terminal.send", {})
+    assert isinstance(raised.value, TerminalBackendError)
+    client.close()
+
+
+def test_call_on_a_closed_client_is_not_sent(fake_hc):
+    from cli_agent_orchestrator.clients.hc_rpc import HcNotSentError
+
+    client = HcRpcClient("cao")
+    client.close()
+    with pytest.raises(HcNotSentError, match="closed before terminal.send"):
+        client.call("terminal.send", {})
+    assert not fake_hc.exists(), "no `hc connect` is started for a closed client"
+
+
+def test_request_lost_after_write_is_not_not_sent(fake_hc, monkeypatch):
+    """Spec scenario "Send request lost after it was written": the core may have typed."""
+    from cli_agent_orchestrator.clients.hc_rpc import HcNotSentError
+
+    monkeypatch.setenv("FAKE_HC_MODE", "eof_after_request")
+    client = HcRpcClient("cao")
+    with pytest.raises(TerminalBackendError, match="lost terminal.send") as raised:
+        client.call("terminal.send", {})
+    assert not isinstance(raised.value, HcNotSentError)
+    client.close()
+
+
+def test_request_unanswered_before_the_timeout_is_not_not_sent(fake_hc):
+    """herdr-core took the request and sent no answer in time (the incident's terminal.read)."""
+    from cli_agent_orchestrator.clients.hc_rpc import HcNotSentError
+
+    client = HcRpcClient("cao")
+    with pytest.raises(TerminalBackendError, match="lost hold") as raised:
+        client.call("hold", {}, timeout=0.5)
+    assert not isinstance(raised.value, HcNotSentError)
+    client.close()
+
+
+def test_error_answer_from_the_core_is_not_not_sent(fake_hc):
+    """An explicit error answer is HcRpcError; which kinds typed nothing is the backend's call."""
+    from cli_agent_orchestrator.clients.hc_rpc import HcNotSentError
+
+    client = HcRpcClient("cao")
+    with pytest.raises(HcRpcError) as raised:
+        client.call("fail")
+    assert not isinstance(raised.value, HcNotSentError)
+    client.close()
+
+
+def test_connection_that_cannot_start_is_not_sent(fake_hc, monkeypatch):
+    """Spec scenario "Send request never written": `hc connect` could not be started."""
+    from cli_agent_orchestrator.clients.hc_rpc import HcNotSentError
+
+    def no_process(*_args, **_kwargs):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(hc_rpc.subprocess, "Popen", no_process)
+    client = HcRpcClient("cao")
+    with pytest.raises(HcNotSentError, match="terminal.send|hc connect") as raised:
+        client.call("terminal.send", {})
+    assert isinstance(raised.value, TerminalBackendError)
+    assert not fake_hc.exists(), "no `hc connect` ran"
+    client.close()
+
+
+def test_missing_hc_binary_is_not_sent(fake_hc, monkeypatch):
+    """Spec scenario "Send request never written": neither `hc` nor `herdr-core` on PATH."""
+    from cli_agent_orchestrator.clients.hc_rpc import HcNotSentError
+
+    monkeypatch.setattr(hc_rpc.shutil, "which", lambda _name: None)
+    client = HcRpcClient("cao")
+    with pytest.raises(HcNotSentError, match="not installed|terminal.send"):
+        client.call("terminal.send", {})
+    assert not fake_hc.exists(), "no `hc connect` ran"
+    client.close()

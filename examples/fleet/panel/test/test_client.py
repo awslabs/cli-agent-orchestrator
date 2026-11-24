@@ -70,6 +70,7 @@ async def test_send_message_path_and_params():
     assert seen["path"] == "/terminals/term-1/inbox/messages"
     assert seen["params"]["message"] == "hello"
     assert seen["params"]["sender_id"] == "fleet-panel"
+    assert "wait_for_outcome" not in seen["params"], "its 8 s timeout needs the default wait"
 
 
 async def test_http_error_raises():

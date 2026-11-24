@@ -98,7 +98,7 @@ NON_CAO_SKILL_NAMES = frozenset({"agui-author", "mcp-apps-builder"})
 # derived floor would either be circular (count what the file happens to say) or
 # wrong (every shipped skill is not a valid route). The slack is therefore stated
 # instead of hidden: the routing section currently names FOUR real skills
-# (cao-mcp-apps, cao-plugin, cao-provider, cao-session-management), so this floor
+# (cao-mcp-apps, cao-event-plugin, cao-provider, cao-session-management), so this floor
 # tolerates losing exactly one before it fires.
 MINIMUM_SKILL_REFERENCES = 3
 

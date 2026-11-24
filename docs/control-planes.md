@@ -201,7 +201,7 @@ which are portable packages of skills and MCP servers.
 
 The [event plugins guide](plugins.md) owns installation, supported events,
 troubleshooting, and authoring. The
-[`cao-plugin` skill](../skills/cao-plugin/SKILL.md) provides guided
+[`cao-event-plugin` skill](../skills/cao-event-plugin/SKILL.md) provides guided
 scaffolding.
 
 ## Related reading

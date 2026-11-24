@@ -188,7 +188,7 @@ plugin uses this hook for the MCP Apps surface.
 
 ## Authoring a plugin
 
-This document focuses on installing and using plugins. For a full plugin-authoring guide — scaffolding a plugin package, subclassing `CaoPlugin`, wiring up `@hook` methods, and testing — see the [`cao-plugin` skill](../skills/cao-plugin/SKILL.md).
+This document focuses on installing and using plugins. For a full plugin-authoring guide — scaffolding a plugin package, subclassing `CaoPlugin`, wiring up `@hook` methods, and testing — see the [`cao-event-plugin` skill](../skills/cao-event-plugin/SKILL.md).
 
 ## Future improvements
 
