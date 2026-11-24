@@ -47,7 +47,7 @@
     "sigma": "^4.0.6"
   },
   "devDependencies": {
-    "@playwright/test": "1.65.0",
+    "@playwright/test": "1.65.1",
     "@testing-library/dom": "^10.4.2",
     "@testing-library/react": "^16.3.3",
     "@types/node": "^26.6.6",
@@ -58,8 +58,8 @@
     "fast-check": "^4.10.2",
     "happy-dom": "^21.0.4",
     "husky": "^9.1.6",
-    "lint-staged": "^17.6.0",
-    "prettier": "^3.10.0",
+    "lint-staged": "^17.6.1",
+    "prettier": "^3.10.1",
     "typescript": "^7.0.2",
     "vite": "^8.3.8",
     "vite-plugin-singlefile": "^2.3.4",
