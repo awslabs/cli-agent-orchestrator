@@ -438,9 +438,7 @@ class TestFragmentCollection:
         self._run(tree, monkeypatch)
         text = (tree / "CHANGELOG.md").read_text()
         assert text.count("- Hand-written release note.") == 1
-        positions = [
-            text.index(f"- {kind} #{number}.") for kind in kinds for number in (3, 20)
-        ]
+        positions = [text.index(f"- {kind} #{number}.") for kind in kinds for number in (3, 20)]
         assert positions == sorted(positions)
         assert text.count("## [Unreleased]") == 1
         assert sorted(path.name for path in directory.iterdir()) == ["README.md"]
@@ -454,9 +452,7 @@ class TestFragmentCollection:
         expected = (
             f"# Changelog\n\n## [Unreleased]\n\n## [{version}] - 2030-04-05\n\n"
             "- Hand-written release note.\n\n"
-            + "".join(
-                f"### {kind}\n\n- {kind} #3.\n- {kind} #20.\n\n" for kind in kinds
-            )
+            + "".join(f"### {kind}\n\n- {kind} #3.\n- {kind} #20.\n\n" for kind in kinds)
             + "## [1.0.0] - 2029-01-01\n\n- Old release.\n"
         )
         assert text == expected
