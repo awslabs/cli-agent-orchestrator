@@ -358,6 +358,12 @@ INBOX_RECONCILE_INTERVAL = 30  # seconds between reconciliation sweeps
 # and missed.
 INBOX_RECONCILE_GRACE_SECONDS = 30
 
+# Attempts a queued message gets when each one fails before anything is typed
+# (reply-delivery-failure D6). The reconcile sweep and status events retry it;
+# after the last one the sender is told. A failure that may have typed is
+# never retried.
+INBOX_MAX_DELIVERY_ATTEMPTS = 3
+
 # Inbox submit confirmation (issue #78). send_input delivers a message as
 # paste-buffer -> fixed submit delay -> Enter. That delay only GUESSES when the
 # receiving TUI is input-ready; when it guesses wrong the TUI swallows the Enter
@@ -410,7 +416,21 @@ DELEGATION_PICKUP_TIMEOUT_SECONDS = _env_positive_float(
 # settings_service.py): a POST that lands while the receiver's lock is held by
 # an unconfirmed delivery could otherwise wait out that whole confirmation,
 # time out at the sender, and tempt it to send the message a second time.
+# Clients of the route time out after 8 to 30 s, so this is the wait unless the
+# client asks for INBOX_DELIVERY_OUTCOME_WAIT with ``wait_for_outcome``.
 INBOX_IMMEDIATE_DELIVERY_WAIT = 5.0
+
+# How long the POST waits when the client sets ``wait_for_outcome``: for the
+# outcome of its own message's immediate delivery attempt, so the sender can
+# learn of a failure (reply-delivery-failure D5). Only a client whose HTTP
+# timeout is longer than this may ask: the CAO MCP clients send it with
+# _inbox_post_timeout (utils/orchestration.py), which is this plus 10 s and
+# must stay below the shortest agent-CLI MCP tool-call limit measured (60 s,
+# Codex's default). 45 s keeps it at 55 s. A slower attempt (herdr-app can
+# hold a send for up to 90 s) answers in_progress, and a later failure of that
+# message is handled as queued. The submit confirmation is never waited for:
+# the answer comes when the paste lands.
+INBOX_DELIVERY_OUTCOME_WAIT = 45.0
 
 # Worker threads the OpenCode poller and the reconcile sweep fan out over.
 # Each receiver's delivery can hold its thread for a full confirmation cycle,

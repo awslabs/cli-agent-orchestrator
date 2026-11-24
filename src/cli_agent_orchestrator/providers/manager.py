@@ -343,6 +343,16 @@ class ProviderManager:
             provider.shell_baseline = metadata["shell_command"]
             if hasattr(provider, "_initialized"):
                 provider._initialized = True
+        # Claude Code rows carry no shell_command, and nothing else in the row
+        # records that initialize() finished. The row is written before
+        # initialize() starts, so its existence proves only that the terminal was
+        # created. accepts_input_while_processing reads _initialized; without this
+        # eager inbox delivery is refused for every Claude terminal that outlived a
+        # cao-server restart. Accepted limit: a restart between the row write and
+        # the end of initialize() can mark a REPL that is still starting as ready,
+        # and an eager delivery in that window can paste into it too early.
+        if isinstance(provider, ClaudeCodeProvider):
+            provider._initialized = True
         logger.info(f"Created provider on-demand for terminal {terminal_id}")
         return provider
 

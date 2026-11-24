@@ -36,7 +36,11 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 import requests
 from pydantic import ValidationError
 
-from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome
+from cli_agent_orchestrator.backends.base import (
+    InputNotSentError,
+    TerminalCleanupOutcome,
+    TerminalNotFoundError,
+)
 from cli_agent_orchestrator.backends.registry import get_backend
 
 # Compatibility/test seam: creation no longer bulk-deletes with this helper, but older
@@ -3807,7 +3811,14 @@ def _notify_caller_of_deferred_failure(
 
     if caller_id:
         try:
-            create_inbox_message(sender_id=terminal_id, receiver_id=caller_id, message=message)
+            # A notice CAO wrote: marked, so its own failure is not reported
+            # back to the worker, which did not write it.
+            create_inbox_message(
+                sender_id=terminal_id,
+                receiver_id=caller_id,
+                message=message,
+                is_system_notice=True,
+            )
         except Exception as exc:  # noqa: BLE001 — best-effort
             logger.warning(
                 "Deferred-init failure notify: could not enqueue inbox message to "
@@ -6421,6 +6432,16 @@ def _refuse_if_provider_gone(terminal_id: str, provider: Any, metadata: Dict[str
         )
 
 
+class TerminalRowMissingError(InputNotSentError, ValueError):
+    """``dispatch_input`` found no metadata row, or a step before the send raised ``ValueError``.
+
+    Nothing was typed, and a later attempt cannot get past the same rejection,
+    so the inbox fails such a message at once (reply-delivery-failure F5). It
+    is also a ``ValueError``, so POST /terminals/{id}/input still answers 404,
+    as it did before the send was classified.
+    """
+
+
 def dispatch_input(
     terminal_id: str,
     message: str,
@@ -6460,11 +6481,26 @@ def dispatch_input(
     not logged. It is last and defaulted so existing positional callers (notably
     ``agent_step.run_agent_step``, which passes exactly two arguments) are
     unaffected.
+
+    Raises:
+        TerminalRowMissingError: The terminal has no metadata row. It is both
+            a ``ValueError`` and an ``InputNotSentError``.
+        TerminalInputBlockedError: The terminal refused input (a prompt, a
+            pending identity check, or a provider that exited).
+        TerminalNotFoundError: The backend could not resolve the pane.
+        InputNotSentError: Any other failure before the backend's send call,
+            so nothing was typed (reply-delivery-failure D4); the original
+            exception is its ``__cause__``. A backend may raise it from the
+            send call too, when it proves nothing was written.
+        Exception: Any other failure in or after the send call, when some or
+            all of the text may have reached the terminal.
     """
+    # Set just before the backend's send call: a failure before it typed nothing.
+    sending = False
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
-            raise ValueError(f"Terminal '{terminal_id}' not found")
+            raise TerminalRowMissingError(f"Terminal '{terminal_id}' not found")
 
         # A Kiro terminal is typed into only once its row records that its
         # identity check passed (#1074). Until then the pane may be kiro-cli's
@@ -6605,13 +6641,16 @@ def dispatch_input(
                 provider.mark_input_received()
             provider.record_dispatched_message(message)
 
-        get_backend().send_keys(
+        backend = get_backend()
+        submit_delay = provider.paste_submit_delay if provider else 0.3
+        sending = True
+        backend.send_keys(
             metadata["tmux_session"],
             metadata["tmux_window"],
             message,
             enter_count=enter_count,
             force_bracketed_paste=True,
-            submit_delay=provider.paste_submit_delay if provider else 0.3,
+            submit_delay=submit_delay,
         )
 
         update_last_active(terminal_id)
@@ -6648,6 +6687,17 @@ def dispatch_input(
 
     except Exception as e:
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
+        # Nothing reached the pane before send_keys (reply-delivery-failure D4).
+        # Refusals and an unresolved pane keep their own types: their callers
+        # branch on them. A missing row is already an InputNotSentError. A
+        # ValueError stays one (POST /terminals/{id}/input maps it to 404).
+        if not sending and not isinstance(
+            e, (TerminalInputBlockedError, TerminalNotFoundError, InputNotSentError)
+        ):
+            if isinstance(e, ValueError):
+                # The text is the 404's detail: keep what the ValueError said.
+                raise TerminalRowMissingError(str(e)) from e
+            raise InputNotSentError(f"{type(e).__name__}: {e}") from e
         raise
 
 

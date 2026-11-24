@@ -37,10 +37,10 @@ from typing import List
 # skips a destination that already exists and never removes one, so an upgraded
 # installation would keep both the old and the new folder. Add the pair to
 # ``SKILL_RENAMES`` in ``cli/commands/init.py`` in the same change — that map is the
-# one-shot retirement step, and it is currently empty pending maintainer decision
-# **M4** (``cao-plugin`` to ``cao-event-plugin``). The contributor agent-plugin
-# package's allowlist in ``scripts/build_agent_plugin.py`` needs the same edit,
-# since a packaged skill folder name must equal its frontmatter ``name``.
+# one-shot retirement step; it holds ``cao-plugin`` to ``cao-event-plugin`` (decision
+# **M4**). The contributor agent-plugin package's allowlist in
+# ``scripts/build_agent_plugin.py`` needs the same edit, since a packaged skill
+# folder name must equal its frontmatter ``name``.
 SHIPPED_SKILLS: List[str] = [
     "agui-author",
     "cao-agent-routing",
@@ -53,7 +53,7 @@ SHIPPED_SKILLS: List[str] = [
     "cao-memory",
     "cao-learning",
     "cao-workflow",
-    "cao-plugin",
+    "cao-event-plugin",
     "cao-provider",
     "cao-contributing",
     "cao-agent-plugin-creator",
