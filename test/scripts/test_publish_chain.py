@@ -413,6 +413,25 @@ class TestNoJobCanDispatchAWorkflow:
         assert set(re.findall(r"secrets\.(\w+)", RELEASE_TEXT)) == {"RELEASE_DEPLOY_KEY"}
 
 
+@pytest.mark.parametrize(
+    ("workflow", "expected_job"),
+    [("release.yml", "release"), ("publish-to-pypi.yml", "regenerate-agent-plugin")],
+)
+def test_every_release_deploy_key_reader_uses_the_release_deploy_environment(
+    workflow, expected_job
+):
+    readers = set()
+    for name, job in _load(workflow)["jobs"].items():
+        if "secrets.RELEASE_DEPLOY_KEY" not in str(job):
+            continue
+        readers.add(name)
+        environment = job.get("environment")
+        if isinstance(environment, Mapping):
+            environment = environment.get("name")
+        assert environment == "release-deploy", f"{workflow}: {name}"
+    assert readers == {expected_job}, workflow
+
+
 class TestReleaseCheckoutPinsTheEventSha:
     """Review on #652, Note 1: the `release` job's checkout has no `ref:`, so it checks out
     the same commit (`github.sha`) `preflight` already validated CI for. `release` is a
