@@ -1236,6 +1236,140 @@ def test_cancelled_create_rollback_keeps_the_row_when_provider_cleanup_is_deferr
     assert session_lock._session_locks == {}
 
 
+def test_single_terminal_delete_cannot_slip_between_create_row_and_registration(
+    real_db, runtime, monkeypatch
+):
+    """#1468 -- ``delete_terminal`` must not run between a create's row write and
+    its FIFO reader / provider registration.
+
+    The create commits its row first, so the id is visible before the reader and
+    the provider exist. A ``delete_terminal`` in that gap stopped nothing,
+    dropped the row and returned; the create then registered both for a row that
+    was gone. The create is paused in ``fifo_manager.create_reader`` (no load, no
+    sleeps). The referee lets it go once the delete has either finished (the bug)
+    or is waiting on the lifecycle lock (the fix). Afterwards nothing of the
+    terminal may be left in either store.
+    """
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-race-1468"
+
+    reader_reached = threading.Event()
+    reader_release = threading.Event()
+    created_ids: List[str] = []
+    delete_started = threading.Event()
+    delete_finished = threading.Event()
+
+    def _paused_create_reader(terminal_id, **kwargs):
+        created_ids.append(terminal_id)
+        reader_reached.set()
+        assert reader_release.wait(DEADLOCK_TIMEOUT), "reader gate never released"
+        runtime.fifo_readers.add(terminal_id)
+
+    monkeypatch.setattr(terminal_service.fifo_manager, "create_reader", _paused_create_reader)
+
+    def _waiters(session):
+        with session_lock._registry_guard:
+            entry = session_lock._session_locks.get(session)
+        return 0 if entry is None else entry[1]
+
+    def _create():
+        return _create_in_thread(name)
+
+    def _delete():
+        assert reader_reached.wait(DEADLOCK_TIMEOUT), "create never reached registration"
+        delete_started.set()
+        try:
+            return terminal_service.delete_terminal(created_ids[0], end_reason="deleted")
+        finally:
+            delete_finished.set()
+
+    def _referee():
+        try:
+            assert delete_started.wait(DEADLOCK_TIMEOUT), "delete thread never started"
+            deadline = time.monotonic() + DEADLOCK_TIMEOUT
+            while not delete_finished.wait(0.005):
+                if _waiters(name) >= 2:
+                    break
+                assert time.monotonic() < deadline, "delete neither finished nor blocked"
+        finally:
+            reader_release.set()
+
+    create_result, delete_result, referee_result = _run_threads([_create, _delete, _referee])
+
+    assert create_result[0] == "ok", f"create failed: {create_result[1]!r}"
+    assert referee_result[0] == "ok", f"referee failed: {referee_result[1]!r}"
+    assert delete_result[0] == "ok", f"delete failed: {delete_result[1]!r}"
+    tid = created_ids[0]
+    assert database.get_terminal_metadata(tid) is None
+    assert runtime.is_fully_gone(
+        tid
+    ), "a single-terminal delete ran between the create's row write and its registration"
+    assert session_lock._session_locks == {}
+
+
+class TestDeleteTerminalTakesTheLifecycleLock:
+    """#1468: the lock-and-re-read wrapper around the single-terminal teardown."""
+
+    @pytest.fixture
+    def seam(self, monkeypatch):
+        rows = {"dt000001": {"id": "dt000001", "tmux_session": "cao-dt"}}
+        inner_calls = []
+
+        def _inner(terminal_id, registry=None, *, end_reason):
+            entry = session_lock._session_locks.get("cao-dt")
+            inner_calls.append((terminal_id, end_reason, entry is not None and entry[0].locked()))
+            rows.pop(terminal_id, None)
+            return True, None
+
+        monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda tid: rows.get(tid))
+        monkeypatch.setattr(terminal_service, "_teardown_terminal_locked", _inner)
+        return rows, inner_calls
+
+    def test_the_teardown_runs_under_the_session_lock(self, seam):
+        _, inner_calls = seam
+        assert terminal_service.delete_terminal("dt000001", end_reason="deleted") is True
+        assert inner_calls == [("dt000001", "deleted", True)]
+        assert session_lock._session_locks == {}
+
+    def test_a_row_removed_while_waiting_is_not_torn_down_twice(self, seam):
+        """The row is re-read under the lock. If a session teardown (or another
+        delete) removed it while this delete waited, the remover did the whole
+        teardown: return True, the outcome callers treat as done (False would
+        make them retry), and do not run a second teardown."""
+        rows, inner_calls = seam
+        result = {}
+        with session_lock.session_lifecycle_lock("cao-dt"):
+            worker = threading.Thread(
+                target=lambda: result.setdefault(
+                    "r", terminal_service.delete_terminal("dt000001", end_reason="deleted")
+                ),
+                daemon=True,
+            )
+            worker.start()
+            _wait_until_lock_contended("cao-dt")
+            rows.clear()  # the holder removes the row, then releases
+        worker.join(DEADLOCK_TIMEOUT)
+        assert not worker.is_alive()
+        assert result == {"r": True}
+        assert inner_calls == []
+        assert session_lock._session_locks == {}
+
+    @pytest.mark.parametrize(
+        "row", [None, {"id": "dt000001", "tmux_session": None}], ids=["no-row", "no-session"]
+    )
+    def test_no_row_or_no_session_falls_through_to_the_old_teardown(self, seam, row):
+        """Nothing to lock, so nothing a create can race with: the unlocked
+        teardown runs as before this change (it still cleans any runtime left)."""
+        rows, inner_calls = seam
+        rows.clear()
+        if row is not None:
+            rows["dt000001"] = row
+        assert terminal_service.delete_terminal("dt000001", end_reason="deleted") is True
+        assert inner_calls == [("dt000001", "deleted", False)]
+        assert session_lock._session_locks == {}
+
+
 class OverlapDetectingBackend(FakeTmuxBackend):
     """Detects two teardowns of the same name inside their critical sections.
 
@@ -1530,6 +1664,202 @@ def test_no_plugin_code_runs_inside_the_lifecycle_lock(real_db, runtime):
     # The teardown itself still did its job.
     assert backend.session_exists("cao-plug") is False
     assert database.list_terminals_by_session("cao-plug") == []
+
+
+def test_no_plugin_code_runs_inside_the_lifecycle_lock_on_a_single_terminal_delete(
+    real_db, runtime
+):
+    """``delete_terminal`` dispatches ``post_kill_terminal`` AFTER the lock is released.
+
+    The API route, ``agent_step`` and the deferred-init failure path call it from a
+    worker thread with a registry; there is no running loop, so the hook runs to
+    completion inline. Inside the lock, a slow hook would stall every create and
+    teardown of the session. The hook here (a) tries the session lock without
+    blocking and (b) starts a delete of ANOTHER terminal in the same session and
+    waits for it (bounded). Both only succeed if the lock is free while the hook runs.
+    """
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    _seed(backend, "cao-single", [("t1", "w1"), ("t2", "w2")], runtime)
+
+    observed: List[tuple] = []
+    second: Dict[str, object] = {}
+
+    def _delete_second():
+        second["result"] = terminal_service.delete_terminal("t2", end_reason="stale_cleanup")
+
+    class ProbingRegistry:
+        async def dispatch(self, event_type, event):
+            entry = session_lock._session_locks.get("cao-single")
+            free = True
+            if entry is not None:
+                lock, _holders = entry
+                free = lock.acquire(blocking=False)
+                if free:
+                    lock.release()
+            thread = threading.Thread(target=_delete_second, daemon=True)
+            thread.start()
+            thread.join(timeout=5.0)
+            observed.append((event_type, event.terminal_id, free, not thread.is_alive()))
+
+    assert (
+        terminal_service.delete_terminal("t1", ProbingRegistry(), end_reason="stale_cleanup")
+        is True
+    )
+
+    kinds = [(kind, tid) for kind, tid, _, _ in observed]
+    assert ("post_kill_terminal", "t1") in kinds
+    held = [entry for entry in observed if not entry[2]]
+    assert held == [], f"post_kill_terminal ran while the lifecycle lock was held: {held}"
+    blocked = [entry for entry in observed if not entry[3]]
+    assert blocked == [], f"a delete in the same session waited for the hook: {blocked}"
+    assert second.get("result") is True
+    assert database.list_terminals_by_session("cao-single") == []
+
+
+def test_a_second_delete_of_the_same_terminal_emits_no_second_post_kill_terminal(real_db, runtime):
+    """Only the call that deleted the row dispatches ``post_kill_terminal``."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    _seed(backend, "cao-once", [("t1", "w1")], runtime)
+    events: List[tuple] = []
+
+    class Recorder:
+        async def dispatch(self, event_type, event):
+            events.append((event_type, event.session_id, event.terminal_id, event.agent_name))
+
+    assert terminal_service.delete_terminal("t1", Recorder(), end_reason="stale_cleanup") is True
+    # The row is gone: nothing is deleted again, so nothing is announced again.
+    assert terminal_service.delete_terminal("t1", Recorder(), end_reason="stale_cleanup") is False
+    # The payload comes from the snapshot taken under the lock.
+    assert events == [("post_kill_terminal", "cao-once", "t1", "developer")]
+
+
+def test_a_deferred_cleanup_emits_no_post_kill_terminal(real_db, runtime, monkeypatch):
+    """The row stays for a retry, so the terminal is not announced as killed."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    _seed(backend, "cao-defer", [("t1", "w1")], runtime)
+    monkeypatch.setattr(terminal_service, "dismantle_terminal_runtime", lambda *_a, **_k: False)
+    events: List[str] = []
+
+    class Recorder:
+        async def dispatch(self, event_type, event):
+            events.append(event_type)
+
+    assert terminal_service.delete_terminal("t1", Recorder(), end_reason="stale_cleanup") is False
+    assert events == []
+    assert database.get_terminal_metadata("t1") is not None
+
+
+def test_a_row_another_owner_already_deleted_is_not_announced_again(real_db, runtime, monkeypatch):
+    """``delete_terminal_row`` returning False (the row was already gone) emits nothing."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    _seed(backend, "cao-gone", [("t1", "w1")], runtime)
+    monkeypatch.setattr(terminal_service, "delete_terminal_row", lambda *_a, **_k: False)
+    events: List[str] = []
+
+    class Recorder:
+        async def dispatch(self, event_type, event):
+            events.append(event_type)
+
+    assert terminal_service.delete_terminal("t1", Recorder(), end_reason="stale_cleanup") is False
+    assert events == []
+
+
+def test_a_row_removed_while_the_delete_waited_emits_nothing(real_db, runtime):
+    """The remover did the whole teardown; this delete returns True and announces nothing."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    _seed(backend, "cao-waited", [("t1", "w1")], runtime)
+    events: List[str] = []
+    result: Dict[str, object] = {}
+
+    class Recorder:
+        async def dispatch(self, event_type, event):
+            events.append(event_type)
+
+    with session_lock.session_lifecycle_lock("cao-waited"):
+        worker = threading.Thread(
+            target=lambda: result.setdefault(
+                "r", terminal_service.delete_terminal("t1", Recorder(), end_reason="stale_cleanup")
+            ),
+            daemon=True,
+        )
+        worker.start()
+        _wait_until_lock_contended("cao-waited")
+        database.delete_terminal("t1", end_reason="stale_cleanup")  # the holder removes the row
+    worker.join(DEADLOCK_TIMEOUT)
+    assert not worker.is_alive()
+    assert result == {"r": True}
+    assert events == []
+
+
+def test_an_event_that_cannot_be_built_does_not_fail_a_completed_delete(
+    real_db, runtime, monkeypatch
+):
+    """The row and runtime are gone by then, so the delete still reports success."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    _seed(backend, "cao-unbuildable", [("t1", "w1")], runtime)
+
+    def _cannot_build(*_args, **_kwargs):
+        raise KeyError("tmux_session")
+
+    # Only the dispatch after the lock builds the event (the teardown passes no registry).
+    monkeypatch.setattr(terminal_service, "PostKillTerminalEvent", _cannot_build)
+
+    assert terminal_service.delete_terminal("t1", object(), end_reason="stale_cleanup") is True
+    assert database.list_terminals_by_session("cao-unbuildable") == []
+
+
+def test_delete_terminal_row_emits_only_when_given_a_registry(real_db, runtime):
+    """Callers that hold no lock (keep_service, retention) pass their registry straight through;
+    the lock-holding teardowns pass None and emit nothing from inside the row delete."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    _seed(backend, "cao-row", [("t1", "w1"), ("t2", "w2")], runtime)
+    events: List[tuple] = []
+
+    class Recorder:
+        async def dispatch(self, event_type, event):
+            events.append((event_type, event.terminal_id))
+
+    meta1 = database.get_terminal_metadata("t1")
+    meta2 = database.get_terminal_metadata("t2")
+    assert (
+        terminal_service.delete_terminal_row("t1", meta1, None, end_reason="stale_cleanup") is True
+    )
+    assert events == []
+    assert (
+        terminal_service.delete_terminal_row("t2", meta2, Recorder(), end_reason="stale_cleanup")
+        is True
+    )
+    assert events == [("post_kill_terminal", "t2")]
+
+
+def test_the_inner_teardown_the_herdr_callers_use_emits_no_plugin_event(real_db, runtime):
+    """``_delete_terminal_locked`` (held lock, herdr callers) never dispatches ``post_kill_terminal``.
+
+    The herdr callers pass no registry, so on ``main`` they emitted nothing either:
+    nothing is lost by dispatching only from the public ``delete_terminal``. Even
+    given a registry, the inner function must not dispatch while a lock may be held.
+    """
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    _seed(backend, "cao-inner", [("t1", "w1")], runtime)
+    events: List[str] = []
+
+    class Recorder:
+        async def dispatch(self, event_type, event):
+            events.append(event_type)
+
+    assert (
+        terminal_service._delete_terminal_locked("t1", Recorder(), end_reason="pane_closed") is True
+    )
+    assert events == []
+    assert database.list_terminals_by_session("cao-inner") == []
 
 
 # ── A raise in the TAIL of the critical section must not destroy the events ───

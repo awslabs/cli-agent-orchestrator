@@ -7513,11 +7513,11 @@ def delete_terminal_row(
     it is needed for the event payload because the row is gone by the time the
     event is built.
 
-    ``registry=None`` drops the row WITHOUT emitting. Session teardown passes
-    None and emits the events itself once it has released the lifecycle lock, so
-    that no third-party plugin ever runs inside its critical section; the
-    single-terminal ``delete_terminal`` path holds no such lock and passes its
-    registry straight through.
+    ``registry=None`` drops the row WITHOUT emitting. Session teardown and the
+    single-terminal ``delete_terminal`` both pass None while they hold the
+    lifecycle lock and emit the event themselves once it is released, so that no
+    third-party plugin ever runs inside the critical section. Callers that hold no
+    lock (keep_service, retention cleanup) pass their registry straight through.
 
     ``end_reason`` (one of ``database.LAUNCH_END_REASONS``) is stamped on the
     terminal's launch record (issue #1082); the caller names why it ended.
@@ -7544,17 +7544,24 @@ def delete_terminal_row(
     if deleted:
         ephemeral_service.release(terminal_id, "terminal_gone")
     logger.info(f"Deleted terminal: {terminal_id}")
-    if deleted and metadata:
-        dispatch_plugin_event(
-            registry,
-            "post_kill_terminal",
-            PostKillTerminalEvent(
-                session_id=metadata["tmux_session"],
-                terminal_id=terminal_id,
-                agent_name=metadata.get("agent_profile"),
-            ),
-        )
+    if deleted and metadata and registry is not None:
+        _emit_post_kill_terminal(registry, terminal_id, metadata)
     return deleted
+
+
+def _emit_post_kill_terminal(
+    registry: PluginRegistry | None, terminal_id: str, metadata: Dict
+) -> None:
+    """Dispatch ``post_kill_terminal`` for a terminal whose row is already gone."""
+    dispatch_plugin_event(
+        registry,
+        "post_kill_terminal",
+        PostKillTerminalEvent(
+            session_id=metadata["tmux_session"],
+            terminal_id=terminal_id,
+            agent_name=metadata.get("agent_profile"),
+        ),
+    )
 
 
 def delete_terminal(
@@ -7566,9 +7573,76 @@ def delete_terminal(
     have always run. Session teardown does NOT use this -- it interleaves its own
     tmux kill-confirmation between them (see ``services/session_service.py``).
 
+    Runs under ``session_lifecycle_lock`` for the terminal's session (#1468), as
+    ``delete_session`` does. A create commits its row inside that lock and
+    registers its FIFO reader and provider before releasing it, so a delete that
+    takes the lock waits for those registrations and then tears them down,
+    instead of dropping the row while the create is still registering. The row
+    is re-read once the lock is held: a session teardown or another delete may
+    have removed it while this one waited.
+
+    The lock is not reentrant. A caller that already holds it for this session
+    must call ``_delete_terminal_locked`` instead. Synchronous and blocking on a
+    ``threading.Lock``: async callers run it through ``asyncio.to_thread``. The one
+    caller that still runs it on the event loop is the herdr ``pane.closed`` handler
+    (``herdr_inbox_service``), which waits only for another thread's locked section.
+
+    ``post_kill_terminal`` is dispatched AFTER the lock is released, and only when
+    this call deleted the row (as ``delete_session`` does): plugin code is
+    third-party and unbounded, and on the API path this runs in a worker thread
+    with no loop, so ``dispatch_plugin_event`` runs the hook to completion inline.
+    Inside the lock, one slow hook would stall every create and teardown of the
+    session.
+
     Returns False when the teardown was deferred (see
     ``dismantle_terminal_runtime``), leaving the row in place for a retry.
     ``end_reason`` is passed through to ``delete_terminal_row``.
+    """
+    row = get_terminal_metadata(terminal_id)
+    session_name = row.get("tmux_session") if row else None
+    if not session_name:
+        # No row (or no session to lock): nothing a create can be racing with.
+        # The unlocked teardown keeps the old behaviour for this case.
+        deleted, metadata = _teardown_terminal_locked(terminal_id, registry, end_reason=end_reason)
+    else:
+        with session_lifecycle_lock(str(session_name)):
+            if get_terminal_metadata(terminal_id) is None:
+                # Removed while this delete waited for the lock; the remover did
+                # the whole teardown (and emitted the event, if it was a delete).
+                return True
+            deleted, metadata = _teardown_terminal_locked(
+                terminal_id, registry, end_reason=end_reason
+            )
+    if deleted and metadata:
+        # The teardown is finished and durable by here; an event that cannot be
+        # built must not turn a completed delete into a failure.
+        try:
+            _emit_post_kill_terminal(registry, terminal_id, metadata)
+        except Exception as exc:  # noqa: BLE001 - the delete already succeeded
+            logger.warning("Failed to emit post_kill_terminal for %s: %s", terminal_id, exc)
+    return deleted
+
+
+def _delete_terminal_locked(
+    terminal_id: str, registry: PluginRegistry | None = None, *, end_reason: str
+) -> bool:
+    """``delete_terminal``'s teardown, for a caller that already holds the lock.
+
+    The caller must hold ``session_lifecycle_lock`` for the terminal's session
+    (or know there is no row to race with); this function takes no lock. It never
+    emits ``post_kill_terminal``: ``registry`` only reaches the delegation notice.
+    The two herdr callers pass no registry, so they emitted nothing before either.
+    """
+    return _teardown_terminal_locked(terminal_id, registry, end_reason=end_reason)[0]
+
+
+def _teardown_terminal_locked(
+    terminal_id: str, registry: PluginRegistry | None = None, *, end_reason: str
+) -> Tuple[bool, Optional[Dict]]:
+    """The teardown itself: ``(deleted, metadata)``; takes no lock, emits no event.
+
+    ``metadata`` is what ``capture_terminal_snapshot`` returned, for the caller to
+    build ``post_kill_terminal`` from once it has released the lock.
     """
     # Tell any caller waiting on this worker before teardown starts. Imported
     # here because delegation_callback_service imports this module.
@@ -7584,8 +7658,9 @@ def delete_terminal(
             logger.warning(
                 "Terminal %s cleanup deferred; retaining metadata for a retry", terminal_id
             )
-            return False
-        return delete_terminal_row(terminal_id, metadata, registry=registry, end_reason=end_reason)
+            return False, None
+        deleted = delete_terminal_row(terminal_id, metadata, registry=None, end_reason=end_reason)
+        return deleted, metadata
 
     except Exception as e:
         logger.error(f"Failed to delete terminal {terminal_id}: {e}")
