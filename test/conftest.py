@@ -24,6 +24,14 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
+from hypothesis import settings
+
+settings.register_profile("ci", max_examples=75, deadline=1000, derandomize=True, print_blob=True)
+settings.register_profile("nightly", max_examples=500, deadline=1000, print_blob=True)
+if os.environ.get("HYPOTHESIS_PROFILE"):
+    settings.load_profile(os.environ["HYPOTHESIS_PROFILE"])
+elif os.environ.get("CI"):
+    settings.load_profile("ci")
 
 # Make the `mock_cli` test-fixture binary discoverable for the pytest
 # session so MockCliProvider can `shlex.join(["mock_cli", ...])` without
