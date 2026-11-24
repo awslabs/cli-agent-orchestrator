@@ -147,7 +147,14 @@ def test_keyless_e2e_job_runs_on_every_pr_without_secrets():
     assert job["timeout-minutes"] >= 10
     assert "if" not in job and "needs" not in job
     runs = [step.get("run", "") for step in job["steps"]]
-    assert any("apt-get install -y tmux" in run for run in runs)
+    install_tmux = next(step for step in job["steps"] if step.get("name") == "Install tmux")
+    assert install_tmux["timeout-minutes"] == 5
+    assert install_tmux["run"] == (
+        "command -v tmux || {\n"
+        "  sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update\n"
+        "  sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y --no-install-recommends tmux\n"
+        "}\n"
+    )
     assert any("uv sync --locked --all-extras --dev" in run for run in runs)
     assert any(
         "-m e2e test/e2e/test_mock_cli_orchestration.py" in run

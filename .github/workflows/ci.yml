@@ -71,7 +71,14 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
       - name: Install tmux
-        run: sudo apt-get update && sudo apt-get install -y tmux
+        # apt mirrors can stall for far longer than this required job's budget;
+        # skip installation if tmux exists, and bound retries and request timeouts.
+        timeout-minutes: 5
+        run: |
+          command -v tmux || {
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y --no-install-recommends tmux
+          }
       - name: Install dependencies
         run: uv sync --locked --all-extras --dev
       - name: Run keyless orchestration e2e
