@@ -146,15 +146,17 @@ class InboxService:
 
     def __init__(self) -> None:
         # deliver_pending is read(PENDING) → status check → mark DELIVERED → send,
-        # with no atomic claim at the DB layer, so two concurrent calls for the
-        # SAME terminal can both read the same oldest row before either marks it
-        # and deliver one task twice. Concurrent callers are real: the status-event
-        # consumer and the immediate POST path both dispatch to worker threads, and
-        # the OpenCode poller and the reconcile sweep add more. Serialize the whole
-        # read→mark→send sequence per terminal; as a side effect this also keeps
-        # two pastes from ever interleaving in one pane. The lock map is tiny
-        # (one Lock per terminal id ever delivered to in this process) and is not
-        # reaped — terminal ids are bounded by session lifecycle.
+        # so two concurrent calls for the SAME terminal can both read the same
+        # oldest row before either marks it. Concurrent callers are real: the
+        # status-event consumer and the immediate POST path both dispatch to
+        # worker threads, and the OpenCode poller and the reconcile sweep add
+        # more. Serialize the whole read→mark→send sequence per terminal; as a
+        # side effect this also keeps two pastes from ever interleaving in one
+        # pane. This lock is what keeps deliveries single and in order. The mark
+        # is also a compare-and-set on PENDING (see _deliver_pending_locked), but
+        # that only backs this lock up against a writer outside it. The lock map
+        # is tiny (one Lock per terminal id ever delivered to in this process)
+        # and is not reaped: terminal ids are bounded by session lifecycle.
         self._delivery_locks_guard = threading.Lock()
         self._delivery_locks: Dict[str, threading.Lock] = {}
         # Created on first use by deliver_pending_in_background.
@@ -392,8 +394,23 @@ class InboxService:
         # If the messages were still PENDING then, they would be delivered twice.
         # Marking them DELIVERED first closes that window; the except path resets
         # them to FAILED.
-        for message in messages:
-            update_message_status(message.id, MessageStatus.DELIVERED)
+        #
+        # The mark is a claim: it succeeds only for a row that is still PENDING,
+        # and only rows this call claimed are sent (#406, #709). Under the
+        # per-terminal lock a row read above is normally still PENDING here, so
+        # this is defence in depth for a writer outside that lock, such as a
+        # second process on the same database (which utils/server_lock.py
+        # refuses to start). The paths below that put a message back to PENDING
+        # only ever touch rows claimed here.
+        messages = [
+            message
+            for message in messages
+            if update_message_status(
+                message.id, MessageStatus.DELIVERED, expected_status=MessageStatus.PENDING
+            )
+        ]
+        if not messages:
+            return 0
 
         # Event-inbox backends whose service delivers off the event loop
         # (herdr-app) run the submit confirmation too. They have no output

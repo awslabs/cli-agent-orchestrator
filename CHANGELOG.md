@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Inbox delivery claims a message in the database before sending it** (#406, #709).
+  `deliver_pending` read PENDING rows and then marked them DELIVERED with an unconditional
+  write, so two deliveries that did not share a lock could both read one row and both send it.
+  The mark is now a compare-and-set (`UPDATE ... WHERE id = ? AND status = 'pending'`), and
+  only rows a delivery claimed are sent. This is defence in depth: inside one server the
+  per-terminal delivery lock already serializes read, mark and send, and a second server on
+  the same `CAO_HOME_DIR` is refused by the one-server-per-home lock, so no supported setup is
+  known to send a message twice this way. It is one plain `UPDATE` with no `RETURNING`, so it
+  does not depend on the SQLite version.
+
 - **Workspace split panes fill themselves**. Picking 2 or 4 panes in the Workspace tab now
   shows the session's other agents in the empty panes, in tab order, instead of leaving them
   blank. Panes already showing an agent keep it, and clicking the current layout again refills
