@@ -61,6 +61,11 @@ COPILOT_TRANSPORTS: dict[str, str] = {
     "sse": "sse",
 }
 
+#: The workflow step identity that ``workflow_return`` in ``cao-mcp-server`` reads.
+#: ``_build_runtime_mcp_config`` forwards it, because Copilot does not pass the
+#: terminal's environment to a stdio MCP server.
+WORKFLOW_STEP_ENV_KEYS = ("CAO_WORKFLOW_RUN_ID", "CAO_WORKFLOW_STEP_ID")
+
 ANSI_CODE_PATTERN = r"\x1b\[[0-?]*[ -/]*[@-~]"
 OSC_PATTERN = r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
 CONTROL_CHARS_PATTERN = r"[\x00-\x08\x0b-\x1f\x7f]"
@@ -249,19 +254,27 @@ class CopilotCliProvider(BaseProvider):
         # invocation, and forward this CAO's own address/home, via the shared
         # resolver. This config is rebuilt fresh at every launch (persisted=False),
         # so the bundled server always learns the CAO that is about to start it.
+        cao_server = forward_terminal_identity(
+            resolve_mcp_server_config({"command": "cao-mcp-server", "args": [], "disabled": False}),
+            self.terminal_id,
+            server_name="cao-mcp-server",
+        )
+        # Copilot starts a stdio MCP server with only PATH and a few platform
+        # variables, so the workflow step identity that CAO sets on this terminal's
+        # window never reached the server, and ``workflow_return`` answered "not
+        # set". Copilot expands ``${VAR:-}`` in ``env`` from its own environment;
+        # outside a workflow step the values are empty, which the tool rejects.
+        cao_server["env"] = {
+            **{key: f"${{{key}:-}}" for key in WORKFLOW_STEP_ENV_KEYS},
+            **(cao_server.get("env") or {}),
+        }
         merged_servers: dict = {
             # forward_terminal_identity injects this terminal's own
             # CAO_TERMINAL_ID (the key is deliberately NOT hand-written in the
-            # literal below -- the forwarder is the one writer of it), and
+            # literal above -- the forwarder is the one writer of it), and
             # resolve_mcp_server_config adds the launching CAO's coordinates for
             # the bundled server (#1066).
-            "cao-mcp-server": forward_terminal_identity(
-                resolve_mcp_server_config(
-                    {"command": "cao-mcp-server", "args": [], "disabled": False}
-                ),
-                self.terminal_id,
-                server_name="cao-mcp-server",
-            )
+            "cao-mcp-server": cao_server
         }
 
         # Agent Plugins: this runtime config is the only MCP configuration Copilot

@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status poll in `wait_until_terminal_status` uses) instead of the module-wide 60s read
   timeout. Each status read stops after 5s to connect and 5s without data, so a stalled
   broker can overrun `cao worker send --timeout` by about 6s instead of about 60s.
+
+- **copilot_cli: a structured workflow step can return its answer**. Copilot starts a stdio
+  MCP server with only `PATH` and a few platform variables. So `cao-mcp-server` did not get
+  the `CAO_WORKFLOW_RUN_ID` and `CAO_WORKFLOW_STEP_ID` that CAO sets for a workflow step, and
+  `workflow_return` said that they were not set. The provider now forwards both as `${VAR:-}`
+  placeholders, which Copilot expands from its own environment. Outside a workflow step the
+  values are empty, and `workflow_return` refuses them.
+
 - **Workspace split panes fill themselves**. Picking 2 or 4 panes in the Workspace tab now
   shows the session's other agents in the empty panes, in tab order, instead of leaving them
   blank. Panes already showing an agent keep it, and clicking the current layout again refills

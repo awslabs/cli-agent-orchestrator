@@ -101,6 +101,11 @@ CAO injects `cao-mcp-server` at runtime via:
 Implementation:
 
 - Add `cao-mcp-server` with `CAO_TERMINAL_ID`
+- Forward the workflow step identity, `CAO_WORKFLOW_RUN_ID` and
+  `CAO_WORKFLOW_STEP_ID`, as `${VAR:-}` placeholders. Copilot gives a stdio
+  MCP server only `PATH` and a few platform variables, and it expands these
+  placeholders from its own environment. Without them, `workflow_return`
+  cannot find the step of a structured workflow step.
 - Pass the merged MCP payload inline as JSON
 
 

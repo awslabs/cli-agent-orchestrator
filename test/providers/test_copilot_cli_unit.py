@@ -1572,15 +1572,40 @@ class TestCopilotCliProviderMisc:
         assert server_env["CAO_HOME_DIR"] == "/srv/cao-b"
         assert "CAO_API_HOST" not in server_env
 
-    def test_build_runtime_mcp_config_adds_nothing_for_a_default_cao(self, monkeypatch):
-        """A default CAO (none of the three address vars set) writes exactly the
-        same runtime MCP config as before this fix."""
+    def test_build_runtime_mcp_config_adds_no_address_for_a_default_cao(self, monkeypatch):
+        """A default CAO (none of the three address vars set) adds no address or
+        home to the env: only the terminal id and the workflow step identity."""
         for key in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
             monkeypatch.delenv(key, raising=False)
         provider = CopilotCliProvider("abc12345", "test-session", "window-0")
         runtime_cfg = json.loads(provider._build_runtime_mcp_config())
         server_env = runtime_cfg["mcpServers"]["cao-mcp-server"]["env"]
-        assert server_env == {"CAO_TERMINAL_ID": "abc12345"}
+        assert server_env == {
+            "CAO_TERMINAL_ID": "abc12345",
+            "CAO_WORKFLOW_RUN_ID": "${CAO_WORKFLOW_RUN_ID:-}",
+            "CAO_WORKFLOW_STEP_ID": "${CAO_WORKFLOW_STEP_ID:-}",
+        }
+
+    def test_build_runtime_mcp_config_forwards_the_workflow_step_identity(self, monkeypatch):
+        """Copilot gives a stdio MCP server only PATH and a few platform variables,
+        so ``workflow_return`` could not see the step that CAO set on the window.
+        The entry asks Copilot to expand the identity from its own environment;
+        the launch line keeps the placeholders literal for Copilot to expand."""
+        monkeypatch.setenv("CAO_WORKFLOW_RUN_ID", "run-in-cao-server")
+        provider = CopilotCliProvider("abc12345", "test-session", "window-0")
+        runtime_cfg = json.loads(provider._build_runtime_mcp_config())
+        server_env = runtime_cfg["mcpServers"]["cao-mcp-server"]["env"]
+        assert server_env["CAO_WORKFLOW_RUN_ID"] == "${CAO_WORKFLOW_RUN_ID:-}"
+        assert server_env["CAO_WORKFLOW_STEP_ID"] == "${CAO_WORKFLOW_STEP_ID:-}"
+        MOD = "cli_agent_orchestrator.providers.copilot_cli"
+        with (
+            patch(f"{MOD}.CopilotCliProvider._supports_flag", return_value=True),
+            patch(f"{MOD}.get_backend") as backend,
+        ):
+            backend.return_value.get_pane_working_directory.return_value = "/tmp/project"
+            parts = shlex.split(provider._command())
+        mcp_json = json.loads(parts[parts.index("--additional-mcp-config") + 1])
+        assert mcp_json["mcpServers"]["cao-mcp-server"]["env"] == server_env
 
     def test_cleanup_resets_initialized_state(self):
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
