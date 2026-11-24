@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout. Each status read stops after 5s to connect and 5s without data, so a stalled
   broker can overrun `cao worker send --timeout` by about 6s instead of about 60s.
 
+- **CI: a pull request review by a panel of CAO agents**. The manually dispatched GitHub
+  Actions workflow `.github/workflows/pr-review.yml` reviews one PR of this repository with two
+  reviewers, two fresh voters and an adjudicator. Each seat is a step of the CAO workflow in
+  `.github/pr-review/`, and it returns a validated report with `workflow_return`. The script
+  applies fixed verdict rules. The panel runs with `kiro_cli` (the default) or `copilot_cli`.
+  The agents run with a read-only token, and a separate job posts one `COMMENT` review. The
+  review never approves a PR or requests changes.
+
 - **copilot_cli: `web_fetch` now gates network access**. A Copilot grant without `web_fetch`,
   such as the `supervisor`, `reviewer` and `workflow_scout` roles, kept URL access and Copilot's
   built-in MCP servers, because the Copilot tool mapping had no network entry. Such a grant now
