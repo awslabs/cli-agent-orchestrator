@@ -28,7 +28,7 @@ the same way.
 
 ## Contents
 
-Version `2.5.3`, synced from CAO's package metadata.
+Version `2.5.5`, synced from CAO's package metadata.
 
 - `agui-author`
 
