@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **herdr: inbox messages are no longer typed into an open Claude Code dialog** (#896). herdr
+  can report a pane as idle or done while an AskUserQuestion, permission or plan-approval
+  dialog is open; CAO then typed the queued message into the dialog, which swallowed it and
+  took the trailing Enter as the answer. On the herdr backends CAO now reads the pane before
+  typing an inbox message, assign or handoff into a Claude Code terminal, and if a dialog is
+  on screen the message stays queued until the dialog is answered. This costs one pane read
+  per delivery on herdr. tmux is unchanged, and a failed pane read does not hold delivery.
+
 - **Workspace split panes fill themselves**. Picking 2 or 4 panes in the Workspace tab now
   shows the session's other agents in the empty panes, in tab order, instead of leaving them
   blank. Panes already showing an agent keep it, and clicking the current layout again refills

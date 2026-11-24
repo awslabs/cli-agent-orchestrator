@@ -1408,6 +1408,74 @@ class ClaudeCodeProvider(BaseProvider):
         )
         return False
 
+    @staticmethod
+    def _user_answer_dialog_at_bottom(output: str) -> bool:
+        """Whether escape-free pane text ends in a dialog only a user may answer.
+
+        The one definition of the AskUserQuestion / permission / plan-approval
+        detection, shared by ``get_status``'s buffer path and
+        ``shows_user_answer_dialog`` so the two cannot drift.
+        """
+        # Anchor dialog detection to the bottom region only. Dialog chrome is
+        # always rendered at the bottom; matching the full buffer false-positives
+        # on stale scrollback containing "↑/↓ to navigate" (issue #405).
+        lines = output.split("\n")
+        bottom_region = "\n".join(lines[-_DIALOG_BOTTOM_LINES:])
+        # AskUserQuestion footer can be pushed down by notes-hint, error banner,
+        # or IDE status line — use a 6-line anchor.
+        # Deliberately asymmetric window sizes (round-3 review, gutosantos82): the trust/bypass
+        # exclusion below reads the wider 15-line bottom_region while the WAITING match itself
+        # reads only the narrower 6-line bottom_chrome. This is fail-closed, not a bug -- the
+        # exclusion window being a strict superset of the match window means a trust/bypass dialog
+        # can only ever be excluded MORE often, never less, so it can't accidentally let a real
+        # trust/bypass dialog through as WAITING_USER_ANSWER.
+        bottom_chrome = "\n".join(lines[-6:])
+
+        if (
+            not re.search(TRUST_PROMPT_PATTERN, bottom_region)
+            and not re.search(BYPASS_PROMPT_PATTERN, bottom_region)
+            # Same reason as trust/bypass: _handle_startup_prompts declines this
+            # one itself, so surfacing it as WAITING_USER_ANSWER would ask an
+            # operator to answer a dialog that is about to answer itself. Its
+            # footer is "Enter to confirm · Esc to cancel", which the WAITING
+            # match below would otherwise hit.
+            and not re.search(MODEL_UPGRADE_PROMPT_PATTERN, bottom_region)
+        ):
+            # AskUserQuestion: "↑/↓ to navigate" in bottom chrome (last 6 lines).
+            # Known residual: agent prose containing this exact string in the
+            # 6-line footer window of an idle prompt will false-positive as
+            # WAITING. Full fix needs structural composer detection (out of scope).
+            if re.search(WAITING_USER_ANSWER_PATTERN, bottom_chrome):
+                return True
+            # Plan-approval: "Would you like to proceed?" with no nav footer.
+            # Guard against dismissed dialog in scrollback: only classify as
+            # WAITING if option markers appear AFTER the plan text AND neither
+            # a separator (────) nor a response marker (⏺/●) follows them —
+            # either indicates the agent proceeded past the dialog.
+            plan_match = re.search(PLAN_APPROVAL_PATTERN, bottom_region)
+            if plan_match:
+                after_plan = bottom_region[plan_match.end() :]
+                has_option_markers = re.search(r"^\s*(?:[❯>]\s*)?\d+\.", after_plan, re.MULTILINE)
+                sep_after_plan = re.search(r"─{20,}", after_plan)
+                response_after_options = False
+                if has_option_markers:
+                    last_option = None
+                    for m in re.finditer(r"^\s*(?:[❯>]\s*)?\d+\.", after_plan, re.MULTILINE):
+                        last_option = m
+                    if last_option:
+                        after_options = after_plan[last_option.end() :]
+                        # EXTRACTION_RESPONSE_PATTERN (not RESPONSE_PATTERN):
+                        # the newest TUI's response marker is ● which
+                        # RESPONSE_PATTERN deliberately excludes, and its
+                        # effort-footer lookahead keeps a "● high · /effort"
+                        # line from counting as dismissal evidence.
+                        response_after_options = bool(
+                            EXTRACTION_RESPONSE_PATTERN.search(after_options)
+                        )
+                if has_option_markers and not sep_after_plan and not response_after_options:
+                    return True
+        return False
+
     def get_status(self, output: str) -> TerminalStatus:
         """Get Claude Code status.
 
@@ -1531,64 +1599,8 @@ class ClaudeCodeProvider(BaseProvider):
             if last_idle is None or last_processing.start() > last_idle.start():
                 return TerminalStatus.PROCESSING
 
-        # Anchor dialog detection to the bottom region only. Dialog chrome is
-        # always rendered at the bottom; matching the full buffer false-positives
-        # on stale scrollback containing "↑/↓ to navigate" (issue #405).
-        lines = output.split("\n")
-        bottom_region = "\n".join(lines[-_DIALOG_BOTTOM_LINES:])
-        # AskUserQuestion footer can be pushed down by notes-hint, error banner,
-        # or IDE status line — use a 6-line anchor.
-        # Deliberately asymmetric window sizes (round-3 review, gutosantos82): the trust/bypass
-        # exclusion below reads the wider 15-line bottom_region while the WAITING match itself
-        # reads only the narrower 6-line bottom_chrome. This is fail-closed, not a bug -- the
-        # exclusion window being a strict superset of the match window means a trust/bypass dialog
-        # can only ever be excluded MORE often, never less, so it can't accidentally let a real
-        # trust/bypass dialog through as WAITING_USER_ANSWER.
-        bottom_chrome = "\n".join(lines[-6:])
-
-        if (
-            not re.search(TRUST_PROMPT_PATTERN, bottom_region)
-            and not re.search(BYPASS_PROMPT_PATTERN, bottom_region)
-            # Same reason as trust/bypass: _handle_startup_prompts declines this
-            # one itself, so surfacing it as WAITING_USER_ANSWER would ask an
-            # operator to answer a dialog that is about to answer itself. Its
-            # footer is "Enter to confirm · Esc to cancel", which the WAITING
-            # match below would otherwise hit.
-            and not re.search(MODEL_UPGRADE_PROMPT_PATTERN, bottom_region)
-        ):
-            # AskUserQuestion: "↑/↓ to navigate" in bottom chrome (last 6 lines).
-            # Known residual: agent prose containing this exact string in the
-            # 6-line footer window of an idle prompt will false-positive as
-            # WAITING. Full fix needs structural composer detection (out of scope).
-            if re.search(WAITING_USER_ANSWER_PATTERN, bottom_chrome):
-                return TerminalStatus.WAITING_USER_ANSWER
-            # Plan-approval: "Would you like to proceed?" with no nav footer.
-            # Guard against dismissed dialog in scrollback: only classify as
-            # WAITING if option markers appear AFTER the plan text AND neither
-            # a separator (────) nor a response marker (⏺/●) follows them —
-            # either indicates the agent proceeded past the dialog.
-            plan_match = re.search(PLAN_APPROVAL_PATTERN, bottom_region)
-            if plan_match:
-                after_plan = bottom_region[plan_match.end() :]
-                has_option_markers = re.search(r"^\s*(?:[❯>]\s*)?\d+\.", after_plan, re.MULTILINE)
-                sep_after_plan = re.search(r"─{20,}", after_plan)
-                response_after_options = False
-                if has_option_markers:
-                    last_option = None
-                    for m in re.finditer(r"^\s*(?:[❯>]\s*)?\d+\.", after_plan, re.MULTILINE):
-                        last_option = m
-                    if last_option:
-                        after_options = after_plan[last_option.end() :]
-                        # EXTRACTION_RESPONSE_PATTERN (not RESPONSE_PATTERN):
-                        # the newest TUI's response marker is ● which
-                        # RESPONSE_PATTERN deliberately excludes, and its
-                        # effort-footer lookahead keeps a "● high · /effort"
-                        # line from counting as dismissal evidence.
-                        response_after_options = bool(
-                            EXTRACTION_RESPONSE_PATTERN.search(after_options)
-                        )
-                if has_option_markers and not sep_after_plan and not response_after_options:
-                    return TerminalStatus.WAITING_USER_ANSWER
+        if self._user_answer_dialog_at_bottom(output):
+            return TerminalStatus.WAITING_USER_ANSWER
 
         # New Claude Code TUI PROCESSING: the input prompt is BOXED between two
         # separators, and the live spinner renders on the line DIRECTLY ABOVE the
@@ -1961,6 +1973,22 @@ class ClaudeCodeProvider(BaseProvider):
         worker alive for answer_user_prompt rather than auto-pasting into it.
         """
         return True
+
+    def shows_user_answer_dialog(self, pane_text: str) -> bool:
+        """Whether a fresh pane read ends in a dialog that would swallow a paste (#896).
+
+        Runs the buffer path's detection rather than ``get_status_from_screen``:
+        it is the only one that knows the plan-approval dialog (#405), and its
+        6-line footer window is the tighter of the two against agent prose that
+        merely quotes a footer. A rendered pane pads the rows under the TUI with
+        blanks, which the buffer path never sees, so they are dropped first to
+        keep the footer inside that window. Trust, bypass and model-upgrade
+        dialogs stay excluded, as in ``get_status``: ``initialize`` answers those.
+        """
+        clean = strip_terminal_escapes(pane_text).rstrip()
+        if not clean:
+            return False
+        return self._user_answer_dialog_at_bottom(clean)
 
     def mark_input_received(self) -> None:
         """Capture content-based snapshots for the staleness guard (issue #407).

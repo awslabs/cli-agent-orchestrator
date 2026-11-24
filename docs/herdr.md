@@ -105,6 +105,8 @@ CAO maps its concepts to herdr primitives:
 
 > Note on `pane.updated`: as of herdr 0.9.x it is still emitted for other pane changes (e.g. agent name/title), but no longer on agent-status transitions, which is why the per-pane `pane.agent_status_changed` subscription is the one that carries delivery. The broadcast subscription is kept only for herdr ≤0.8, where it did carry status.
 
+herdr's state is trusted for status, with one exception. herdr can report `idle` or `done` while a Claude Code dialog (AskUserQuestion, a permission prompt, plan approval) is open, and a message typed there is swallowed while its Enter answers the dialog. So before each orchestrated delivery to a provider that blocks input at dialogs, CAO reads the pane once (`herdr pane read`, the last 50 lines as text) and holds the message as PENDING if the provider sees a dialog (issue #896). See [Inbox Delivery](inbox-delivery.md#standard-delivery).
+
 ### Startup and reconnect behavior
 
 On server start (or reconnect after socket disconnect):

@@ -275,6 +275,70 @@ def _dialog_blocks_orchestrated_input(
     )
 
 
+def _pane_shows_dialog_native_status_missed(
+    terminal_id: str,
+    provider: Any,
+    orchestration_type: "Optional[OrchestrationType]",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Whether the pane shows a user-answer dialog the backend's status did not report.
+
+    #896 case 2. On a backend that supplies native agent status (herdr), the
+    status the guard above acts on was never read off the screen, and herdr has
+    reported ``idle`` and ``done`` with a Claude Code dialog open. So for the
+    input ``_dialog_blocks_orchestrated_input`` would refuse had the status said
+    WAITING_USER_ANSWER, read the visible screen once, here, and ask the provider.
+
+    ``supports_event_inbox()`` is the signal for "status is native": it is the
+    same test ``status_monitor.get_status`` uses to derive status from the
+    backend instead of the pane. On tmux it is False, so nothing is captured and
+    nothing changes. The ``is True`` tests keep a provider without
+    ``shows_user_answer_dialog`` (default False), and any stand-in object, out.
+
+    Fails open on purpose: a pane read that raises or comes back empty returns
+    False and the send proceeds as it did before this check existed. This is a
+    backstop for a wrong status, and a herdr CLI hiccup must not become an inbox
+    that never drains.
+    """
+    # Same provider and input condition as the status guard, by construction.
+    if not _dialog_blocks_orchestrated_input(
+        provider, orchestration_type, TerminalStatus.WAITING_USER_ANSWER
+    ):
+        return False
+    try:
+        backend = get_backend()
+        if backend.supports_event_inbox() is not True:
+            return False
+        if metadata is None:
+            metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            return False
+        # The same bounded read the composer check uses: the current screen,
+        # escapes stripped. The dialog is drawn at the bottom of it.
+        pane_text = backend.get_history(
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            strip_escapes=True,
+            visible_only=True,
+        )
+        if not isinstance(pane_text, str) or not pane_text.strip():
+            logger.warning(
+                "Could not read the pane of %s to check for an open dialog (empty read); "
+                "sending on the backend's status alone",
+                terminal_id,
+            )
+            return False
+        return provider.shows_user_answer_dialog(pane_text) is True
+    except Exception as exc:
+        logger.warning(
+            "Could not read the pane of %s to check for an open dialog (%s); "
+            "sending on the backend's status alone",
+            terminal_id,
+            exc,
+        )
+        return False
+
+
 _DEFERRED_INIT_FAILURE_MESSAGE_MAX = 4096
 _DEFERRED_INIT_FAILURE_SCAN_MAX = 16384
 _DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS = 3
@@ -5310,9 +5374,12 @@ def redeliver_dropped_message_with_boundary(
         # the composer under an overlaying permission prompt, this Enter starts
         # answering dialogs. Check the guard here rather than inherit it by
         # coincidence.
+        #
+        # The pane check is here for the reason it is in ``dispatch_input``: on
+        # a native-status backend that status can read ready with a dialog open.
         if _dialog_blocks_orchestrated_input(
             provider, orchestration_type, status_monitor.get_status(terminal_id)
-        ):
+        ) or _pane_shows_dialog_native_status_missed(terminal_id, provider, orchestration_type):
             logger.warning(
                 "Delivery to %s is unsubmitted but the terminal is waiting on a user "
                 "answer; skipping the bare-Enter re-submit so it cannot answer the "
@@ -6536,7 +6603,18 @@ def dispatch_input(
             # typing by hand (no orchestration type, so an empty value here) may
             # resolve a prompt. Shared with the bare-Enter recovery's own check;
             # see ``_dialog_blocks_orchestrated_input``.
-            if _dialog_blocks_orchestrated_input(provider, orchestration_type, current_status):
+            #
+            # The second test covers a status that is wrong (#896 case 2): on a
+            # backend with native status it reads the pane, once, and refuses
+            # the same way. It runs whatever that status says, because herdr's
+            # ``done`` reaches here as PROCESSING during the flush wait. It sits
+            # before inject_memory_context so a refusal, which the inbox retries,
+            # does not spend the terminal's one-time memory block.
+            if _dialog_blocks_orchestrated_input(
+                provider, orchestration_type, current_status
+            ) or _pane_shows_dialog_native_status_missed(
+                terminal_id, provider, orchestration_type, metadata
+            ):
                 raise TerminalInputBlockedError(
                     f"Terminal {terminal_id} is waiting for a user answer. "
                     "Use answer_user_prompt to submit a selection or approval before "
