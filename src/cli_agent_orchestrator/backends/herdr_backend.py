@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, cast
+from typing import Callable, Dict, List, Optional, Tuple, cast
 
 from cli_agent_orchestrator.backends.base import (
     TerminalBackend,
@@ -700,6 +700,7 @@ class HerdrBackend(TerminalBackend):
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
+        pre_write_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         """Send text to a pane via herdr pane send-text + send-keys Enter.
 
@@ -711,6 +712,10 @@ class HerdrBackend(TerminalBackend):
         ``submit_delay`` is accepted for parity with the backend interface; herdr
         governs its own post-paste timing below (the generous 2s bracketed wait
         already covers Claude Code's Ink renderer), so the value is not used here.
+
+        ``pre_write_hook``, if given, runs immediately before ``pane send-text``:
+        the pane lookup and the foreground-command probe above it only read, so
+        that is the last point before this call writes to the pane (#709).
         """
         # Resolve pane_id from terminal_id stored in DB metadata
         # The window_name is used as a lookup key in CAO's DB → terminal_id mapping
@@ -739,6 +744,8 @@ class HerdrBackend(TerminalBackend):
         else:
             text = keys
 
+        if pre_write_hook is not None:
+            pre_write_hook()
         self._run_herdr(["pane", "send-text", pane_id, text])
 
         # Allow the TUI to process the pasted content before sending Enter.

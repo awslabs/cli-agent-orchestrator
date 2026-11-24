@@ -6463,6 +6463,10 @@ def dispatch_input(
     emit and complete; sampled afterwards, those chunks would be inside the
     baseline and a genuine completion would read as pre-dispatch.
 
+    The sample is taken again from the backend's ``pre_write_hook``, at the last
+    point before the pane write, and that later value is the one returned
+    (#709); see the comment at the ``send_keys`` call.
+
     Uses bracketed paste mode (-p) to bypass TUI hotkey handling. The number
     of Enter keys sent after pasting is determined by the provider's
     ``paste_enter_count`` property (e.g., some TUIs need 2 Enters because
@@ -6612,10 +6616,13 @@ def dispatch_input(
         # THE DISPATCH BOUNDARY. Sampled here -- armed, buffer cleared, no key
         # sent yet -- and returned to the caller. Output that lands from this
         # point on is output produced after this send; output that landed before
-        # it is already inside the value and can never count as evidence. This
-        # is the only place the sample is correct: one line later send_keys
+        # it is already inside the value and can never count as evidence. It
+        # must not be taken any later in THIS function: one line later send_keys
         # starts, and its submit delay is exactly the window in which a fast
-        # worker emits and completes (reviewer-reproduced on PR #566).
+        # worker emits and completes (reviewer-reproduced on PR #566). The
+        # backend re-takes it from inside send_keys, just before the pane write
+        # (see ``_resample_dispatch_boundary`` below); this sample is what is
+        # returned when a backend never gets that far or never calls the hook.
         #
         # Deliberately a separate lock acquisition AFTER the clear, not atomic
         # with it. A chunk that lands between the two is pre-dispatch output (no
@@ -6641,6 +6648,32 @@ def dispatch_input(
                 provider.mark_input_received()
             provider.record_dispatched_message(message)
 
+        def _resample_dispatch_boundary() -> None:
+            # The provider bookkeeping above and the backend's own preparation
+            # (on tmux a cancel, a foreground-command probe and load-buffer,
+            # each a subprocess) all run after the sample above and before any
+            # key reaches the pane. A receiver that is still emitting while it
+            # reads as ready advances the generation in that window, and a
+            # status earned from that old output then sat above the boundary
+            # and confirmed a send whose Enter was swallowed, so the recovery
+            # was skipped (#709). The backend calls this at its last point
+            # before the write, which folds that output into the baseline for
+            # the same reason the sample above follows the clear.
+            #
+            # Never raises: the backend calls it between its preparation and
+            # the write, and a failed sample must cost only the later boundary,
+            # not the send. The earlier sample then stands.
+            nonlocal dispatch_boundary
+            try:
+                dispatch_boundary = status_monitor.output_generation(terminal_id)
+            except Exception as exc:  # noqa: BLE001 - see above
+                logger.warning(
+                    "Could not re-sample the dispatch boundary for %s before the pane "
+                    "write (%r); keeping the earlier sample",
+                    terminal_id,
+                    exc,
+                )
+
         backend = get_backend()
         submit_delay = provider.paste_submit_delay if provider else 0.3
         sending = True
@@ -6651,6 +6684,7 @@ def dispatch_input(
             enter_count=enter_count,
             force_bracketed_paste=True,
             submit_delay=submit_delay,
+            pre_write_hook=_resample_dispatch_boundary,
         )
 
         update_last_active(terminal_id)

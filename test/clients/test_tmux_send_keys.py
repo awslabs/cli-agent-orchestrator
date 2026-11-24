@@ -187,6 +187,71 @@ class TestSendKeys:
         assert len(load_call[1]["input"]) == 50000
 
 
+class TestSendKeysPreWriteHook:
+    """``pre_write_hook`` fires once, after load-buffer and before paste-buffer (#709).
+
+    load-buffer only stores bytes in a tmux buffer; paste-buffer is the first
+    call that writes to the pane. ``dispatch_input`` samples its dispatch
+    boundary from the hook, so output emitted while load-buffer runs must
+    already have landed when it fires. Plumbing and tests carried from #709.
+    """
+
+    @staticmethod
+    def _commands_at_hook_time(mock_subprocess, client, **send_kwargs):
+        seen = []
+
+        def hook():
+            seen.append([c[0][0][1] for c in payload_calls(mock_subprocess)])
+
+        client.send_keys("sess", "win", "hello", pre_write_hook=hook, **send_kwargs)
+        return seen
+
+    def test_fires_between_load_buffer_and_paste_buffer(self, client, mock_subprocess, mock_uuid):
+        seen = self._commands_at_hook_time(mock_subprocess, client)
+
+        # Exactly one call; load-buffer had run and paste-buffer had not.
+        assert seen == [["load-buffer"]]
+        assert [c[0][0][1] for c in payload_calls(mock_subprocess)][:2] == [
+            "load-buffer",
+            "paste-buffer",
+        ]
+
+    def test_fires_at_the_same_point_for_a_forced_bracketed_paste(
+        self, client, mock_subprocess, mock_uuid, legacy_tmux
+    ):
+        with patch.object(client, "get_pane_current_command", return_value="node"):
+            seen = self._commands_at_hook_time(mock_subprocess, client, force_bracketed_paste=True)
+
+        assert seen == [["load-buffer"]]
+
+    def test_not_called_when_omitted(self, client, mock_subprocess, mock_uuid):
+        client.send_keys("sess", "win", "hello")
+
+        assert mock_subprocess.run.call_count == 6
+
+    def test_not_called_when_load_buffer_fails(self, client, mock_subprocess, mock_uuid):
+        hook = MagicMock()
+        mock_subprocess.run.side_effect = [None, Exception("load-buffer failed"), None]
+
+        with pytest.raises(Exception, match="load-buffer failed"):
+            client.send_keys("sess", "win", "hello", pre_write_hook=hook)
+
+        hook.assert_not_called()
+
+    def test_raising_hook_propagates_and_nothing_is_pasted(
+        self, client, mock_subprocess, mock_uuid
+    ):
+        """The documented contract: the client does not guard the hook."""
+        hook = MagicMock(side_effect=RuntimeError("hook failed"))
+
+        with pytest.raises(RuntimeError, match="hook failed"):
+            client.send_keys("sess", "win", "hello", pre_write_hook=hook)
+
+        hook.assert_called_once_with()
+        commands = [c[0][0][1] for c in payload_calls(mock_subprocess)]
+        assert commands == ["load-buffer", "delete-buffer"]
+
+
 class TestSendKeysNoHandCraftedMarkersOnModernTmux:
     """Regression tests for issue #413 (tmux >= 3.7).
 

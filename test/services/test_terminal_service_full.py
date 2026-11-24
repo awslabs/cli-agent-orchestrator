@@ -5,7 +5,7 @@ import os
 import threading
 import time
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -3308,6 +3308,7 @@ class TestSendInput:
             enter_count=2,
             force_bracketed_paste=True,
             submit_delay=0.3,
+            pre_write_hook=ANY,
         )
         mock_update.assert_called_once_with("test1234")
 
@@ -3509,6 +3510,7 @@ class TestSendInput:
             enter_count=1,
             force_bracketed_paste=True,
             submit_delay=0.3,
+            pre_write_hook=ANY,
         )
         mock_update.assert_called_once_with("test1234")
 

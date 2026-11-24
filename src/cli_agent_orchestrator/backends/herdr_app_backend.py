@@ -570,6 +570,7 @@ class HerdrAppBackend(TerminalBackend):
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
+        pre_write_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         try:
             address = self._address(session_name, window_name)
@@ -587,6 +588,8 @@ class HerdrAppBackend(TerminalBackend):
                 # hc rejects shifted punctuation as key names (invalid_params,
                 # nothing typed), which surfaces as a TerminalBackendError.
                 names = [_CHAR_KEY_NAMES.get(ch, ch) for ch in keys]
+                if pre_write_hook is not None:
+                    pre_write_hook()
                 self._input_call(address, "terminal.keys", keys=names)
             return
         # force: CAO's own delivery gates decide when to type, as on tmux.
@@ -595,6 +598,12 @@ class HerdrAppBackend(TerminalBackend):
         # after the paste unless a template file sets paste_gap_ms (input.rs).
         # Inbox deliveries catch a swallowed Enter instead
         # (event_inbox_confirms_submit).
+        #
+        # ``pre_write_hook`` runs here, immediately before the one call that
+        # types: hc pastes and presses Enter inside terminal.send, so there is
+        # no later point this backend can offer (#709).
+        if pre_write_hook is not None:
+            pre_write_hook()
         try:
             self._input_call(address, "terminal.send", text=keys, force=True)
         except HcNotSentError as exc:

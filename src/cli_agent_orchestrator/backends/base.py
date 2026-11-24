@@ -7,7 +7,7 @@ Core services depend only on this ABC, never on a concrete backend directly.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
@@ -308,6 +308,7 @@ class TerminalBackend(ABC):
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
+        pre_write_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         """Send text input to a window.
 
@@ -327,6 +328,18 @@ class TerminalBackend(ABC):
             submit_delay: Seconds to wait after pasting before sending Enter, so
                 a TUI (e.g. Claude Code's Ink renderer) finishes processing the
                 paste before submission. Backends without a paste step may ignore.
+            pre_write_hook: Optional callback, invoked synchronously on the
+                calling thread exactly once, at the last point before this call
+                first writes to the pane: after any preparation that cannot
+                make the application read input (tmux: after ``load-buffer``,
+                immediately before ``paste-buffer``). A backend with no later
+                point calls it immediately before its first write. It is not
+                called when the call fails, or has nothing to write, before
+                that point. ``dispatch_input`` uses it to sample its dispatch
+                boundary as late as possible (#709), and keeps an earlier
+                sample for a backend that never calls it. The hook must not
+                raise: backends do not guard the call, so an exception
+                propagates and nothing is written.
         """
         ...
 

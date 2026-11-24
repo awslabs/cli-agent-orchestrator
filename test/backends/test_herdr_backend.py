@@ -559,6 +559,44 @@ class TestHerdrBackendCommands:
         assert "send-keys" in calls[-1]
         assert "Enter" in calls[-1]
 
+    @staticmethod
+    def _send_keys_responses():
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+        return [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(),  # send-text
+            _completed(),  # send-keys Enter
+        ]
+
+    @patch("subprocess.run")
+    def test_send_keys_pre_write_hook_fires_immediately_before_send_text(self, mock_run, backend):
+        """The pane lookup only reads, so the hook runs once, right before send-text (#709)."""
+        mock_run.side_effect = self._send_keys_responses()
+        calls_at_hook_time = []
+
+        backend.send_keys(
+            "cao-test",
+            "window-0",
+            "hello world",
+            pre_write_hook=lambda: calls_at_hook_time.append(mock_run.call_count),
+        )
+
+        # The 3 resolution calls have run; send-text is the 4th.
+        assert calls_at_hook_time == [3]
+        assert "send-text" in mock_run.call_args_list[3][0][0]
+
+    @patch("subprocess.run")
+    def test_send_keys_without_pre_write_hook_is_unchanged(self, mock_run, backend):
+        mock_run.side_effect = self._send_keys_responses()
+
+        backend.send_keys("cao-test", "window-0", "hello world")
+
+        assert mock_run.call_count == 5
+
     @patch("subprocess.run")
     def test_send_keys_force_bracketed_wraps_when_pane_runs_a_real_tui(self, mock_run, backend):
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
