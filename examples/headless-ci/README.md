@@ -1,6 +1,6 @@
 # Headless / CI Example
 
-This example shows how to drive a single CAO agent from a CI runner — non-interactively, with a hard timeout, and with an exit code CI can act on. It launches with `--headless --async --yolo`, wrapped in a polling loop; `--yolo` removes every tool restriction, so read [`--auto-approve` vs `--yolo`](../../docs/tool-restrictions.md#--auto-approve-vs---yolo) before reusing it. With an initial message, `cao launch --async` sends that message and returns immediately while the agent continues in the background.
+This example shows how to drive a single CAO agent from a CI runner — non-interactively, with a hard timeout, and with an exit code CI can act on. It launches with `--headless --async --yolo`, wrapped in a polling loop; `--yolo` removes every tool restriction, so read [`--auto-approve` vs `--yolo`](../../docs/tool-restrictions.md#--auto-approve-vs---yolo) before reusing it. With an initial message, `cao launch --async` sends that message and returns once the server confirms it reached the agent, which includes the time the provider takes to start. The agent then continues in the background.
 
 ## What this demonstrates
 
@@ -16,7 +16,7 @@ sequenceDiagram
     participant Agent as 🤖 ci_developer
     CI->>CAO: cao launch --headless --async --yolo
     CAO->>Agent: spawn in tmux (session=cao-ci-$$)
-    CAO-->>CI: returns terminal id immediately
+    CAO-->>CI: returns once delivery is confirmed
     loop every CAO_CI_POLL_INTERVAL (default 5s)
         CI->>CAO: cao session status --workers
         CAO-->>CI: status JSON

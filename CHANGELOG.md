@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **`cao launch --async` is described as it behaves** (#882). The flag's help text, the CLI
+  reference, the quick start and the headless CI example said it returns immediately. Since
+  #566 it returns once the server confirms the message reached the agent, a wait that covers
+  provider startup, and it exits non-zero with the reason if delivery fails. The notice for an
+  initial message that a cao-server restart interrupted now says the message may already have
+  reached the worker, and to check the terminal before re-sending.
 - **Workspace split panes fill themselves**. Picking 2 or 4 panes in the Workspace tab now
   shows the session's other agents in the empty panes, in tab order, instead of leaving them
   blank. Panes already showing an agent keep it, and clicking the current layout again refills

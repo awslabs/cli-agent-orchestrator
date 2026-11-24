@@ -179,7 +179,11 @@ def _parse_env_pairs(pairs):
     "--async",
     "is_async",
     is_flag=True,
-    help="Send message and return immediately without waiting for completion",
+    help=(
+        "With --headless and MESSAGE: return once the message is confirmed delivered to "
+        "the agent, without waiting for the task to finish. Exits non-zero with the "
+        "reason if delivery fails."
+    ),
 )
 @click.option(
     "--auto-approve",

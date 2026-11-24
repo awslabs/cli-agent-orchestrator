@@ -4548,7 +4548,8 @@ async def recover_interrupted_initial_deliveries() -> bool:
             continue
         message = (
             f"Worker {terminal_id}'s initial message was accepted but cao-server restarted "
-            "before its delivery was confirmed. Re-send the task or re-launch."
+            "before its delivery was confirmed. The message may already have reached the worker, "
+            "so check the terminal before you re-send the task or re-launch."
         )
         try:
             settled = await asyncio.to_thread(

@@ -7117,6 +7117,11 @@ class TestInitialDeliveryIsDurable:
         assert settled == ["old1234"]
         assert mock_persist_delivery.call_args.args[1] == "failed"
         assert mock_persist_delivery.call_args.kwargs["kind"] == "interrupted"
+        # The keys may have gone out before the restart, so the operator is told to look
+        # at the terminal first, not to re-send blind and run the task twice (#882 item 3).
+        message = mock_persist_delivery.call_args.kwargs["message"]
+        assert "may already have reached the worker" in message
+        assert "check the terminal before you re-send" in message
         mock_persist_failure.assert_called_once()
         assert mock_persist_failure.call_args.args == ("old1234",)
         assert mock_persist_failure.call_args.kwargs["kind"] == "interrupted_init"
