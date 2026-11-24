@@ -4383,3 +4383,166 @@ class TestClaudeCode310PermissionFooterFixtures:
 
         raw_prompt = "\n".join(self._frame(name))
         assert classify_reason("claude_code", raw_prompt) == "claude-code:permission_request"
+
+
+class TestClaudeCode896HerdrDialogFixtures:
+    """Real ``herdr pane read --source recent --lines 50 --format text`` frames
+    from Claude Code 2.1.330 (#896), run through the two tmux status paths.
+
+    They are escape-free rendered screens, which is what both paths are written
+    for. Two pages were not recognised by either path before #896's follow-up:
+    the multi-question AskUserQuestion footer ``Enter to select · Tab/Arrow keys
+    to navigate · Esc to cancel`` and the footerless "Review your answers" page.
+    Both now are, on both paths, because the footer arm lives in the shared
+    ``WAITING_USER_ANSWER_PATTERN`` and the review page is one helper both call.
+
+    Plan approval is still recognised by the raw path only: the screen path has
+    no plan-approval branch (#405). That gap is older than these fixtures and is
+    pinned here, not changed.
+    """
+
+    FIXTURES = Path(__file__).parent / "fixtures"
+    DIALOGS = [
+        "single_question",
+        "preview",
+        "two_question_page1",
+        "two_question_page2",
+        "review_page",
+        "named_session_single",
+        "named_session_focus_type_something",
+        "named_session_focus_chat",
+        "named_session_typed_in_other",
+        "named_session_preview",
+        "named_session_two_question_preview_page1",
+        "named_session_two_question_preview_page2",
+        "review_page_named_session",
+    ]
+    READY = {
+        "idle": TerminalStatus.IDLE,
+        "finished_turn": TerminalStatus.COMPLETED,
+        "named_session_idle": TerminalStatus.COMPLETED,
+    }
+
+    @classmethod
+    def _frame(cls, name: str) -> list:
+        return (
+            (cls.FIXTURES / f"claude_code_896_herdr_{name}.txt")
+            .read_text(encoding="utf-8")
+            .split("\n")
+        )
+
+    @staticmethod
+    def _provider(mock_backend, *, dispatched: bool = False) -> ClaudeCodeProvider:
+        mock_backend.get_native_status.return_value = None
+        mock_backend.supports_event_inbox.return_value = False
+        mock_backend.get_history.return_value = ""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        if dispatched:
+            provider.mark_input_received()
+        return provider
+
+    @pytest.mark.parametrize("name", DIALOGS + ["plan_approval"])
+    @pytest.mark.parametrize("dispatched", [False, True])
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_dialog_is_waiting_user_answer_on_raw_path(self, mock_backend, name, dispatched):
+        frame = self._frame(name)
+        assert (
+            self._provider(mock_backend, dispatched=dispatched).get_status("\n".join(frame))
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    @pytest.mark.parametrize("name", DIALOGS)
+    @pytest.mark.parametrize("dispatched", [False, True])
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_dialog_is_waiting_user_answer_on_screen_path(self, mock_backend, name, dispatched):
+        frame = self._frame(name)
+        assert (
+            self._provider(mock_backend, dispatched=dispatched).get_status_from_screen(frame)
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_plan_approval_is_unknown_on_screen_path(self, mock_backend):
+        """Pre-existing gap (#405), pinned so a change to it is a decision."""
+        frame = self._frame("plan_approval")
+        assert self._provider(mock_backend).get_status_from_screen(frame) == TerminalStatus.UNKNOWN
+
+    @pytest.mark.parametrize("name", sorted(READY))
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_ready_pane_is_unchanged_on_both_paths(self, mock_backend, name):
+        frame = self._frame(name)
+        provider = self._provider(mock_backend)
+        assert provider.get_status("\n".join(frame)) == self.READY[name]
+        assert provider.get_status_from_screen(frame) == self.READY[name]
+
+    @pytest.mark.parametrize(
+        "footer",
+        [
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+            # Not captured here: the other navigate hints herdr's Claude Code
+            # manifest (2026.10.11.1, live_blocked_form) pairs with "enter to select".
+            "Enter to select · Arrow keys to navigate · Esc to cancel",
+            "Enter to select · arrows to navigate · Esc to cancel",
+            "Enter to select · ↑↓ to navigate · Esc to cancel",
+        ],
+    )
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_select_and_navigate_hints_paired_on_one_line_are_a_footer(self, mock_backend, footer):
+        frame = self._frame("two_question_page1")
+        captured = "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"
+        assert frame.count(captured) == 1
+        frame = [footer if row == captured else row for row in frame]
+        provider = self._provider(mock_backend)
+        assert provider.get_status("\n".join(frame)) == TerminalStatus.WAITING_USER_ANSWER
+        assert provider.get_status_from_screen(frame) == TerminalStatus.WAITING_USER_ANSWER
+
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            ["● Use Tab/Arrow keys to navigate between the questions."],
+            ["● Press Enter to select, then use the arrow keys to navigate."],
+            # The pairing split over two rows: a real footer is one row.
+            [
+                "● The footer reads Enter to select ·",
+                "  Tab/Arrow keys to navigate · Esc to cancel",
+            ],
+            ["● Review your answers", "  1. Submit answers", "  2. Cancel"],
+            [
+                "● The last page reads:",
+                "  Review your answers",
+                "  ❯ 1. Submit answers",
+                "    2. Cancel",
+            ],
+        ],
+        ids=["keys-only", "no-separator", "split-rows", "no-cursor", "quoted-page"],
+    )
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_new_wording_in_a_reply_above_the_input_box_is_completed(self, mock_backend, reply):
+        frame = self._frame("finished_turn")
+        top_rail = max(i for i, row in enumerate(frame) if row.startswith("────")) - 2
+        assert frame[top_rail + 1].startswith("❯")
+        frame = frame[:top_rail] + reply + frame[top_rail:]
+        provider = self._provider(mock_backend)
+        assert provider.get_status("\n".join(frame)) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_answered_review_page_left_in_the_transcript_is_completed(self, mock_backend):
+        """The page, then the reply that followed it: the screen has moved on."""
+        frame = self._frame("review_page")
+        while frame and not frame[-1].strip():
+            frame.pop()
+        frame += [
+            "",
+            "● Color: Red, Size: Small.",
+            "",
+            "✻ Sautéed for 3s · done 10:38 PM",
+            "",
+            "─" * 119,
+            "❯ ",
+            "─" * 119,
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        ]
+        provider = self._provider(mock_backend)
+        assert provider.get_status("\n".join(frame)) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED

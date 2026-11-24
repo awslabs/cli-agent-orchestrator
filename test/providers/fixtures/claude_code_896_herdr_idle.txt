@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.330
+▝▜██████▀  Sonnet 5 · Amazon Bedrock
+ ▝▝   ▝▝   ~/cao-896-live/work
+
+▎ Organization notice (scrubbed): line one of a managed startup banner......
+▎ Organization notice (scrubbed): line two of a managed startup banner................
+▎ Read more: https://example.com/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Sonnet 5 | Context: 0% | Uptime: 19h 45m
+  ⏵⏵ auto mode on (shift+tab to cycle)

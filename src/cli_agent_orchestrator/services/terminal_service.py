@@ -328,7 +328,16 @@ def _pane_shows_dialog_native_status_missed(
                 terminal_id,
             )
             return False
-        return provider.shows_user_answer_dialog(pane_text) is True
+        if provider.shows_user_answer_dialog(pane_text) is not True:
+            return False
+        # One line that only this check writes, so a hold by it can be told
+        # apart from a hold by the status guard. The pane itself is not logged.
+        logger.info(
+            "Native-status pane check held input to %s: a user-answer dialog is open "
+            "on screen that the backend's status did not report",
+            terminal_id,
+        )
+        return True
     except Exception as exc:
         logger.warning(
             "Could not read the pane of %s to check for an open dialog (%s); "
@@ -5377,14 +5386,23 @@ def redeliver_dropped_message_with_boundary(
         #
         # The pane check is here for the reason it is in ``dispatch_input``: on
         # a native-status backend that status can read ready with a dialog open.
-        if _dialog_blocks_orchestrated_input(
+        blocked_by_status = _dialog_blocks_orchestrated_input(
             provider, orchestration_type, status_monitor.get_status(terminal_id)
-        ) or _pane_shows_dialog_native_status_missed(terminal_id, provider, orchestration_type):
+        )
+        if blocked_by_status or _pane_shows_dialog_native_status_missed(
+            terminal_id, provider, orchestration_type
+        ):
             logger.warning(
                 "Delivery to %s is unsubmitted but the terminal is waiting on a user "
-                "answer; skipping the bare-Enter re-submit so it cannot answer the "
+                "answer%s; skipping the bare-Enter re-submit so it cannot answer the "
                 "dialog (attempt %d)",
                 terminal_id,
+                (
+                    ""
+                    if blocked_by_status
+                    else " (its reported status was ready; the native-status pane check "
+                    "found a dialog on screen)"
+                ),
                 attempt,
             )
             return False, None
@@ -6610,14 +6628,25 @@ def dispatch_input(
             # ``done`` reaches here as PROCESSING during the flush wait. It sits
             # before inject_memory_context so a refusal, which the inbox retries,
             # does not spend the terminal's one-time memory block.
-            if _dialog_blocks_orchestrated_input(
+            #
+            # Both refusals are the same exception type and reason, which is what
+            # callers branch on. The message says which of the two it was.
+            blocked_by_status = _dialog_blocks_orchestrated_input(
                 provider, orchestration_type, current_status
-            ) or _pane_shows_dialog_native_status_missed(
+            )
+            if blocked_by_status or _pane_shows_dialog_native_status_missed(
                 terminal_id, provider, orchestration_type, metadata
             ):
+                reported = getattr(current_status, "value", current_status)
                 raise TerminalInputBlockedError(
-                    f"Terminal {terminal_id} is waiting for a user answer. "
-                    "Use answer_user_prompt to submit a selection or approval before "
+                    f"Terminal {terminal_id} is waiting for a user answer"
+                    + (
+                        ". "
+                        if blocked_by_status
+                        else f": its reported status was {reported}, but a dialog is "
+                        "open on screen (native-status pane check). "
+                    )
+                    + "Use answer_user_prompt to submit a selection or approval before "
                     f"sending {orchestration_value} input.",
                     reason=TerminalInputBlockedReason.WAITING_USER_ANSWER,
                 )

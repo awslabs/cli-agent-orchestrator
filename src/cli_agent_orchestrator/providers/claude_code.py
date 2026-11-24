@@ -183,10 +183,62 @@ IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" pro
 # "↑/↓ to navigate" or "Enter to confirm ·". Anchored to the same-line "[ \t]*·[ \t]*Tab to amend"
 # chrome structure so completed prose mentioning "Esc to cancel" or "Tab to amend" without the
 # "·" separator does not false-match.
+#
+# Claude Code 2.1.330 multi-question AskUserQuestion pages without previews render the footer
+# "Enter to select · Tab/Arrow keys to navigate · Esc to cancel" (#896, captured live through
+# herdr: test/providers/fixtures/claude_code_896_herdr_two_question_page1.txt), which none of the
+# arms above match. The new arm does not match a bare "... to navigate" phrase: it requires the
+# select hint, the chrome separator and the navigate hint in that order on ONE line
+# ("Enter to select · <keys> to navigate"), the same same-line "[ \t]*·" anchoring as the
+# "Enter to confirm" and "Tab to amend" arms. That adjacency is the stable part of the footer
+# ("Esc to cancel" is not adjacent once "n to add notes" or "Tab to switch questions" sit between
+# them), and prose has to quote the whole footer to trip it, not just mention arrow keys.
+# "Tab/Arrow keys" is the captured wording. "Arrow keys", "Arrows" and "↑↓" are not captured
+# here: they are the other navigate hints herdr's own Claude Code detection manifest
+# (2026.10.11.1, rule live_blocked_form) pairs with "enter to select" for the same footer, and
+# they ride on the same anchor.
 WAITING_USER_ANSWER_PATTERN = (
     r"↑/↓ to navigate|Enter to confirm[ \t]*·|Esc to cancel[ \t]*·[ \t]*Tab to amend"
+    r"|Enter to select[ \t]*·[ \t]*(?:Tab/Arrow keys|[Aa]rrow keys|[Aa]rrows|↑↓) to navigate"
 )
 PLAN_APPROVAL_PATTERN = r"Would you like to proceed\?"
+# The last page of a multi-question AskUserQuestion (#896, Claude Code 2.1.330):
+#
+#   ←  ☒ Color  ☒ Size  ✔ Submit  →
+#
+#   Review your answers
+#
+#    ● Pick a color:
+#      → Red
+#    ● Pick a size:
+#      → Small
+#
+#   ❯ 1. Submit answers
+#     2. Cancel
+#
+# It has NO footer, so no arm of WAITING_USER_ANSWER_PATTERN can see it, and an Enter typed
+# into it submits the answers. Matched by structure, not by phrase (see
+# ``_review_answers_page_at_bottom``): the heading alone on a row, then the two choices as
+# consecutive numbered rows.
+REVIEW_ANSWERS_HEADING_PATTERN = re.compile(r"^[ \t]*Review your answers[ \t]*$")
+REVIEW_ANSWERS_SUBMIT_PATTERN = re.compile(
+    r"^[ \t]*(?:(?P<cursor>[❯>])[ \t]+)?1\.[ \t]+Submit answers[ \t]*$"
+)
+REVIEW_ANSWERS_CANCEL_PATTERN = re.compile(
+    r"^[ \t]*(?:(?P<cursor>[❯>])[ \t]+)?2\.[ \t]+Cancel[ \t]*$"
+)
+# A row that starts with the prompt glyph: the input box, or an echoed user turn.
+_PROMPT_ROW_PATTERN = re.compile(r"^[ \t]*[❯>](?:[\s\xa0]|$)")
+# How many NON-BLANK rows from the bottom the review page is looked for in. Counted in
+# non-blank rows, not screen rows, because the page keeps the height of the tallest question
+# page before it: in a named session the capture
+# (claude_code_896_herdr_review_page_named_session.txt) has 8 blank rows between "2. Cancel"
+# and the session-name rule under them, which puts the choices 10-11 rows and the heading 18
+# rows from the bottom, outside the 15 screen rows the plan-approval check reads, and a taller
+# preview would push them further. In non-blank rows the same capture needs 8 (heading, two
+# rows per question, two choices, the rule) and each further question adds two; a call may
+# carry four, so 12. 15 leaves three rows for anything drawn under the rule.
+_REVIEW_ANSWERS_BOTTOM_ROWS = 15
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
 # Bedrock model-upgrade nudge, e.g.
@@ -1409,6 +1461,39 @@ class ClaudeCodeProvider(BaseProvider):
         return False
 
     @staticmethod
+    def _review_answers_page_at_bottom(rows: List[str]) -> bool:
+        """Whether escape-free screen rows end in AskUserQuestion's "Review your answers" page.
+
+        Structure, all within the last ``_REVIEW_ANSWERS_BOTTOM_ROWS`` non-blank rows:
+
+        - "1. Submit answers" directly followed by "2. Cancel", each alone on its
+          row, and exactly one of the two carrying the selection cursor. A numbered
+          list an agent wrote has no cursor; a live Select always has exactly one.
+        - the heading "Review your answers", alone on a row, above them.
+        - below them no prompt row and no response marker: either means the screen
+          has moved on and the page is transcript, not a live dialog. The
+          session-name rule a named session draws under the page is neither.
+
+        Blank rows are dropped before counting; see ``_REVIEW_ANSWERS_BOTTOM_ROWS``.
+        """
+        region = [ln for ln in rows if ln.strip()][-_REVIEW_ANSWERS_BOTTOM_ROWS:]
+        for i in range(len(region) - 1, 0, -1):
+            submit = REVIEW_ANSWERS_SUBMIT_PATTERN.match(region[i - 1])
+            cancel = REVIEW_ANSWERS_CANCEL_PATTERN.match(region[i])
+            if submit and cancel:
+                break
+        else:
+            return False
+        if bool(submit.group("cursor")) == bool(cancel.group("cursor")):
+            return False
+        if not any(REVIEW_ANSWERS_HEADING_PATTERN.match(ln) for ln in region[: i - 1]):
+            return False
+        return not any(
+            _PROMPT_ROW_PATTERN.match(ln) or EXTRACTION_RESPONSE_PATTERN.search(ln)
+            for ln in region[i + 1 :]
+        )
+
+    @staticmethod
     def _user_answer_dialog_at_bottom(output: str) -> bool:
         """Whether escape-free pane text ends in a dialog only a user may answer.
 
@@ -1474,6 +1559,9 @@ class ClaudeCodeProvider(BaseProvider):
                         )
                 if has_option_markers and not sep_after_plan and not response_after_options:
                     return True
+            # AskUserQuestion "Review your answers": no footer either (#896).
+            if ClaudeCodeProvider._review_answers_page_at_bottom(lines):
+                return True
         return False
 
     def get_status(self, output: str) -> TerminalStatus:
@@ -1901,7 +1989,12 @@ class ClaudeCodeProvider(BaseProvider):
 
         bottom_joined = "\n".join(bottom)
         if (
-            re.search(WAITING_USER_ANSWER_PATTERN, bottom_joined)
+            (
+                re.search(WAITING_USER_ANSWER_PATTERN, bottom_joined)
+                # The "Review your answers" page has no footer (#896); the same
+                # structural check the raw path and the herdr pane check run.
+                or self._review_answers_page_at_bottom(rows)
+            )
             and not re.search(TRUST_PROMPT_PATTERN, joined)
             and not re.search(BYPASS_PROMPT_PATTERN, joined)
             and not re.search(MODEL_UPGRADE_PROMPT_PATTERN, joined)

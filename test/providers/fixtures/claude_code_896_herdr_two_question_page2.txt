@@ -1,0 +1,40 @@
+ ▐▛███▛█   Claude Code v2.1.330
+▝▜██████▀  Sonnet 5 · Amazon Bedrock
+ ▝▝   ▝▝   ~/cao-896-live/work
+
+▎ Organization notice (scrubbed): line one of a managed startup banner......
+▎ Organization notice (scrubbed): line two of a managed startup banner................
+▎ Read more: https://example.com/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+❯ Use the AskUserQuestion tool to ask me which of two options to pick (give two short options), then wait for my
+  answer. Do nothing else.
+
+● Answered Claude's questions:
+  ⎿  · Which option do you want to pick? → Option A
+
+● You picked Option A.
+
+✻ Worked for 5s · done 10:35 PM
+
+❯ VALIDATION-MARKER-1: reply with the word received
+
+● received
+
+✻ Cooked for 1s · done 10:35 PM
+
+❯ Use the AskUserQuestion tool ONCE, with TWO questions in that single call (question 1: pick a color, options Red or
+  Blue; question 2: pick a size, options Small or Large), then wait for my answers. Do nothing else.
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Color  ☐ Size  ✔ Submit  →
+
+Pick a size:
+
+❯ 1. Small
+     Small
+  2. Large
+     Large
+  3. Type something.
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
