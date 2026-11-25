@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assert, finish, hasTool, mkTmp, skip, test } from "./test/harness.mjs";
+import { assert, finish, hasTool, mkTmp, parallel, skip, test } from "./test/harness.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const INSTALL = join(here, "install.sh");
@@ -25,6 +25,10 @@ const BRAND_ASSETS = ["cao-mark-dark.svg", "cao-mark.svg"];
 const DRAWINGS = { side: MOD_ASSETS, tabs: TAB_ASSETS, brand: BRAND_ASSETS };
 const drawingsOf = (m) => DRAWINGS[m] ?? [];
 if (!hasTool("jq")) skip("install.test.mjs: jq is not installed");
+// Every case makes its own world (a scratch HOME, its own stubs) and shares nothing with another, and each runs the shell installer
+// several times, so the cases are spread over up to four processes (test/harness.mjs); CAO_WINDOW_TEST_WORKERS=1 runs them in one.
+// The time is mostly the programs the installer and the stubs start, so a host that starts programs slowly gains less from more workers.
+parallel(4);
 
 const STUB_HC = `#!/bin/sh
 D=$(dirname "$0")
