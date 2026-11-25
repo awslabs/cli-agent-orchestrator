@@ -160,19 +160,14 @@ export default function App() {
   return (
     <div className={`bg-[#0f0f14] text-gray-200 ${fullBleed ? 'h-screen flex flex-col overflow-hidden' : 'min-h-screen'}`}>
       {/* Header */}
-      {/* A labelled server also gets an amber accent (header strip and badge), so
-          it is told apart at a glance from an unlabelled UI, which keeps today's green. */}
-      <header
-        className={`border-b border-gray-800 bg-gray-900/80 backdrop-blur-xs sticky top-0 z-40 ${instanceLabel ? 'border-t-4 border-t-amber-400' : ''}`}
-        data-instance-labelled={instanceLabel ? 'true' : undefined}
-      >
+      <header className="border-b border-gray-800 bg-gray-900/80 backdrop-blur-xs sticky top-0 z-40">
         <div className="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <CaoMark size={32} />
             <h1 className="text-lg font-bold text-white">{APP_TITLE}</h1>
             {instanceLabel && (
               <span
-                className="max-w-xs truncate rounded-md border border-amber-400/70 bg-amber-500/15 px-2.5 py-0.5 text-lg font-bold text-amber-300"
+                className="max-w-xs truncate rounded-md border border-amber-400/70 bg-amber-500/15 px-2.5 text-lg font-bold text-amber-300"
                 title={instanceLabel}
                 data-testid="instance-label"
               >

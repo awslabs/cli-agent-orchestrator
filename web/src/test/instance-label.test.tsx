@@ -39,8 +39,6 @@ describe('instance label', () => {
     render(<App />)
     await waitFor(() => expect(screen.getByTestId('instance-label')).toHaveTextContent('Cluster Mode'))
     expect(screen.getByRole('banner')).toContainElement(screen.getByTestId('instance-label'))
-    // The accent: a labelled UI must not look like an unlabelled one at a glance.
-    expect(screen.getByRole('banner')).toHaveAttribute('data-instance-labelled', 'true')
     expect(document.title).toBe('Cluster Mode · CLI Agent Orchestrator')
   })
 
@@ -56,7 +54,6 @@ describe('instance label', () => {
     await waitFor(() => expect(fetchMock.mock.calls.some(([u]) => String(u).includes('/health'))).toBe(true))
     await act(async () => {})
     expect(screen.queryByTestId('instance-label')).toBeNull()
-    expect(screen.getByRole('banner')).not.toHaveAttribute('data-instance-labelled')
     expect(document.title).toBe('CLI Agent Orchestrator')
   })
 
