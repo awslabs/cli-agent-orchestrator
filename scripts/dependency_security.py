@@ -98,7 +98,7 @@ New CLI options: ``--policy FILE`` (default ``<repo>/.github/dependency-security
 when passed explicitly a missing file is exit 2, when only the default is missing the checks
 that need it are skipped with a warning), ``--base-rev REV`` (default env
 ``CAO_DEPSEC_BASE_REV``; the base commit whose lockfiles and ignore-file history are compared;
-with ``GITHUB_EVENT_NAME=pull_request`` and no base the run is exit 2), ``--baseline FILE``
+with ``GITHUB_EVENT_NAME=pull_request`` or ``merge_group`` and no base the run is exit 2), ``--baseline FILE``
 (default ``.github/dependency-security/shipped-baseline.json``; must be inside the repository
 root, because the base revision's copy is read from git at the same relative path),
 ``--write-baseline`` (write the
@@ -431,7 +431,7 @@ def scan(
     producers run against the real build output and any failure is an ``error``.
     ``policy`` enables the completeness and sentinel checks, ``base_rev`` the
     new-with-a-fix tier, the git dating of ignore entries and the baseline comparison;
-    ``require_base`` makes a missing ``base_rev`` an error (pull-request runs).
+    ``require_base`` makes a missing ``base_rev`` an error (PR and merge-group runs).
     """
     hashes = {}
     today = today or datetime.now(timezone.utc).date()
@@ -497,7 +497,7 @@ def scan(
             verify_sentinels(inventory, policy)
         if require_base and not base_rev:
             raise BaseUnavailableError(
-                "a pull-request run needs the base revision (--base-rev or CAO_DEPSEC_BASE_REV)"
+                "a pull-request or merge-group run needs the base revision (--base-rev or CAO_DEPSEC_BASE_REV)"
             )
         ignore_path = ignore_file or root / ".github" / "dependency-security" / "trivyignore.yaml"
         ignores = load_ignore_file(ignore_path, today)
@@ -1521,7 +1521,7 @@ def main(argv: list[str] | None = None) -> int:
     document_error = None
     policy = None
     base_rev = args.base_rev or os.environ.get("CAO_DEPSEC_BASE_REV") or None
-    require_base = os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
+    require_base = os.environ.get("GITHUB_EVENT_NAME") in {"pull_request", "merge_group"}
     policy_path = args.policy or root / DEFAULT_POLICY
     if args.policy is not None or policy_path.is_file():
         try:

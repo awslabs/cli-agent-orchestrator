@@ -18,10 +18,24 @@ from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 
 
 @pytest.fixture
-def backend():
+def backend(tmp_path):
     # Patch os.path.exists so _ensure_session_running finds the socket immediately,
     # avoiding the 5-second poll timeout in unit tests.
-    with patch("cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True):
+    #
+    # focus_web_input takes the herdr session's focus lock, and the real path is
+    # <tempdir>/cao-herdr-web-view-<uid>/cao/focus.lock: one file shared by every
+    # pytest-xdist worker on the machine (and by a real cao-server or web view).
+    # While another worker's focus test held it, this one polled with the module's
+    # mocked time.sleep(0.02) and failed assert_not_called (CI, #1408). A lock
+    # file of this test's own keeps the real locking code under test.
+    lock_path = str(tmp_path / "focus.lock")
+    with (
+        patch("cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True),
+        patch(
+            "cli_agent_orchestrator.backends.herdr_web_view.focus_lock_path",
+            return_value=lock_path,
+        ),
+    ):
         backend = HerdrBackend(send_delay_ms=0)
         yield backend
     backend.release_web_input("")  # a focus test's lock, so the next test can take it
@@ -83,6 +97,19 @@ class TestHerdrBackendABC:
 
 
 # --- Command Construction ---
+
+
+def _module_time() -> MagicMock:
+    """A ``time`` stand-in for ``herdr_backend`` alone: real clock, mocked ``sleep``.
+
+    Patching ``herdr_backend.time.sleep`` replaces the process-wide ``time.sleep``, so
+    a thread still sleeping from another test in the same worker (a CI run saw five
+    ``sleep(0.02)`` calls) was counted by ``assert_not_called``. Replacing
+    the module's own ``time`` name leaves every other module's ``time.sleep`` real.
+    """
+    fake = MagicMock(wraps=time)
+    fake.sleep = MagicMock()
+    return fake
 
 
 class TestHerdrBackendCommands:
@@ -175,8 +202,8 @@ class TestHerdrBackendCommands:
             }
         )
 
-    @patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep")
-    def test_focus_web_input_focuses_and_settles_when_elsewhere(self, mock_sleep, backend):
+    @patch("cli_agent_orchestrator.backends.herdr_backend.time", new_callable=_module_time)
+    def test_focus_web_input_focuses_and_settles_when_elsewhere(self, mock_time, backend):
         """A focus change is followed by a settle wait, so the next key is not lost."""
         target = json.dumps(["cao-test", "developer-abcd"])
         with (
@@ -190,10 +217,10 @@ class TestHerdrBackendCommands:
             backend.focus_web_input(target)
 
         assert run.call_args_list[-1].args[0] == ["tab", "focus", "w1:t2"]
-        mock_sleep.assert_called_once()
+        mock_time.sleep.assert_called_once()
 
-    @patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep")
-    def test_focus_web_input_skips_when_already_focused(self, mock_sleep, backend):
+    @patch("cli_agent_orchestrator.backends.herdr_backend.time", new_callable=_module_time)
+    def test_focus_web_input_skips_when_already_focused(self, mock_time, backend):
         """Typing into the focused tab costs no focus command and no wait."""
         target = json.dumps(["cao-test", "developer-abcd"])
         with (
@@ -205,7 +232,7 @@ class TestHerdrBackendCommands:
             backend.focus_web_input(target)
 
         assert run.call_count == 1
-        mock_sleep.assert_not_called()
+        mock_time.sleep.assert_not_called()
 
     def test_focus_web_input_rejects_malformed_target(self, backend):
         with pytest.raises(TerminalBackendError):
