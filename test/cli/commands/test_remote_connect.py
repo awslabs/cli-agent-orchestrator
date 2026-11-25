@@ -226,6 +226,98 @@ def test_host_key_validation_rejects_invalid_values(value):
         parse_host_key(value)
 
 
+def test_host_key_accepts_comment_but_pins_only_key(box, tmp_path):
+    assert parse_host_key("ssh-ed25519 c2FmZS1rZXk= root@host") == "ssh-ed25519 c2FmZS1rZXk="
+    assert parse_host_key("ssh-ed25519 c2FmZS1rZXk=") == "ssh-ed25519 c2FmZS1rZXk="
+
+
+def test_run_command_parameters_are_json(box, tmp_path):
+    runner = FakeRunner()
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    (ssh / "cao-box-1_ed25519.pub").write_text(
+        "ssh-ed25519 cHVibGljLWtleQ== workstation", encoding="utf-8"
+    )
+    install_public_key(box, runner, tmp_path)
+    command = next(argv for argv in runner.argv if "send-command" in argv)
+    parameters = json.loads(command[command.index("--parameters") + 1])
+    assert len(parameters["commands"]) == 1
+    assert "runuser -u" in parameters["commands"][0]
+
+
+def test_unreachable_probe_exits_one_without_ready(box, tmp_path, monkeypatch):
+    monkeypatch.setattr("cli_agent_orchestrator.services.remote.connect.check_box", lambda *_: [])
+    runner = FakeRunner()
+    original = runner.run
+
+    def unreachable(argv, timeout=15.0):
+        if argv[0] == "ssh" and "true" in argv:
+            return RunResult(255, stderr="Connection refused")
+        return original(argv, timeout)
+
+    monkeypatch.setattr(runner, "run", unreachable)
+    messages = []
+    assert connect(box, runner, tmp_path, lambda _: True, messages.append, no_attach=True) == 1
+    assert any(line.startswith("FIX  ssh:") for line in messages)
+    assert "Ready:" not in messages
+
+
+@pytest.mark.parametrize("failed_command", ["aws", "ssh-keygen"])
+def test_failed_interactive_setup_exits_one(box, tmp_path, monkeypatch, failed_command):
+    from cli_agent_orchestrator.services.remote.checks import Check
+
+    checks = [Check("FIX", "aws-login", "login")] if failed_command == "aws" else []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.remote.connect.check_box", lambda *_: checks
+    )
+    runner = FakeRunner()
+
+    def failed(argv):
+        runner.interactive.append(tuple(argv))
+        return RunResult(7)
+
+    monkeypatch.setattr(runner, "run_interactive", failed)
+    assert connect(box, runner, tmp_path, lambda _: True, lambda _: None) == 1
+    assert len(runner.interactive) == 1
+
+
+def test_declined_prompt_exits_one(box, tmp_path, monkeypatch):
+    monkeypatch.setattr("cli_agent_orchestrator.services.remote.connect.check_box", lambda *_: [])
+    assert connect(box, FakeRunner(), tmp_path, lambda _: False, lambda _: None) == 1
+
+
+def test_attach_exit_code_is_forwarded(box, tmp_path, monkeypatch):
+    monkeypatch.setattr("cli_agent_orchestrator.services.remote.connect.check_box", lambda *_: [])
+    runner = FakeRunner()
+    original = runner.run_interactive
+
+    def attach_failure(argv):
+        if argv[0] == "herdr":
+            return RunResult(17)
+        return original(argv)
+
+    monkeypatch.setattr(runner, "run_interactive", attach_failure)
+    assert connect(box, runner, tmp_path, lambda _: True, lambda _: None) == 17
+
+
+def test_rekey_shows_fingerprints_and_asks_again(box, tmp_path, monkeypatch):
+    monkeypatch.setattr("cli_agent_orchestrator.services.remote.connect.check_box", lambda *_: [])
+    known = tmp_path / ".ssh" / "cao_known_hosts"
+    known.parent.mkdir()
+    known.write_text("cao-box-1 ssh-ed25519 b2xkLWtleQ==\n", encoding="utf-8")
+    actions = []
+    messages = []
+
+    def ask(action):
+        actions.append(action)
+        return "Replace changed" not in action
+
+    assert connect(box, FakeRunner(), tmp_path, ask, messages.append, rekey=True) == 1
+    assert len([action for action in actions if "host key" in action.lower()]) >= 2
+    assert any("SHA256:" in message for message in messages)
+    assert known.read_text(encoding="utf-8") == "cao-box-1 ssh-ed25519 b2xkLWtleQ==\n"
+
+
 def test_host_key_changed_stops_then_rekeys(box, tmp_path):
     ssh = tmp_path / ".ssh"
     ssh.mkdir()
@@ -244,6 +336,56 @@ def test_connect_no_consent_leaves_files_unchanged(box, tmp_path, monkeypatch):
     connect(box, runner, tmp_path, lambda _: False, messages.append, no_attach=True)
     assert not (tmp_path / ".ssh").exists()
     assert not runner.interactive
+
+
+@pytest.mark.parametrize("declined", ["login", "key", "config", "pin", "install"])
+def test_each_declined_action_preserves_its_artifacts(box, tmp_path, monkeypatch, declined):
+    from cli_agent_orchestrator.services.remote.checks import Check
+
+    checks = [Check("FIX", "aws-login", "login")] if declined == "login" else []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.remote.connect.check_box", lambda *_: checks
+    )
+    ssh = tmp_path / ".ssh"
+    if declined in {"config", "pin", "install"}:
+        ssh.mkdir()
+        (ssh / "cao-box-1_ed25519").write_text("private", encoding="utf-8")
+        (ssh / "cao-box-1_ed25519.pub").write_text(
+            "ssh-ed25519 cHVibGljLWtleQ== workstation", encoding="utf-8"
+        )
+    runner = FakeRunner()
+    if declined == "install":
+        original_run = runner.run
+
+        def denied(argv, timeout=15.0):
+            if argv[0] == "ssh" and "true" in argv:
+                return RunResult(255, stderr="Permission denied (publickey).")
+            return original_run(argv, timeout)
+
+        monkeypatch.setattr(runner, "run", denied)
+    prefixes = {
+        "login": "Run aws sso login",
+        "key": "Create SSH key",
+        "config": "Update managed SSH entries",
+        "pin": "Pin host key",
+        "install": "Install SSH public key",
+    }
+    assert (
+        connect(
+            box,
+            runner,
+            tmp_path,
+            lambda action: not action.startswith(prefixes[declined]),
+            lambda _: None,
+            no_attach=True,
+        )
+        == 1
+    )
+    if declined in {"login", "key", "config"}:
+        assert not (ssh / "config").exists()
+    if declined == "pin":
+        assert not (ssh / "cao_known_hosts").exists()
+    assert not any("authorized_keys" in " ".join(argv) for argv in runner.argv)
 
 
 def test_connect_no_attach_writes_and_reports_ready(box, tmp_path, monkeypatch):
@@ -276,6 +418,14 @@ def test_attach_argv_per_mode(box):
         "tmux",
         "attach",
     ]
+
+
+def test_probe_disables_agent_forwarding(box, tmp_path, monkeypatch):
+    monkeypatch.setattr("cli_agent_orchestrator.services.remote.connect.check_box", lambda *_: [])
+    runner = FakeRunner()
+    assert connect(box, runner, tmp_path, lambda _: True, lambda _: None, no_attach=True) == 0
+    probe = next(argv for argv in runner.argv if argv[0] == "ssh" and "true" in argv)
+    assert probe[probe.index("-o") + 1] == "ForwardAgent=no"
 
 
 def test_allowlist_uses_no_private_key_read_or_raw_public_key(box, tmp_path, monkeypatch):
@@ -408,11 +558,14 @@ def test_remove_ssh_artifacts_preserves_other_blocks_and_is_idempotent(box, tmp_
         handle.write(other)
     known = ssh / "cao_known_hosts"
     known.write_text(
-        "cao-box-1 ssh-ed25519 c2FmZQ==\nother ssh-ed25519 b3RoZXI=\n", encoding="utf-8"
+        "cao-box-1 ssh-ed25519 c2FmZQ==\ncao-box-10 ssh-ed25519 c2FmZQ==\nother ssh-ed25519 b3RoZXI=\n",
+        encoding="utf-8",
     )
     assert remove_ssh_artifacts(box, tmp_path)
     assert config.read_text(encoding="utf-8") == other
-    assert known.read_text(encoding="utf-8") == "other ssh-ed25519 b3RoZXI=\n"
+    assert known.read_text(encoding="utf-8") == (
+        "cao-box-10 ssh-ed25519 c2FmZQ==\nother ssh-ed25519 b3RoZXI=\n"
+    )
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
     assert stat.S_IMODE(known.stat().st_mode) == 0o600
     assert not remove_ssh_artifacts(box, tmp_path)
@@ -446,6 +599,36 @@ def test_remote_remove_cleanup_requires_consent(
     )
     monkeypatch.setattr("cli_agent_orchestrator.cli.commands.remote.Path.home", lambda: tmp_path)
     result = CliRunner().invoke(cli, ["remote", "remove", box.name, *arguments], input=input_text)
-    assert result.exit_code == 0
-    assert calls[0] == "remove"
-    assert (len(calls) == 2) is expected_cleanup
+    assert result.exit_code == (0 if expected_cleanup else 1)
+    if expected_cleanup:
+        assert calls == [(box, tmp_path), "remove"]
+    else:
+        assert not calls
+
+
+def test_remote_remove_no_input_keeps_registration_and_entries(box, tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.remote import registry
+
+    monkeypatch.setattr(registry, "CAO_HOME_DIR", tmp_path / "cao")
+    monkeypatch.setattr("cli_agent_orchestrator.cli.commands.remote.Path.home", lambda: tmp_path)
+    registry.save(box)
+    update_ssh_config(box, tmp_path)
+    config = tmp_path / ".ssh" / "config"
+    before = config.read_bytes()
+    result = CliRunner().invoke(cli, ["remote", "remove", box.name], input="")
+    assert result.exit_code == 1
+    assert registry.load(box.name) == box
+    assert config.read_bytes() == before
+
+
+def test_runtime_connect_error_is_exit_one(box, tmp_path, monkeypatch):
+    monkeypatch.setattr("cli_agent_orchestrator.cli.commands.remote.load", lambda _: box)
+
+    def failure(*args, **kwargs):
+        raise ConnectError("SSM Run Command failed")
+
+    monkeypatch.setattr("cli_agent_orchestrator.cli.commands.remote.connect", failure)
+    result = CliRunner().invoke(cli, ["remote", "connect", box.name, "--yes"])
+    assert result.exit_code == 1
+    assert "SSM Run Command failed" in result.output
+    assert "Usage:" not in result.output

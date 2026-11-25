@@ -64,7 +64,7 @@ _COMMANDS: tuple[tuple[str, str, str, str, bool], ...] = (
         "remote",
         _PKG + "remote",
         "remote",
-        "Register and check experimental Remote CAO boxes.",
+        "Register, check and connect to experimental Remote CAO boxes.",
         False,
     ),
     ("schedule", _PKG + "schedule", "schedule", "Manage scheduled agent flows.", False),

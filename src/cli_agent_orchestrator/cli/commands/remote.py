@@ -1,4 +1,4 @@
-"""Experimental, read-only Remote CAO prerequisites."""
+"""Experimental Remote CAO registration, checks and consent-gated connect."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from cli_agent_orchestrator.services.remote.runner import Runner
 
 @click.group()
 def remote() -> None:
-    """Register and check experimental Remote CAO boxes."""
+    """Register, check and connect to experimental Remote CAO boxes."""
 
 
 @remote.command("add")
@@ -67,16 +67,17 @@ def remove_cmd(box: str, yes: bool) -> None:
     """Remove a local Remote CAO box registration."""
     try:
         remote_box = load(box)
+        home = Path.home()
+        if has_ssh_artifacts(remote_box, home):
+            action = f"Remove managed SSH entries for cao-{remote_box.name}"
+            click.echo(action)
+            if not (yes or click.confirm(f"{action}?", default=False)):
+                raise click.exceptions.Exit(1)
+            remove_ssh_artifacts(remote_box, home)
         remove(remote_box.name)
     except RemoteConfigError as exc:
         raise click.UsageError(str(exc)) from exc
     click.echo(f"Removed remote box '{box}'.")
-    home = Path.home()
-    if has_ssh_artifacts(remote_box, home):
-        action = f"Remove managed SSH entries for cao-{remote_box.name}"
-        click.echo(action)
-        if yes or click.confirm(f"{action}?", default=False):
-            remove_ssh_artifacts(remote_box, home)
 
 
 @remote.command("check")
@@ -106,7 +107,7 @@ def connect_cmd(box: str, no_attach: bool, yes: bool, rekey: bool) -> None:
     """Set up an experimental Remote CAO connection after confirmation."""
     try:
         remote_box = load(box)
-        connect(
+        status = connect(
             remote_box,
             runner=Runner(),
             home=Path.home(),
@@ -115,5 +116,10 @@ def connect_cmd(box: str, no_attach: bool, yes: bool, rekey: bool) -> None:
             no_attach=no_attach,
             rekey=rekey,
         )
-    except (RemoteConfigError, ConnectError) as exc:
+        if status:
+            raise click.exceptions.Exit(status)
+    except RemoteConfigError as exc:
         raise click.UsageError(str(exc)) from exc
+    except ConnectError as exc:
+        click.echo(str(exc), err=True)
+        raise click.exceptions.Exit(1) from exc

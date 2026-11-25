@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -20,7 +21,7 @@ Ask = Callable[[str], bool]
 Tell = Callable[[str], None]
 MARKER = "# >>> cao remote: {host} (managed by CAO; edits are replaced) >>>"
 END_MARKER = "# <<< cao remote: {host} (managed by CAO; edits are replaced) <<<"
-HOST_KEY_RE = re.compile(r"^ssh-ed25519 ([A-Za-z0-9+/]+={0,2})$")
+HOST_KEY_RE = re.compile(r"^ssh-ed25519 ([A-Za-z0-9+/]+={0,2})(?: [^\r\n]+)?$")
 PUBLIC_KEY_RE = re.compile(r"^ssh-ed25519 ([A-Za-z0-9+/]+={0,2})(?: [^\r\n]+)?$")
 
 
@@ -162,7 +163,7 @@ def parse_host_key(value: str) -> str:
         base64.b64decode(match.group(1), validate=True)
     except ValueError as exc:
         raise ConnectError("SSM returned an invalid ed25519 host key") from exc
-    return lines[0]
+    return f"ssh-ed25519 {match.group(1)}"
 
 
 def parse_public_key(value: str) -> str:
@@ -198,7 +199,7 @@ def _run_command(runner: Runner, box: RemoteBox, command: str, timeout: float = 
             "--instance-ids",
             box.instance_id,
             "--parameters",
-            f"commands={command}",
+            json.dumps({"commands": [command]}),
             "--profile",
             box.aws_profile,
             "--region",
@@ -242,7 +243,19 @@ def _run_command(runner: Runner, box: RemoteBox, command: str, timeout: float = 
     raise ConnectError("SSM Run Command timed out")
 
 
-def ensure_host_key(box: RemoteBox, runner: Runner, home: Path, rekey: bool = False) -> bool:
+def _fingerprint(key: str) -> str:
+    digest = hashlib.sha256(base64.b64decode(key.split()[-1])).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def ensure_host_key(
+    box: RemoteBox,
+    runner: Runner,
+    home: Path,
+    rekey: bool = False,
+    ask: Ask | None = None,
+    tell: Tell | None = None,
+) -> bool:
     """Pin one SSM-obtained key, refusing an unexpected replacement."""
     path = home / ".ssh" / "cao_known_hosts"
     host = f"cao-{box.name}"
@@ -254,6 +267,11 @@ def ensure_host_key(box: RemoteBox, runner: Runner, home: Path, rekey: bool = Fa
         return False
     if matching and not rekey:
         raise ConnectError(f"host key for {host} changed; rerun with --rekey after verification")
+    if matching and rekey and tell is not None and ask is not None:
+        tell(f"Old host key fingerprint for {host}: {_fingerprint(matching[0])}")
+        tell(f"New host key fingerprint for {host}: {_fingerprint(desired)}")
+        if not ask(f"Replace changed host key for {host}"):
+            raise ConnectError(f"host key replacement for {host} declined")
     lines = [line for line in old.splitlines() if not line.startswith(f"{host} ")]
     lines.append(desired)
     _atomic_write(path, "\n".join(lines) + "\n")
@@ -346,37 +364,52 @@ def connect(
     tell: Tell,
     no_attach: bool = False,
     rekey: bool = False,
-) -> None:
+) -> int:
     """Run checks, perform approved setup, then attach or print instructions."""
     checks = check_box(box, runner, home)
     for check in checks:
         tell(check.rendered())
+    if any(
+        check.status == "FIX" and check.name not in {"aws-login", "ssh-key", "ssh-config", "ssh"}
+        for check in checks
+    ):
+        return 1
     if any(check.name == "aws-login" and check.status == "FIX" for check in checks):
         action = f"Run aws sso login --profile {box.aws_profile}"
         tell(action)
         if not ask(action):
-            return
-        runner.run_interactive(["aws", "sso", "login", "--profile", box.aws_profile])
+            return 1
+        if runner.run_interactive(["aws", "sso", "login", "--profile", box.aws_profile]).returncode:
+            tell("FIX  aws-login: SSO login failed")
+            return 1
     key = home / ".ssh" / f"cao-{box.name}_ed25519"
     if not key.exists():
         action = f"Create SSH key {key.name}"
         tell(action)
         if not ask(action):
-            return
+            return 1
         key.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        runner.run_interactive(
+        if runner.run_interactive(
             ["ssh-keygen", "-t", "ed25519", "-f", str(key), "-C", f"cao-{box.name}"]
-        )
+        ).returncode:
+            tell("FIX  ssh key: ssh-keygen failed")
+            return 1
     action = f"Update managed SSH entries for cao-{box.name}"
     tell(action)
     if not ask(action):
-        return
+        return 1
     update_ssh_config(box, home)
     action = f"Pin host key for cao-{box.name} from SSM"
     tell(action)
     if not ask(action):
-        return
-    ensure_host_key(box, runner, home, rekey)
+        return 1
+    try:
+        ensure_host_key(box, runner, home, rekey, ask, tell)
+    except ConnectError as exc:
+        if "declined" in str(exc):
+            tell(f"FIX  host key: {exc}")
+            return 1
+        raise
     ssh = runner.run(
         ["ssh", "-o", "ForwardAgent=no", "-o", "BatchMode=yes", f"cao-{box.name}", "true"]
     )
@@ -384,26 +417,38 @@ def connect(
         public_path = home / ".ssh" / f"cao-{box.name}_ed25519.pub"
         if not public_path.exists():
             tell(f"FIX  ssh key: public key {public_path.name} is missing")
-            return
+            return 1
         public_key = parse_public_key(public_path.read_text(encoding="utf-8"))
         tell(f"BOX_SSH_PUBLIC_KEY='{public_key}'")
         action = f"Install SSH public key for {box.user} through SSM Run Command"
         tell(action)
         if not ask(action):
-            return
+            return 1
         try:
             install_public_key(box, runner, home)
         except ConnectError as exc:
             tell(f"FIX  ssh key: {exc}")
-            return
+            return 1
         checks = check_box(box, runner, home)
         for check in checks:
             if check.name == "ssh":
                 tell(check.rendered())
                 if check.status == "FIX":
-                    return
+                    return 1
+        ssh = runner.run(
+            ["ssh", "-o", "ForwardAgent=no", "-o", "BatchMode=yes", f"cao-{box.name}", "true"]
+        )
+    if ssh.returncode:
+        tell("FIX  ssh: connection failed")
+        return 1
+    final_checks = check_box(box, runner, home)
+    if any(check.status == "FIX" for check in final_checks):
+        for check in final_checks:
+            if check.status == "FIX":
+                tell(check.rendered())
+        return 1
     if no_attach:
         for line in ready_lines(box):
             tell(line)
-        return
-    runner.run_interactive(attach_argv(box))
+        return 0
+    return runner.run_interactive(attach_argv(box)).returncode

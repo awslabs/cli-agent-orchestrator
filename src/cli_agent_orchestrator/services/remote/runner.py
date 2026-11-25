@@ -28,10 +28,11 @@ _AMBIENT_AWS_CREDENTIALS = frozenset(
 )
 
 
-def _clean_env() -> dict[str, str]:
+def _clean_env(locale: bool = True) -> dict[str, str]:
     # Keep PATH, SSH_AUTH_SOCK, proxy and CA settings: the user's tools live outside os.defpath.
     env = {key: value for key, value in os.environ.items() if key not in _AMBIENT_AWS_CREDENTIALS}
-    env.update(LANG="C", LC_ALL="C")
+    if locale:
+        env.update(LANG="C", LC_ALL="C")
     return env
 
 
@@ -57,7 +58,7 @@ class Runner:
     def run_interactive(self, argv: Sequence[str]) -> RunResult:
         """Run an explicitly approved command on the caller's terminal."""
         try:
-            completed = subprocess.run(list(argv), check=False, env=_clean_env())
+            completed = subprocess.run(list(argv), check=False, env=_clean_env(locale=False))
         except OSError as exc:
             return RunResult(1, stderr=type(exc).__name__)
         return RunResult(completed.returncode)

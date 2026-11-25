@@ -406,6 +406,8 @@ def test_interactive_runner_drops_ambient_aws_credentials(monkeypatch):
     for name in names:
         monkeypatch.setenv(name, "ambient-canary")
     monkeypatch.setenv("SSH_AUTH_SOCK", "ssh-marker")
+    monkeypatch.setenv("LANG", "fr_FR.UTF-8")
+    monkeypatch.setenv("LC_ALL", "fr_FR.UTF-8")
     captured = {}
 
     def capture(argv, **kwargs):
@@ -418,7 +420,7 @@ def test_interactive_runner_drops_ambient_aws_credentials(monkeypatch):
     assert "stdin" not in captured and "stdout" not in captured
     env = captured["env"]
     assert all(name not in env for name in names)
-    assert env["LANG"] == env["LC_ALL"] == "C"
+    assert env["LANG"] == env["LC_ALL"] == "fr_FR.UTF-8"
     assert env["SSH_AUTH_SOCK"] == "ssh-marker"
 
 
