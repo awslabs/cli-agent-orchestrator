@@ -57,7 +57,7 @@ case $LAUNCHER_NAME in ''|.|..|*/*) die 2 "the manifest's launcher value is not 
 case $BIN_DIR in /*) ;; *) die 2 "the manifest does not give an absolute path for the launcher; nothing was changed" ;; esac
 LAUNCHER=$BIN_DIR/$LAUNCHER_NAME
 # The app copy (CAO.app) is removed only when it is what install.sh made: an absolute path to a folder named *.app (not a
-# link) whose Info.plist carries our key. The path comes from the manifest, so it is checked here, before anything is
+# link) whose Info.plist carries our key or that holds our marker file. The path comes from the manifest, so it is checked here, before anything is
 # changed, and again just before the removal. A path that fails is never touched and never globbed.
 APP_COPY=$(jq -r 'if (.appCopy | type) == "object" and (.appCopy.path | type) == "string" then .appCopy.path else "" end' "$MANIFEST")
 if [ -n "$APP_COPY" ]; then
@@ -67,8 +67,8 @@ if [ -n "$APP_COPY" ]; then
     esac
     [ -z "${APP_COPY_BAD:-}" ] || die 2 "the manifest's appCopy path is not an absolute path to a folder named *.app: $APP_COPY; nothing was changed"
     if [ -e "$APP_COPY" ] || [ -L "$APP_COPY" ]; then
-        app_copy_mark "$APP_COPY" >/dev/null \
-            || die 2 "the manifest names $APP_COPY as the app copy, but it is not a folder whose Info.plist has $COPY_MARK_KEY (not a copy install.sh made); nothing was changed"
+        app_copy_is_ours "$APP_COPY" \
+            || die 2 "the manifest names $APP_COPY as the app copy, but it is not a folder whose Info.plist has $COPY_MARK_KEY or that holds $COPY_MARKER_FILE (not a copy install.sh made); nothing was changed"
     fi
 fi
 
@@ -104,11 +104,20 @@ elif [ -e "$LAUNCHER" ]; then
 else
     echo "uninstall: warning: the launcher $LAUNCHER named in the manifest was not found; nothing to remove there" >&2
 fi
+# An earlier install.sh left a backup of a changed launcher next to it, as <launcher>.bak-<epoch>, where PATH finds it; it now
+# keeps those in the window's home. A backup that is a regular file with the header line is ours and goes; the user's own file
+# of that name stays.
+for backup in "$BIN_DIR"/*; do
+    case $backup in "$LAUNCHER".bak-*) ;; *) continue ;; esac
+    [ -f "$backup" ] && [ ! -L "$backup" ] || continue
+    grep -qxF -- "$LAUNCHER_MARK" "$backup" 2>/dev/null || continue
+    rm -f -- "$backup" && echo "uninstall: removed $backup"
+done
 # The app copy goes before the home does, so a failure leaves the manifest that names it and a rerun can finish. It is
 # removed, not moved aside like the home: it holds nothing of the user's, and a rerun of install.sh builds it again.
 if [ -n "$APP_COPY" ]; then
     if [ -e "$APP_COPY" ] || [ -L "$APP_COPY" ]; then
-        app_copy_mark "$APP_COPY" >/dev/null || die 1 "$APP_COPY is no longer a copy install.sh made; it was left in place, and so was the window's home"
+        app_copy_is_ours "$APP_COPY" || die 1 "$APP_COPY is no longer a copy install.sh made; it was left in place, and so was the window's home"
         rm -r -- "$APP_COPY" || die 1 "cannot remove $APP_COPY; the window's home was left in place, fix that and run uninstall again"
         echo "uninstall: removed $APP_COPY"
     else

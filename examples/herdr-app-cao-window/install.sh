@@ -168,6 +168,20 @@ if [ -n "${HERDR_APP_HOME:-}" ]; then
 fi
 if contains "$HOME_DIR" "$(canon "$HOME")"; then refuse_home "it is or holds your home folder"; fi
 if contains "$HOME_DIR" "$BIN_DIR"; then refuse_home "it is or holds the launcher folder ($BIN_DIR)"; fi
+# The install sets the home to mode 700 and uninstall renames it, so a folder that already holds other things (a typo for
+# ~/Documents) is refused. An empty or missing folder is fine, and so is one this installer made: it holds the manifest, or
+# the layout a first run wrote before it was stopped (the manifest is written last).
+if [ -d "$HOME_DIR" ] && [ -n "$(ls -A -- "$HOME_DIR" 2>/dev/null)" ] \
+    && [ ! -f "$HOME_DIR/cao-window-install.json" ] && [ ! -f "$HOME_DIR/layouts/cao-window.json" ]; then
+    refuse_home "it is not empty and holds no cao-window-install.json, so it is not a home this installer made; use an empty or new folder. Nothing was written"
+fi
+# What the last run asked for, read before this run writes its own manifest: the machine step below uses it.
+PREV_EXISTS=false PREV_LOCAL=false PREV_HOST=''
+if [ -f "$HOME_DIR/cao-window-install.json" ] && jq -e 'type == "object"' "$HOME_DIR/cao-window-install.json" >/dev/null 2>&1; then
+    PREV_EXISTS=true
+    PREV_LOCAL=$(jq -r 'if .local == true then "true" else "false" end' "$HOME_DIR/cao-window-install.json")
+    PREV_HOST=$(jq -r 'if (.caoSshHost | type) == "string" then .caoSshHost else "" end' "$HOME_DIR/cao-window-install.json")
+fi
 
 OS=$(uname -s)
 case $OS in
@@ -199,8 +213,9 @@ fi
 
 # --- the app copy (macOS): every refusal is made here, before anything is written ---
 # CAO.app is a clone of the Herdr app with its own name, so the app switcher, the Dock and Mission Control say CAO. It is
-# ours only while its Info.plist carries $COPY_MARK_KEY, the Herdr version it was made from; a rerun rebuilds it when that
-# version differs from the app's, or when the copy is gone, and otherwise leaves it alone.
+# ours while its Info.plist carries $COPY_MARK_KEY, the Herdr version it was made from, or the bundle holds $COPY_MARKER_FILE
+# (app-copy.sh); a rerun rebuilds it when that version differs from the app's or the plist lost the key, or when the copy
+# is gone, and otherwise leaves it alone.
 COPY=''; COPY_BUILD=0; ICON_SRC=$HERE/assets/CAO.icns
 if [ "$OS" = Darwin ] && [ "$NO_APP_COPY" = 0 ]; then
     [ -n "$APP_COPY_DIR" ] || APP_COPY_DIR=$HOME/Applications
@@ -217,8 +232,10 @@ if [ "$OS" = Darwin ] && [ "$NO_APP_COPY" = 0 ]; then
         die 2 "refusing --app-copy-dir $APP_COPY_DIR: CAO.app would be, hold or lie inside the Herdr app ($APP_CANON); nothing was written"
     fi
     if [ -e "$COPY" ] || [ -L "$COPY" ]; then
-        recorded=$(app_copy_mark "$COPY") \
-            || die 2 "refusing to replace $COPY: it is not a copy this installer made (its Info.plist has no $COPY_MARK_KEY). Move it away or pass --app-copy-dir; nothing was written"
+        app_copy_is_ours "$COPY" \
+            || die 2 "refusing to replace $COPY: it is not a copy this installer made (its Info.plist has no $COPY_MARK_KEY and it holds no $COPY_MARKER_FILE). Move it away or pass --app-copy-dir; nothing was written"
+        # A copy whose plist lost the key (an update changed it in place) records no version, so it is rebuilt.
+        recorded=$(app_copy_mark "$COPY" 2>/dev/null || true)
         [ "$recorded" = "$APP_RAW" ] || COPY_BUILD=1
     else
         COPY_BUILD=1
@@ -254,6 +271,16 @@ for kv in $PROP_ARGS; do
     [ -n "$kv" ] || continue
     case $kv in *=*) ;; *) die 2 "--prop expects KEY=JSON, got '$kv'" ;; esac
     [ -n "${kv%%=*}" ] || die 2 "--prop needs a key before the '=': '$kv'"
+    # machine and caoPort are set from --machine and --cao-port, which are checked and used for the hc entry and the port
+    # check; a --prop that says something else would stamp a value no other part of the install knows about.
+    case ${kv%%=*} in
+        machine) own=$(jq -nc --arg v "$MACHINE" '$v'); flag=--machine; shown=$MACHINE ;;
+        caoPort) own=$CAO_PORT; flag=--cao-port; shown=$CAO_PORT ;;
+        *) own='' ;;
+    esac
+    if [ -n "$own" ] && [ "$(printf '%s' "${kv#*=}" | jq -c . 2>/dev/null)" != "$own" ]; then
+        die 2 "--prop ${kv%%=*}=${kv#*=} conflicts with $flag $shown; set it with $flag and leave --prop out"
+    fi
     PROPS=$(printf '%s' "$PROPS" | jq -c --arg k "${kv%%=*}" --argjson v "${kv#*=}" '.[$k] = $v') \
         || die 2 "--prop ${kv%%=*}: the value is not JSON"
 done
@@ -289,7 +316,7 @@ for m in $MODS; do
         for f in "$STAGE/mods/$m"/*.js; do [ ! -e "$f" ] || rm -- "$f"; done
         mv "$WORK/bundle.new" "$STAGE/mods/$m/main.js"
     else
-        for f in "$HERE"/lib/*.js; do cp "$f" "$STAGE/mods/$m/"; done
+        cp -- "$HERE"/lib/*.js "$STAGE/mods/$m/"
     fi
 done
 
@@ -349,10 +376,12 @@ fill_launcher "$HERE/bin/herdr-cao.in" "$WORK/launcher" "$OS" "$APP" "$HOME_DIR"
 
 # Manifest: options and the SHA-256 of every file written. No timestamps, so a rerun is identical.
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
-: > "$WORK/files.ndjson"
-( cd "$STAGE" && find . -type f | sed 's|^\./||' | LC_ALL=C sort ) | while IFS= read -r rel; do
-    jq -n -c --arg path "$rel" --arg sha "$(sha256 "$STAGE/$rel")" '{path: $path, sha256: $sha}' >> "$WORK/files.ndjson"
-done
+# One hashing run and one jq run for every staged file, not one of each per file: the installer is run many times by its tests.
+( cd "$STAGE" && find . -type f | sed 's|^\./||' | LC_ALL=C sort ) > "$WORK/hash.list"
+( cd "$STAGE" && tr '\n' '\0' < "$WORK/hash.list" | if command -v sha256sum >/dev/null 2>&1; then xargs -0 sha256sum; else xargs -0 shasum -a 256; fi ) > "$WORK/hashes.txt" \
+    || die 1 "cannot hash the staged files"
+jq -R -c 'capture("^(?<sha>[0-9a-f]{64})  (?<path>.*)$") | {path: .path, sha256: .sha}' "$WORK/hashes.txt" > "$WORK/files.ndjson" \
+    || die 1 "cannot read the hashes of the staged files"
 jq -n -c --arg path "$BIN_DIR/$LAUNCHER_NAME" --arg sha "$(sha256 "$WORK/launcher")" '{path: $path, sha256: $sha}' >> "$WORK/files.ndjson"
 ICON_SHA=''; [ -z "$COPY" ] || ICON_SHA=$(sha256 "$ICON_SRC")
 jq -n --arg home "$HOME_DIR" --arg core "$CORE" --arg machine "$MACHINE" --arg caoCore "$CAO_CORE" \
@@ -379,10 +408,10 @@ fi
 # --- check every target, still without writing: a folder where a file goes, a file where a folder goes
 # or an unwritable folder stops the run here, before any file changes ---
 check_target() {   # check_target DST
-    ct_d=$(dirname -- "$1")
+    ct_d=${1%/*}; [ -n "$ct_d" ] || ct_d=/        # the parent folder, as dirname says it, without starting a process
     while [ ! -d "$ct_d" ]; do
         if [ -e "$ct_d" ] || [ -L "$ct_d" ]; then die 1 "$ct_d exists and is not a folder; nothing was written"; fi
-        ct_d=$(dirname -- "$ct_d")
+        ct_d=${ct_d%/*}; [ -n "$ct_d" ] || ct_d=/
     done
     { [ -w "$ct_d" ] && [ -x "$ct_d" ]; } || die 1 "cannot write in $ct_d; nothing was written"
     if [ -e "$1" ] || [ -L "$1" ]; then
@@ -413,13 +442,15 @@ if [ "$COPY_BUILD" = 1 ]; then
     # An icon named through an asset catalog would win over the file; Herdr 0.1.18 has none, a later one might.
     plistbuddy -c "Delete :CFBundleIconName" "$PLIST" >/dev/null 2>&1 || true
     mkdir -p -- "$APP_NEW/Contents/Resources" && cp -- "$ICON_SRC" "$APP_NEW/Contents/Resources/CAO.icns" || die 1 "cannot put the icon in $APP_NEW"
+    # The marker is written before the bundle is signed, so the signature covers it.
+    printf '%s\n' "$APP_RAW" > "$APP_NEW/$COPY_MARKER_FILE" || die 1 "cannot mark $APP_NEW as ours"
     # The changed plist breaks the original signature; an ad-hoc one makes the bundle valid again (it has no Team ID, so
     # Herdr's own entitlements and updater trust do not carry over; see the README).
     xattr -cr "$APP_NEW" || die 1 "xattr -cr failed on $APP_NEW"
     codesign --force --deep -s - "$APP_NEW" || die 1 "codesign could not sign $APP_NEW"
     codesign -v "$APP_NEW" || die 1 "codesign could not verify $APP_NEW"
     if [ -e "$COPY" ] || [ -L "$COPY" ]; then
-        app_copy_mark "$COPY" >/dev/null || die 1 "$COPY is no longer a copy this installer made; it was left in place"
+        app_copy_is_ours "$COPY" || die 1 "$COPY is no longer a copy this installer made; it was left in place"
         rm -r -- "$COPY" || die 1 "cannot remove the old $COPY"
     fi
     mv -- "$APP_NEW" "$COPY" || die 1 "cannot move the new copy to $COPY"
@@ -432,17 +463,19 @@ fi
 # reads it as a file name. HOME_DIR is absolute (canon), so it cannot be read as an option.
 mkdir -p -- "$HOME_DIR" && chmod 700 "$HOME_DIR" || die 1 "cannot make $HOME_DIR private (mode 700)"
 EPOCH=$(date +%s)
-put_file() {   # put_file SRC DST LABEL: write DST when it differs, keeping the old one as .bak-<epoch>
+put_file() {   # put_file SRC DST LABEL [BACKUP_BASE]: write DST when it differs, keeping the old one as <base>.bak-<epoch>
     if [ -f "$2" ] && cmp -s "$1" "$2"; then return 0; fi
-    mkdir -p -- "$(dirname -- "$2")" || die 1 "cannot create the folder for $3"
+    [ -d "${2%/*}" ] || mkdir -p -- "${2%/*}" || die 1 "cannot create the folder for $3"
     if [ -f "$2" ]; then
-        # A backup never replaces a file: when <file>.bak-<epoch> is taken (a second run in the same second, or
-        # a file of the user's) the first free <file>.bak-<epoch>-<n> is used, n from 1.
-        bak=$2.bak-$EPOCH
+        # A backup never replaces a file: when <base>.bak-<epoch> is taken (a second run in the same second, or
+        # a file of the user's) the first free <base>.bak-<epoch>-<n> is used, n from 1. The base is the file
+        # itself unless the caller names another one (the launcher's backups stay out of the folder PATH reads).
+        bak=${4:-$2}.bak-$EPOCH
         n=0
-        while [ -e "$bak" ] || [ -L "$bak" ]; do n=$((n + 1)); bak=$2.bak-$EPOCH-$n; done
+        while [ -e "$bak" ] || [ -L "$bak" ]; do n=$((n + 1)); bak=${4:-$2}.bak-$EPOCH-$n; done
+        [ -d "${bak%/*}" ] || mkdir -p -- "${bak%/*}" || die 1 "cannot create the folder for the old $3"
         cp -p -- "$2" "$bak" || die 1 "cannot keep the old $3"
-        echo "install: kept the old $3 as $3${bak#"$2"}"
+        if [ -n "${4:-}" ]; then echo "install: kept the old $3 as $bak"; else echo "install: kept the old $3 as $3${bak#"$2"}"; fi
     fi
     # The temp file name carries this process's id; the exit trap removes it if the run stops before the mv.
     OWN_TMP=$2.new.$$
@@ -456,11 +489,39 @@ put_file() {   # put_file SRC DST LABEL: write DST when it differs, keeping the 
 while IFS= read -r rel; do
     [ "$rel" = cao-window-install.json ] || put_file "$STAGE/$rel" "$HOME_DIR/$rel" "$rel"
 done < "$WORK/stage.list"
-put_file "$WORK/launcher" "$BIN_DIR/$LAUNCHER_NAME" "$BIN_DIR/$LAUNCHER_NAME"
+put_file "$WORK/launcher" "$BIN_DIR/$LAUNCHER_NAME" "$BIN_DIR/$LAUNCHER_NAME" "$HOME_DIR/launcher-backups/$LAUNCHER_NAME"
 put_file "$STAGE/cao-window-install.json" "$HOME_DIR/cao-window-install.json" cao-window-install.json
 
-have_machine() { HC_SESSION=$CORE hc machine ls --json 2>/dev/null | jq -e --arg m "$MACHINE" '[.. | objects | select(.name? == $m)] | length > 0' >/dev/null 2>&1; }
-if ! have_machine; then
+# The CAO machine entry of the window's own core (HC_SESSION=$CORE, never CAO's core or the default one). An entry made for
+# another CAO host is replaced, or a rerun with a new --cao-ssh-host (or a switch to or from --local) would record the new
+# host in the manifest while the core kept the old one. hc lists a --via machine with via true and its command as target; an
+# ssh machine is told apart by its target. hc may write a host differently from how it was typed, so an entry whose target
+# differs counts only when the last manifest does not vouch for these options either; with no target to read, the manifest
+# alone decides.
+MACHINE_ENTRY=$(HC_SESSION=$CORE hc machine ls --json 2>/dev/null | jq -c --arg m "$MACHINE" '[.. | objects | select(.name? == $m)] | first // empty' 2>/dev/null || true)
+machine_is_stale() {
+    printf '%s' "$MACHINE_ENTRY" | jq -e --argjson local "$([ "$LOCAL" = 1 ] && echo true || echo false)" --arg host "$SSH_HOST" \
+        --argjson prev "$(jq -n -c --argjson e "$PREV_EXISTS" --argjson l "$PREV_LOCAL" --arg h "$PREV_HOST" '{exists: $e, local: $l, host: $h}')" '
+        ($prev.exists and $prev.local == $local and $prev.host == $host) as $vouched
+        | .via as $via | (.target? // null) as $t
+        | if $local then
+            if $via == true then false
+            elif $via == false then true
+            elif $t == "sh -c" then false
+            else ($prev.exists and ($prev.local | not)) end
+          else
+            if $via == true then true
+            elif ($t | type) == "string" then ($t != $host and ($vouched | not))
+            else ($prev.exists and ($vouched | not)) end
+          end' >/dev/null 2>&1
+}
+REPLACED=0
+if [ -n "$MACHINE_ENTRY" ] && machine_is_stale; then
+    HC_SESSION=$CORE hc machine rm "$MACHINE" \
+        || die 1 "hc machine rm $MACHINE failed in core session '$CORE'; the files are written, fix hc and run the installer again"
+    MACHINE_ENTRY=''; REPLACED=1
+fi
+if [ -z "$MACHINE_ENTRY" ]; then
     if [ "$LOCAL" = 1 ]; then
         HC_SESSION=$CORE hc machine add --via "sh -c" --name "$MACHINE" --session "$CAO_CORE" \
             || die 1 "hc machine add failed; the files are written, fix hc and run the installer again"
@@ -468,7 +529,12 @@ if ! have_machine; then
         HC_SESSION=$CORE hc machine add "$SSH_HOST" --session "$CAO_CORE" --name "$MACHINE" \
             || die 1 "hc machine add failed; the files are written, fix hc and run the installer again"
     fi
-    CHANGED=1; echo "install: added machine '$MACHINE' to core session '$CORE'"
+    CHANGED=1
+    if [ "$REPLACED" = 1 ]; then
+        echo "install: replaced machine '$MACHINE' in core session '$CORE': its entry was made for another CAO host, and it now points at $([ "$LOCAL" = 1 ] && echo "this machine (--local)" || echo "$SSH_HOST")"
+    else
+        echo "install: added machine '$MACHINE' to core session '$CORE'"
+    fi
 fi
 
 [ -z "$SETTINGS_NOTE" ] || echo "install: $SETTINGS_NOTE"

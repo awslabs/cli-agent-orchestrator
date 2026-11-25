@@ -36,8 +36,11 @@ case "$1" in
     case "$2" in
       ls) cat "$D/machines.json"; exit 0 ;;
       add) [ -f "$D/add.fail" ] && exit 9
-           name=cao; while [ $# -gt 0 ]; do [ "$1" = --name ] && name=$2; shift; done
-           printf '[{"name":"%s"}]\\n' "$name" > "$D/machines.json"; exit 0 ;;
+           name=cao; host=; via=; shift 2
+           while [ $# -gt 0 ]; do case $1 in --name) name=$2; shift ;; --via) via=$2; shift ;; --session) shift ;; -*) ;; *) host=$1 ;; esac; shift; done
+           # A --via machine lists its command as target and via true (as hc 0.1.22 does); the stub writes an ssh machine the same way, with its host and via false.
+           if [ -n "$via" ]; then printf '[{"name":"%s","target":"%s","via":true}]\\n' "$name" "$via"
+           else printf '[{"name":"%s","target":"%s","via":false}]\\n' "$name" "$host"; fi > "$D/machines.json"; exit 0 ;;
       rm) [ -f "$D/rm.fail" ] && exit 9
           printf '[]\\n' > "$D/machines.json"; exit 0 ;;
     esac ;;
@@ -255,6 +258,9 @@ function launcherArgv(w, launcherPath) {
   const r = spawnSync("sh", [launcherPath], { env: { ...w.env, PATH: `${join(dir, "bin")}:${process.env.PATH}`, ARGV_OUT: out }, encoding: "utf8" });
   return { status: r.status, argv: existsSync(out) ? JSON.parse(readFileSync(out, "utf8")) : null, err: r.stderr };
 }
+// A window home that already holds files of its own (a shared.json or settings.json Herdr wrote, a themes folder) is accepted only when
+// it is one this installer made, which its manifest says; these cases set the home up that way before they seed it.
+const seedManifest = (w) => { mkdirSync(w.caoHome, { recursive: true }); writeFileSync(join(w.caoHome, "cao-window-install.json"), "{}\n"); };
 const nothingWritten = (w) => {
   assert.deepEqual(files(w.caoHome), [], "files were written to the window's home");
   assert.ok(!existsSync(w.launcher), "the launcher was written");
@@ -916,14 +922,17 @@ test("a deleted shipped file is written again and needs no backup", () => {
   assert.doesNotMatch(r.out, /up to date/);
 });
 
-test("a launcher that already exists with other content is kept as .bak-<epoch> and replaced", () => {
+test("a launcher that already exists with other content is kept in the window's home as a backup, not next to it on PATH", () => {
   const w = world();
   mkdirSync(dirname(w.launcher), { recursive: true });
   writeFileSync(w.launcher, "#!/bin/sh\necho mine\n");
-  assert.equal(w.install(["--local"]).status, 0);
-  const found = files(dirname(w.launcher)).filter((f) => /^herdr-cao\.bak-\d+$/.test(f));
+  const r = w.install(["--local"]);
+  assert.equal(r.status, 0, r.text);
+  assert.deepEqual(files(dirname(w.launcher)), ["herdr-cao"], "a backup was left next to the launcher, where PATH finds it");
+  const found = files(join(w.caoHome, "launcher-backups")).filter((f) => /^herdr-cao\.bak-\d+$/.test(f));
   assert.equal(found.length, 1);
-  assert.equal(readFileSync(join(dirname(w.launcher), found[0]), "utf8"), "#!/bin/sh\necho mine\n");
+  assert.equal(readFileSync(join(w.caoHome, "launcher-backups", found[0]), "utf8"), "#!/bin/sh\necho mine\n");
+  assert.ok(r.out.includes(join(w.caoHome, "launcher-backups", found[0])), "the run does not say where the old launcher went");
   assert.match(readFileSync(w.launcher, "utf8"), /open -n -a/);
 });
 
@@ -1116,7 +1125,7 @@ test("--main-home chooses where the base layout is read from, and the main home 
 
 test("shared.json is merged: other keys stay, layout and the flat frame.welcomed key are set", () => {
   const w = world();
-  mkdirSync(w.caoHome, { recursive: true });
+  seedManifest(w);
   writeFileSync(join(w.caoHome, "shared.json"), JSON.stringify({ layout: "main", keep: [1, 2], "frame.welcomed": "pending", nested: { a: 1 } }));
   assert.equal(w.install(["--local"]).status, 0);
   assert.deepEqual(w.json("shared.json"), { layout: "cao-window", keep: [1, 2], "frame.welcomed": "finished", nested: { a: 1 } });
@@ -1344,7 +1353,7 @@ test("the theme is read from the settings.json the window's home already has, no
   mainSettings(w, { theme: "dracula" });
   mainTheme(w, "dracula", DRACULA);
   mainTheme(w, "nord", '{"name": "nord"}\n');
-  mkdirSync(w.caoHome, { recursive: true });
+  seedManifest(w);
   writeFileSync(join(w.caoHome, "settings.json"), '{"theme": "nord"}\n');
   const r = w.install(["--local"]);
   assert.equal(r.status, 0, r.text);
@@ -1414,11 +1423,12 @@ test("a folder where the theme file goes stops the install before anything is wr
   const w = world();
   mainSettings(w, { theme: "dracula" });
   mainTheme(w, "dracula", DRACULA);
+  seedManifest(w);
   mkdirSync(join(w.caoHome, "themes", "dracula.json", "keep"), { recursive: true });
   const r = w.install(["--local"]);
   assert.equal(r.status, 1, r.text);
   assert.match(r.err, /not a file/);
-  assert.deepEqual(files(w.caoHome), [], "files were written to the window's home");
+  assert.deepEqual(files(w.caoHome), ["cao-window-install.json"], "files were written to the window's home");
   assert.ok(existsSync(join(w.caoHome, "themes", "dracula.json", "keep")));
   assert.ok(!existsSync(w.launcher));
   assert.deepEqual(w.adds(), []);
@@ -2301,7 +2311,7 @@ test("a third run in the same second takes the next free number, and a freed num
 test("the launcher's backups follow the same rule within one second", () => {
   const { w, env } = pinnedWorld(1700000011);
   assert.equal(w.install(["--local"], env).status, 0);
-  const dir = dirname(w.launcher);
+  const dir = join(w.caoHome, "launcher-backups");
   const texts = ["#!/bin/sh\necho mine one\n", "#!/bin/sh\necho mine two\n"];
   for (const text of texts) {
     writeFileSync(w.launcher, text);
@@ -2310,6 +2320,7 @@ test("the launcher's backups follow the same rule within one second", () => {
   assert.deepEqual(anyBaks(dir, "herdr-cao"), ["herdr-cao.bak-1700000011", "herdr-cao.bak-1700000011-1"]);
   assert.equal(readFileSync(join(dir, "herdr-cao.bak-1700000011"), "utf8"), texts[0]);
   assert.equal(readFileSync(join(dir, "herdr-cao.bak-1700000011-1"), "utf8"), texts[1]);
+  assert.deepEqual(files(dirname(w.launcher)), ["herdr-cao"]);
 });
 
 test("a backup name that a user file already holds is not overwritten either", () => {
@@ -2337,6 +2348,9 @@ function tamper(patch) {
   writeFileSync(join(w.caoHome, MANIFEST_FILE), JSON.stringify({ ...manifest, ...patch }));
   return { w, manifest };
 }
+// The same world with its manifest replaced by the install's own plus `patch`, for a case that tries several tamperings in turn: an
+// uninstall that refuses changes nothing, so one install serves all of them instead of one install each.
+const retamper = (w, manifest, patch) => writeFileSync(join(w.caoHome, MANIFEST_FILE), JSON.stringify({ ...manifest, ...patch }));
 const nameRule = (v) => !/^$|^\.{1,2}$|^-|[^A-Za-z0-9._-]/.test(v);   // install.sh valid_name
 
 test("uninstall refuses a launcher name that holds a slash or is . or .. : exit 2, no hc call, nothing deleted", () => {
@@ -2348,8 +2362,9 @@ test("uninstall refuses a launcher name that holds a slash or is . or .. : exit 
     ["..", () => null],
     [".", () => null],
   ];
+  const { w, manifest } = tamper({});
   for (const [launcher, decoyAt] of cases) {
-    const { w } = tamper({ launcher });
+    retamper(w, manifest, { launcher });
     const decoy = decoyAt(w);
     if (decoy) { mkdirSync(dirname(decoy), { recursive: true }); writeFileSync(decoy, "mine"); }
     const mark = w.log().length;
@@ -2378,9 +2393,10 @@ const BAD_NAMES = ["a b", "a/b", ".", "..", "a;b", "$(touch x)", "a`b", "a\tb", 
 
 for (const key of ["core", "machine"]) {
   test(`uninstall refuses a ${key} name that install.sh would refuse: exit 2, no hc call, nothing removed`, () => {
+    const { w, manifest } = tamper({});
     for (const bad of [...BAD_NAMES, ...(key === "core" ? ["-x"] : []), ["caowin"], { a: 1 }]) {
       assert.ok(typeof bad !== "string" || !nameRule(bad), `${JSON.stringify(bad)} is a bad name`);
-      const { w } = tamper({ [key]: bad });
+      retamper(w, manifest, { [key]: bad });
       const mark = w.log().length;
       const r = w.uninstall([]);
       assert.equal(r.status, 2, `${key} ${JSON.stringify(bad)}: ${r.text}`);
@@ -2892,11 +2908,12 @@ test("app copy: uninstall refuses a path that is not a folder named *.app carryi
     "the home folder": (w) => w.home,
     "a plain file named *.app": (w) => { const f = join(w.root, "File.app"); writeFileSync(f, "x"); return f; },
   };
+  // One install serves every case: a refused uninstall changes nothing, which each case checks.
+  const w = world({ copy: true });
+  assert.equal(w.install(["--local"]).status, 0);
+  const manifest = w.json(MANIFEST_FILE);
   for (const [name, make] of Object.entries(cases)) {
-    const w = world({ copy: true });
-    assert.equal(w.install(["--local"]).status, 0, name);
     const target = make(w);
-    const manifest = w.json(MANIFEST_FILE);
     writeFileSync(join(w.caoHome, MANIFEST_FILE), JSON.stringify({ ...manifest, appCopy: { ...manifest.appCopy, path: target } }));
     const before = { copy: snapshot(w.copyDir), home: snapshot(w.caoHome), root: files(w.root).length };
     const mark = w.log().length;
@@ -2924,6 +2941,156 @@ test("app copy: uninstall of a copy that is already gone says so and finishes; a
   writeFileSync(join(v.copyApp, "keep"), "mine\n");
   assert.equal(v.uninstall([]).status, 0);
   assert.equal(readFileSync(join(v.copyApp, "keep"), "utf8"), "mine\n", "a folder the manifest does not name was removed");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Review round: a changed CAO host, a copy the updater changed, a --home that is not ours, launcher backups, --prop conflicts
+// ---------------------------------------------------------------------------------------------
+
+const hcCallsOf = (w, mark = 0) => w.log().slice(mark).filter((l) => /hc (machine|server)/.test(l) && !l.endsWith("machine ls --json"));
+
+test("a rerun with another CAO host, or a switch between a host and --local, replaces the machine entry in the window's own core and says so once", () => {
+  const w = world();
+  assert.equal(w.install(["--cao-ssh-host", "old-box"]).status, 0);
+  let mark = w.log().length;
+  const same = w.install(["--cao-ssh-host", "old-box"]);
+  assert.match(same.out, /install: up to date/);
+  assert.deepEqual(hcCallsOf(w, mark), [], "the same options touched the machine entry");
+
+  mark = w.log().length;
+  const moved = w.install(["--cao-ssh-host", "new-box"]);
+  assert.equal(moved.status, 0, moved.text);
+  assert.deepEqual(hcCallsOf(w, mark), ["HC_SESSION=caowin hc machine rm cao", "HC_SESSION=caowin hc machine add new-box --session cao --name cao"]);
+  assert.equal(moved.out.split("\n").filter((l) => /^install: replaced machine 'cao'/.test(l)).length, 1, moved.out);
+  assert.equal(w.json("cao-window-install.json").caoSshHost, "new-box");
+  assert.equal(JSON.parse(readFileSync(join(w.stubs, "machines.json"), "utf8"))[0].target, "new-box");
+  assert.match(w.install(["--cao-ssh-host", "new-box"]).out, /install: up to date/);
+
+  mark = w.log().length;
+  const local = w.install(["--local"]);
+  assert.equal(local.status, 0, local.text);
+  assert.deepEqual(hcCallsOf(w, mark), ["HC_SESSION=caowin hc machine rm cao", 'HC_SESSION=caowin hc machine add --via "sh -c" --name cao --session cao']);
+  assert.match(w.install(["--local"]).out, /install: up to date/);
+
+  mark = w.log().length;
+  assert.equal(w.install(["--cao-ssh-host", "new-box"]).status, 0);
+  assert.equal(hcCallsOf(w, mark).length, 2, "a switch back from --local was not applied");
+  assert.ok(w.log().every((l) => !/^HC_SESSION=(cao|default)? hc machine/.test(l)), "a machine call ran in a core that is not the window's own");
+});
+
+test("a machine entry whose listing names no target is replaced only when the last manifest says another host was asked for", () => {
+  const w = world();
+  assert.equal(w.install(["--cao-ssh-host", "old-box"]).status, 0);
+  writeFileSync(join(w.stubs, "machines.json"), '[{"name":"cao"}]\n');
+  const mark = w.log().length;
+  assert.match(w.install(["--cao-ssh-host", "old-box"]).out, /install: up to date/);
+  assert.deepEqual(hcCallsOf(w, mark), []);
+  assert.equal(w.install(["--cao-ssh-host", "other-box"]).status, 0);
+  assert.equal(hcCallsOf(w, mark).length, 2);
+});
+
+const stripUpdaterMark = (w) => {
+  // What the README says an in-place update does to the copy: the new release's plist (no CAOWindowSourceVersion, Herdr's own name).
+  const plist = join(w.copyApp, "Contents", "Info.plist");
+  writeFileSync(plist, readFileSync(plist, "utf8").split("\n").filter((l) => !l.startsWith("CAOWindowSourceVersion=")).map((l) => (l.startsWith("CFBundleName=") ? "CFBundleName=Herdr" : l)).join("\n"));
+};
+
+test("app copy: the installer marks its copy with a file inside the bundle, outside the plist", () => {
+  const w = world({ copy: true });
+  assert.equal(w.install(["--local"]).status, 0);
+  assert.equal(readFileSync(join(w.copyApp, "Contents", "Resources", "cao-window-copy"), "utf8").trim(), "0.1.16");
+  assert.ok(!existsSync(join(w.sourceApp, "Contents", "Resources", "cao-window-copy")), "Herdr.app was marked");
+});
+
+test("app copy: a copy the updater changed in place (plist key gone, marker file kept) is rebuilt by install and removed by uninstall; a foreign CAO.app is still refused", () => {
+  const w = world({ copy: true });
+  assert.equal(w.install(["--local"]).status, 0);
+  stripUpdaterMark(w);
+  const r = w.install(["--local"]);
+  assert.equal(r.status, 0, r.text);
+  assert.match(r.out, /install: built .*CAO\.app/);
+  assert.equal(copyPlist(w).CAOWindowSourceVersion, "0.1.16");
+  assert.equal(copyPlist(w).CFBundleName, "CAO");
+  assert.ok(existsSync(join(w.copyApp, "Contents", "Resources", "cao-window-copy")));
+
+  stripUpdaterMark(w);
+  const u = w.uninstall([]);
+  assert.equal(u.status, 0, u.text);
+  assert.ok(!existsSync(w.copyApp), "the changed copy was not removed");
+
+  const foreign = world({ copy: true });
+  assert.equal(foreign.install(["--local"]).status, 0);
+  stripUpdaterMark(foreign);
+  rmSync(join(foreign.copyApp, "Contents", "Resources", "cao-window-copy"));
+  writeFileSync(join(foreign.copyApp, "keep"), "mine\n");
+  const before = snapshot(foreign.copyDir);
+  const refused = foreign.install(["--local"]);
+  assert.equal(refused.status, 2, refused.text);
+  assert.match(refused.err, /not a copy this installer made/);
+  assert.deepEqual(snapshot(foreign.copyDir), before);
+  const kept = foreign.uninstall([]);
+  assert.equal(kept.status, 2, kept.text);
+  assert.deepEqual(snapshot(foreign.copyDir), before);
+});
+
+test("a --home that is an existing folder with other things in it is refused with exit 2 and nothing is written; an empty one, a missing one and one of ours are fine", () => {
+  const w = world();
+  const docs = join(w.home, "Documents");
+  mkdirSync(docs, { recursive: true });
+  writeFileSync(join(docs, "2025.txt"), "mine\n");
+  chmodSync(docs, 0o755);
+  const r = w.install(["--local", "--home", docs]);
+  assert.equal(r.status, 2, r.text);
+  assert.match(r.err, /refusing --home .*Documents/);
+  assert.match(r.err, /not empty/);
+  assert.deepEqual(files(docs), ["2025.txt"]);
+  assert.equal(statSync(docs).mode & 0o777, 0o755, "the folder's mode was changed");
+  assert.ok(!existsSync(w.launcher));
+  assert.deepEqual(w.adds(), []);
+
+  const empty = join(w.home, "empty");
+  mkdirSync(empty);
+  assert.equal(w.install(["--local", "--home", empty]).status, 0);
+  assert.equal(w.install(["--local", "--home", empty]).status, 0, "a home of ours is accepted again");
+  assert.equal(w.install(["--local", "--home", join(w.home, "missing", "yet")]).status, 0);
+
+  const half = join(w.home, "half");
+  mkdirSync(join(half, "layouts"), { recursive: true });
+  writeFileSync(join(half, "layouts", "cao-window.json"), "{}\n");
+  const resumed = w.install(["--local", "--home", half, "--force"]);
+  assert.equal(resumed.status, 0, `a first install that stopped before its manifest cannot be resumed:\n${resumed.text}`);
+});
+
+test("uninstall removes the backup launchers an earlier install left next to the launcher, and only those that carry the installer's header", () => {
+  const w = world();
+  assert.equal(w.install(["--local"]).status, 0);
+  const dir = dirname(w.launcher);
+  const header = readFileSync(w.launcher, "utf8");
+  writeFileSync(join(dir, "herdr-cao.bak-1700000001"), header);
+  writeFileSync(join(dir, "herdr-cao.bak-1700000002-1"), header);
+  writeFileSync(join(dir, "herdr-cao.bak-1700000003"), "#!/bin/sh\necho the user's own\n");
+  writeFileSync(join(dir, "herdr-cao.bakery"), header);
+  const r = w.uninstall([]);
+  assert.equal(r.status, 0, r.text);
+  assert.deepEqual(files(dir), ["herdr-cao.bak-1700000003", "herdr-cao.bakery"], "uninstall removed a file that is not a backup launcher of ours, or left one that is");
+  assert.match(r.out, /removed .*herdr-cao\.bak-1700000001/);
+});
+
+test("--prop machine and --prop caoPort that disagree with --machine and --cao-port are refused with exit 2 naming both; the same value is accepted", () => {
+  const w = world();
+  const a = w.install(["--local", "--machine", "box", "--prop", 'machine="other"']);
+  assert.equal(a.status, 2, a.text);
+  assert.match(a.err, /--prop machine/);
+  assert.match(a.err, /--machine/);
+  const b = w.install(["--local", "--cao-port", "9000", "--prop", "caoPort=9999"]);
+  assert.equal(b.status, 2, b.text);
+  assert.match(b.err, /--prop caoPort/);
+  assert.match(b.err, /--cao-port/);
+  const c = w.install(["--local", "--prop", 'caoPort="9889; x"']);
+  assert.equal(c.status, 2, c.text);
+  nothingWritten(w);
+  const same = w.install(["--local", "--machine", "box", "--cao-port", "9000", "--prop", 'machine="box"', "--prop", "caoPort=9000"]);
+  assert.equal(same.status, 0, same.text);
 });
 
 await finish();

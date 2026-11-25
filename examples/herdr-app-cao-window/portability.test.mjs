@@ -255,7 +255,9 @@ test("the CLI fails when the running user's own login appears, and does not prin
   const r = runCli(dir);
   assert.notEqual(r.status, 0);
   assert.ok(r.out.includes(path.join("lib", "planted.js")));
-  assert.ok(!r.out.includes(LOGIN_NOW));
+  // The report names the file under the scratch folder, and $TMPDIR may sit under the login's own home. The check is that the
+  // matched text is not printed, so the folder's path is taken out of the output first (and no temp path is asserted on).
+  assert.ok(!r.out.split(dir).join("").includes(LOGIN_NOW));
 });
 
 test("a patterns file that cannot be read makes the CLI fail and names the variable", () => {
