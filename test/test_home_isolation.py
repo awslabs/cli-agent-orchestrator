@@ -219,3 +219,30 @@ def test_memory_home_guard_allows_isolated_home_under_startup_home(tmp_path):
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_own_worker_home_is_a_fresh_directory_named_for_the_worker(monkeypatch):
+    """Each xdist worker gets its own fake home instead of sharing the controller's."""
+    monkeypatch.setenv("HOME", os.environ["HOME"])  # restored on teardown
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw7")
+
+    first = Path(conftest._own_worker_home())
+    second = Path(conftest._own_worker_home())
+    try:
+        assert first != second
+        assert first.is_dir() and second.is_dir()
+        assert first.name.startswith("cao-test-home-gw7-")
+        assert Path(os.environ["HOME"]) == second
+    finally:
+        import shutil
+
+        shutil.rmtree(first, ignore_errors=True)
+        shutil.rmtree(second, ignore_errors=True)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("PYTEST_XDIST_WORKER"), reason="only meaningful on an xdist worker"
+)
+def test_this_xdist_worker_runs_in_its_own_fake_home():
+    assert f"cao-test-home-{os.environ['PYTEST_XDIST_WORKER']}-" in conftest._ISOLATED_HOME["path"]
+    assert Path.home() == Path(conftest._ISOLATED_HOME["path"])

@@ -195,6 +195,19 @@ def test_inline_markdown_extraction_refuses_unsupported_destinations(markdown):
     assert extract_wikilinks(markdown).links == ()
 
 
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("Speed is ~~~ 5 m/s.\n[[after]]", ((False, "after"),)),
+        ("Type ``` to start a block.\n[[after]]", ((False, "after"),)),
+        ("~~~\n[[inside]]\n~~~\n[[after]]", ((False, "after"),)),
+        ("~~~\n[[inside]]\n[[after]]", ()),
+    ],
+)
+def test_fence_markers_only_at_line_start(content, expected) -> None:
+    assert extract_wikilinks(content).links == expected
+
+
 def test_relative_inline_resolution_requires_source_and_matches_exact_source_relative_path():
     candidates = (
         LinkCandidate(

@@ -820,6 +820,7 @@ def get_memory_settings() -> Dict[str, Any]:
         "explain_enabled": True,
         "non_accessing_inspection": True,
         "parser": {"lenient": True},
+        "relationships": {"content_links": False},
         "lifecycle": {"enabled": False},
         "injection": dict(MEMORY_INJECTION_DEFAULTS),
         "ranking": {"default_sort": "recency"},
@@ -853,6 +854,14 @@ def get_memory_settings() -> Dict[str, Any]:
         result["lifecycle"] = {
             **(lifecycle if isinstance(lifecycle, dict) else {}),
             "enabled": env_lifecycle.strip().lower() in ("1", "true", "yes"),
+        }
+
+    env_content_links = os.environ.get("CAO_MEMORY_RELATIONSHIPS_CONTENT_LINKS")
+    if env_content_links is not None and env_content_links.strip():
+        relationships = result.get("relationships", {})
+        result["relationships"] = {
+            **(relationships if isinstance(relationships, dict) else {}),
+            "content_links": env_content_links.strip().lower() in ("1", "true", "yes"),
         }
 
     env_inspection = os.environ.get("CAO_MEMORY_NON_ACCESSING_INSPECTION")
@@ -1036,6 +1045,19 @@ def is_memory_parser_lenient() -> bool:
     except Exception:
         logger.warning("Failed to read memory.parser.lenient; defaulting to True")
         return True
+
+
+def is_memory_content_links_enabled() -> bool:
+    """Content-authored relationship edges: env > nested file value > False."""
+    try:
+        relationships = get_memory_settings().get("relationships", {})
+        if not isinstance(relationships, dict):
+            return False
+        value = relationships.get("content_links", False)
+        return value if isinstance(value, bool) else False
+    except Exception:
+        logger.warning("Failed to read memory.relationships.content_links; defaulting to False")
+        return False
 
 
 def is_memory_lifecycle_enabled() -> bool:
@@ -1354,6 +1376,7 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``ranking.default_sort`` (str) — ``recency`` or ``bm25`` query recall default.
         ``non_accessing_inspection`` (bool) — operator reads without access bumps.
         ``parser.lenient`` (bool) — parse valid native topics without canonical timestamps.
+        ``relationships.content_links`` (bool) — parse authored links into relationship edges.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
         ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
         ``learning_enabled`` (bool) — workflow self-learning (outcome capture).
@@ -1405,7 +1428,12 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         if not isinstance(value, bool):
             raise ValueError(f"{key} must be a bool")
         coerced = value
-    elif key in {"explain_enabled", "non_accessing_inspection", "parser.lenient"}:
+    elif key in {
+        "explain_enabled",
+        "non_accessing_inspection",
+        "parser.lenient",
+        "relationships.content_links",
+    }:
         if not isinstance(value, bool):
             raise ValueError(f"{key} must be a bool, got {type(value).__name__}")
         coerced = value
@@ -1448,6 +1476,11 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
             if not isinstance(injection, dict):
                 injection = {}
             memory["injection"] = {**injection, key.split(".", 1)[1]: coerced}
+        elif key == "relationships.content_links":
+            relationships = memory.get("relationships", {})
+            if not isinstance(relationships, dict):
+                relationships = {}
+            memory["relationships"] = {**relationships, "content_links": coerced}
         elif key == "ranking.default_sort":
             ranking = memory.get("ranking", {})
             if not isinstance(ranking, dict):

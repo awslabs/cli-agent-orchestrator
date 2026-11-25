@@ -1163,6 +1163,61 @@ class MemoryReconciliationService:
                 row.token_estimate = topic.token_estimate
             db.commit()
 
+    def _repair_content_links(self, topic: _Topic, targets: Optional[list[str]] = None) -> None:
+        """Rebuild one topic's content-link projection in the repair database."""
+        from cli_agent_orchestrator.services.memory_content_links import (
+            extract_content_link_targets,
+        )
+        from cli_agent_orchestrator.services.memory_relationship_service import (
+            MAX_EDGES_PER_MUTATION,
+            EdgeInput,
+            MemoryRelationshipService,
+        )
+        from cli_agent_orchestrator.services.memory_service import MemoryService
+        from cli_agent_orchestrator.services.settings_service import (
+            is_memory_content_links_enabled,
+        )
+
+        if not is_memory_content_links_enabled():
+            return
+        if targets is None:
+            targets = extract_content_link_targets(
+                MemoryService._strip_generated_see_also(
+                    topic.file_path.read_text(encoding="utf-8")
+                ),
+                MemoryService._sanitize_key,
+                topic.identity.scope,
+                scope_id=topic.identity.scope_id,
+            )
+        audits: list[Any] = []
+        with self._get_db_session() as db:
+            relationships = MemoryRelationshipService()
+            valid_targets = []
+            for target in targets:
+                try:
+                    relationships._assert_endpoint_exists(
+                        db,
+                        topic.identity.scope,
+                        topic.identity.scope_id,
+                        target,
+                    )
+                except ValueError:
+                    continue
+                valid_targets.append(target)
+            relationships.replace_set(
+                topic.identity.scope,
+                topic.identity.scope_id,
+                topic.identity.key,
+                "content_link",
+                "relates_to",
+                [EdgeInput(target) for target in valid_targets[:MAX_EDGES_PER_MUTATION]],
+                db=db,
+                audit_sink=audits,
+            )
+            db.commit()
+        for emit_audit in audits:
+            emit_audit()
+
     def _dedupe_metadata(self, topic: _Topic) -> int:
         """Remove stale duplicate rows for ``topic.identity`` (issue #657).
 
@@ -1338,6 +1393,7 @@ class MemoryReconciliationService:
 
         locked_groups: dict[Path, list[tuple[RepairRecord, _Candidate, Any]]] = {}
         locked_all: list[tuple[RepairRecord, _Candidate, Any]] = []
+        content_topics: dict[MemoryIdentity, _Topic] = {}
         for index_path in sorted(groups, key=str):
             group = sorted(groups[index_path], key=lambda item: item[1].file_path)
             locked = locked_groups.setdefault(index_path, [])
@@ -1449,6 +1505,7 @@ class MemoryReconciliationService:
                         ):
                             if metadata_action in current.actions:
                                 self._repair_metadata(parsed, metadata_action)
+                        content_topics[parsed.identity] = parsed
                     except Exception as exc:
                         metadata_error = exc
 
@@ -1540,6 +1597,7 @@ class MemoryReconciliationService:
                             ):
                                 if metadata_action in replanned.actions:
                                     self._repair_metadata(parsed, metadata_action)
+                            content_topics[parsed.identity] = parsed
                             if RepairAction.REBUILD_INDEX in replanned.actions:
                                 self._repair_index_batch([parsed])
                             results[index] = replace(
@@ -1552,6 +1610,43 @@ class MemoryReconciliationService:
                             )
                         except Exception as exc:
                             results[index] = self._failed_record(replanned, exc)
+
+            # Relationship endpoint validation reads the complete metadata
+            # projection. Run this only after every topic's metadata repair, so
+            # a source sorted before its target does not lose a valid link.
+            from cli_agent_orchestrator.services.memory_content_links import (
+                extract_content_link_targets,
+            )
+            from cli_agent_orchestrator.services.memory_relationship_service import (
+                MemoryRelationshipService,
+            )
+            from cli_agent_orchestrator.services.memory_service import MemoryService
+            from cli_agent_orchestrator.services.settings_service import (
+                is_memory_content_links_enabled,
+            )
+
+            if is_memory_content_links_enabled():
+                existing_sources = MemoryRelationshipService(self._get_db_session).producer_sources(
+                    "content_link", "relates_to"
+                )
+                for identity, topic in content_topics.items():
+                    try:
+                        targets = extract_content_link_targets(
+                            MemoryService._strip_generated_see_also(
+                                topic.file_path.read_text(encoding="utf-8")
+                            ),
+                            MemoryService._sanitize_key,
+                            topic.identity.scope,
+                            scope_id=topic.identity.scope_id,
+                        )
+                        source_identity = (identity.scope, identity.scope_id, identity.key)
+                        if targets or source_identity in existing_sources:
+                            self._repair_content_links(topic, targets)
+                    except Exception as exc:
+                        for index, result in enumerate(results):
+                            if result.identity == identity:
+                                results[index] = self._failed_record(result, exc)
+                                break
         finally:
             for _, _, lock_fd in reversed(locked_all):
                 try:
