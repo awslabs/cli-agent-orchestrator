@@ -196,7 +196,6 @@ def _unpin_args(receipt: Optional[Path]) -> List[str]:
     cao = f"{_PACKAGE}@latest"
     with_args: List[str] = []
     problems: List[str] = []
-    carries_registry_package = False
     for req in (_requirements(receipt) if receipt else None) or []:
         if isinstance(req, dict) and req.get("name") == _PACKAGE:
             extras = _extras(req)
@@ -213,14 +212,13 @@ def _unpin_args(receipt: Optional[Path]) -> List[str]:
             problems.append(f"the extra package {label} is from a source it can't rebuild")
             with_args += ["--with", f"<{name or 'requirement'} source>"]
             continue
-        if not ("path" in req or "directory" in req):
-            carries_registry_package = True
         with_args += ["--with", value]
 
     index_keys = _index_options(receipt) if receipt else []
-    if index_keys and carries_registry_package:
-        # Without them uv looks the extra packages up on the default index, which can
-        # fail, or install a different package that happens to have the same name.
+    if index_keys and with_args:
+        # Without them uv resolves the extra packages and their dependencies on the
+        # default index, which can install a different package that has the same name.
+        # A local wheel or directory needs no index itself, but what it requires does.
         problems.append(
             f"the install sets {', '.join(index_keys)}, which uv would not reuse for the "
             "extra packages"

@@ -215,7 +215,8 @@ whether the receipt records it. Upgrade behavior depends on the source:
   recorded that way stays. It stops before changing anything, and prints the receipt path and
   a command to finish by hand, when an entry is a git or URL source, editable, or has a marker
   (the `"cao-decider-jev @ git+…"` form above is recorded as git), or when the receipt sets an
-  index under `[tool.options]` and a `name<spec>` entry would be looked up on it. An unpinned
+  index under `[tool.options]` and any decider is carried, since uv would resolve it, or the
+  packages a wheel or directory decider requires, without that index. An unpinned
   PyPI install runs `uv tool upgrade`, which keeps recorded deciders;
 - on a local install, `cao update` changes nothing and prints a reinstall command that has no
   `--with` either;

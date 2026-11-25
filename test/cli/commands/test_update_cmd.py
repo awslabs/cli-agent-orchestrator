@@ -462,25 +462,85 @@ requirements = [
         assert "CAO's own requirement" in result.output
         mock_run.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "option",
+        [
+            # The form uv writes for --index, --default-index and UV_DEFAULT_INDEX.
+            'index = [{ url = "https://packages.example.com/simple", explicit = false, '
+            'default = true, format = "simple", authenticate = "auto" }]',
+            'index-url = "https://packages.example.com/simple"',
+            'extra-index-url = ["https://packages.example.com/simple"]',
+            'find-links = ["file:///opt/wheels"]',
+            "no-index = true",
+        ],
+        ids=lambda option: option.split(" ", 1)[0],
+    )
     @patch(f"{_MOD}.subprocess.run")
     @patch(f"{_MOD}._receipt_path")
     @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
-    def test_constrained_registry_refuses_index_settings_with_a_registry_extra(
-        self, _which, receipt_path, mock_run, tmp_path
+    def test_constrained_registry_refuses_each_index_setting_with_a_registry_extra(
+        self, _which, receipt_path, mock_run, tmp_path, option
     ):
         # `uv tool install` does not reuse the receipt's [tool.options], so the
         # decider would be looked up on the default index instead.
         receipt = _write(
             tmp_path,
-            """
+            f"""
 [tool]
 requirements = [
-    { name = "cli-agent-orchestrator", specifier = "==1.0.0" },
-    { name = "cao-decider-demo", specifier = ">=1.0" },
+    {{ name = "cli-agent-orchestrator", specifier = "==1.0.0" }},
+    {{ name = "cao-decider-demo", specifier = ">=1.0" }},
 ]
 
 [tool.options]
-index-url = "https://packages.example.com/simple"
+{option}
+""",
+        )
+        receipt_path.return_value = receipt
+
+        result = CliRunner().invoke(update, [])
+
+        assert result.exit_code != 0
+        assert f"the install sets {option.split(' ', 1)[0]}," in result.output
+        assert str(receipt) in result.output
+        assert "--with 'cao-decider-demo>=1.0'" in result.output
+        mock_run.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "entry,carried",
+        [
+            (
+                '{ name = "cao-decider-wheel", '
+                'path = "/opt/wheels/cao_decider_wheel-0.1.0-py3-none-any.whl" }',
+                "/opt/wheels/cao_decider_wheel-0.1.0-py3-none-any.whl",
+            ),
+            (
+                '{ name = "cao-decider-dir", directory = "/opt/src/cao-decider" }',
+                "/opt/src/cao-decider",
+            ),
+        ],
+        ids=["path", "directory"],
+    )
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._receipt_path")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_index_settings_block_a_local_extra_too(
+        self, _which, receipt_path, mock_run, tmp_path, entry, carried
+    ):
+        # A local wheel or directory is not looked up on an index, but uv resolves
+        # its dependencies on the new command's indexes, and those may be what the
+        # recorded index was there for.
+        receipt = _write(
+            tmp_path,
+            f"""
+[tool]
+requirements = [
+    {{ name = "cli-agent-orchestrator", specifier = "==1.0.0" }},
+    {entry},
+]
+
+[tool.options]
+no-index = true
 find-links = ["file:///opt/wheels"]
 """,
         )
@@ -489,29 +549,27 @@ find-links = ["file:///opt/wheels"]
         result = CliRunner().invoke(update, [])
 
         assert result.exit_code != 0
-        assert "index-url, find-links" in result.output
+        assert "the install sets find-links, no-index," in result.output
         assert str(receipt) in result.output
-        assert "--with 'cao-decider-demo>=1.0'" in result.output
+        assert f"--with {carried}" in result.output
         mock_run.assert_not_called()
 
     @patch(f"{_MOD}.subprocess.run")
     @patch(f"{_MOD}._receipt_path")
     @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
-    def test_index_settings_alone_do_not_block_a_local_extra(
+    def test_index_settings_with_nothing_carried_unpin_as_before(
         self, _which, receipt_path, mock_run, tmp_path
     ):
-        # A wheel path is not looked up on any index, so carrying it is safe.
+        # CAO and its extras have public names, so with nothing else to carry the
+        # recorded index changes nothing.
         receipt_path.return_value = _write(
             tmp_path,
             """
 [tool]
-requirements = [
-    { name = "cli-agent-orchestrator", specifier = "==1.0.0" },
-    { name = "cao-decider-wheel", path = "/opt/wheels/cao_decider_wheel-0.1.0-py3-none-any.whl" },
-]
+requirements = [{ name = "cli-agent-orchestrator", extras = ["agui"], specifier = "==1.0.0" }]
 
 [tool.options]
-no-index = true
+index-url = "https://packages.example.com/simple"
 """,
         )
         mock_run.return_value = _completed(0)
@@ -520,15 +578,7 @@ no-index = true
 
         assert result.exit_code == 0
         mock_run.assert_called_once_with(
-            [
-                "uv",
-                "tool",
-                "install",
-                f"{_PACKAGE}@latest",
-                "--upgrade",
-                "--with",
-                "/opt/wheels/cao_decider_wheel-0.1.0-py3-none-any.whl",
-            ]
+            ["uv", "tool", "install", f"{_PACKAGE}[agui]@latest", "--upgrade"]
         )
 
     @pytest.mark.parametrize(
