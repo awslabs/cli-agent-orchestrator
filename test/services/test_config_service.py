@@ -53,6 +53,16 @@ class TestPrecedence:
         monkeypatch.setenv("CAO_TERMINAL_BACKEND", "tmux")
         assert ConfigService.get("terminal.backend") == "tmux"
 
+    def test_herdr_auto_start_env_var_beats_file_value(self, _isolated_settings, monkeypatch):
+        _isolated_settings["settings"].write_text(
+            json.dumps({"terminal": {"herdr_auto_start": True}})
+        )
+        monkeypatch.setenv("CAO_HERDR_AUTO_START", "false")
+        assert ConfigService.get("terminal.herdr_auto_start") is False
+
+    def test_herdr_auto_start_defaults_to_true(self):
+        assert ConfigService.get("terminal.herdr_auto_start") is True
+
     def test_cli_override_beats_env_var(self, _isolated_settings, monkeypatch):
         monkeypatch.setenv("CAO_TERMINAL_BACKEND", "herdr")
         assert ConfigService.get("terminal.backend", override="tmux") == "tmux"
@@ -708,3 +718,13 @@ def test_lifecycle_set_keeps_nested_and_top_level_siblings(_isolated_settings):
     ConfigService.set("memory.lifecycle.enabled", True)
     original["memory"]["lifecycle"]["enabled"] = True
     assert json.loads(settings.read_text()) == original
+
+
+def test_herdr_app_session_default_and_env(_isolated_settings, monkeypatch):
+    from cli_agent_orchestrator.services.config_service import ENV_REGISTRY
+
+    assert ConfigService.get("terminal.herdr_app_session") == "cao"
+    assert ENV_REGISTRY["CAO_HERDR_APP_SESSION"] == ("terminal.herdr_app_session", "str", "cao")
+    monkeypatch.setenv("CAO_HERDR_APP_SESSION", "x")
+    assert ConfigService.get("terminal.herdr_app_session") == "x"
+    assert ConfigService.get_config().terminal.herdr_app_session == "x"

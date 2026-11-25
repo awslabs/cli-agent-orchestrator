@@ -15,11 +15,28 @@ class RunResult:
     stderr: str = ""
 
 
+# Every AWS call names its profile, so ambient credentials must never answer for it.
+_AMBIENT_AWS_CREDENTIALS = frozenset(
+    {
+        "AWS_ACCESS_KEY_ID",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_PROFILE",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SECURITY_TOKEN",
+        "AWS_SESSION_TOKEN",
+    }
+)
+
+
 class Runner:
-    """Run argv-only commands with no stdin or ambient credential environment."""
+    """Run argv-only commands with no stdin and no ambient AWS credentials."""
 
     def run(self, argv: Sequence[str], timeout: float = 15.0) -> RunResult:
-        env = {"PATH": os.defpath, "LANG": "C"}
+        # Keep PATH, SSH_AUTH_SOCK, proxy and CA settings: the user's tools live outside os.defpath.
+        env = {
+            key: value for key, value in os.environ.items() if key not in _AMBIENT_AWS_CREDENTIALS
+        }
+        env.update(LANG="C", LC_ALL="C")
         try:
             completed = subprocess.run(
                 list(argv),

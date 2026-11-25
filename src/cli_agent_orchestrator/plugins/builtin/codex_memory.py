@@ -25,7 +25,16 @@ from typing import TYPE_CHECKING
 
 from cli_agent_orchestrator.plugins import PostCreateTerminalEvent, hook
 from cli_agent_orchestrator.plugins.base import CaoPlugin
-from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
+from cli_agent_orchestrator.services.memory_injection import (
+    empty_memory_block,
+    memory_blocks_have_same_body,
+    stamp_memory_block,
+    uniquely_delimited_block,
+)
+from cli_agent_orchestrator.utils.atomic_file import (
+    locked_atomic_rewrite,
+    locked_atomic_rewrite_or_delete,
+)
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.backends.base import TerminalBackend
@@ -73,6 +82,31 @@ def MemoryService() -> "_MemoryService":
     return _MemoryService()
 
 
+def memory_is_enabled() -> bool:
+    """Resolve the operator's memory switch only on the handler path."""
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    return is_memory_enabled()
+
+
+def memory_injection_clear_on_empty_enabled() -> bool:
+    """Resolve the default-on stale-block fix only on the handler path."""
+    from cli_agent_orchestrator.services.settings_service import (
+        is_memory_injection_clear_on_empty_enabled,
+    )
+
+    return is_memory_injection_clear_on_empty_enabled()
+
+
+def memory_injection_write_project_files_enabled() -> bool:
+    """Resolve the opt-in project-file writer only on the handler path."""
+    from cli_agent_orchestrator.services.settings_service import (
+        is_memory_injection_write_project_files_enabled,
+    )
+
+    return is_memory_injection_write_project_files_enabled()
+
+
 def get_terminal_metadata(terminal_id: str):
     """Lazy indirection onto ``clients.database.get_terminal_metadata``.
 
@@ -108,6 +142,9 @@ class CodexMemoryPlugin(CaoPlugin):
         if event.provider != "codex":
             return
 
+        if not memory_is_enabled():
+            return
+
         try:
             working_directory = self._resolve_working_directory(event)
         except Exception as exc:
@@ -123,6 +160,10 @@ class CodexMemoryPlugin(CaoPlugin):
                 "codex_memory: no working directory for %s; skipping",
                 event.terminal_id,
             )
+            return
+
+        if not memory_injection_write_project_files_enabled():
+            await self._remove_project_file_memory(working_directory)
             return
 
         try:
@@ -141,12 +182,18 @@ class CodexMemoryPlugin(CaoPlugin):
             )
             return
 
-        if not context_block:
+        if context_block:
+            context_block = stamp_memory_block(context_block)
+        elif memory_injection_clear_on_empty_enabled():
+            clear_existing = True
+        else:
             logger.debug(
                 "codex_memory: no memory context for %s; skipping write",
                 event.terminal_id,
             )
             return
+        if context_block:
+            clear_existing = False
 
         try:
             target = self._validated_target_path(working_directory)
@@ -159,6 +206,19 @@ class CodexMemoryPlugin(CaoPlugin):
             return
 
         try:
+            try:
+                existing = await asyncio.to_thread(target.read_text, encoding="utf-8")
+            except FileNotFoundError:
+                existing = ""
+            existing_block = uniquely_delimited_block(existing, BEGIN_MARKER, END_MARKER)
+            if clear_existing:
+                if existing_block is None:
+                    return
+                context_block = empty_memory_block()
+            if existing_block is not None and memory_blocks_have_same_body(
+                existing_block, context_block
+            ):
+                return
             # locked_atomic_rewrite polls with time.sleep up to the lock
             # timeout; run it off the event loop so a contended lock cannot
             # stall cao-server for other terminals.
@@ -169,6 +229,20 @@ class CodexMemoryPlugin(CaoPlugin):
                 target,
                 exc,
             )
+
+    async def _remove_project_file_memory(self, working_directory: str) -> None:
+        """Remove CAO's old block without fetching memory or changing user text."""
+        try:
+            target = self._validated_target_path(working_directory)
+            await asyncio.to_thread(self._remove_existing_block, target)
+        except ValueError as exc:
+            logger.warning(
+                "codex_memory: path validation rejected %s: %s",
+                working_directory,
+                exc,
+            )
+        except Exception as exc:
+            logger.warning("codex_memory: cleanup failed for %s: %s", working_directory, exc)
 
     # ------------------------------------------------------------------
     # helpers
@@ -234,6 +308,14 @@ class CodexMemoryPlugin(CaoPlugin):
         locked_atomic_rewrite(target, compute_new_content)
 
     @staticmethod
+    def _remove_existing_block(target: Path) -> None:
+        locked_atomic_rewrite_or_delete(
+            target,
+            CodexMemoryPlugin._strip_existing_block_for_cleanup,
+            lambda content: not content.strip(),
+        )
+
+    @staticmethod
     def _strip_existing_block(content: str) -> str:
         """Remove any prior cao-memory block so we replace rather than append.
 
@@ -260,5 +342,25 @@ class CodexMemoryPlugin(CaoPlugin):
                 content = f"{before}\n{after}"
             else:
                 content = before or after
+
+        return content
+
+    @staticmethod
+    def _strip_existing_block_for_cleanup(content: str) -> str:
+        """Remove managed blocks while restoring CAO's single separator."""
+        while True:
+            begin = content.find(BEGIN_MARKER)
+            if begin == -1:
+                break
+            end = content.find(END_MARKER, begin + len(BEGIN_MARKER))
+            next_begin = content.find(BEGIN_MARKER, begin + len(BEGIN_MARKER))
+            if end == -1 or (next_begin != -1 and next_begin < end):
+                content = content[:begin] + content[begin + len(BEGIN_MARKER) :]
+                continue
+            before = content[:begin]
+            after = content[end + len(END_MARKER) :]
+            if before.endswith("\n") and after.startswith("\n"):
+                after = after[1:]
+            content = before + after
 
         return content

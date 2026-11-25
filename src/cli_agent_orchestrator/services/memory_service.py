@@ -36,9 +36,11 @@ from cli_agent_orchestrator.models.memory import Memory, MemoryScope, MemoryType
 from cli_agent_orchestrator.services import memory_eligibility
 from cli_agent_orchestrator.services.memory_archive.base import ExportReport, ImportReport
 from cli_agent_orchestrator.services.memory_format import (
+    TOPIC_HEADER_RE,
     normalize_memory_tags,
     parse_index_entry,
 )
+from cli_agent_orchestrator.services.memory_injection import render_memory_block
 from cli_agent_orchestrator.services.vault.binding import VaultBinding
 from cli_agent_orchestrator.services.vault.reader import (
     MEMORY_MANAGER_PROFILE,
@@ -65,6 +67,18 @@ logger = logging.getLogger(__name__)
 
 VALID_SEARCH_MODES = ("metadata", "bm25", "hybrid")
 
+_CANONICAL_ENTRY_HEADING_RE = re.compile(
+    r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$", re.MULTILINE
+)
+_LENIENT_ENTRY_HEADING_RE = re.compile(
+    r"^#{2,} [^\n]*?(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)[^\n]*$",
+    re.MULTILINE,
+)
+_LEGACY_ENTRY_TIMESTAMP_RE = re.compile(r"## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)")
+_COMPILED_MARKER_RE = re.compile(
+    r"^<!-- cao-compiled: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z entries=\d+ -->$"
+)
+
 # #861: cap hybrid score/usage widening at 200 per source, never below the requested limit.
 HYBRID_CANDIDATE_MIN = 50
 HYBRID_CANDIDATE_MULTIPLIER = 3
@@ -78,6 +92,15 @@ class RecallPool:
     rows: list[Memory]
     all_term_identities: set[tuple]
     effective_sort: str
+
+
+@dataclass(frozen=True)
+class WikiContentSplit:
+    """Parser-owned latest-content and history boundaries for one topic."""
+
+    latest_section: str
+    latest_start: int
+    history_range: Optional[tuple[int, int]]
 
 
 @dataclass(frozen=True)
@@ -96,8 +119,15 @@ def _matches_all_terms(query: str, content: str) -> bool:
     return all(term in content_lower for term in query.lower().split())
 
 
+def _first_sentence(content: str) -> str:
+    """Return the first prose sentence, normalised onto one injection line."""
+    normalized = " ".join(content.split())
+    match = re.search(r"[.!?](?=\s|$)", normalized)
+    return normalized[: match.end()] if match else normalized
+
+
 MEMORY_DISABLED_MESSAGE = (
-    "memory subsystem is disabled. Set memory.enabled=true in settings.json " "to re-enable."
+    "memory subsystem is disabled. Set memory.enabled=true in settings.json to re-enable."
 )
 
 _VaultProjectionResult = TypeVar("_VaultProjectionResult")
@@ -253,9 +283,7 @@ def _validate_project_id_override(raw: str) -> str:
     if "\x00" in raw:
         raise ValueError("project_id override contains null byte")
     if not _PROJECT_ID_OVERRIDE_PATTERN.match(raw):
-        raise ValueError(
-            "project_id override must match ^[a-zA-Z0-9._\\-]{1,128}$; " f"got {raw!r}"
-        )
+        raise ValueError(f"project_id override must match ^[a-zA-Z0-9._\\-]{{1,128}}$; got {raw!r}")
     return raw
 
 
@@ -1094,6 +1122,7 @@ class MemoryService:
                         # version just written already contains the new entry,
                         # so merging into it would feed the LLM a duplicate.
                         pre_append_content=existing_content,  # noqa: F821
+                        newest_entry_at=timestamp,
                         # Concurrency token: the bytes this store() wrote. If
                         # the file differs when the compile finishes, a newer
                         # store won the race and the result is dropped.
@@ -1492,6 +1521,7 @@ class MemoryService:
         key: str,
         new_entry: str,
         pre_append_content: str,
+        newest_entry_at: Optional[str],
         expected_content: str,
         provider_hint: Optional[str],
     ) -> None:
@@ -1522,6 +1552,8 @@ class MemoryService:
                     key=key,
                     new_entry=new_entry,
                     pre_append_content=pre_append_content,
+                    newest_entry_at=newest_entry_at,
+                    fallback_updated_at=None,
                     expected_content=expected_content,
                     provider_hint=provider_hint,
                 )
@@ -1563,6 +1595,8 @@ class MemoryService:
         key: str,
         new_entry: str,
         pre_append_content: str,
+        newest_entry_at: Optional[str],
+        fallback_updated_at: Optional[str],
         expected_content: str,
         provider_hint: Optional[str],
     ) -> str:
@@ -1603,6 +1637,8 @@ class MemoryService:
                 topic_key=key,
                 timeout_s=get_compile_timeout_s(),
                 provider_hint=provider_hint,
+                newest_entry_at=newest_entry_at,
+                fallback_updated_at=fallback_updated_at,
             )
         except Exception as e:  # noqa: BLE001 — compile is best-effort
             logger.warning(f"background wiki compile failed (key={key}): {e}")
@@ -1791,13 +1827,22 @@ class MemoryService:
                             updated = updated.replace(tzinfo=timezone.utc)
                         if last_compiled >= updated:
                             continue
-                    candidates.append((row.key, row.scope_id))
+                    row_updated = row.updated_at
+                    if row_updated is not None:
+                        if row_updated.tzinfo is None:
+                            row_updated = row_updated.replace(tzinfo=timezone.utc)
+                        else:
+                            row_updated = row_updated.astimezone(timezone.utc)
+                        fallback_updated_at = row_updated.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    else:
+                        fallback_updated_at = None
+                    candidates.append((row.key, row.scope_id, fallback_updated_at))
         except Exception as e:  # noqa: BLE001
             logger.warning(f"compact: candidate query failed: {e}")
             return {"_summary": {"error": str(e)}}
 
         results: dict = {}
-        for topic_key, topic_scope_id in candidates:
+        for topic_key, topic_scope_id, fallback_updated_at in candidates:
             wiki_path = self.get_wiki_path(scope, topic_scope_id, topic_key)
             try:
                 article = wiki_path.read_text(encoding="utf-8")
@@ -1812,6 +1857,8 @@ class MemoryService:
                 key=topic_key,
                 new_entry="",
                 pre_append_content=article,
+                newest_entry_at=None,
+                fallback_updated_at=fallback_updated_at,
                 expected_content=article,
                 provider_hint=provider_hint,
             )
@@ -2465,6 +2512,160 @@ class MemoryService:
     # -------------------------------------------------------------------------
     # Recall
     # -------------------------------------------------------------------------
+
+    async def read_exact_key(
+        self,
+        key: str,
+        scope: Optional[str] = None,
+        scope_id: Optional[str] = None,
+        terminal_context: Optional[dict] = None,
+        scan_all: bool = False,
+        *,
+        record_access: bool = True,
+    ) -> Optional[Memory]:
+        """Read one exact key without routing the lookup through ranked search."""
+        if not _is_memory_enabled():
+            return None
+
+        key = self._sanitize_key(key)
+        terminal_id = (terminal_context or {}).get("terminal_id")
+        policy = _resolve_injection_policy(
+            False,
+            consumer="explicit_recall",
+            terminal_id=terminal_id,
+        )
+        selected_scope_id = scope_id
+
+        if scope is not None and scope_id is not None:
+            try:
+                from cli_agent_orchestrator.services.settings_service import get_vault_config
+                from cli_agent_orchestrator.services.vault.binding import resolve
+
+                vault_config = get_vault_config()
+                binding = resolve(scope, scope_id, vault_config=vault_config)
+            except Exception as exc:
+                logger.warning("vault exact-key source unavailable; returning no content: %s", exc)
+                return None
+            if isinstance(binding, VaultBinding):
+                search_dirs: list[Path] = []
+                vault_bindings = [binding]
+                selected_scope_id = binding.scope_id
+            else:
+                project_dir = self._get_project_dir(scope, scope_id)
+                search_dirs = [project_dir] if project_dir.exists() else []
+                vault_bindings = []
+                selected_scope_id = scope_id
+        else:
+            search_dirs, vault_bindings, _max_body_chars, vault_config = self._resolve_sources(
+                scope,
+                terminal_context,
+                scan_all=scan_all,
+            )
+
+        results: list[Memory] = []
+        private_scope_ids = self._private_recall_scope_ids(terminal_context, scan_all)
+        for project_dir in search_dirs:
+            index_path = project_dir / "wiki" / "index.md"
+            if not index_path.exists():
+                continue
+            for entry in self._parse_index(index_path):
+                entry = dict(entry)
+                if entry["scope"] == MemoryScope.PROJECT.value:
+                    entry["scope_id"] = (
+                        project_dir.name
+                        if project_dir.name not in {"global", "federated"}
+                        else None
+                    )
+                if entry["key"] != key or (scope and entry["scope"] != scope):
+                    continue
+                entry_scope_id = entry.get("scope_id")
+                if selected_scope_id is not None and entry_scope_id != selected_scope_id:
+                    continue
+                if self._native_entry_is_vault_mapped(entry["scope"], entry_scope_id, vault_config):
+                    continue
+                if not self._private_scope_is_visible(
+                    entry["scope"], entry_scope_id, private_scope_ids
+                ):
+                    continue
+                memory = self._load_related_memory(key, entry["scope"], entry_scope_id)
+                if memory is not None:
+                    results.append(memory)
+
+        for binding in vault_bindings:
+            memory = self._load_related_vault_memory(
+                key,
+                scope=binding.scope,
+                scope_id=binding.scope_id,
+                require_injectable=False,
+                terminal_id=terminal_id,
+                consumer="explicit_recall",
+                policy=policy,
+            )
+            if memory is not None and (
+                selected_scope_id is None or self._effective_scope_id(memory) == selected_scope_id
+            ):
+                results.append(memory)
+
+        results.sort(key=lambda memory: memory.updated_at, reverse=True)
+        if not scope:
+            precedence = {
+                MemoryScope.SESSION.value: 0,
+                MemoryScope.PROJECT.value: 1,
+                MemoryScope.GLOBAL.value: 2,
+                MemoryScope.AGENT.value: 3,
+                MemoryScope.FEDERATED.value: 4,
+            }
+            results.sort(
+                key=lambda memory: (
+                    precedence.get(memory.scope, 99),
+                    -memory.updated_at.timestamp(),
+                )
+            )
+
+        from cli_agent_orchestrator.services.settings_service import is_memory_lifecycle_enabled
+
+        lifecycle_on = is_memory_lifecycle_enabled()
+        superseded = self._superseded_keys(results) if lifecycle_on else None
+        self._order_candidates(
+            results,
+            scope,
+            "recency",
+            lifecycle_on=lifecycle_on,
+            superseded_snapshot=superseded,
+        )
+
+        check = None
+        if (
+            policy.is_curator
+            or (terminal_context or {}).get("agent_profile") == MEMORY_MANAGER_PROFILE
+        ):
+            check = memory_eligibility.begin_check(
+                memory_eligibility.EligibilityRequest.from_context(
+                    "curated_recall", terminal_context
+                )
+            )
+        if check is not None:
+            results = list(
+                islice(
+                    check.eligible_in_order(
+                        results,
+                        lambda memory: memory_eligibility.MemoryIdentity(*self._identity(memory)),
+                        1,
+                    ),
+                    1,
+                )
+            )
+
+        finished = self._finish_recall(
+            results,
+            scope,
+            1,
+            eligibility=check,
+            lifecycle_on=lifecycle_on,
+            record_access=record_access,
+            superseded_snapshot=superseded,
+        )
+        return finished[0] if finished else None
 
     def _bm25_scope_id(
         self, scope: Optional[str], terminal_context: Optional[dict]
@@ -4126,12 +4327,19 @@ class MemoryService:
 
     def _parse_wiki_file(self, wiki_file: Path, file_content: str, entry: dict) -> Optional[Memory]:
         """Parse a wiki topic file into a Memory object."""
+        memory, _ = self._parse_wiki_file_with_split(wiki_file, file_content, entry)
+        return memory
+
+    def _parse_wiki_file_with_split(
+        self, wiki_file: Path, file_content: str, entry: dict
+    ) -> tuple[Optional[Memory], Optional[WikiContentSplit]]:
+        """Parse a wiki topic and expose the content split used by recall."""
         if self._native_identity_is_migration_dormant(
             entry["key"],
             entry.get("scope", "global"),
             entry.get("scope_id"),
         ):
-            return None
+            return None, None
         # Extract id from comment
         id_match = re.search(r"<!-- id: ([a-f0-9\-]+)", file_content)
         memory_id = id_match.group(1) if id_match else str(uuid.uuid4())
@@ -4152,23 +4360,167 @@ class MemoryService:
         scope = scope.rstrip(" |")
         memory_type = memory_type.rstrip(" |")
 
-        # Extract all timestamped entries
-        timestamps = re.findall(r"## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)", file_content)
-        if not timestamps:
+        from cli_agent_orchestrator.services.settings_service import is_memory_parser_lenient
+
+        lines = file_content.splitlines()
+        header_index = next(
+            (index for index, line in enumerate(lines) if TOPIC_HEADER_RE.fullmatch(line)),
+            -1,
+        )
+        body_lines = lines[header_index + 1 :] if header_index >= 0 else lines
+        while body_lines and not body_lines[0].strip():
+            body_lines.pop(0)
+        if body_lines and body_lines[0].startswith("# "):
+            body_lines.pop(0)
+            while body_lines and not body_lines[0].strip():
+                body_lines.pop(0)
+        compiled = bool(body_lines and _COMPILED_MARKER_RE.fullmatch(body_lines[0]))
+
+        def _entry_time(name: str) -> Optional[datetime]:
+            value = entry.get(name)
+            if isinstance(value, datetime):
+                return (
+                    value.replace(tzinfo=timezone.utc)
+                    if value.tzinfo is None
+                    else value.astimezone(timezone.utc)
+                )
+            if isinstance(value, str):
+                try:
+                    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+                        tzinfo=timezone.utc
+                    )
+                except ValueError:
+                    return None
             return None
 
-        created_at = datetime.strptime(timestamps[0], "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc
-        )
-        updated_at = datetime.strptime(timestamps[-1], "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc
-        )
+        def _timestamp_boundaries(
+            matches: list[re.Match[str]], group: int | str
+        ) -> tuple[list[re.Match[str]], list[datetime]]:
+            first_index: Optional[int] = None
+            first_match: Optional[re.Match[str]] = None
+            first_time: Optional[datetime] = None
+            for index, match in enumerate(matches):
+                value = match.group(group)
+                try:
+                    first_time = datetime.strptime(
+                        value if len(value) == 20 else value.replace("Z", ":00Z"),
+                        "%Y-%m-%dT%H:%M:%SZ",
+                    ).replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                first_index = index
+                first_match = match
+                break
+            if first_index is None or first_match is None or first_time is None:
+                return [], []
 
-        # Extract content (everything after the last ## timestamp line)
-        last_section = file_content.rsplit(f"## {timestamps[-1]}", 1)
-        latest_content = last_section[-1].strip() if len(last_section) > 1 else ""
+            for match in reversed(matches[first_index + 1 :]):
+                value = match.group(group)
+                try:
+                    last_time = datetime.strptime(
+                        value if len(value) == 20 else value.replace("Z", ":00Z"),
+                        "%Y-%m-%dT%H:%M:%SZ",
+                    ).replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                return [first_match, match], [first_time, last_time]
+            return [first_match], [first_time]
 
-        return Memory(
+        lenient = is_memory_parser_lenient()
+        heading_matches: list[re.Match[str]] = []
+        timestamps: list[datetime] = []
+        timestamp_candidates = list(
+            (_CANONICAL_ENTRY_HEADING_RE if compiled else _LEGACY_ENTRY_TIMESTAMP_RE).finditer(
+                file_content
+            )
+        )
+        timestamp_matches, timestamps = _timestamp_boundaries(timestamp_candidates, 1)
+        use_legacy_split = False
+        if not compiled and not lenient:
+            if not timestamps:
+                return None, None
+            use_legacy_split = True
+        elif not compiled and timestamps:
+            use_legacy_split = True
+        elif not compiled:
+            heading_matches, timestamps = _timestamp_boundaries(
+                list(_LENIENT_ENTRY_HEADING_RE.finditer(file_content)),
+                "timestamp",
+            )
+
+        if timestamps:
+            created_at = timestamps[0]
+            updated_at = timestamps[-1]
+        else:
+            # Leniency applies only to an otherwise-canonical topic. A random
+            # Markdown file in the wiki tree must not become a memory merely
+            # because its filename resembles a key.
+            header_match = next(
+                (
+                    TOPIC_HEADER_RE.fullmatch(line)
+                    for line in file_content.splitlines()
+                    if TOPIC_HEADER_RE.fullmatch(line) is not None
+                ),
+                None,
+            )
+            if header_match is None:
+                return None, None
+            try:
+                uuid.UUID(header_match.group("id"))
+                MemoryScope(header_match.group("scope").strip())
+                MemoryType(header_match.group("type").strip())
+            except ValueError:
+                return None, None
+            memory_id = header_match.group("id")
+            scope = header_match.group("scope").strip()
+            memory_type = header_match.group("type").strip()
+            tags = normalize_memory_tags(header_match.group("tags"))
+
+            file_time = datetime.fromtimestamp(wiki_file.stat().st_mtime, tz=timezone.utc)
+            created_at = _entry_time("created_at") or file_time
+            updated_at = _entry_time("updated_at") or file_time
+
+        history_range: Optional[tuple[int, int]] = None
+        if compiled or not timestamps:
+            if compiled:
+                body_lines.pop(0)
+                while body_lines and not body_lines[0].strip():
+                    body_lines.pop(0)
+            if compiled and body_lines and _CANONICAL_ENTRY_HEADING_RE.fullmatch(body_lines[0]):
+                body_lines.pop(0)
+                while body_lines and not body_lines[0].strip():
+                    body_lines.pop(0)
+            latest_section = "\n".join(body_lines).strip()
+            latest_content = self._strip_existing_see_also(latest_section).strip()
+            latest_start = (
+                timestamp_matches[-1].end()
+                if timestamp_matches
+                else file_content.find(body_lines[0]) if body_lines else len(file_content)
+            )
+        elif not use_legacy_split:
+            latest_start = heading_matches[-1].end("timestamp")
+            latest_section = file_content[latest_start:].strip()
+            latest_content = self._strip_existing_see_also(latest_section).strip()
+            if len(heading_matches) > 1:
+                history_range = (heading_matches[0].start(), heading_matches[-1].start())
+        else:
+            latest_start = timestamp_matches[-1].end()
+            latest_section = file_content[latest_start:].strip()
+            latest_content = (
+                self._strip_existing_see_also(latest_section).strip() if lenient else latest_section
+            )
+            if len(timestamp_matches) > 1:
+                history_range = (timestamp_matches[0].start(), timestamp_matches[-1].start())
+
+        # A timestamp is sufficient structural evidence that this is a stored
+        # topic.  In lenient mode the derived See-Also projection is stripped
+        # from content, but a See-Also-only topic must remain listable/exportable
+        # just as it was under the legacy parser.  Headingless header-only files
+        # still have neither content nor timestamps and remain invisible.
+        if not latest_content and not timestamps:
+            return None, None
+
+        memory = Memory(
             id=memory_id,
             key=entry["key"],
             memory_type=memory_type,
@@ -4182,6 +4534,12 @@ class MemoryService:
             updated_at=updated_at,
             content=latest_content,
         )
+        split = WikiContentSplit(
+            latest_section=latest_section,
+            latest_start=latest_start,
+            history_range=history_range,
+        )
+        return memory, split
 
     # -------------------------------------------------------------------------
     # Forget
@@ -4495,33 +4853,63 @@ class MemoryService:
         check = memory_eligibility.begin_check(
             memory_eligibility.EligibilityRequest.from_context("injected_context", terminal_context)
         )
+        from cli_agent_orchestrator.services.settings_service import (
+            is_memory_injection_v1_fixes_enabled,
+        )
+
+        v1_fixes = is_memory_injection_v1_fixes_enabled()
 
         for scope_val in scopes_in_order:
             scope_id = self.resolve_scope_id(scope_val, terminal_context)
             project_dir = self._get_project_dir(scope_val, scope_id)
             wiki_dir = project_dir / "wiki"
-            wiki_resolved = os.path.realpath(str(wiki_dir))
-            index_path = wiki_dir / "index.md"
 
             native_dirs, vault_bindings, max_body_chars, _vault_config = self._resolve_sources(
                 scope_val, terminal_context, scan_all=False
             )
-            scope_entries = []
-            if native_dirs and not vault_bindings and index_path.exists():
-                for e in self._parse_index(index_path):
-                    if e["scope"] != scope_val:
+            scope_entries: list[tuple[Path, str, dict]] = []
+            native_wiki_dirs = (
+                [
+                    native_dir / "wiki"
+                    for native_dir in native_dirs
+                    if native_dir not in {self.base_dir / "global", self.base_dir / "federated"}
+                ]
+                if scope_val == MemoryScope.PROJECT.value and v1_fixes
+                else ([wiki_dir] if native_dirs else [])
+            )
+            if not vault_bindings:
+                for native_wiki_dir in native_wiki_dirs:
+                    index_path = native_wiki_dir / "index.md"
+                    if not index_path.exists():
                         continue
-                    # Session/agent entries embed scope_id in the wiki path and
-                    # share index.md with global, so the scope_id must match the
-                    # caller's. Project entries already live in a per-project
-                    # directory and global has no scope_id by design.
-                    if scope_val in (MemoryScope.SESSION.value, MemoryScope.AGENT.value):
-                        if e.get("scope_id") != scope_id:
+                    wiki_resolved = os.path.realpath(str(native_wiki_dir))
+                    for entry in self._parse_index(index_path):
+                        if entry["scope"] != scope_val:
                             continue
-                    scope_entries.append(e)
+                        # Session/agent entries embed scope_id in the wiki path and
+                        # share index.md with global, so the scope_id must match the
+                        # caller's. Project entries already live in a per-project
+                        # directory and global has no scope_id by design.
+                        if scope_val in (MemoryScope.SESSION.value, MemoryScope.AGENT.value):
+                            if entry.get("scope_id") != scope_id:
+                                continue
+                        scope_entries.append((native_wiki_dir, wiki_resolved, entry))
             # U7 adds injectable vault candidates here. A missing native index
             # must not skip this scope, because a vault-only mapping has none.
-            scope_entries.sort(key=lambda e: e.get("updated_at", ""), reverse=True)
+            scope_entries.sort(key=lambda item: item[2].get("updated_at", ""), reverse=True)
+            if scope_val == MemoryScope.PROJECT.value and v1_fixes:
+                # Alias folders can retain an older copy of a key after project
+                # identity becomes canonical. Keep the newest indexed copy so
+                # injection never presents conflicting versions of one fact.
+                deduplicated_entries: list[tuple[Path, str, dict]] = []
+                seen_keys: set[str] = set()
+                for item in scope_entries:
+                    key = item[2]["key"]
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    deduplicated_entries.append(item)
+                scope_entries = deduplicated_entries
 
             scope_memories: list[Memory] = []
             native_entries = (
@@ -4529,16 +4917,16 @@ class MemoryService:
                 if check is None
                 else check.eligible_in_order(
                     scope_entries,
-                    lambda e: memory_eligibility.MemoryIdentity(
-                        e["key"], scope_val, scope_id, "native"
+                    lambda item: memory_eligibility.MemoryIdentity(
+                        item[2]["key"], scope_val, scope_id, "native"
                     ),
                     MEMORY_MAX_PER_SCOPE,
                 )
             )
-            for entry in native_entries:
+            for native_wiki_dir, wiki_resolved, entry in native_entries:
                 if len(scope_memories) >= MEMORY_MAX_PER_SCOPE:
                     break
-                wiki_file = wiki_dir / entry["relative_path"]
+                wiki_file = native_wiki_dir / entry["relative_path"]
                 resolved_wiki = Path(os.path.realpath(str(wiki_file)))
                 # Guard against a crafted/corrupted index entry (e.g.
                 # ``../<other-project>/wiki/...``) escaping this scope's wiki
@@ -4690,6 +5078,31 @@ class MemoryService:
                         # it and try the next (possibly shorter) one.
                         self._record_vault_related_injection_skip(mem)
                         continue
+                    if v1_fixes:
+                        self._record_vault_injection_clip(scope_val, scope_id, [mem])
+                        if position == 0:
+                            suffix = f" … (full note: {mem.key})"
+                            prefix = f"- [{mem.scope}] {mem.key}{tag}: "
+                            later_lengths = [
+                                len(f"- [{later.scope}] {later.key}: {later.content}") + 1
+                                for later in scope_memories[position + 1 :]
+                                if not getattr(later, "is_related", False)
+                            ]
+                            reserve = min(
+                                (length for length in later_lengths if length <= scope_char_cap),
+                                default=0,
+                            )
+                            available = scope_char_cap - reserve - len(prefix) - len(suffix) - 1
+                            if available > 0:
+                                sentence = _first_sentence(mem.content)
+                                clipped_line = prefix + sentence[:available].rstrip() + suffix
+                                lines.append(clipped_line)
+                                scope_used_chars += len(clipped_line) + 1
+                                if redacted_patterns:
+                                    self._record_vault_injection_redaction(
+                                        mem, len(redacted_patterns)
+                                    )
+                        continue
                     self._record_vault_injection_clip(
                         scope_val,
                         scope_id,
@@ -4709,7 +5122,7 @@ class MemoryService:
             return ""
 
         context = "## Context from CAO Memory\n" + "\n".join(lines)
-        return f"<cao-memory>\n{context}\n</cao-memory>"
+        return render_memory_block(context)
 
     def _record_vault_injection_clip(
         self, scope: str, scope_id: Optional[str], dropped: list[Memory]
@@ -5031,4 +5444,4 @@ class MemoryService:
             return ctx
         except Exception as e:
             logger.warning(f"Could not get terminal context for {terminal_id}: {e}")
-            return None
+            raise RuntimeError(f"Could not get terminal context for {terminal_id}") from e

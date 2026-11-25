@@ -45,8 +45,9 @@ echo "[stock-client] Starting cao-server (CAO_AGUI_ENABLED=${CAO_AGUI_ENABLED}) 
 "${CAO_SERVER_BIN}" >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 
-# Wait for the server to become healthy.
-for _ in $(seq 1 40); do
+# Server startup includes database recovery and plugin loading. Allow one minute
+# so a loaded CI runner does not fail while the server is still making progress.
+for _ in $(seq 1 120); do
     if curl -fsS "${BASE}/health" >/dev/null 2>&1; then break; fi
     sleep 0.5
 done

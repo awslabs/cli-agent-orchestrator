@@ -50,7 +50,7 @@ def _make_svc(tmp_path: Path) -> MemoryService:
 
 def _inner(block: str) -> str:
     """Return the content between the cao-memory tags."""
-    return block.split("<cao-memory>")[1].split("</cao-memory>")[0]
+    return block.split(">", 1)[1].split("</cao-memory>")[0]
 
 
 def _count_scope_lines(block: str, scope: str) -> int:
@@ -297,3 +297,74 @@ def test_empty_scope_does_not_grow_other_scopes(tmp_path: Path) -> None:
             f"{scope} scope grew beyond MEMORY_SCOPE_BUDGET_CHARS "
             f"({scope_chars} > {MEMORY_SCOPE_BUDGET_CHARS})"
         )
+
+
+def test_oversized_first_memory_is_clipped_and_later_memory_is_considered(
+    tmp_path: Path,
+) -> None:
+    svc = _make_svc(tmp_path)
+    ctx = _ctx()
+    _run(
+        svc.store(
+            content="small later memory",
+            scope="global",
+            memory_type="reference",
+            key="later",
+            terminal_context=ctx,
+        )
+    )
+    _run(
+        svc.store(
+            content="First sentence. " + ("x" * 1600),
+            scope="global",
+            memory_type="reference",
+            key="oversized",
+            terminal_context=ctx,
+        )
+    )
+
+    block = svc.get_memory_context_for_terminal("term-u2", budget_chars=9000)
+
+    assert "- [global] oversized: First sentence. … (full note: oversized)" in block
+    assert "- [global] later: small later memory" in block
+    global_chars = sum(
+        len(line) + 1 for line in _inner(block).splitlines() if line.startswith("- [global]")
+    )
+    assert global_chars <= MEMORY_SCOPE_BUDGET_CHARS
+
+
+def test_v1_fixes_false_retains_break_on_oversized_first_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cli_agent_orchestrator.services import settings_service
+
+    svc = _make_svc(tmp_path)
+    ctx = _ctx()
+    _run(
+        svc.store(
+            content="small later memory",
+            scope="global",
+            memory_type="reference",
+            key="later",
+            terminal_context=ctx,
+        )
+    )
+    _run(
+        svc.store(
+            content="First sentence. " + ("x" * 1600),
+            scope="global",
+            memory_type="reference",
+            key="oversized",
+            terminal_context=ctx,
+        )
+    )
+    original_get_memory_settings = settings_service.get_memory_settings
+
+    def legacy_settings() -> dict:
+        settings = original_get_memory_settings()
+        settings["injection"] = {"clear_on_empty": True, "v1_fixes": False}
+        return settings
+
+    monkeypatch.setattr(settings_service, "get_memory_settings", legacy_settings)
+
+    assert svc.get_memory_context_for_terminal("term-u2", budget_chars=9000) == ""

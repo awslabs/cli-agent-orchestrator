@@ -1,7 +1,8 @@
 """BackendFactory — constructs the configured TerminalBackend at startup.
 
 Reads `terminal.backend` via ConfigService (CLI flag > CAO_TERMINAL_BACKEND
-env var > settings.json > "tmux" default). "herdr" is opt-in and experimental.
+env var > settings.json > "tmux" default). "herdr" and "herdr-app" are opt-in
+and experimental.
 """
 
 import logging
@@ -78,13 +79,30 @@ class BackendFactory:
             from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 
             herdr_session = ConfigService.get("terminal.herdr_session", default="cao")
+            herdr_auto_start = ConfigService.get("terminal.herdr_auto_start", default=True)
             logger.info(
                 "[EXPERIMENTAL] terminal_backend='herdr' is experimental. "
                 "Report issues at https://github.com/awslabs/cli-agent-orchestrator/issues"
             )
-            return HerdrBackend(herdr_session=herdr_session)
+            return HerdrBackend(herdr_session=herdr_session, auto_start=herdr_auto_start)
+        elif backend_name == "herdr-app":
+            from cli_agent_orchestrator.backends.herdr_app_backend import HerdrAppBackend
+
+            session = ConfigService.get("terminal.herdr_app_session", default="cao")
+            if session == "default":
+                raise ConfigurationError(
+                    "terminal.herdr_app_session is 'default', the herdr-core session "
+                    "the Herdr app opens for your own terminals. CAO starts that "
+                    "session's core, writes its app layout, and kills terminals in it, "
+                    "so it needs a session of its own. Set another name, such as 'cao'."
+                )
+            logger.info(
+                "[EXPERIMENTAL] terminal_backend='herdr-app' is experimental. "
+                "Report issues at https://github.com/awslabs/cli-agent-orchestrator/issues"
+            )
+            return HerdrAppBackend(herdr_app_session=session)
         else:
             raise ConfigurationError(
                 f"Unknown terminal_backend: '{backend_name}'. "
-                f"Valid options are: 'tmux', 'herdr' [EXPERIMENTAL]"
+                f"Valid options are: 'tmux', 'herdr' [EXPERIMENTAL], 'herdr-app' [EXPERIMENTAL]"
             )

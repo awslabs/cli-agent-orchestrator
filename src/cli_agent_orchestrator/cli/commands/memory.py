@@ -288,7 +288,13 @@ def doctor_cmd(fixtures: bool, do_apply: bool, backup: Path | None) -> None:
     default=None,
     help="Plan or apply rollback for exactly one migration receipt.",
 )
-def repair_cmd(do_apply, receipt_id):
+@click.option(
+    "--add-headings",
+    is_flag=True,
+    default=False,
+    help="With --apply, back up and add canonical headings to fallback-dated topics.",
+)
+def repair_cmd(do_apply, receipt_id, add_headings):
     """Reconcile topics into SQLite and index.md.
 
     Reconciles the surviving canonical topics. Dry-run unless --apply.
@@ -315,7 +321,14 @@ def repair_cmd(do_apply, receipt_id):
             click.echo(f"{record.status} {label} [{actions}]{detail}")
 
     try:
-        report = service.reconcile(apply=do_apply, receipt_id=receipt_id)
+        if add_headings:
+            report = service.reconcile(
+                apply=do_apply,
+                receipt_id=receipt_id,
+                add_headings=True,
+            )
+        else:
+            report = service.reconcile(apply=do_apply, receipt_id=receipt_id)
     except MemoryReconciliationError as exc:
         report = exc.report
         render_report(report)
@@ -783,11 +796,10 @@ def show(key, scope):
     _validate_key(key)
     svc = _get_memory_service()
     try:
-        memories = _run_async(
-            svc.recall(
-                query=key,
+        match = _run_async(
+            svc.read_exact_key(
+                key,
                 scope=scope,
-                limit=100,
                 terminal_context=_cwd_context(),
                 scan_all=True,
                 record_access=not is_non_accessing_inspection_enabled(),
@@ -795,13 +807,6 @@ def show(key, scope):
         )
     except Exception as e:
         raise click.ClickException(str(e))
-
-    # Find exact key match
-    match = None
-    for mem in memories:
-        if mem.key == key:
-            match = mem
-            break
 
     if not match:
         raise click.ClickException(f"Memory '{key}' not found.")

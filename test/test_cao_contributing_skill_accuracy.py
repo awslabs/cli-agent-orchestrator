@@ -98,7 +98,7 @@ NON_CAO_SKILL_NAMES = frozenset({"agui-author", "mcp-apps-builder"})
 # derived floor would either be circular (count what the file happens to say) or
 # wrong (every shipped skill is not a valid route). The slack is therefore stated
 # instead of hidden: the routing section currently names FOUR real skills
-# (cao-mcp-apps, cao-plugin, cao-provider, cao-session-management), so this floor
+# (cao-mcp-apps, cao-event-plugin, cao-provider, cao-session-management), so this floor
 # tolerates losing exactly one before it fires.
 MINIMUM_SKILL_REFERENCES = 3
 
@@ -334,11 +334,11 @@ def _unit_tests_pytest_command() -> str:
     """The Unit Tests job's pytest invocation, and only that one.
 
     Anchored to ``jobs.test`` rather than regexed out of the whole file because
-    ``ci.yml`` runs a SECOND pytest, with its own ``--cov`` and ``-m``, in the
-    ``cao-mcp-apps`` job (the coverage-ratchet floor). A whole-file regex can
-    therefore validate the wrong job: verified by deleting ``--cov`` and ``-m``
-    from the Unit Tests step, which left the previous unanchored assertions green
-    while the documented job produced no coverage and deselected nothing.
+    ``ci.yml`` runs other pytest commands, including the HTTP-only boundary guard
+    in the ``cao-mcp-apps`` job. A whole-file regex can therefore validate the
+    wrong job: verified by deleting ``--cov`` and ``-m`` from the Unit Tests step,
+    which left the previous unanchored assertions green while the documented job
+    produced no coverage and deselected nothing.
     """
     steps = _ci_spec()["jobs"]["test"]["steps"]
     commands = [str(s.get("run", "")) for s in steps if "pytest" in str(s.get("run", ""))]
@@ -944,7 +944,7 @@ class TestMypyToleranceClaim:
 # Review of #448 found the gate map silently incomplete: ``Secret Scan`` had been
 # split out of ci.yml into its own workflow (#457), so a table pinned to ci.yml
 # alone could never notice it was missing, and neither could cargo-deny or the
-# path-filtered provider workflows. These guards derive the set from every
+# other PR gates. These guards derive the set from every
 # workflow file that triggers on ``pull_request`` instead of from a list, so a
 # new PR-gating workflow fails here until the skill documents it.
 
@@ -1025,11 +1025,20 @@ def _other_workflow_rows() -> dict[str, tuple[str, str, str, str]]:
 
 class TestOtherPrGatingWorkflowsAreDocumented:
     def test_the_guard_has_something_to_check(self):
-        """Non-vacuity: at least Secret Scan, cargo-deny and one path-filtered one."""
+        """Non-vacuity: the external PR gates and the docs path filter exist."""
         found = _pr_gating_workflows()
         assert {"Secret Scan", "cargo-deny"} <= set(found), sorted(found)
         assert any(
             isinstance(w["trigger"], dict) and w["trigger"].get("paths") for w in found.values()
+        )
+
+    def test_merge_queue_runs_all_filtered_jobs(self):
+        reference = (SKILL.parent / "references" / "pr-gating-workflows.md").read_text()
+        assert "pushes to `main` and merge queue entries run every filtered job" in " ".join(
+            reference.split()
+        )
+        assert "no later queue entry can skip a previously failing job" in " ".join(
+            reference.split()
         )
 
     def test_every_pr_gating_workflow_has_a_row(self):
@@ -1080,7 +1089,11 @@ class TestOtherPrGatingWorkflowsAreDocumented:
         documented.add(f".github/workflows/{file_cell}")
         trigger = _pull_request_trigger(spec)
         assert isinstance(trigger, dict)
-        assert documented == set(trigger["paths"])
+        assert trigger["branches-ignore"] == ["main"]
+        assert documented - {"main"} == set(trigger["paths"])
+        from scripts.ci_changed_paths import FILTERS
+
+        assert set(spec.get("on", spec.get(True))["push"]["paths"]) <= set(FILTERS["docs"])
 
     @pytest.mark.parametrize("workflow", sorted(_pr_gating_workflows()))
     def test_the_verdict_matches_job_level_continue_on_error(self, workflow: str):

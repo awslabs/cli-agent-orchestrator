@@ -348,7 +348,7 @@ OpenCode's `opencode.json` with no per-provider work.
 | When | Providers |
 |---|---|
 | **Install time** — written into a config file the CLI reads later | `kiro_cli`, `opencode_cli` |
-| **Launch time** — recomputed each time a terminal is created | `claude_code`, `codex`, `kimi_cli`, `cursor_cli`, `copilot_cli`, `antigravity_cli`, `omp`, `grok_cli`, `mcode` |
+| **Launch time** — recomputed each time a terminal is created | `claude_code`, `codex`, `kimi_cli`, `cursor_cli`, `copilot_cli`, `antigravity_cli`, `omp`, `grok_cli`, `mcode`, `qwen_cli` |
 | **Never** — the provider builds no MCP configuration at all | `hermes`, `mock_cli` |
 
 The last row is *reported*, not silent: installing an agent for one of those
@@ -458,7 +458,7 @@ Some entries are rejected, always with a report and never silently:
 
   | Delivery | Providers | How |
   |---|---|---|
-  | Native field | `codex`, `antigravity_cli`, `opencode_cli`, `kimi_cli` | The format documents a working-directory key, so CAO writes it directly. Codex `mcp_servers.<id>.cwd` and Antigravity `cwd` are documented; OpenCode's `McpLocalConfig.cwd` and FastMCP's `StdioMCPServer.cwd` (Kimi) are in their schemas. |
+  | Native field | `codex`, `antigravity_cli`, `opencode_cli`, `kimi_cli`, `qwen_cli` | The format documents a working-directory key, so CAO writes it directly. Codex `mcp_servers.<id>.cwd` and Antigravity `cwd` are documented; OpenCode's `McpLocalConfig.cwd`, FastMCP's `StdioMCPServer.cwd` (Kimi), and Qwen's `MCPServerConfig.cwd` are in their schemas. |
   | `/bin/sh` wrapper | `grok_cli`, `mcode`, `kiro_cli`, `claude_code`, `cursor_cli`, `copilot_cli`, `omp` | The format has **no** working-directory key, so the command becomes `/bin/sh -c 'cd -- "$1" && shift && exec "$@"' cao-cwd-shim <cwd> <command> <args…>`. `exec` replaces the shell, the environment passes through, and argument boundaries survive because each argument stays a separate argv element. |
   | Nothing to carry | `hermes`, `mock_cli` | These build no MCP configuration at all and already report `mcp.provider_unsupported` per server. |
 
@@ -511,7 +511,7 @@ AG-UI client on CAO without CAO-specific integration code:
 | Package | Install this if you are… | Skills | Also ships |
 |---|---|---|---|
 | [`cao`](../agent-plugin/cao) | **an operator** driving CAO from another client | `cao-session-management`, `cao-agent-routing`, `cao-supervisor-protocols`, `cao-worker-protocols` | the `cao-ops` MCP server |
-| [`cao-contributor`](../agent-plugin/cao-contributor) | **a contributor** extending CAO itself | `cao-provider`, `cao-plugin`, `cao-contributing` | — |
+| [`cao-contributor`](../agent-plugin/cao-contributor) | **a contributor** extending CAO itself | `cao-provider`, `cao-event-plugin`, `cao-contributing` | — |
 | [`cao-agent-plugin-lifecycle`](../agent-plugin/cao-agent-plugin-lifecycle) | **an author** writing a new Agent Plugins 1.0.0 package or auditing an existing one | `cao-agent-plugin-creator`, `cao-agent-plugin-audit` | — |
 | [`cao-ag-ui-builder`](../agent-plugin/cao-ag-ui-builder) (name provisional) | **a builder** writing a UI or client on CAO's AG-UI surface, against CAO `main` | `agui-author` | — |
 
@@ -602,6 +602,42 @@ failing CI on any drift.
 > The name `cao-contributor` and the packaged name of the event-plugin authoring
 > skill are provisional, pending maintainer decision **M4**.
 
+## Install from the marketplace
+
+The repository root carries a marketplace catalog for each client that can add a
+repository as a marketplace, so the four packages above install without
+cloning anything or enabling `CAO_AGENT_PLUGINS_ENABLED`:
+
+```sh
+# Claude Code
+/plugin marketplace add awslabs/cli-agent-orchestrator
+/plugin install cao@cli-agent-orchestrator
+
+# Codex
+codex plugin marketplace add awslabs/cli-agent-orchestrator
+codex plugin add cao@cli-agent-orchestrator
+```
+
+The same commands work from a shell as `claude plugin marketplace add ...` and
+`claude plugin install ...`. Verified against Claude Code 2.1.328 and Codex CLI
+0.170.0, from a local checkout.
+
+The catalogs are `.claude-plugin/marketplace.json` (Claude Code) and
+`.agents/plugins/marketplace.json` (Codex). The Agent Plugins specification
+defines one manifest per plugin and no marketplace format, so each client's own
+file is needed. `scripts/build_agent_plugin.py` writes both from the same package
+list that writes the per-package manifests, and `make check-agent-plugin` fails
+when either is stale.
+
+**The catalog follows `main`**, not a release tag. A marketplace added from
+`awslabs/cli-agent-orchestrator` receives `main`'s skills, including
+`cao-ag-ui-builder`, which can describe behavior that has not been released.
+Package versions say what was last pinned, not what `main` contains.
+
+`cao plugin add` remains the route that works across every CAO provider: it
+installs a package into CAO's own skill store and provider configs, which a
+client-specific marketplace does not do.
+
 ## Trying it in a client
 
 Two routes reach a client, and they are worth keeping apart. **Through CAO** —
@@ -648,8 +684,23 @@ An operator opts in by naming the server in the profile's `allowedTools`:
 allowedTools:
   - "@builtin"
   - fs_read
-  - "@cao-ops"     # or a matching glob, or "*" — then it is granted
+  - "@cao-ops"              # or a matching glob, or "*" — then it is granted
+  - "@cao-ops-mcp-server"   # what the operations server's own gate asks for
 ```
+
+**That agent runs in a CAO terminal, so it needs both entries** (#1062). They
+answer two different checks. `@cao-ops` names the server by the key it is
+declared under, which is how CAO and the provider decide whether the agent may
+see its tools. `@cao-ops-mcp-server` is the grant the operations server itself
+requires of a bound terminal on every tool except `decisions_off`; that gate
+reads the fixed selector, not the key, so `@cao-ops` alone is refused with
+`the calling terminal's allowed tools do not include '@cao-ops-mcp-server'`. `"*"`
+covers both. A glob that covers both names, such as `"@cao-ops*"`, satisfies the
+gate and CAO's own server selection, but CAO passes the entry to the provider as
+written, so the two explicit entries are the form to rely on. See
+[Tool Restrictions](tool-restrictions.md#cao-ops-mcp-server-gates-the-operations-control-plane-separately).
+A client that runs the plugin **outside** CAO has no `CAO_TERMINAL_ID`, is an
+operator context, and needs neither.
 
 The accepted cost is that a freshly installed plugin's tools are inert until
 named. That is visible, because the operator just ran the install; the widening it
@@ -733,8 +784,10 @@ What each step asserts, and why it is the load-bearing one:
    `x-cao-pre-expanded` marker leaked. The profile names no `allowedTools`, so
    `@cao-ops` is **absent** from the resolved list — the fail-closed rule below,
    asserted where it takes effect. A second install (step 3b) of a profile that
-   *does* declare `allowedTools: ["@builtin", fs_read, "@cao-ops"]` gets the
-   grant, so the recording proves both halves of the rule rather than one.
+   *does* declare `allowedTools: ["@builtin", fs_read, "@cao-ops", "@cao-ops-mcp-server"]`
+   gets the grant, so the recording proves both halves of the rule rather than
+   one. The second entry is the one the operations server's gate reads in a CAO
+   terminal (#1062); the step asserts that it survives into the emitted list.
 4. **`cao install … --provider opencode_cli`** — `opencode.json` gets a real
    boolean `"enabled": true`; and installing over a user's own same-named entry
    **preserves it and emits a finding** rather than clobbering it.
@@ -827,7 +880,7 @@ corpus case is a directory under `fixtures/corpus/`, and
 
 | # | Requirement | Spec | Status | CAO code | Proven by |
 |---|---|---|---|---|---|
-| 11 | Support at least one of stdio and Streamable HTTP | §7.2.1 (Transport support) | Implemented, per provider. Eight providers carry stdio, Streamable HTTP and SSE; `opencode_cli`, `codex` and `antigravity_cli` carry stdio only; `hermes` and `mock_cli` have no MCP path, which is reported as `mcp.provider_unsupported` | `PROVIDER_TRANSPORTS` (`mcp_mapping.py:103`) | `test_mcp_launch_delivery.py::TestEveryDeliveringProviderIsCovered::test_every_provider_type_has_a_transport_row`; `test_mcp_mapping.py::TestTransportMatrix::test_http_transports_map_for_providers_that_carry_them`, `::test_a_provider_with_no_mcp_path_reports_provider_unsupported` |
+| 11 | Support at least one of stdio and Streamable HTTP | §7.2.1 (Transport support) | Implemented, per provider. Eight providers carry stdio, Streamable HTTP and SSE; `opencode_cli`, `codex`, `antigravity_cli` and `qwen_cli` carry stdio only; `hermes` and `mock_cli` have no MCP path, which is reported as `mcp.provider_unsupported` | `PROVIDER_TRANSPORTS` (`mcp_mapping.py:103`) | `test_mcp_launch_delivery.py::TestEveryDeliveringProviderIsCovered::test_every_provider_type_has_a_transport_row`; `test_mcp_mapping.py::TestTransportMatrix::test_http_transports_map_for_providers_that_carry_them`, `::test_a_provider_with_no_mcp_path_reports_provider_unsupported` |
 | 12 | Use each entry's declared transport for the initial connection attempt | §7.2.1 (Transport support) | Delegated. CAO never substitutes a transport: an unsupported one is skipped with `mcp.transport_unsupported` (`mcp_mapping.py:771`, §7.2.2 rule 4). The connection attempt is the provider CLI's | `_map_entry` (`mcp_mapping.py:719`) | CAO's half: `test_mcp_mapping.py::TestTransportMatrix::test_an_unsupported_transport_is_skipped_not_substituted`; `test_mcp_launch_delivery.py::TestKimiCarriesTheDeclaredTransport::test_an_sse_plugin_server_reaches_kimi_as_transport_sse` |
 | 13 | Validate the closed top-level `mcp.json` and each server entry independently | §7.2.1, §7.2.2 | Implemented | `_document_errors` (`mcp_mapping.py:626`); `_server_errors` (`:646`) | corpus `mcp-invalid`; `test_mcp_mapping.py::TestTheDocumentEntryBoundary::test_one_invalid_server_does_not_drop_its_valid_siblings`; `::TestDocumentLevelFailures::test_an_unknown_top_level_key_still_disables_mcp` |
 | 14a | Keep a stdio `command` as one token, never split or placeholder-expanded, and resolve a `./` command against the plugin root | §7.2.1 (stdio) | Implemented | `_map_stdio` (`mcp_mapping.py:816`); `mcp.command_invalid` (`:835`); `mcp.command_escapes_root` (`:849`) | `test_mcp_mapping.py::TestCommandIsOneToken::test_a_command_with_spaces_is_not_split`, `::test_a_command_is_never_placeholder_expanded`, `::test_a_dot_rooted_command_is_resolved_inside_the_plugin`, `::test_a_dot_rooted_command_escaping_the_root_is_skipped` |

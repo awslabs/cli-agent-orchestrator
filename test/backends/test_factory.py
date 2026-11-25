@@ -7,10 +7,14 @@ and clear the relevant CAO_* env vars so each test is isolated.
 """
 
 import json
+import os
+from unittest.mock import patch
 
 import pytest
 
+from cli_agent_orchestrator.backends.base import TerminalBackendError
 from cli_agent_orchestrator.backends.factory import BackendFactory, ConfigurationError
+from cli_agent_orchestrator.backends.herdr_app_backend import HerdrAppBackend
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
 
@@ -33,6 +37,8 @@ def _isolated_settings(tmp_path, monkeypatch):
     )
     monkeypatch.delenv("CAO_TERMINAL_BACKEND", raising=False)
     monkeypatch.delenv("CAO_HERDR_SESSION", raising=False)
+    monkeypatch.delenv("CAO_HERDR_AUTO_START", raising=False)
+    monkeypatch.delenv("CAO_HERDR_APP_SESSION", raising=False)
     return fake_settings
 
 
@@ -85,6 +91,47 @@ class TestBackendFactoryHerdr:
         ):
             backend = BackendFactory.create()
         assert isinstance(backend, HerdrBackend)
+
+    def test_disabled_auto_start_reaches_herdr_backend(self, _isolated_settings):
+        """Factory-launched herdr must honor the service-manager setting."""
+        _isolated_settings.write_text(
+            json.dumps({"terminal": {"backend": "herdr", "herdr_auto_start": False}})
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+                return_value=False,
+            ),
+            patch("subprocess.Popen") as mock_popen,
+            pytest.raises(TerminalBackendError, match="herdr isn't running for session 'cao'"),
+        ):
+            BackendFactory.create()
+
+        mock_popen.assert_not_called()
+
+    def test_default_auto_start_starts_herdr_server(self, _isolated_settings):
+        """With no terminal.herdr_auto_start, a missing server is started."""
+        _write_terminal_config(_isolated_settings, backend="herdr")
+        real_exists = os.path.exists
+        socket_states = [False, True]
+
+        def exists(path):
+            if str(path).endswith("herdr.sock"):
+                return socket_states.pop(0) if socket_states else True
+            return real_exists(path)
+
+        with (
+            patch(
+                "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+                side_effect=exists,
+            ),
+            patch("time.sleep"),
+            patch("subprocess.Popen") as mock_popen,
+        ):
+            BackendFactory.create()
+
+        mock_popen.assert_called_once()
+        assert mock_popen.call_args[0][0] == ["herdr", "--session", "cao", "server"]
 
 
 class TestBackendFactoryOverride:
@@ -232,3 +279,50 @@ class TestSpawnModeWiring:
 
         assert backend._pane_layout == "tiled"
         assert "even-vertikal" in caplog.text
+
+
+class TestHerdrAppSelection:
+    """herdr-app backend selection; _connect is stubbed so no `hc` is needed."""
+
+    def test_herdr_app_backend_selected(self, _isolated_settings, monkeypatch):
+        monkeypatch.setenv("CAO_TERMINAL_BACKEND", "herdr-app")
+        monkeypatch.setattr(HerdrAppBackend, "_connect", lambda self: None)
+        backend = BackendFactory.create()
+        assert isinstance(backend, HerdrAppBackend)
+        assert backend.herdr_app_session == "cao"
+
+    def test_herdr_app_session_from_env(self, _isolated_settings, monkeypatch):
+        monkeypatch.setenv("CAO_TERMINAL_BACKEND", "herdr-app")
+        monkeypatch.setenv("CAO_HERDR_APP_SESSION", "cao-test")
+        monkeypatch.setattr(HerdrAppBackend, "_connect", lambda self: None)
+        assert BackendFactory.create().herdr_app_session == "cao-test"
+
+    def test_override_argument(self, _isolated_settings, monkeypatch):
+        monkeypatch.setattr(HerdrAppBackend, "_connect", lambda self: None)
+        assert isinstance(BackendFactory.create("herdr-app"), HerdrAppBackend)
+
+    def test_the_users_default_session_is_refused(self, _isolated_settings, monkeypatch):
+        """docs/herdr-app.md promises CAO never uses the app's own `default` session."""
+        monkeypatch.setenv("CAO_TERMINAL_BACKEND", "herdr-app")
+        monkeypatch.setenv("CAO_HERDR_APP_SESSION", "default")
+        connected = []
+        monkeypatch.setattr(HerdrAppBackend, "_connect", lambda self: connected.append(self))
+        with pytest.raises(ConfigurationError) as exc:
+            BackendFactory.create()
+        assert "'default'" in str(exc.value) and "your own terminals" in str(exc.value)
+        assert connected == [], "refused before any core is started or contacted"
+
+    def test_default_session_in_settings_is_refused(self, _isolated_settings, monkeypatch):
+        _isolated_settings.write_text(
+            json.dumps({"terminal": {"backend": "herdr-app", "herdr_app_session": "default"}})
+        )
+        monkeypatch.setattr(HerdrAppBackend, "_connect", lambda self: None)
+        with pytest.raises(ConfigurationError, match="session of its own"):
+            BackendFactory.create()
+
+    def test_unknown_backend_lists_all_three(self, _isolated_settings, monkeypatch):
+        monkeypatch.setenv("CAO_TERMINAL_BACKEND", "screen")
+        with pytest.raises(ConfigurationError) as exc:
+            BackendFactory.create()
+        for name in ("tmux", "herdr", "herdr-app"):
+            assert f"'{name}'" in str(exc.value)

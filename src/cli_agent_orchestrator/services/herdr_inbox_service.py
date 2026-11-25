@@ -1,15 +1,22 @@
 """HerdrInboxService — socket event-based inbox delivery for herdr backend.
 
 Replaces the pipe-pane + file watchdog approach with herdr's native socket API.
-Subscribes to a broadcast pane.updated event (whose payload carries
-agent_status) and delivers pending inbox messages when a pane transitions to
-idle or done.
+Subscribes to per-pane pane.agent_status_changed events (plus a broadcast
+pane.updated for older herdr versions that still emit it) and delivers pending
+inbox messages when a pane transitions to idle or done.
 
 Design:
 - Maintains a pane_id → terminal_id map for managed panes
-- Subscribes once to a broadcast pane.updated (no pane_id) covering all panes,
-  so a newly registered pane's events already arrive — registration updates the
-  map only and never re-subscribes or forces a reconnect
+- Subscribes to pane.agent_status_changed per managed pane, validated against a
+  fresh snapshot: herdr ≥0.9 accepts a broadcast pane.updated subscription but
+  no longer emits it on agent-status transitions, and rejects (and then RESETS
+  the connection on) any subscription naming a pane it does not know
+- herdr allows exactly ONE events.subscribe per connection (a second resets the
+  connection, measured on 0.7.5 and again on 0.9.5), so a pane registered after
+  connect is picked up by an intentional reconnect, not an incremental call
+- Reads the events.subscribe response: an error ack means the subscription is
+  NOT active, and silently carrying on would leave delivery to the slow
+  reconciliation sweep
 - Reconnects with exponential backoff on socket disconnect
 - Supplements with periodic pane read for kiro-cli (working >30s check)
 """
@@ -23,6 +30,8 @@ import time
 from datetime import datetime, timezone
 from typing import Callable, Dict, Optional, Set
 
+from cli_agent_orchestrator.services.inbox_service import DELIVERY_DEFERRED
+
 logger = logging.getLogger(__name__)
 
 # Exponential backoff parameters
@@ -32,6 +41,57 @@ _BACKOFF_MULTIPLIER = 2.0
 
 # Kiro supplement check: how long in "working" before we check pane read
 _KIRO_WORKING_THRESHOLD = 30.0  # seconds
+
+# How long to wait for herdr's response to events.subscribe before treating the
+# connection as broken. herdr answers a subscribe immediately (it is the first
+# and only in-flight request on a fresh connection), so this only fires when
+# the server is wedged.
+_SUBSCRIBE_ACK_TIMEOUT = 10.0  # seconds
+
+# Max event lines tolerated before the events.subscribe ack. Normally 0-1 (the
+# ack is the first line); a larger run means a herdr replay bug or a hostile
+# socket, so cap the buffer and reconnect rather than accumulate memory.
+_PRE_ACK_BUFFER_CAP = 1000
+
+# Pause before reconnecting when the pane set changed, so a burst of
+# registrations (one session launching several workers) coalesces into one
+# resubscribe cycle instead of one per pane.
+_RESUBSCRIBE_COALESCE_DELAY = 0.25  # seconds
+
+# After an idle/done event, re-check delivery a few times over this window.
+# A provider can hold PROCESSING for a post-turn "flush wait" (10s cap from
+# first detection; see providers/base.py), and that cap RESETS every time the
+# agent flaps back to working — e.g. while it generates its reply — so the real
+# settle can be tens of seconds after the first done event. pane.agent_status_
+# changed fires ONCE per transition, so a single delivery attempt at the event
+# instant finds the gate closed and nothing re-opens it until the 30s
+# reconciliation sweep. (The retired broadcast pane.updated hid this by firing
+# on every output change, which re-checked delivery for free.) These retries
+# re-run the SAME readiness gate — they never bypass the flush wait — just often
+# enough to catch it opening; deliver_pending is idempotent so a tick after the
+# message already landed is a cheap no-op. One loop per terminal (see
+# _arm_settle_retries): a later event does NOT stack a second loop, and if the
+# window lapses while the agent is still flapping, the next done event re-arms.
+_SETTLE_RETRY_INTERVAL = 3.0  # seconds between re-checks
+# Cover ~27s past the event — long enough for a turn that flaps several times
+# while generating a reply (measured live: a settle ~27s after task start) to
+# land before the reconciliation sweep (INBOX_RECONCILE_INTERVAL + grace).
+# Cheap because the loop stops at the first successful delivery (see
+# _settle_retry_loop), so the full tick count only runs when nothing is
+# deliverable, in which case there is nothing to spam into the pane.
+_SETTLE_RETRY_TICKS = 9
+
+# herdr socket protocol versions this integration has been verified against.
+# Outside this range the event contract may have changed shape again (0.9.x
+# silently stopped emitting broadcast pane.updated while still acking its
+# subscription), so log loudly rather than fail.
+_HERDR_TESTED_PROTOCOL_MIN = 17
+_HERDR_TESTED_PROTOCOL_MAX = 22
+
+
+class _ResubscribeRequested(Exception):
+    """Internal control flow: the managed pane set changed, reconnect to refresh
+    the per-pane subscription list. Never leaves _socket_loop."""
 
 
 def _utcnow() -> datetime:
@@ -149,7 +209,7 @@ class HerdrInboxService:
     def __init__(
         self,
         socket_path: Optional[str] = None,
-        delivery_callback: Optional[Callable[[str], None]] = None,
+        delivery_callback: Optional[Callable[[str, str], int]] = None,
         herdr_session: str = "cao",
     ) -> None:
         """Initialize the inbox service.
@@ -157,7 +217,9 @@ class HerdrInboxService:
         Args:
             socket_path: Path to herdr socket. None = auto-detect from env.
             delivery_callback: Function to call for message delivery.
-                Signature: callback(terminal_id) → checks and delivers pending messages.
+                Signature: callback(terminal_id, source) → int, the number of
+                messages delivered; source names the trigger for log attribution.
+                The count lets the settle-retry loop stop once a message lands.
             herdr_session: Name of the herdr session to connect to. Used to
                 derive the default socket path and prefix CLI calls.
         """
@@ -198,6 +260,24 @@ class HerdrInboxService:
         self._writer: Optional[asyncio.StreamWriter] = None
         self._backoff = _BACKOFF_BASE
 
+        # Resubscribe signalling: register_terminal runs on request-handler
+        # threads while the socket loop owns the connection, so the wake-up is
+        # an asyncio.Event set via call_soon_threadsafe on the loop captured in
+        # start(). Both stay None until start() runs.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._resubscribe_requested: Optional[asyncio.Event] = None
+
+        # Protocol observability: log herdr's version/protocol once per process.
+        self._protocol_logged = False
+
+        # At most one bounded settle-retry loop per terminal, to carry a
+        # delivery across the provider's flush-wait window (see
+        # _SETTLE_RETRY_INTERVAL / _SETTLE_RETRY_TICKS). Mutated only on the
+        # event loop (_dispatch_event, _deliver_settled_panes, _close_connection),
+        # never from the request threads that call register/unregister, so no
+        # cross-thread task cancellation.
+        self._settle_tasks: Dict[str, "asyncio.Task"] = {}
+
     @staticmethod
     def _default_socket_path(session_name: str = "cao") -> str:
         """Determine default herdr socket path for a named session.
@@ -234,6 +314,19 @@ class HerdrInboxService:
             self._kiro_terminals.add(terminal_id)
 
         logger.info(f"Registered terminal {terminal_id} (pane={pane_id}, kiro={is_kiro})")
+        # herdr permits one events.subscribe per connection, so a new pane needs
+        # a reconnect to join the per-pane subscription set. Unregistration does
+        # NOT resubscribe: a subscription for a closed pane just never fires
+        # again, and events for a live-but-unmanaged pane fail the map lookup.
+        self._request_resubscribe()
+
+    def _request_resubscribe(self) -> None:
+        """Wake the socket loop to rebuild its subscription set (thread-safe)."""
+        loop = self._loop
+        event = self._resubscribe_requested
+        if loop is None or event is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(event.set)
 
     def unregister_terminal(self, terminal_id: str) -> None:
         """Remove a terminal from managed set.
@@ -251,6 +344,8 @@ class HerdrInboxService:
 
     async def start(self) -> None:
         """Start the event loop: wait for first terminal, then connect and listen."""
+        self._loop = asyncio.get_running_loop()
+        self._resubscribe_requested = asyncio.Event()
         # Run DB cleanup before starting the socket loop so ghost records from
         # prior server runs are removed even when no terminals are registered yet.
         await self._startup_db_cleanup()
@@ -573,29 +668,22 @@ class HerdrInboxService:
             try:
                 await self._connect()
 
-                # Subscribe BEFORE taking any snapshot. herdr 0.9.0 stopped
-                # replaying retained history on subscribe, so every event
-                # emitted between a snapshot and a later subscribe is lost
-                # permanently — a dropped idle/done means _deliver() never
-                # fires for that transition (#755). Replay is what used to
-                # close that window on 0.8.x, which is why this was latent.
+                # Subscribe BEFORE reconciling. herdr 0.9.0 stopped replaying
+                # retained history on subscribe, so every event emitted between
+                # a snapshot and a later subscribe is lost permanently — a
+                # dropped idle/done means _deliver() never fires for that
+                # transition (#755). Replay is what used to close that window
+                # on 0.8.x, which is why this was latent.
                 #
-                # The old reconcile-first ordering was never required:
-                # _subscribe_all_events sends NO pane_id, so the subscription
-                # does not depend on _pane_to_terminal (see its docstring).
-                #
-                # Everything goes in ONE events.subscribe call: a single
-                # broadcast pane.updated plus the lifecycle events. herdr
-                # resets the connection on a second events.subscribe.
+                # Everything goes in ONE events.subscribe call: the per-pane
+                # agent-status subscriptions, a broadcast pane.updated for
+                # older herdr versions, plus the lifecycle events. herdr
+                # resets the connection on a second events.subscribe (measured
+                # on 0.7.5 and 0.9.5), so a pane set change recycles the
+                # connection instead (_ResubscribeRequested below).
                 await self._subscribe_all_events()
 
-                # Reconcile map against live herdr state. _subscribe_all_events
-                # only proves the request was written to the socket, not that
-                # herdr has activated it server-side — this is fire-and-forget,
-                # we never read its response. Any pane.updated that arrives
-                # before activation completes is lost; _deliver_settled_panes
-                # below is what actually closes that window, by re-reading
-                # live state rather than depending on the subscription.
+                # Reconcile map against live herdr state.
                 await self._reconcile()
 
                 # A subscription only reports TRANSITIONS. A pane that settled
@@ -612,6 +700,14 @@ class HerdrInboxService:
                 # Listen for events
                 await self._event_loop()
 
+            except _ResubscribeRequested:
+                logger.info(
+                    "Herdr pane set changed; reconnecting to refresh per-pane subscriptions"
+                )
+                # Intentional recycle: no backoff, but pause briefly so a burst
+                # of registrations becomes one reconnect, not one per pane.
+                await asyncio.sleep(_RESUBSCRIBE_COALESCE_DELAY)
+
             except (ConnectionError, OSError, asyncio.IncompleteReadError) as e:
                 logger.warning(f"Herdr socket disconnected: {e}")
 
@@ -619,6 +715,30 @@ class HerdrInboxService:
                 logger.info(f"Reconnecting in {self._backoff}s...")
                 await asyncio.sleep(self._backoff)
                 self._backoff = min(self._backoff * _BACKOFF_MULTIPLIER, _BACKOFF_MAX)
+
+            finally:
+                await self._close_connection()
+
+    async def _close_connection(self) -> None:
+        """Best-effort close of the current socket connection.
+
+        The loop now recycles connections on every pane registration, so a
+        leaked writer per cycle would accumulate real file descriptors rather
+        than only one per rare network error.
+        """
+        # A recycle re-runs the settled-pane sweep, which re-arms any retry that
+        # still matters, so in-flight ones from the old connection can be dropped.
+        self._cancel_settle_retries()
+        writer = self._writer
+        self._reader = None
+        self._writer = None
+        if writer is None:
+            return
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:  # noqa: BLE001 — closing a broken socket must not raise
+            logger.debug("Herdr socket close failed", exc_info=True)
 
     def _fetch_snapshot(self) -> Optional[dict]:
         """Return herdr's full live session snapshot in one socket call.
@@ -930,6 +1050,15 @@ class HerdrInboxService:
             deleted,
         )
 
+        # A re-map changed a managed pane_id (herdr renumbered a live pane). The
+        # active subscription is keyed on the OLD pane_id, so without a recycle
+        # that terminal would get no agent-status events until some other
+        # terminal happened to register — the same silent fall-through to the
+        # reconcile sweep this fix exists to prevent. Request a resubscribe so
+        # the next cycle subscribes on the new pane_id.
+        if remapped:
+            self._request_resubscribe()
+
     async def _deliver_settled_panes(self) -> None:
         """Deliver to managed panes already settled in idle/done at subscribe time.
 
@@ -963,7 +1092,11 @@ class HerdrInboxService:
                 continue
             if pane.get("agent_status") in ("idle", "done"):
                 self._working_since.pop(terminal_id, None)
-                self._deliver(terminal_id)
+                # A pane already settled at connect time has the same flush-wait
+                # gap as a live event, and no event will follow, so carry it too
+                # — but only if queued messages are deferred by the readiness gate.
+                if self._deliver(terminal_id, source="settled-sweep") == DELIVERY_DEFERRED:
+                    self._arm_settle_retries(terminal_id)
                 delivered += 1
             self._note_activity(terminal_id, pane.get("agent_status"))
             # A transition missed while disconnected surfaces here as the
@@ -1012,96 +1145,286 @@ class HerdrInboxService:
         logger.info(f"Connected to herdr socket: {self._socket_path}")
 
     async def _subscribe_all_events(self) -> None:
-        """Subscribe to all events in a SINGLE events.subscribe call.
+        """Subscribe to all events in a SINGLE events.subscribe call and read the ack.
 
-        herdr (0.7.5) resets the entire connection when it receives a second
+        herdr resets the entire connection when it receives a second
         events.subscribe on a connection that already has an active
-        subscription, so this must remain exactly one events.subscribe per
-        connection.
+        subscription (measured on 0.7.5 and again on 0.9.5), so this must
+        remain exactly one events.subscribe per connection; a pane set change
+        is handled by recycling the connection (_ResubscribeRequested).
 
-        The subscription is a broadcast pane.updated (sent with NO pane_id):
-        herdr streams it for every pane and its payload carries agent_status,
-        so a single broadcast subscription replaces the former per-pane
-        pane.agent_status_changed subscriptions. This is independent of
-        _pane_to_terminal — no per-pane enumeration is needed. The pane.closed
-        and workspace.closed lifecycle events are sent in the same call.
+        The subscription set is:
+        - pane.agent_status_changed PER MANAGED PANE. herdr ≥0.9 (protocol 22)
+          accepts a broadcast pane.updated subscription but no longer emits it
+          on agent-status transitions, so the per-pane form is the only one
+          that actually delivers them. pane_id is required by the schema.
+        - a broadcast pane.updated, kept for older herdr versions (≤0.8) that
+          emit it with agent_status in the payload. Duplicate signals are
+          harmless: _deliver is idempotent and _record_agent_status dedupes.
+        - pane.closed and workspace.closed lifecycle events.
+
+        Per-pane entries are filtered against a fresh snapshot because herdr
+        answers a subscription naming an unknown pane with a pane_not_found
+        error and then RESETS the connection — one stale map entry must not be
+        able to poison every retry. A pane missing from the snapshot is left to
+        _reconcile to prune; a pane registered after the snapshot sets the
+        resubscribe event again, so the next cycle picks it up.
+
+        Raises ConnectionError when the snapshot cannot be fetched (the sweep
+        and reconcile paths need it anyway) or when herdr rejects the
+        subscription, so _socket_loop retries with backoff.
         """
-        subscriptions = [
+        event = self._resubscribe_requested
+        if event is not None:
+            # Clear BEFORE reading state: a registration landing after this
+            # point re-sets the event and forces another cycle, so it can never
+            # be silently absorbed into a subscription that predates it.
+            event.clear()
+
+        live_panes = self._list_live_pane_ids()
+        if live_panes is None:
+            raise ConnectionError("herdr snapshot unavailable; cannot build subscription set")
+
+        subscriptions: list[dict] = [
             {"type": "pane.updated"},
             {"type": "pane.closed"},
             {"type": "workspace.closed"},
         ]
+        skipped = 0
+        for pane_id in sorted(self._pane_to_terminal):
+            if pane_id not in live_panes:
+                skipped += 1
+                continue
+            subscriptions.append({"type": "pane.agent_status_changed", "pane_id": pane_id})
+
         message = {
             "id": "sub_all",
             "method": "events.subscribe",
             "params": {"subscriptions": subscriptions},
         }
         await self._send(message)
+        buffered = await self._await_subscribe_ack()
         logger.info(
-            "Subscribed to broadcast pane.updated + lifecycle events "
-            "in one events.subscribe call"
+            "Subscribed to %d per-pane agent-status event(s) + broadcast pane.updated "
+            "+ lifecycle events in one events.subscribe call%s",
+            len(subscriptions) - 3,
+            f" ({skipped} stale pane(s) left to reconcile)" if skipped else "",
         )
-
-    async def _event_loop(self) -> None:
-        """Listen for events and dispatch delivery."""
-        assert self._reader is not None
-        while True:
-            line = await self._reader.readline()
-            if not line:
-                raise ConnectionError("Socket closed")
-
+        # Dispatch any event lines that arrived before the ack AFTER the ack read
+        # has completed, so a slow DB write inside _dispatch_event (via
+        # _record_agent_status) can never stall the ack-critical read path.
+        # Isolate each dispatch: one failing event (e.g. a transient DB error)
+        # must not drop the rest and tip the whole connection into reconnect —
+        # the settled-pane sweep below is the backstop for anything missed here.
+        for event in buffered:
             try:
-                event = json.loads(line.decode())
+                await self._dispatch_event(event)
+            except Exception:  # noqa: BLE001 — a bad pre-ack event must not abort setup
+                logger.warning("Failed to dispatch buffered pre-ack event", exc_info=True)
+
+    def _list_live_pane_ids(self) -> Optional[Set[str]]:
+        """Return the pane_ids herdr currently knows, or None when unavailable.
+
+        This is an EXISTENCE read used to filter the per-pane subscription list:
+        herdr rejects an events.subscribe naming an unknown pane with
+        pane_not_found and then resets the connection, so one stale map entry
+        must not poison every retry. It is deliberately NOT the coverage
+        snapshot the #755 guard is about — a transition between this read and
+        subscription activation is recovered by _deliver_settled_panes, which
+        re-reads live state AFTER the subscribe ack.
+        """
+        snapshot = self._fetch_snapshot()
+        if snapshot is None:
+            return None
+        self._log_herdr_protocol(snapshot)
+        return {
+            pane_id
+            for pane in snapshot.get("panes") or []
+            if isinstance(pane, dict)
+            and isinstance(pane_id := pane.get("pane_id"), str)
+            and pane_id
+        }
+
+    async def _await_subscribe_ack(self) -> list:
+        """Read herdr's response to events.subscribe; fail loudly on an error ack.
+
+        The old fire-and-forget subscribe could not tell an active subscription
+        from a rejected one, which turns every later delivery into a silent
+        fallback to the 30s reconciliation sweep. The ack is the first line
+        herdr sends on a fresh connection; any event line that somehow precedes
+        it is COLLECTED and returned for the caller to dispatch AFTER the ack
+        read — dispatching inline here would run a DB write (_record_agent_status
+        via asyncio.to_thread) on the ack-critical path, so a wedged DB could
+        stall subscription setup past the timeout. Reading only parses lines.
+
+        Raises ConnectionError on an error ack, EOF, or timeout, so
+        _socket_loop's retry/backoff path owns recovery.
+        """
+        assert self._reader is not None
+        buffered: list = []
+        deadline = time.monotonic() + _SUBSCRIBE_ACK_TIMEOUT
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ConnectionError("Timed out waiting for events.subscribe ack")
+            try:
+                line = await asyncio.wait_for(self._reader.readline(), timeout=remaining)
+            except asyncio.TimeoutError:
+                raise ConnectionError("Timed out waiting for events.subscribe ack") from None
+            if not line:
+                raise ConnectionError("Socket closed before events.subscribe ack")
+            try:
+                msg = json.loads(line.decode())
             except json.JSONDecodeError:
                 continue
-
-            # herdr identifies the event in the "event" key. Lifecycle events use
-            # underscore names (pane_closed / workspace_closed); the agent-status
-            # event uses the dotted name (pane.agent_status_changed). Normalize the
-            # name so routing does not depend on the separator herdr happens to use.
-            # (Older code read "type" and matched dotted lifecycle names, which never
-            # matched herdr's real wire format — lifecycle cleanup silently never ran.)
-            raw_event = event.get("event", "") or event.get("type", "")
-            event_name = raw_event.replace("_", ".")
-            # Read before any dispatch below, so a busy-time transition is
-            # stamped when herdr reported it, not when its write lands.
-            observed_at = _utcnow()
-
-            # Handle lifecycle events
-            if event_name in ("pane.closed", "workspace.closed"):
-                self._handle_lifecycle_event(event_name, event.get("data", {}))
+            if not isinstance(msg, dict):
                 continue
+            if msg.get("id") == "sub_all":
+                error = msg.get("error")
+                if error:
+                    # repr(): the error can echo pane labels; keep log lines unforgeable.
+                    raise ConnectionError(f"events.subscribe rejected: {error!r}")
+                return buffered
+            buffered.append(msg)
+            # The ack is normally the first line, so this buffer holds 0-1
+            # entries. A flood before the ack is abnormal (a herdr replay bug or
+            # a hostile socket); cap it so it cannot grow without bound, and let
+            # the reconnect path recover rather than accumulating memory.
+            if len(buffered) > _PRE_ACK_BUFFER_CAP:
+                raise ConnectionError(
+                    f"events.subscribe ack not seen after {_PRE_ACK_BUFFER_CAP} events"
+                )
 
-            data = event.get("data", {})
-            # Broadcast pane.updated nests the pane under data.pane; retired
-            # agent-status events used top-level data. Fall back to data, and
-            # guard against a null/non-dict pane so one malformed event cannot
-            # escape the loop and kill delivery.
-            pane_obj = data.get("pane") or data
-            if not isinstance(pane_obj, dict):
-                pane_obj = {}
-            pane_id = pane_obj.get("pane_id", "")
-            status = pane_obj.get("agent_status", "")
+    def _log_herdr_protocol(self, snapshot: dict) -> None:
+        """Log herdr's version/protocol once; warn outside the tested range.
 
-            # Only process events for managed panes
-            terminal_id = self._pane_to_terminal.get(pane_id)
-            if not terminal_id:
-                continue
+        This integration was written against one protocol and silently broken
+        by another (0.9.x stopped emitting broadcast pane.updated while still
+        acking its subscription), so an untested protocol is worth a WARNING
+        even though the service keeps running.
+        """
+        if self._protocol_logged:
+            return
+        self._protocol_logged = True
+        protocol = snapshot.get("protocol")
+        version = snapshot.get("version")
+        logger.info("herdr version %s, socket protocol %s", version, protocol)
+        if isinstance(protocol, int) and not (
+            _HERDR_TESTED_PROTOCOL_MIN <= protocol <= _HERDR_TESTED_PROTOCOL_MAX
+        ):
+            logger.warning(
+                "herdr socket protocol %s is outside the tested range [%d, %d]; "
+                "event-driven inbox delivery may silently degrade to the "
+                "reconciliation sweep — verify a pane.agent_status_changed event "
+                "arrives after an agent goes idle",
+                protocol,
+                _HERDR_TESTED_PROTOCOL_MIN,
+                _HERDR_TESTED_PROTOCOL_MAX,
+            )
 
-            if status in ("idle", "done"):
-                # Clear working timestamp
-                self._working_since.pop(terminal_id, None)
-                # Trigger delivery
-                self._deliver(terminal_id)
+    async def _event_loop(self) -> None:
+        """Listen for events and dispatch delivery.
 
-            elif status == "working":
-                # Track working start for kiro supplement check
-                if terminal_id in self._kiro_terminals:
-                    if terminal_id not in self._working_since:
-                        self._working_since[terminal_id] = time.time()
+        Also watches the resubscribe event: herdr allows one events.subscribe
+        per connection, so a pane registered after connect needs the connection
+        recycled. A completed line is processed BEFORE honouring a concurrent
+        resubscribe request, so a buffered idle/done is not dropped; anything
+        lost to the cancelled read is covered by _deliver_settled_panes on the
+        next connection.
+        """
+        assert self._reader is not None
+        resub_event = self._resubscribe_requested
+        resub_task: Optional[asyncio.Task] = (
+            asyncio.create_task(resub_event.wait()) if resub_event is not None else None
+        )
+        try:
+            while True:
+                line_task = asyncio.create_task(self._reader.readline())
+                wait_set = {line_task} if resub_task is None else {line_task, resub_task}
+                done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
 
-            self._note_activity(terminal_id, status)
-            await self._record_agent_status(terminal_id, status, observed_at)
+                if line_task in done:
+                    line = line_task.result()  # propagates read errors to _socket_loop
+                    if not line:
+                        raise ConnectionError("Socket closed")
+                    try:
+                        event = json.loads(line.decode())
+                    except json.JSONDecodeError:
+                        event = None
+                    if isinstance(event, dict):
+                        await self._dispatch_event(event)
+                else:
+                    line_task.cancel()
+                    try:
+                        await line_task
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
+
+                if resub_task is not None and resub_task.done():
+                    raise _ResubscribeRequested()
+        finally:
+            if resub_task is not None and not resub_task.done():
+                resub_task.cancel()
+                try:
+                    await resub_task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _dispatch_event(self, event: dict) -> None:
+        """Route one decoded herdr event to lifecycle cleanup or delivery."""
+        # herdr identifies the event in the "event" key. Lifecycle events use
+        # underscore names (pane_closed / workspace_closed); the agent-status
+        # event uses the dotted name (pane.agent_status_changed). Normalize the
+        # name so routing does not depend on the separator herdr happens to use.
+        # (Older code read "type" and matched dotted lifecycle names, which never
+        # matched herdr's real wire format — lifecycle cleanup silently never ran.)
+        raw_event = event.get("event", "") or event.get("type", "")
+        event_name = raw_event.replace("_", ".")
+        # Read before any dispatch below, so a busy-time transition is
+        # stamped when herdr reported it, not when its write lands.
+        observed_at = _utcnow()
+
+        # Handle lifecycle events
+        if event_name in ("pane.closed", "workspace.closed"):
+            self._handle_lifecycle_event(event_name, event.get("data", {}))
+            return
+
+        data = event.get("data", {})
+        if not isinstance(data, dict):
+            data = {}
+        # Broadcast pane.updated nests the pane under data.pane; the per-pane
+        # agent-status event uses top-level data. Fall back to data, and
+        # guard against a null/non-dict pane so one malformed event cannot
+        # escape the loop and kill delivery.
+        pane_obj = data.get("pane") or data
+        if not isinstance(pane_obj, dict):
+            pane_obj = {}
+        pane_id = pane_obj.get("pane_id", "")
+        status = pane_obj.get("agent_status", "")
+
+        # Only process events for managed panes
+        terminal_id = self._pane_to_terminal.get(pane_id)
+        if not terminal_id:
+            return
+
+        if status in ("idle", "done"):
+            # Clear working timestamp
+            self._working_since.pop(terminal_id, None)
+            # Trigger delivery now; only arm the flush-wait re-check when
+            # queued messages are deferred by the readiness gate. Herdr sends
+            # only one agent-status event for this transition, so the retry
+            # loop carries pending messages until the provider is ready.
+            if self._deliver(terminal_id, source="herdr-event") == DELIVERY_DEFERRED:
+                self._arm_settle_retries(terminal_id)
+
+        elif status == "working":
+            # Track working start for kiro supplement check
+            if terminal_id in self._kiro_terminals:
+                if terminal_id not in self._working_since:
+                    self._working_since[terminal_id] = time.time()
+
+        self._note_activity(terminal_id, status)
+        await self._record_agent_status(terminal_id, status, observed_at)
 
     @staticmethod
     def _note_activity(terminal_id: str, agent_status: object) -> None:
@@ -1411,13 +1734,92 @@ class HerdrInboxService:
 
     # TODO: _deliver() calls callback synchronously — if callback is async,
     # this will need a threadsafe bridge (out of scope for this change).
-    def _deliver(self, terminal_id: str) -> None:
-        """Check and deliver pending messages for a terminal."""
+    def _arm_settle_retries(self, terminal_id: str) -> None:
+        """Ensure a bounded re-delivery loop is running for a terminal.
+
+        Call on the event loop only. If a loop is already active for this
+        terminal, do nothing — it is already covering the window, and stacking
+        a second loop per event just multiplies redundant readiness checks
+        (seen live: a turn that flaps working/done fires several done events).
+        A later event that arrives AFTER the loop has lapsed re-arms it, so a
+        settle beyond the window is still caught (or, failing that, by the 30s
+        reconciliation backstop).
+        """
+        loop = self._loop
+        if loop is None:
+            return
+        existing = self._settle_tasks.get(terminal_id)
+        if existing is not None and not existing.done():
+            return
+        self._settle_tasks[terminal_id] = loop.create_task(self._settle_retry_loop(terminal_id))
+
+    async def _settle_retry_loop(self, terminal_id: str) -> None:
+        """Re-attempt delivery over the flush-wait window, then defer to reconcile.
+
+        TODO: this is a tactical bridge between two layers that do not talk —
+        herdr's agent-status events and the provider's output-flush readiness.
+        The clean fix is a provider/StatusMonitor "delivery-ready" signal that
+        herdr subscribes to, so no polling is needed; that is a provider-contract
+        change tracked separately. Until then, re-check the existing gate.
+        """
+        try:
+            for _ in range(_SETTLE_RETRY_TICKS):
+                # Check before sleeping so a terminal unregistered during the
+                # previous tick's sleep exits now instead of burning another
+                # interval.
+                if terminal_id not in self._terminal_to_pane:
+                    return
+                await asyncio.sleep(_SETTLE_RETRY_INTERVAL)
+                if terminal_id not in self._terminal_to_pane:
+                    return
+                # Offload the delivery: _deliver → deliver_pending reads status
+                # via the herdr CLI (blocking subprocess) and types into the
+                # pane, so running it inline here would block the single event
+                # loop for every other terminal on each tick. deliver_pending is
+                # already driven off-loop this way by the reconciliation daemon
+                # (asyncio.to_thread) and the inbox POST pool, and serializes per
+                # terminal under its own lock, so a concurrent on-loop live-event
+                # delivery cannot double-send.
+                #
+                # Stop as soon as a message lands: the gate has opened, so there
+                # is no point re-checking. Anything still queued is delivered by
+                # the normal event/sweep paths now that the terminal is ready.
+                delivered = await asyncio.to_thread(self._deliver, terminal_id, "herdr-settle")
+                if delivered > 0:
+                    return
+        except asyncio.CancelledError:
+            # Propagates automatically after finally (Python 3.8+); re-raised
+            # explicitly only to make the cancel path obvious to readers.
+            raise
+        finally:
+            # Drop self from the registry so a later event can re-arm. Guard
+            # against a replacement task having already taken the slot.
+            if self._settle_tasks.get(terminal_id) is asyncio.current_task():
+                self._settle_tasks.pop(terminal_id, None)
+
+    def _cancel_settle_retries(self) -> None:
+        """Cancel all in-flight settle retries (event loop only)."""
+        for task in list(self._settle_tasks.values()):
+            task.cancel()
+        self._settle_tasks.clear()
+
+    def _deliver(self, terminal_id: str, source: str = "herdr") -> int:
+        """Deliver pending messages; pass through the three-state delivery result.
+
+        ``source`` names the trigger (herdr-event, herdr-settle, settled-sweep,
+        kiro-supplement) so a delivery in the logs can be told apart from the
+        reconciliation sweep's — the event path dying silently is exactly how
+        this backend degraded unnoticed on herdr 0.9.x. The count lets the
+        settle-retry loop stop once a message lands.
+        """
+        logger.debug("Delivery trigger (%s) for terminal %s", source, terminal_id)
         if self._delivery_callback:
             try:
-                self._delivery_callback(terminal_id)
+                result = self._delivery_callback(terminal_id, source)
+                return result if isinstance(result, int) else 0
             except Exception as e:
                 logger.error(f"Delivery failed for terminal {terminal_id}: {e}")
+        return 0
 
     async def check_kiro_supplements(self) -> None:
         """Periodic check for kiro-cli terminals stuck in 'working' state.
@@ -1459,7 +1861,7 @@ class HerdrInboxService:
                     f"Kiro permission prompt detected for {terminal_id} "
                     f"(working for {working_duration:.0f}s)"
                 )
-                self._deliver(terminal_id)
+                self._deliver(terminal_id, source="kiro-supplement")
                 # Reset the timer so we don't spam
                 self._working_since[terminal_id] = now
 

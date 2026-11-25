@@ -359,29 +359,31 @@ Create a pull request on GitHub. CI will automatically run tests and code qualit
 
 ### Comprehensive Workflow (`ci.yml`)
 
-Runs on all pushes to `main` and all PRs targeting `main`:
+Runs on pushes to `main`, PRs targeting `main`, and merge queue groups:
 - **Unit tests**: Python 3.11, 3.12 matrix with coverage
 - **Code quality**: black, isort, ruff, mypy — all blocking; mypy via a per-file ratchet (see [SKILL.md](skills/cao-contributing/SKILL.md))
 - **Security scan**: Trivy filesystem scan — fails on a committed secret of any severity, or on a fixable CRITICAL, HIGH or UNKNOWN (not yet scored) vulnerability; fixable MEDIUM and LOW vulnerabilities are uploaded to the Security tab without failing (see [SECURITY.md](SECURITY.md#running-security-scans-locally))
-- **Dependency Security**: Full locked npm, Bun, uv, and Cargo graphs, including dev dependencies and unfixed advisories; every HIGH/CRITICAL finding or scan error blocks. Also verifies the installed dependency mitigations. The Python 3.12 unit job runs a real-Trivy dev-inventory regression; see [SECURITY.md](SECURITY.md#full-dependency-gate).
+- **Dependency Security**: Full locked npm, Bun, uv, and Cargo graphs, including dev dependencies and unfixed advisories, scanned; every HIGH/CRITICAL finding in the shipped set (measured from the builds) a malware advisory anywhere, a toolchain HIGH/CRITICAL with a fix that the PR adds or changes, or any scan/producer/completeness error blocks, while other toolchain-only findings are reported without blocking. Also verifies the installed dependency mitigations. The Python 3.12 unit job runs a real-Trivy dev-inventory regression; see [SECURITY.md](SECURITY.md#full-dependency-gate).
 - **Dependency review**: License and vulnerability checks on PRs
+- **Filtered jobs**: On PRs, `changed-paths` selects four provider test/lint pairs, both robotics examples, and the docs build by path. Pushes to `main` and merge queue entries run all of them; `filtered-gate` checks their results before `ci-gate`. Release preflight therefore checks every filtered job on the release commit.
 
-### Provider-Specific Workflows (path-triggered)
+### Provider-Specific CI Jobs (path-selected)
 
-Each provider has a dedicated workflow that runs only when its files change:
+The four former provider workflows are now jobs in `ci.yml`, selected by `changed-paths` when their files change:
 
-| Workflow | Tests | Trigger Paths |
+| CI jobs | Tests | Trigger Paths |
 |---|---|---|
-| `test-codex-provider.yml` | `test_codex_provider_unit.py` | `providers/codex.py`, `test/providers/**` |
-| `test-claude-code-provider.yml` | `test_claude_code_unit.py` | `providers/claude_code.py`, `test/providers/**` |
-| `test-kiro-cli-provider.yml` | `test_kiro_cli_unit.py` | `providers/kiro_cli.py`, `test/providers/**` |
+| `provider-antigravity`, `provider-antigravity-lint` | `test_antigravity_cli_*.py` | `providers/antigravity_cli.py`, `test/providers/test_antigravity_cli_*.py`, fixtures |
+| `provider-claude`, `provider-claude-lint` | `test_claude_code_*.py` | `providers/claude_code.py`, `test/providers/test_claude_code_*.py` |
+| `provider-codex`, `provider-codex-lint` | `test_codex_*.py` | `providers/codex.py`, `test/providers/test_codex_*.py`, fixtures |
+| `provider-kiro`, `provider-kiro-lint` | `test_kiro_cli_*.py` | `providers/kiro_cli.py`, `test/providers/test_kiro_cli_*.py`, fixtures |
 
-Each includes unit tests (Python 3.11/3.12) and code quality checks (black, isort, mypy).
+Each includes unit tests (Python 3.11/3.12) and blocking black/isort checks; mypy is advisory.
 
 ### Docs Site Workflow (`gh-pages.yml`)
 
-Builds the Docusaurus site (`docusaurus/`) on every PR and push to `main` for a
-build signal, but only **deploys** to GitHub Pages on the upstream repo
+PRs to `main` build the Docusaurus site (`docusaurus/`) in `ci.yml` when docs paths
+change. `gh-pages.yml` builds on pushes to `main` and **deploys** only on the upstream repo
 (`awslabs/cli-agent-orchestrator`) by default — forks don't have Pages enabled,
 so `actions/deploy-pages` would otherwise fail with a 404. Fork maintainers can
 opt in by enabling GitHub Pages in their fork and setting the `DEPLOY_DOCS_PAGES`

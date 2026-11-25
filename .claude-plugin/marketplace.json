@@ -1,0 +1,40 @@
+{
+  "name": "cli-agent-orchestrator",
+  "owner": {
+    "name": "awslabs"
+  },
+  "metadata": {
+    "description": "CLI Agent Orchestrator (CAO) Agent Plugins: drive multi-agent sessions, contribute to CAO, and author AG-UI and Agent Plugins packages.",
+    "version": "2.5.5"
+  },
+  "plugins": [
+    {
+      "name": "cao",
+      "source": "./agent-plugin/cao",
+      "description": "Drive CLI Agent Orchestrator multi-agent sessions from any Agent-Plugins-compatible client. Prerequisites: the `uv` toolchain must be on PATH (the MCP server is launched via `uvx`), and a CAO API server must be running locally at http://127.0.0.1:9889 (`cao-server`). All communication is localhost-only.",
+      "version": "2.5.5",
+      "category": "Developer Tools"
+    },
+    {
+      "name": "cao-contributor",
+      "source": "./agent-plugin/cao-contributor",
+      "description": "Skills for extending CLI Agent Orchestrator: authoring providers and event plugins, and working on the repo itself (dev loop, CI gates, dependency and lockfile rules). Development-facing; install the `cao` plugin instead to drive sessions.",
+      "version": "2.5.5",
+      "category": "Developer Tools"
+    },
+    {
+      "name": "cao-agent-plugin-lifecycle",
+      "source": "./agent-plugin/cao-agent-plugin-lifecycle",
+      "description": "Skills for the Agent Plugins 1.0.0 package lifecycle: author a new package from an empty directory (the plugin.json manifest, skills/ and an optional mcp.json), and audit an existing one against the vendored schemas and the Agent Skills limits that CAO's own validator only warns about. The audit skill bundles a validator that needs no CAO install and opens no network connection itself; its first run needs its dependencies available.",
+      "version": "2.5.5",
+      "category": "Developer Tools"
+    },
+    {
+      "name": "cao-ag-ui-builder",
+      "source": "./agent-plugin/cao-ag-ui-builder",
+      "description": "Emit-side AG-UI vocabulary for CLI Agent Orchestrator: the six allow-listed generative-UI components (approval_card, choice_prompt, diff_summary, progress, metric, agent_card) an agent sends with emit_ui, carried as CUSTOM `cao.generative_ui` frames. Describes CAO `main`; no released version carries this yet (#1198). Needs a local cao-server with the [agui] extra. No mcp.json.",
+      "version": "2.5.5",
+      "category": "Developer Tools"
+    }
+  ]
+}

@@ -11,27 +11,35 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from itertools import groupby
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
-from cli_agent_orchestrator.backends.base import TerminalNotFoundError
+from cli_agent_orchestrator.backends.base import InputNotSentError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
+    close_edges_replied_by,
     fail_orphaned_pending_messages,
     get_pending_messages,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
     mark_message_edges_delivered,
+    record_delivery_failure,
     update_message_status,
 )
 from cli_agent_orchestrator.constants import (
     EAGER_INBOX_DELIVERY,
+    INBOX_MAX_DELIVERY_ATTEMPTS,
     INBOX_RECONCILE_GRACE_SECONDS,
     INBOX_SUBMIT_CONFIRM_TIMEOUT,
     INBOX_SUBMIT_CONFIRMATION,
     INBOX_SUBMIT_MAX_RESUBMITS,
     INBOX_SWEEP_FANOUT,
 )
-from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.inbox import (
+    DeliveryOutcome,
+    InboxMessage,
+    MessageStatus,
+    OrchestrationType,
+)
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
     TerminalInputBlockedError,
@@ -43,9 +51,13 @@ from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.terminal_service import TerminalRowMissingError
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
+
+# Pending messages exist, but the readiness gate is still closed.
+DELIVERY_DEFERRED = -1
 
 # Poll interval for the submit-confirmation wait. Short because the common case
 # is a healthy delivery that is already PROCESSING on the first or second read.
@@ -69,6 +81,64 @@ def _short_reason(exc: Exception) -> str:
     text = " ".join(str(exc).split())
     reason = f"{type(exc).__name__}: {text}" if text else type(exc).__name__
     return reason if len(reason) <= 200 else reason[:197] + "..."
+
+
+OutcomeCallback = Callable[[int, DeliveryOutcome, Optional[str]], None]
+
+
+class DeliveryHandOff:
+    """Decides who reports the failure of the inbox POST's own message (design D5).
+
+    The POST waits for its message's outcome only up to a bound. While it
+    waits, a failure of that message is the POST's to report: the message is
+    failed at once, with no retry and no notice. Once the POST has given up
+    (answered ``in_progress``), the sender is no longer listening, so a later
+    failure is handled as a queued one. ``offer`` and ``abandon`` take the same
+    lock, so exactly one of the two paths runs for a failure.
+
+    Thread Safety:
+        Safe from any thread: the POST calls ``abandon`` from the event loop
+        while ``deliver_pending`` calls ``offer`` from a worker thread.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._outcome: Optional[Tuple[DeliveryOutcome, Optional[str]]] = None
+        self._abandoned = False
+
+    def offer(self, outcome: DeliveryOutcome, error: Optional[str]) -> bool:
+        """Hand ``outcome`` to the POST. True while the POST is still waiting.
+
+        The first outcome offered is the one the POST reports; a later offer
+        changes nothing. False once the POST has given up, so the caller
+        handles the message as queued.
+        """
+        with self._lock:
+            if self._abandoned:
+                return False
+            if self._outcome is None:
+                self._outcome = (outcome, error)
+            return True
+
+    def abandon(self) -> Optional[Tuple[DeliveryOutcome, Optional[str]]]:
+        """End the POST's wait: the outcome offered so far, or None.
+
+        None means no outcome was offered, and every later ``offer`` returns
+        False.
+        """
+        with self._lock:
+            if self._outcome is None:
+                self._abandoned = True
+            return self._outcome
+
+
+def _record_failure(message_id: int, reason: str) -> int:
+    """Count a failed attempt; a bookkeeping failure ends the retries rather than looping."""
+    try:
+        return record_delivery_failure(message_id, reason)
+    except Exception as exc:  # noqa: BLE001 - delivery status must still be set
+        logger.warning(f"Could not record the failed attempt for message {message_id}: {exc}")
+        return INBOX_MAX_DELIVERY_ATTEMPTS
 
 
 class InboxService:
@@ -175,8 +245,18 @@ class InboxService:
         num_messages: int = 1,
         registry: PluginRegistry | None = None,
         after_dispatch: Optional[Callable[[], None]] = None,
-    ) -> None:
+        source: Optional[str] = None,
+        on_outcome: Optional[OutcomeCallback] = None,
+        report_to_sender: Optional[int] = None,
+        hand_off: Optional[DeliveryHandOff] = None,
+    ) -> int:
         """Deliver pending message(s) to a ready terminal. Use num_messages=0 for all.
+
+        Return the positive delivered count, or 0 if empty or permanently failed.
+        Return DELIVERY_DEFERRED when the readiness gate blocks queued messages,
+        or a refused send, or a failure before typing with attempts left
+        (INBOX_MAX_DELIVERY_ATTEMPTS), re-queues a message to PENDING with none
+        delivered. A final failure leaves nothing queued, so it returns 0.
 
         Status comes from the StatusMonitor (the event-driven source of truth).
         Delivery normally happens on IDLE/COMPLETED; providers that accept input
@@ -197,6 +277,18 @@ class InboxService:
         confirmation. It is never an acknowledgement that the receiver accepted
         the message.
 
+        ``on_outcome(message_id, outcome, error)`` is called at most once per
+        message this call handles: DELIVERED when the paste reached the pane
+        (before the submit confirmation), or FAILED, UNCERTAIN or RETRYING when
+        it did not. A message left alone (receiver not ready, older messages
+        ahead, an unresolved pane or a transient refusal that leaves it
+        PENDING) gets no call. An exception from the callback is logged and
+        never changes the delivery. ``report_to_sender`` names the message
+        whose outcome the caller returns to its sender (the inbox POST): that
+        message is never retried by the server (reply-delivery-failure D5).
+        With a ``hand_off``, that holds only while the POST still waits: a
+        failure the hand-off refuses is handled as a queued one.
+
         Safe to call from any thread: the whole read→mark→send sequence is
         serialized per terminal (see __init__ for why that is load-bearing).
         """
@@ -211,7 +303,16 @@ class InboxService:
 
         try:
             with self._delivery_lock(terminal_id):
-                self._deliver_pending_locked(terminal_id, num_messages, registry, notify)
+                return self._deliver_pending_locked(
+                    terminal_id,
+                    num_messages,
+                    registry,
+                    notify,
+                    source=source,
+                    on_outcome=on_outcome,
+                    report_to_sender=report_to_sender,
+                    hand_off=hand_off,
+                )
         finally:
             notify()
 
@@ -221,14 +322,40 @@ class InboxService:
         num_messages: int,
         registry: PluginRegistry | None,
         after_dispatch: Callable[[], None] = lambda: None,
-    ) -> None:
+        source: Optional[str] = None,
+        on_outcome: Optional[OutcomeCallback] = None,
+        report_to_sender: Optional[int] = None,
+        hand_off: Optional[DeliveryHandOff] = None,
+    ) -> int:
+        """Return 0 if empty or failed, DELIVERY_DEFERRED if deferred, or the delivered count.
+
+        DELIVERY_DEFERRED means messages are queued but the readiness gate is
+        still closed, or a refused send, or a failure before typing with attempts
+        left, re-queues a message to PENDING with none delivered. A final
+        failure (attempts used up, uncertain, a permanent refusal) leaves
+        nothing queued to retry and returns the delivered count. A positive
+        count records messages handed to the pane.
+        """
+        reported: Set[int] = set()
+
+        def report(message_id: int, outcome: DeliveryOutcome, error: Optional[str]) -> None:
+            if on_outcome is None or message_id in reported:
+                return
+            reported.add(message_id)
+            try:
+                on_outcome(message_id, outcome, error)
+            except Exception as exc:  # noqa: BLE001 - a caller's callback never fails a delivery
+                logger.warning(f"Delivery outcome callback failed for message {message_id}: {exc}")
+
         limit = num_messages if num_messages > 0 else 100
         messages = get_pending_messages(terminal_id, limit=limit)
         if not messages:
-            return
+            return 0
 
         status = status_monitor.get_status(terminal_id)
         eager = False
+        delivered_count = 0
+        requeued_pending = False
         if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
             # Not ready on the normal path. Eager delivery (#251) lets providers
             # that accept input mid-turn receive messages while PROCESSING or
@@ -256,7 +383,7 @@ class InboxService:
                 ):
                     eager_eligible = False
             if not eager_eligible:
-                return
+                return DELIVERY_DEFERRED
             eager = True
 
         # Mark DELIVERED before sending (#164). send_input() types into the tmux
@@ -268,6 +395,18 @@ class InboxService:
         for message in messages:
             update_message_status(message.id, MessageStatus.DELIVERED)
 
+        # Event-inbox backends whose service delivers off the event loop
+        # (herdr-app) run the submit confirmation too. They have no output
+        # generation, so pickup is judged by a transition from the status read
+        # just before each dispatch, as the first-task path does for them
+        # (terminal_service._wait_for_post_dispatch_start).
+        confirm = INBOX_SUBMIT_CONFIRMATION and not eager
+        native_confirm = (
+            confirm
+            and get_backend().supports_event_inbox()
+            and get_backend().event_inbox_confirms_submit() is True
+        )
+
         # Deliver in contiguous runs of the same sender. With the default
         # num_messages=1 this is a single run; when draining all pending messages
         # (num_messages=0) a batch can span multiple senders, so each run is sent
@@ -277,6 +416,9 @@ class InboxService:
             batch = list(group)
             combined = "\n".join(m.message for m in batch)
             try:
+                pre_dispatch_status = (
+                    status_monitor.get_status(terminal_id) if native_confirm else None
+                )
                 # Taken from dispatch_input's return value -- sampled AFTER the
                 # monitor is armed and the rolling buffer cleared, before any key
                 # reaches the pane (terminal_service.py:4008-4022). That is the
@@ -305,59 +447,86 @@ class InboxService:
                         sender_id=sender_id,
                         orchestration_type=OrchestrationType.SEND_MESSAGE,
                     )
-                logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
-                # The paste is in the pane: the immediate-delivery caller may
-                # answer now. Everything below is confirmation and recovery.
-                after_dispatch()
-                # Delegation edges opened by this batch are armed only after the
-                # submit confirmation has run. An edge armed on the paste alone
-                # could be evaluated while the receiver's screen still holds
-                # the previous answer, before it shows the new turn. They are armed even
-                # when the confirmation gives up, because pickup can lag
-                # delivery by more than that wait. The evaluator's own check
-                # that the receiver started on its last input keeps an
-                # unpicked delivery from forwarding the previous answer, and
-                # its pickup timeout tells the caller if it never starts.
-                if INBOX_SUBMIT_CONFIRMATION and not eager:
-                    if get_backend().supports_event_inbox():
-                        # Event-inbox backends (herdr) push delivery synchronously
-                        # inline on their single asyncio event loop thread
-                        # (herdr_inbox_service.py's _event_loop -> _deliver, with
-                        # no asyncio.to_thread offload -- see the TODO at
-                        # herdr_inbox_service.py:1276-1277). _confirm_submitted's
-                        # blocking time.sleep() would stall that whole session's
-                        # event processing for up to
-                        # INBOX_SUBMIT_CONFIRM_TIMEOUT * (1 + INBOX_SUBMIT_MAX_RESUBMITS)
-                        # seconds. Skip confirmation there until that offload
-                        # exists -- the drop stays undetected on herdr, same as
-                        # before this fix, instead of freezing the session.
-                        logger.debug(
-                            "Skipping inbox submit confirmation for terminal %s: "
-                            "event-inbox backend delivery runs on the API event loop",
-                            terminal_id,
-                        )
-                    else:
-                        # Still holding the per-terminal delivery lock,
-                        # deliberately: the pile-up in #78 ({MSG1}{MSG2} in one
-                        # composer) is a second delivery landing while the first
-                        # sits unsubmitted. The lock only DELAYS that second
-                        # delivery until this confirmation ends; what prevents
-                        # the pile-up is a recovery that submits the first paste
-                        # (bare Enter), which needs the provider to read its
-                        # composer -- see _confirm_submitted. Other terminals
-                        # are not held: each delivery runs on its own thread.
-                        # Eager delivery is excluded because its receiver was
-                        # already PROCESSING -- "left the ready state" proves
-                        # nothing there.
-                        self._confirm_submitted(
-                            terminal_id,
-                            combined,
-                            boundary,
-                            registry=registry,
-                            sender_id=sender_id,
-                        )
+                # Name the trigger when the caller supplied one: an event-driven
+                # delivery and a reconciliation-sweep delivery are otherwise
+                # indistinguishable here, which is exactly how a dead event path
+                # (herdr 0.9.x pane.updated) went unnoticed.
+                logger.info(
+                    "Delivered %d message(s) to terminal %s%s",
+                    len(batch),
+                    terminal_id,
+                    f" (trigger: {source})" if source else "",
+                )
+                delivered_count += len(batch)
+                for message in batch:
+                    report(message.id, DeliveryOutcome.DELIVERED, None)
+                # The text is typed: nothing below can make it undelivered. A
+                # failure in the caller's callback or in the confirmation is
+                # logged, and the batch stays DELIVERED, armed and settled.
+                try:
+                    # The paste is in the pane: the immediate-delivery caller may
+                    # answer now. Everything below is confirmation and recovery.
+                    after_dispatch()
+                    # Delegation edges opened by this batch are armed only after the
+                    # submit confirmation has run. An edge armed on the paste alone
+                    # could be evaluated while the receiver's screen still holds
+                    # the previous answer, before it shows the new turn. They are armed even
+                    # when the confirmation gives up, because pickup can lag
+                    # delivery by more than that wait. The evaluator's own check
+                    # that the receiver started on its last input keeps an
+                    # unpicked delivery from forwarding the previous answer, and
+                    # its pickup timeout tells the caller if it never starts.
+                    if confirm:
+                        if get_backend().supports_event_inbox() and not native_confirm:
+                            # The herdr TUI backend pushes live-event delivery
+                            # inline on its single asyncio event loop thread
+                            # (herdr_inbox_service.py's _event_loop -> _deliver). The
+                            # settle-retry path is offloaded via asyncio.to_thread,
+                            # but this on-event path is not, so _confirm_submitted's
+                            # blocking time.sleep() here would stall that whole
+                            # session's event processing for up to
+                            # INBOX_SUBMIT_CONFIRM_TIMEOUT * (1 + INBOX_SUBMIT_MAX_RESUBMITS)
+                            # seconds. Skip confirmation there until the live-event
+                            # path is driven off-loop too (tracked as a follow-up to
+                            # the delivery-ready-signal work) -- the drop stays
+                            # undetected on herdr, same as before this fix, instead
+                            # of freezing the session.
+                            logger.debug(
+                                "Skipping inbox submit confirmation for terminal %s: "
+                                "event-inbox backend delivery runs on the API event loop",
+                                terminal_id,
+                            )
+                        else:
+                            # Still holding the per-terminal delivery lock,
+                            # deliberately: the pile-up in #78 ({MSG1}{MSG2} in one
+                            # composer) is a second delivery landing while the first
+                            # sits unsubmitted. The lock only DELAYS that second
+                            # delivery until this confirmation ends; what prevents
+                            # the pile-up is a recovery that submits the first paste
+                            # (bare Enter), which needs the provider to read its
+                            # composer -- see _confirm_submitted. Other terminals
+                            # are not held: each delivery runs on its own thread.
+                            # Eager delivery is excluded because its receiver was
+                            # already PROCESSING -- "left the ready state" proves
+                            # nothing there.
+                            self._confirm_submitted(
+                                terminal_id,
+                                combined,
+                                boundary,
+                                registry=registry,
+                                sender_id=sender_id,
+                                native=native_confirm,
+                                pre_dispatch_status=pre_dispatch_status,
+                            )
+                except Exception as exc:  # noqa: BLE001 - the paste already landed
+                    logger.warning(
+                        f"Delivered {len(batch)} message(s) to terminal {terminal_id}, "
+                        f"but the step after the paste failed: {exc}"
+                    )
                 self._arm_message_edges(terminal_id, batch)
+                self._settle_reply_edges(terminal_id, batch)
             except TerminalNotFoundError as e:
+                requeued_pending = True
                 # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
                 # for this window). Treat as transient: reset to PENDING so the
                 # reconcile sweep retries rather than marking FAILED. These were
@@ -389,6 +558,7 @@ class InboxService:
                     TerminalInputBlockedReason.WAITING_USER_ANSWER,
                     TerminalInputBlockedReason.IDENTITY_PENDING,
                 ):
+                    requeued_pending = True
                     for message in batch:
                         update_message_status(message.id, MessageStatus.PENDING)
                     logger.warning(
@@ -396,23 +566,39 @@ class InboxService:
                         f"{len(batch)} message(s) pending for retry: {e}"
                     )
                 else:
-                    for message in batch:
-                        logger.error(
-                            f"Delivery into terminal {terminal_id} refused for "
-                            f"message {message.id}: {e}"
-                        )
-                        update_message_status(message.id, MessageStatus.FAILED)
-                    self._close_message_edges(
+                    # Refused before typing, and no later attempt can succeed.
+                    # Nothing goes back to PENDING, so this never defers.
+                    self._fail_batch(
                         terminal_id,
                         batch,
-                        "the terminal refused input" + (f" ({e.reason.value})" if e.reason else ""),
-                        registry,
+                        e,
+                        not_sent=True,
+                        retryable=False,
+                        report_to_sender=report_to_sender,
+                        hand_off=hand_off,
+                        report=report,
+                        registry=registry,
+                        reason="the terminal refused input"
+                        + (f" ({e.reason.value})" if e.reason else ""),
                     )
             except Exception as e:
-                for message in batch:
-                    logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
-                    update_message_status(message.id, MessageStatus.FAILED)
-                self._close_message_edges(terminal_id, batch, _short_reason(e), registry)
+                if self._fail_batch(
+                    terminal_id,
+                    batch,
+                    e,
+                    not_sent=isinstance(e, InputNotSentError),
+                    # A terminal with no row cannot take a later attempt either.
+                    retryable=not isinstance(e, TerminalRowMissingError),
+                    report_to_sender=report_to_sender,
+                    hand_off=hand_off,
+                    report=report,
+                    registry=registry,
+                ):
+                    requeued_pending = True
+
+        if delivered_count == 0 and requeued_pending:
+            return DELIVERY_DEFERRED
+        return delivered_count
 
     def deliver_pending_in_background(
         self, terminal_id: str, registry: PluginRegistry | None = None
@@ -460,27 +646,122 @@ class InboxService:
             pool = self._background_pool
         return pool.submit(deliver)
 
-    @staticmethod
-    def _close_message_edges(
+    def _fail_batch(
+        self,
         terminal_id: str,
         batch: List[InboxMessage],
+        error: Exception,
+        *,
+        not_sent: bool,
+        retryable: bool,
+        report_to_sender: Optional[int],
+        hand_off: Optional[DeliveryHandOff],
+        report: OutcomeCallback,
+        registry: PluginRegistry | None,
+        reason: Optional[str] = None,
+    ) -> bool:
+        """Retry, or fail for good and report, each message of a batch whose delivery failed.
+
+        A queued message that failed before anything was typed goes back to
+        PENDING until INBOX_MAX_DELIVERY_ATTEMPTS attempts have failed. The
+        message whose outcome goes back to its sender (``report_to_sender``),
+        a message that may have been typed, and a permanent refusal are failed
+        at once. Every failed attempt is counted on its message.
+
+        Args:
+            terminal_id: The receiver.
+            batch: The messages of the failed dispatch.
+            error: What the dispatch raised.
+            not_sent: True when nothing of the batch can have been typed.
+            retryable: False for a refusal no later attempt can get past.
+            report_to_sender: Id of the message the inbox POST reports on.
+            hand_off: The POST's hand-off for that message; when it refuses
+                the failure, the message is handled as queued.
+            report: Outcome reporter of this ``deliver_pending`` call.
+            registry: Plugin registry for the failure notices.
+            reason: Text for the notices; derived from ``error`` when None.
+
+        Returns:
+            True when a message went back to PENDING for another attempt, so
+            the caller can report the delivery as deferred.
+        """
+        reason = reason or _short_reason(error)
+        final_outcome = DeliveryOutcome.FAILED if not_sent else DeliveryOutcome.UNCERTAIN
+        final: List[InboxMessage] = []
+        reported_ids: Set[int] = set()
+        requeued = False
+        for message in batch:
+            reported = message.id == report_to_sender and (
+                hand_off is None or hand_off.offer(final_outcome, reason)
+            )
+            if reported:
+                reported_ids.add(message.id)
+            attempts = _record_failure(message.id, reason)
+            if not_sent and retryable and not reported and attempts < INBOX_MAX_DELIVERY_ATTEMPTS:
+                update_message_status(message.id, MessageStatus.PENDING)
+                requeued = True
+                report(message.id, DeliveryOutcome.RETRYING, reason)
+                logger.warning(
+                    f"Message {message.id} to {terminal_id} not delivered "
+                    f"(attempt {attempts} of {INBOX_MAX_DELIVERY_ATTEMPTS}), retrying: {reason}"
+                )
+                continue
+            logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {error}")
+            update_message_status(message.id, MessageStatus.FAILED)
+            report(message.id, final_outcome, reason)
+            final.append(message)
+        if final:
+            self._report_failed_messages(
+                terminal_id,
+                final,
+                reason,
+                uncertain=not not_sent,
+                reported_ids=reported_ids,
+                registry=registry,
+            )
+        return requeued
+
+    @staticmethod
+    def _report_failed_messages(
+        terminal_id: str,
+        messages: List[InboxMessage],
         reason: str,
+        *,
+        uncertain: bool,
+        reported_ids: Set[int],
         registry: PluginRegistry | None,
     ) -> None:
-        """Close the delegation edges of a batch whose delivery failed, telling each caller.
+        """Settle the edges of messages failed for good and tell whoever must know.
 
-        See ``delegation_callback_service.handle_delivery_failed``. Imported
-        here because that module imports this one. Best-effort, like arming: a
-        failure must not change the batch's FAILED status.
+        See ``delegation_callback_service.handle_messages_failed``. Imported
+        here because that module imports this one. Best-effort: a failure must
+        not change the messages' FAILED status.
         """
         try:
             from cli_agent_orchestrator.services import delegation_callback_service
 
-            delegation_callback_service.handle_delivery_failed(
-                terminal_id, [m.id for m in batch], reason, registry
+            delegation_callback_service.handle_messages_failed(
+                terminal_id,
+                messages,
+                reason,
+                uncertain=uncertain,
+                reported_ids=reported_ids,
+                registry=registry,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Could not close delegation edges for {terminal_id}: {exc}")
+            logger.warning(f"Could not report failed messages for {terminal_id}: {exc}")
+
+    @staticmethod
+    def _settle_reply_edges(terminal_id: str, batch: List[InboxMessage]) -> None:
+        """Close as replied the edges whose reply this batch delivered (design D1).
+
+        Bookkeeping, like arming: a failure here must not mark a delivered
+        batch FAILED.
+        """
+        try:
+            close_edges_replied_by([m.id for m in batch])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Could not settle reply edges for {terminal_id}: {exc}")
 
     @staticmethod
     def _arm_message_edges(terminal_id: str, batch: List[InboxMessage]) -> None:
@@ -521,6 +802,9 @@ class InboxService:
         self,
         terminal_id: str,
         boundary: int,
+        *,
+        native: bool = False,
+        pre_dispatch_status: TerminalStatus | None = None,
     ) -> bool:
         """Wait for a started status that is EVIDENCE OF THIS DELIVERY.
 
@@ -531,15 +815,33 @@ class InboxService:
         causal pair from ``status_observation`` is required -- the generation the
         status was EARNED at must exceed the delivery boundary.
 
-        Callers never pass event-inbox (herdr) terminals here: that backend
-        pushes delivery inline on its own asyncio event loop thread, so
-        ``_deliver_pending_locked`` skips confirmation for it entirely rather
-        than block that loop (see the caller).
+        The herdr TUI backend never gets here: it pushes delivery inline on
+        its own asyncio event loop thread, so ``_deliver_pending_locked`` skips
+        confirmation for it rather than block that loop (see the caller).
+
+        ``native`` (herdr-app, which delivers off the loop): status is derived
+        on demand and has no output generation, so ``boundary`` cannot be
+        used. The rule is the first-task path's for event-inbox backends
+        (``terminal_service._wait_for_post_dispatch_start``): a started status
+        counts if it is PROCESSING or differs from ``pre_dispatch_status``, the
+        reading taken just before the dispatch. Native activity after the send
+        (herdr-core reported ``working``, ``status_monitor.started_on_last_input``)
+        also counts: herdr-core's terminal.send itself waits up to 5 s for the
+        agent to start, so a short turn can be over before the wait begins.
         """
         deadline = time.monotonic() + INBOX_SUBMIT_CONFIRM_TIMEOUT
         while True:
             observation = status_monitor.status_observation(terminal_id)
-            if (
+            if native:
+                if (
+                    observation.status in _SUBMIT_STARTED_STATUSES
+                    and (
+                        observation.status == TerminalStatus.PROCESSING
+                        or observation.status != pre_dispatch_status
+                    )
+                ) or status_monitor.started_on_last_input(terminal_id) is True:
+                    return True
+            elif (
                 observation.status in _SUBMIT_STARTED_STATUSES
                 and observation.output_generation is not None
                 and observation.output_generation > boundary
@@ -557,6 +859,8 @@ class InboxService:
         *,
         registry: PluginRegistry | None,
         sender_id: str | None,
+        native: bool = False,
+        pre_dispatch_status: TerminalStatus | None = None,
     ) -> bool:
         """Confirm the receiver began processing this delivery; re-submit if not.
 
@@ -590,7 +894,15 @@ class InboxService:
         DELIVERED either way: it HAS been typed into the pane, so reverting it to
         PENDING would let the reconcile sweep paste it a second time.
         """
-        if self._wait_for_pickup(terminal_id, boundary):
+
+        def picked_up(since: int) -> bool:
+            # ``native``: judged against the pre-dispatch reading every time, as
+            # the first-task path keeps one reading across its resubmits.
+            return self._wait_for_pickup(
+                terminal_id, since, native=native, pre_dispatch_status=pre_dispatch_status
+            )
+
+        if picked_up(boundary):
             return True
 
         for attempt in range(1, INBOX_SUBMIT_MAX_RESUBMITS + 1):
@@ -637,7 +949,7 @@ class InboxService:
             # The recency bar advances per attempt: evidence has to be earned
             # after THIS re-submission, not after the original send.
             boundary = new_boundary
-            if self._wait_for_pickup(terminal_id, boundary):
+            if picked_up(boundary):
                 return True
 
         logger.error(
@@ -653,6 +965,7 @@ class InboxService:
         terminal_ids: Iterable[str],
         registry: PluginRegistry | None,
         failure_label: str,
+        source: Optional[str] = None,
     ) -> None:
         """Run ``deliver_pending`` for every receiver, in parallel, failures isolated.
 
@@ -667,7 +980,9 @@ class InboxService:
             return
         with ThreadPoolExecutor(max_workers=min(len(ids), INBOX_SWEEP_FANOUT)) as pool:
             futures = {
-                pool.submit(self.deliver_pending, terminal_id, registry=registry): terminal_id
+                pool.submit(
+                    self.deliver_pending, terminal_id, registry=registry, source=source
+                ): terminal_id
                 for terminal_id in ids
             }
             for future in as_completed(futures):
@@ -687,6 +1002,7 @@ class InboxService:
             list_pending_receiver_ids_by_provider(ProviderType.OPENCODE_CLI.value),
             registry,
             "OpenCode inbox poll",
+            source="opencode-poll",
         )
 
     def reconcile_orphaned_messages(self, registry: PluginRegistry | None = None) -> None:
@@ -724,6 +1040,7 @@ class InboxService:
             list_pending_receiver_ids_older_than(INBOX_RECONCILE_GRACE_SECONDS),
             registry,
             "Inbox reconciliation",
+            source="reconcile-sweep",
         )
 
 

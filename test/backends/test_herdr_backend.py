@@ -1,6 +1,7 @@
 """Unit tests for HerdrBackend — pane_id resolution and command construction."""
 
 import json
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -21,7 +22,9 @@ def backend():
     # Patch os.path.exists so _ensure_session_running finds the socket immediately,
     # avoiding the 5-second poll timeout in unit tests.
     with patch("cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True):
-        yield HerdrBackend(send_delay_ms=0)
+        backend = HerdrBackend(send_delay_ms=0)
+        yield backend
+    backend.release_web_input("")  # a focus test's lock, so the next test can take it
 
 
 def _make_pane_list_response(panes):
@@ -122,20 +125,189 @@ class TestHerdrBackendCommands:
         assert result[1]["name"] == "cao-proj2"
 
     @patch("subprocess.run")
-    def test_prepare_web_attach_focuses_tab_and_returns_herdr_command(self, mock_run, backend):
-        """Browser attachment focuses the requested Herdr tab before opening its TUI."""
+    def test_prepare_web_attach_returns_single_pane_view(self, mock_run, backend):
+        """Browser attachment runs the one-pane view, not herdr's shared-focus TUI."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
         tabs = [{"tab_id": "tab-1", "workspace_id": "w1", "label": "developer-abcd"}]
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),
             _completed(_make_tab_list_response(tabs)),
-            _completed(),
         ]
 
         command = backend.prepare_web_attach("cao-test", "developer-abcd")
 
-        assert command == ["herdr", "--session", "cao"]
-        assert mock_run.call_args_list[-1].args[0][-3:] == ["tab", "focus", "tab-1"]
+        assert command[1:3] == ["-m", "cli_agent_orchestrator.backends.herdr_web_view"]
+        args = dict(zip(command[3::2], command[4::2]))
+        assert args["--herdr-session"] == "cao"
+        assert args["--workspace"] == "cao-test"
+        assert args["--tab"] == "developer-abcd"
+        assert args["--socket"].endswith("/herdr/sessions/cao/herdr.sock")
+        # Attaching no longer moves herdr's focus: input does, per frame.
+        assert all("focus" not in call.args[0] for call in mock_run.call_args_list)
+
+    def test_prepare_web_attach_input_scopes_by_herdr_session(self, backend):
+        """Input focus is serialised per herdr session and names the tab by its labels."""
+        with patch.object(backend, "prepare_web_attach", return_value=["view"]):
+            argv, focus = backend.prepare_web_attach_input("cao-test", "developer-abcd")
+
+        assert argv == ["view"]
+        assert focus == ("herdr:cao", json.dumps(["cao-test", "developer-abcd"]))
+
+    @staticmethod
+    def _snapshot(ws_focused, tab_focused):
+        return json.dumps(
+            {
+                "result": {
+                    "snapshot": {
+                        "workspaces": [
+                            {"workspace_id": "w1", "label": "cao-test", "focused": ws_focused}
+                        ],
+                        "tabs": [
+                            {
+                                "tab_id": "w1:t2",
+                                "workspace_id": "w1",
+                                "label": "developer-abcd",
+                                "focused": tab_focused,
+                            }
+                        ],
+                    }
+                }
+            }
+        )
+
+    @patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep")
+    def test_focus_web_input_focuses_and_settles_when_elsewhere(self, mock_sleep, backend):
+        """A focus change is followed by a settle wait, so the next key is not lost."""
+        target = json.dumps(["cao-test", "developer-abcd"])
+        with (
+            patch.object(backend, "_resolve_workspace_id", return_value="w1"),
+            patch.object(
+                backend,
+                "_run_herdr",
+                side_effect=[_completed(self._snapshot(True, False)), _completed()],
+            ) as run,
+        ):
+            backend.focus_web_input(target)
+
+        assert run.call_args_list[-1].args[0] == ["tab", "focus", "w1:t2"]
+        mock_sleep.assert_called_once()
+
+    @patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep")
+    def test_focus_web_input_skips_when_already_focused(self, mock_sleep, backend):
+        """Typing into the focused tab costs no focus command and no wait."""
+        target = json.dumps(["cao-test", "developer-abcd"])
+        with (
+            patch.object(backend, "_resolve_workspace_id", return_value="w1"),
+            patch.object(
+                backend, "_run_herdr", return_value=_completed(self._snapshot(True, True))
+            ) as run,
+        ):
+            backend.focus_web_input(target)
+
+        assert run.call_count == 1
+        mock_sleep.assert_not_called()
+
+    def test_focus_web_input_rejects_malformed_target(self, backend):
+        with pytest.raises(TerminalBackendError):
+            backend.focus_web_input("not-json")
+
+    @pytest.fixture
+    def lock_path(self, tmp_path):
+        path = str(tmp_path / "focus.lock")
+        with patch(
+            "cli_agent_orchestrator.backends.herdr_web_view.focus_lock_path", return_value=path
+        ):
+            yield path
+
+    def _focus(self, backend, focused=True):
+        with (
+            patch.object(backend, "_resolve_workspace_id", return_value="w1"),
+            patch.object(
+                backend,
+                "_run_herdr",
+                side_effect=[_completed(self._snapshot(True, focused)), _completed()],
+            ),
+            patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep"),
+        ):
+            backend.focus_web_input(json.dumps(["cao-test", "developer-abcd"]))
+
+    def test_focus_web_input_holds_the_focus_lock_until_released(self, backend, lock_path):
+        """A web view must not move herdr's focus while this frame is on its way."""
+        from cli_agent_orchestrator.backends import herdr_web_view
+
+        self._focus(backend)
+        assert herdr_web_view.try_lock(lock_path) is None
+
+        backend.release_web_input("")
+        fd = herdr_web_view.try_lock(lock_path)
+        assert fd is not None
+        herdr_web_view.unlock(fd)
+
+    def test_focus_web_input_waits_for_a_view_resizing(self, backend, lock_path):
+        from cli_agent_orchestrator.backends import herdr_web_view
+
+        view_fd = herdr_web_view.try_lock(lock_path)
+        timer = threading.Timer(0.2, herdr_web_view.unlock, args=(view_fd,))
+        timer.start()
+        started = time.monotonic()
+        self._focus(backend)
+        timer.join()
+        assert time.monotonic() - started >= 0.15
+        backend.release_web_input("")
+
+    def test_focus_web_input_gives_up_rather_than_race_a_resize(self, backend, lock_path):
+        from cli_agent_orchestrator.backends import herdr_backend, herdr_web_view
+
+        view_fd = herdr_web_view.try_lock(lock_path)
+        try:
+            with (
+                patch.object(herdr_backend, "_HERDR_WEB_FOCUS_LOCK_TIMEOUT_S", 0.1),
+                pytest.raises(TerminalBackendError, match="focus lock"),
+            ):
+                self._focus(backend)
+        finally:
+            herdr_web_view.unlock(view_fd)
+
+    def test_a_failed_focus_releases_the_lock(self, backend, lock_path):
+        from cli_agent_orchestrator.backends import herdr_web_view
+
+        with (
+            patch.object(backend, "_resolve_workspace_id", side_effect=TerminalBackendError("x")),
+            pytest.raises(TerminalBackendError),
+        ):
+            backend.focus_web_input(json.dumps(["cao-test", "developer-abcd"]))
+        fd = herdr_web_view.try_lock(lock_path)
+        assert fd is not None
+        herdr_web_view.unlock(fd)
+
+    def test_no_state_directory_logs_once_and_lets_input_through(self, backend, caplog):
+        """The views do not move the focus without the lock, so input stays safe."""
+        with patch(
+            "cli_agent_orchestrator.backends.herdr_web_view.focus_lock_path", return_value=None
+        ):
+            self._focus(backend)
+            self._focus(backend)
+        warnings = [r for r in caplog.records if "focus lock" in r.getMessage()]
+        assert len(warnings) == 1
+        assert backend._web_focus_lock_fd is None
+
+    def test_a_lock_file_it_cannot_open_drops_the_frame(self, backend, tmp_path):
+        """A view may still hold the lock, so the focus must not move (review P3)."""
+        path = str(tmp_path / "missing-dir" / "focus.lock")
+        with (
+            patch(
+                "cli_agent_orchestrator.backends.herdr_web_view.focus_lock_path",
+                return_value=path,
+            ),
+            patch.object(backend, "_run_herdr") as run,
+            pytest.raises(TerminalBackendError, match="focus lock unusable"),
+        ):
+            backend.focus_web_input(json.dumps(["cao-test", "developer-abcd"]))
+        run.assert_not_called()
+
+    def test_release_without_a_turn_is_harmless(self, backend):
+        backend.release_web_input("")
+        backend.release_web_input("")
 
     def test_prepare_web_attach_propagates_tab_not_found(self, backend):
         """Browser attachment propagates a missing requested Herdr tab."""
@@ -1057,6 +1229,24 @@ class TestEnsureSessionRunning:
         mock_popen.assert_called_once()
         cmd = mock_popen.call_args[0][0]
         assert cmd == ["herdr", "--session", "cao", "server"]
+
+    def test_refuses_missing_socket_when_auto_start_disabled(self):
+        """A system-managed server must never be spawned by this backend."""
+        with patch(
+            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+            return_value=False,
+        ):
+            with patch("subprocess.Popen") as mock_popen:
+                with pytest.raises(TerminalBackendError) as exc_info:
+                    HerdrBackend(herdr_session="systemd-cao", auto_start=False)
+
+        assert (
+            str(exc_info.value)
+            == "herdr isn't running for session 'systemd-cao', and terminal.herdr_auto_start is false. "
+            "Start the herdr server that owns this session (for example, its systemd service), "
+            "then retry."
+        )
+        mock_popen.assert_not_called()
 
     def test_logs_warning_when_socket_never_appears(self):
         """If socket never appears within 15s, a warning is logged and no error raised."""

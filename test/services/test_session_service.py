@@ -56,7 +56,26 @@ class TestCreateSession:
         assert call_kwargs["provider"] == "claude_code"
         assert call_kwargs["defer_init"] is False
         assert call_kwargs["initial_message"] is None
+        assert call_kwargs["inject_memory_at_start"] is False
         assert call_kwargs["model"] is None
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_create_session_forwards_start_memory_request(
+        self, mock_create_terminal, mock_dispatch
+    ):
+        mock_terminal = MagicMock()
+        mock_terminal.session_name = "cao-test"
+        mock_create_terminal.return_value = mock_terminal
+
+        await create_session(
+            provider="codex",
+            agent_profile="my_agent",
+            inject_memory_at_start=True,
+        )
+
+        assert mock_create_terminal.call_args.kwargs["inject_memory_at_start"] is True
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")

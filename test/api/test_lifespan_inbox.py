@@ -30,6 +30,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.api.main import app, lifespan
+from cli_agent_orchestrator.backends.herdr_app_backend import HerdrAppBackend
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.plugins import PluginRegistry
 
@@ -118,6 +119,7 @@ def _patched_lifespan(backend: object, tasks: list):
         namespace = SimpleNamespace(
             get_backend=patch_main("get_backend", return_value=backend),
             herdr_cls=patch_main("HerdrInboxService"),
+            herdr_app_cls=patch_main("HerdrAppInboxService"),
             set_svc=patch_main("set_herdr_inbox_service"),
             load=stack.enter_context(patch.object(PluginRegistry, "load", new_callable=AsyncMock)),
             teardown=stack.enter_context(
@@ -156,6 +158,24 @@ class TestLifespanInboxWiring:
                 # svc.start() was scheduled as a task.
                 svc.start.assert_called_once()
                 assert _find_task(tasks, svc.start.return_value) is not None
+
+    @pytest.mark.asyncio
+    async def test_herdr_delivery_callback_forwards_trigger_source(self) -> None:
+        """The callback forwards its source so delivery log lines carry the
+        trigger tag — docs/herdr.md promises a dead event path is visible in
+        the logs, and the live smoke's verdict reads that tag."""
+        tasks: list = []
+        backend = MagicMock(spec=HerdrBackend)
+        backend.herdr_session = "cao"
+        with _patched_lifespan(backend, tasks) as mocks:
+            async with lifespan(app):
+                callback = mocks.herdr_cls.call_args.kwargs["delivery_callback"]
+                with patch(
+                    "cli_agent_orchestrator.api.main.inbox_service.deliver_pending",
+                    return_value=1,
+                ) as deliver:
+                    assert callback("tid1", "herdr-event") == 1
+                deliver.assert_called_once_with("tid1", registry=ANY, source="herdr-event")
 
     @pytest.mark.asyncio
     async def test_tmux_backend_skips_herdr_service(self) -> None:
@@ -253,3 +273,48 @@ class TestLifespanInboxWiring:
             retry_task.cancel.assert_called_once()
             # The fake create_task closes rather than runs the coroutine.
             retry_called.assert_not_called()
+
+
+class TestLifespanHerdrAppWiring:
+    """Startup + shutdown wiring for the herdr-app (herdr-core) inbox."""
+
+    @pytest.mark.asyncio
+    async def test_herdr_app_backend_starts_and_stops_service(self) -> None:
+        tasks: list = []
+        backend = MagicMock(spec=HerdrAppBackend)
+        with _patched_lifespan(backend, tasks) as mocks:
+            async with lifespan(app):
+                mocks.herdr_app_cls.assert_called_once_with(backend, ANY)
+                assert callable(mocks.herdr_app_cls.call_args.args[1])
+                mocks.herdr_cls.assert_not_called()
+                svc = mocks.herdr_app_cls.return_value
+                mocks.set_svc.assert_called_once_with(svc)
+                svc.start.assert_called_once()
+                task = _find_task(tasks, svc.start.return_value)
+                assert task is not None
+                task.cancel.assert_not_called()
+            task.cancel.assert_called_once()
+            mocks.set_svc.assert_called_with(None)
+
+    @pytest.mark.asyncio
+    async def test_delivery_callback_delivers_pending(self) -> None:
+        tasks: list = []
+        backend = MagicMock(spec=HerdrAppBackend)
+        with (
+            _patched_lifespan(backend, tasks) as mocks,
+            patch("cli_agent_orchestrator.api.main.inbox_service") as inbox,
+        ):
+            async with lifespan(app):
+                callback = mocks.herdr_app_cls.call_args.args[1]
+                callback("aaaa0001")
+                inbox.deliver_pending.assert_called_once_with("aaaa0001", registry=ANY)
+
+    @pytest.mark.asyncio
+    async def test_tmux_and_herdr_backends_skip_herdr_app_service(self) -> None:
+        for backend in (MagicMock(), MagicMock(spec=HerdrBackend)):
+            if isinstance(backend, HerdrBackend):
+                backend.herdr_session = "cao"
+            tasks: list = []
+            with _patched_lifespan(backend, tasks) as mocks:
+                async with lifespan(app):
+                    mocks.herdr_app_cls.assert_not_called()

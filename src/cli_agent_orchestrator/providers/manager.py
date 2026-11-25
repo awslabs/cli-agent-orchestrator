@@ -27,6 +27,7 @@ from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
 from cli_agent_orchestrator.providers.omp import OmpProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
+from cli_agent_orchestrator.providers.qwen_cli import QwenCliProvider
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ class ProviderManager:
             ProviderType.CODEX.value: CodexProvider,
             ProviderType.COPILOT_CLI.value: CopilotCliProvider,
             ProviderType.KIMI_CLI.value: KimiCliProvider,
+            ProviderType.QWEN_CLI.value: QwenCliProvider,
             ProviderType.OPENCODE_CLI.value: OpenCodeCliProvider,
             ProviderType.OMP.value: OmpProvider,
             ProviderType.HERMES.value: HermesProvider,
@@ -169,6 +171,16 @@ class ProviderManager:
                 )
                 if provider_variant is not None:
                     provider.restore_runtime_variant(provider_variant)
+            elif provider_type == ProviderType.QWEN_CLI.value:
+                provider = QwenCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                    model=model,
+                )
             elif provider_type == ProviderType.OPENCODE_CLI.value:
                 provider = OpenCodeCliProvider(
                     terminal_id,
@@ -331,6 +343,16 @@ class ProviderManager:
             provider.shell_baseline = metadata["shell_command"]
             if hasattr(provider, "_initialized"):
                 provider._initialized = True
+        # Claude Code rows carry no shell_command, and nothing else in the row
+        # records that initialize() finished. The row is written before
+        # initialize() starts, so its existence proves only that the terminal was
+        # created. accepts_input_while_processing reads _initialized; without this
+        # eager inbox delivery is refused for every Claude terminal that outlived a
+        # cao-server restart. Accepted limit: a restart between the row write and
+        # the end of initialize() can mark a REPL that is still starting as ready,
+        # and an eager delivery in that window can paste into it too early.
+        if isinstance(provider, ClaudeCodeProvider):
+            provider._initialized = True
         logger.info(f"Created provider on-demand for terminal {terminal_id}")
         return provider
 

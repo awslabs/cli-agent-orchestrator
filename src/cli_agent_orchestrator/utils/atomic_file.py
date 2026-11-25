@@ -364,6 +364,39 @@ def locked_atomic_rewrite(
         _atomic_publish(target, compute_new_content(existing), encoding, mode=mode)
 
 
+def locked_atomic_rewrite_or_delete(
+    target: Path,
+    compute_new_content: Callable[[str], str],
+    should_delete: Callable[[str], bool],
+    *,
+    encoding: str = "utf-8",
+    lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+) -> None:
+    """Transform an existing file under its lock, deleting a qualifying result.
+
+    Both the transform and the delete predicate see the text read while the
+    target lock is held. A missing target is a no-op, which makes concurrent
+    cleanup idempotent without creating its parent directory.
+    """
+    lock_path = _lock_path_for(target)
+
+    with _file_lock(lock_path, lock_timeout):
+        try:
+            existing = target.read_text(encoding=encoding)
+        except FileNotFoundError:
+            return
+        rewritten = compute_new_content(existing)
+        if rewritten == existing:
+            return
+        if should_delete(rewritten):
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        _atomic_publish(target, rewritten, encoding)
+
+
 def locked_atomic_write(
     target: Path,
     content: str,

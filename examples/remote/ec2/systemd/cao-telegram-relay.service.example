@@ -1,0 +1,41 @@
+# OPTIONAL: a Telegram relay for the box's own (second) bot. Not installed or
+# enabled by bootstrap.sh. Follow telegram/README.md first; then:
+#
+#   1. Replace the placeholders:
+#        @BOX_HOME@      the box user's home (for the herdr socket folder)
+#        RELAY_COMMAND   the relay's start command, absolute path first
+#   2. sudo cp cao-telegram-relay.service.example /etc/systemd/system/cao-telegram-relay.service
+#   3. sudo systemctl daemon-reload && sudo systemctl enable --now cao-telegram-relay.service
+#
+# The relay runs as its OWN system user, cao-relay, not as the box user the
+# agents run as. Its token file, /etc/cao-box/telegram.env, is owned by
+# cao-relay with mode 0600 and holds one line, TELEGRAM_BOT_TOKEN=<token>.
+# So agents can read neither the file nor the relay's process environment.
+# Never put the token in box.env, the herdr unit or the cao-server unit.
+
+[Unit]
+Description=Telegram relay for the CAO box (second bot)
+Requires=herdr-cao.service
+Wants=network-online.target
+After=herdr-cao.service network-online.target
+
+[Service]
+Type=simple
+User=cao-relay
+Group=cao-relay
+StateDirectory=cao-relay
+WorkingDirectory=/var/lib/cao-relay
+EnvironmentFile=/etc/cao-box/box.env
+EnvironmentFile=/etc/cao-box/telegram.env
+Environment=HOME=/var/lib/cao-relay
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Where herdr's session sockets live; rename to whatever your relay expects.
+Environment=HERDR_SOCKET_DIR=@BOX_HOME@/.config/herdr/sessions
+NoNewPrivileges=yes
+PrivateTmp=yes
+ExecStart=RELAY_COMMAND
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

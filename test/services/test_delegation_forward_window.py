@@ -12,6 +12,7 @@ latched IDLE and "PREVIOUS ANSWER" is on its screen. The pane itself is mocked.
 
 import asyncio
 import json
+import re
 import time
 from unittest.mock import MagicMock
 
@@ -406,30 +407,37 @@ class TestEdgesThatCanNeverBeArmed:
     """
 
     @pytest.mark.parametrize(
-        ("failure", "reason"),
+        ("failure", "reason", "uncertain"),
         [
-            (RuntimeError("tmux error"), "RuntimeError: tmux error"),
+            (RuntimeError("tmux error"), "RuntimeError: tmux error", True),
             (
                 TerminalInputBlockedError(
                     "provider exited", reason=TerminalInputBlockedReason.PROVIDER_ERROR
                 ),
                 "the terminal refused input (provider_error)",
+                False,
             ),
         ],
         ids=["exception", "refused"],
     )
     def test_failed_delivery_closes_its_edge_and_a_follow_up_gets_a_fresh_one(
-        self, world, monkeypatch, failure, reason
+        self, world, monkeypatch, failure, reason, uncertain
     ):
         typed = inbox_module.terminal_service.dispatch_input.side_effect
         monkeypatch.setattr(inbox_module.terminal_service.dispatch_input, "side_effect", failure)
         _send(SUP, W1, "lost")
         assert list_open_edges_into(W1) == []
         assert list_open_edges_out_of(SUP) == []
-        assert _notices_to(SUP) == [
-            f"[CAO delivery failed] Your message to worker {W1} (profile developer) was not "
-            f"delivered: {reason}. Check the worker's terminal before you send it again."
-        ]
+        # One notice, which also names the failed message and, when it may have
+        # been typed, says so (reply-delivery-failure ruling on edge notices).
+        (notice,) = _notices_to(SUP)
+        lost_id = next(m.id for m in get_inbox_messages(W1, limit=5) if m.message == "lost")
+        assert notice.startswith("[CAO delivery failed] Your message")
+        assert f"worker {W1} (profile developer)" in notice
+        assert f"delivered: {reason}." in notice
+        assert "Check the worker's terminal before you send it again." in notice
+        assert re.search(rf"\b{lost_id}\b", notice), "names the failed message id"
+        assert ("may have arrived" in notice) is uncertain
 
         monkeypatch.setattr(inbox_module.terminal_service.dispatch_input, "side_effect", typed)
         _send(SUP, W1, "again")

@@ -30,6 +30,7 @@ from cli_agent_orchestrator.models.workflow_runtime import (
     WorkflowRunResult,
 )
 from cli_agent_orchestrator.services import workflow_service
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 _SPEC = WorkflowSpec(
     name="wf", steps=[WorkflowStep(id="s1", provider="claude_code", agent="dev", prompt="go")]
@@ -2321,7 +2322,7 @@ def test_failure_envelope_adds_no_persisted_column(client, read_surface_db):
     client.get("/workflows/runs/nocol/result")  # assembles the envelope
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
-    with sqlite3.connect(str(DATABASE_FILE)) as conn:
+    with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(workflow_run_step)")}
     assert cols == {
         "run_id",

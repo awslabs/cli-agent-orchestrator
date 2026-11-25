@@ -62,6 +62,7 @@ from pydantic import (
 )
 
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
+from cli_agent_orchestrator.backends.herdr_app_backend import HerdrAppBackend
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.cli.commands.agent_plugin import UNTRUSTED_CONTENT_WARNING
@@ -85,6 +86,7 @@ from cli_agent_orchestrator.constants import (
     DECISION_RESPONSE_HEADER,
     DEFAULT_PROVIDER,
     HANDOFF_RESULTS_ROUTE,
+    INBOX_DELIVERY_OUTCOME_WAIT,
     INBOX_IMMEDIATE_DELIVERY_WAIT,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
@@ -125,7 +127,11 @@ from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
 from cli_agent_orchestrator.graph.sinks import get_sink
 from cli_agent_orchestrator.models.delegation import EdgeSource
 from cli_agent_orchestrator.models.flow import Flow
-from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.inbox import (
+    DeliveryOutcome,
+    MessageStatus,
+    OrchestrationType,
+)
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.memory import (
     LenientMemoryKey,
@@ -191,9 +197,10 @@ from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.event_log_service import RING_CAPACITY
 from cli_agent_orchestrator.services.event_primitives import KINDS as EVENT_KINDS
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.services.herdr_app_inbox_service import HerdrAppInboxService
 from cli_agent_orchestrator.services.herdr_inbox_registry import set_herdr_inbox_service
 from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
-from cli_agent_orchestrator.services.inbox_service import inbox_service
+from cli_agent_orchestrator.services.inbox_service import DeliveryHandOff, inbox_service
 from cli_agent_orchestrator.services.install_service import (
     InstallResult,
     KiroAgentPathError,
@@ -515,6 +522,7 @@ class CreateSessionBody(_CreateMessageBody):
     # its own stored ceiling and the created terminal is bounded by it
     # (utils/delegation.py). Rejected (400) together with a local caller.
     caller_ceiling: Optional[List[str]] = None
+    inject_memory_at_start: bool = False
 
     @field_validator("env_vars")
     @classmethod
@@ -1459,11 +1467,25 @@ class InstallAgentProfileRequest(BaseModel):
     ``provider`` may be omitted (None): the install service then honours the
     profile's frontmatter ``provider:`` key, falling back to the default
     provider — the same flag > frontmatter > default precedence as the CLI.
+
+    ``content`` carries a profile document the client read itself (the web
+    UI's file picker), the HTTP equivalent of ``cao install ./agent.md``.
+    The server still never reads a path: ``source`` must then be a bare
+    profile name (the file's stem), and the text goes to ``install_agent``
+    as ``profile_content``, the same import shape the CLI uses.
     """
 
     source: str
     provider: Optional[str] = None
     env_vars: Optional[Dict[str, str]] = None
+    content: Optional[str] = Field(
+        default=None,
+        max_length=262_144,
+        description=(
+            "Profile markdown to import under the bare name in `source`, "
+            "instead of resolving `source` as a name or URL"
+        ),
+    )
 
 
 # Scaffold templates are identified as ``category/name`` (e.g.
@@ -1895,6 +1917,15 @@ async def lifespan(app: FastAPI):
     delegation_callback_task = asyncio.create_task(delegation_callback_service.run(registry))
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
 
+    # Re-attach FIFO output pipelines for surviving pipe-pane terminals (#1438).
+    # Runs after the deferred-init, initial-delivery, and ephemeral sweeps so
+    # stranded or residue rows are not re-attached, and after bus.set_loop +
+    # consumer startup so StatusMonitor/LogWriter receive output and seeded status.
+    try:
+        await asyncio.to_thread(terminal_service.reattach_surviving_terminals)
+    except Exception:  # noqa: BLE001 — never block startup on terminal re-attach
+        logger.warning("surviving terminal re-attach failed", exc_info=True)
+
     # Start ApprovalBridge when AG-UI surface is enabled
     approval_bridge_task: Optional[asyncio.Task] = None
     from cli_agent_orchestrator.services.agui_enablement import agui_surface_enabled
@@ -1940,8 +1971,8 @@ async def lifespan(app: FastAPI):
     backend = get_backend()
     if isinstance(backend, HerdrBackend):
 
-        def deliver_inbox(terminal_id: str) -> None:
-            inbox_service.deliver_pending(terminal_id, registry=registry)
+        def deliver_inbox(terminal_id: str, source: str = "herdr") -> int:
+            return inbox_service.deliver_pending(terminal_id, registry=registry, source=source)
 
         svc = HerdrInboxService(
             herdr_session=backend.herdr_session,
@@ -1950,6 +1981,16 @@ async def lifespan(app: FastAPI):
         set_herdr_inbox_service(svc)
         herdr_inbox_task = asyncio.create_task(svc.start())
         logger.info("Herdr inbox service started")
+    elif isinstance(backend, HerdrAppBackend):
+        # herdr-app: the same delivery path, driven by herdr-core events.
+
+        def deliver_app_inbox(terminal_id: str) -> None:
+            inbox_service.deliver_pending(terminal_id, registry=registry)
+
+        app_svc = HerdrAppInboxService(backend, deliver_app_inbox)
+        set_herdr_inbox_service(app_svc)
+        herdr_inbox_task = asyncio.create_task(app_svc.start())
+        logger.info("Herdr app inbox service started")
 
     yield
 
@@ -1959,7 +2000,7 @@ async def lifespan(app: FastAPI):
 
     _ambient_run.request_stop(sticky=False)
 
-    # Stop herdr inbox service on shutdown
+    # Stop the event inbox service (herdr or herdr-app) on shutdown
     if herdr_inbox_task is not None:
         herdr_inbox_task.cancel()
         try:
@@ -1968,6 +2009,9 @@ async def lifespan(app: FastAPI):
             pass
         set_herdr_inbox_service(None)
         logger.info("Herdr inbox service stopped")
+    if isinstance(backend, HerdrAppBackend):
+        # One `hc connect` child per terminal CAO typed into: end them with the server.
+        backend.close_inputs()
 
     if deferred_init_recovery_task is not None:
         deferred_init_recovery_task.cancel()
@@ -2271,6 +2315,7 @@ async def oauth_protected_resource_metadata():
 async def health_check():
     import shutil
 
+    from cli_agent_orchestrator.backends.herdr_app_backend import HerdrAppBackend
     from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 
     def _probe(binary: str) -> str:
@@ -2279,7 +2324,12 @@ async def health_check():
     from cli_agent_orchestrator.services.settings_service import get_server_settings
 
     backend = get_backend()
-    backend_name = "herdr" if isinstance(backend, HerdrBackend) else "tmux"
+    if isinstance(backend, HerdrAppBackend):
+        backend_name = "herdr-app"
+    elif isinstance(backend, HerdrBackend):
+        backend_name = "herdr"
+    else:
+        backend_name = "tmux"
 
     # The installed package version, so a client (the web UI's server card) can
     # show what it is talking to without a shell. Same source as `cao --version`.
@@ -2308,6 +2358,9 @@ async def health_check():
         "components": {
             "cao": "ok",
             "herdr": _probe("herdr"),
+            "herdr-core": (
+                "ok" if (shutil.which("hc") or shutil.which("herdr-core")) else "unavailable"
+            ),
             "claude": _probe("claude"),
         },
     }
@@ -3929,12 +3982,24 @@ async def install_agent_profile_endpoint(
     https:// URLs; local filesystem paths are handled by the CLI entry point
     alone. A remote caller therefore cannot coerce the server into reading
     arbitrary ``.md`` files from disk.
+
+    A client that has the file itself sends its text as ``content`` with the
+    stem as ``source``. ``install_agent`` then takes its name branch, so a
+    URL or path-shaped ``source`` is refused by the same name validator.
     """
-    result = install_agent(
-        source=request.source,
-        provider=request.provider,
-        env_vars=request.env_vars,
-    )
+    if request.content is not None:
+        result = install_agent(
+            source=request.source,
+            provider=request.provider,
+            env_vars=request.env_vars,
+            profile_content=request.content,
+        )
+    else:
+        result = install_agent(
+            source=request.source,
+            provider=request.provider,
+            env_vars=request.env_vars,
+        )
     if not result.success:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result.message)
 
@@ -4098,6 +4163,7 @@ async def list_providers_endpoint(
         "codex": "codex",
         "hermes": "hermes",
         "kimi_cli": "kimi",
+        "qwen_cli": "qwen",
         "copilot_cli": "copilot",
         "opencode_cli": "opencode",
         "cursor_cli": "agent",
@@ -4797,6 +4863,12 @@ async def create_session(
     via ``PATCH /terminals/{id}/group``, ``metadata`` via the
     ``update_metadata`` MCP tool).
 
+    ``body.inject_memory_at_start`` asks prompt-capable providers to receive
+    memory through their launch prompt when no initial message is supplied.
+    It defaults to false so orchestration, workflow, handoff, and direct HTTP
+    callers retain task-aware first-message delivery. ``cao launch`` sets it
+    only when that command will not deliver a first message.
+
     ``use_worktree`` (issue #100 Phase 1; review on PR #634): provision an
     isolated git worktree for this terminal instead of sharing
     ``working_directory`` as given, mirroring ``POST
@@ -4924,6 +4996,7 @@ async def create_session(
             engine=engine,
             initial_message=initial_message,
             initial_message_orchestration_type=initial_message_orchestration_type,
+            inject_memory_at_start=body.inject_memory_at_start if body else False,
             model=model,
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
@@ -10323,9 +10396,27 @@ async def create_inbox_message_endpoint(
     sender_id: str,
     message: str,
     expect_reply: bool = False,
+    wait_for_outcome: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Create inbox message and attempt immediate delivery."""
+    """Store an inbox message, attempt its delivery, and report what happened to it.
+
+    The answer's ``delivery`` is the outcome of this message's immediate
+    attempt (reply-delivery-failure D5): ``delivered`` (the paste reached the
+    terminal), ``queued`` (the receiver was not ready, or older messages were
+    ahead), ``failed`` (nothing was typed) or ``uncertain`` (some or all of it
+    may have been typed), or ``in_progress`` when the wait ran out first.
+    ``failed`` and ``uncertain`` set ``success`` false and ``error``; such a
+    message is marked failed and never retried by the server, because the
+    sender now owns the retry. After ``in_progress`` a failure of the message
+    is handled as a queued one (retry or notice).
+
+    The POST waits at most INBOX_IMMEDIATE_DELIVERY_WAIT (5 s) by default.
+    ``wait_for_outcome=true`` raises the wait to INBOX_DELIVERY_OUTCOME_WAIT
+    (45 s). A client that sets it must use an HTTP timeout longer than that
+    wait, or it sees an error for a message that is stored and may still
+    arrive. Clients that do not set it keep the short wait.
+    """
     try:
         inbox_msg = create_inbox_message(
             sender_id,
@@ -10354,58 +10445,106 @@ async def create_inbox_message_endpoint(
     except Exception as e:  # noqa: BLE001
         logger.warning(f"Delegation edge update failed for {sender_id} -> {receiver_id}: {e}")
 
-    # Attempt immediate delivery if terminal is already IDLE.
-    # If not, InboxService will deliver on next IDLE status event.
+    # Attempt immediate delivery if the receiver is ready; if not, InboxService
+    # delivers on its next IDLE status event or sweep. The edge rules ran
+    # above, so a reply's in-flight mark exists before the delivery settles it.
     #
-    # deliver_pending reads status_monitor.get_status() (which can fork a tmux
-    # capture-pane via the stale-PROCESSING fallback), paste-bombs the pane on
-    # delivery, and then waits for the receiver to confirm the submit (#78) --
-    # blocking I/O throughout, so it runs on a worker thread. The response does
-    # NOT wait for that confirmation: the message is stored, so a reply of
-    # success is already true, and a sender held past its own HTTP timeout
-    # (30s default) would be tempted to send the message again (PR #1004
-    # review, P2-2). We wait only until the paste has reached the pane, and
-    # only up to INBOX_IMMEDIATE_DELIVERY_WAIT; the attempt itself keeps running
-    # in the background either way.
+    # deliver_pending does blocking I/O (status reads, the paste, the submit
+    # confirmation), so it runs on a worker thread. The answer waits for this
+    # message's outcome, which is reported when the paste lands, not for the
+    # confirmation, and only up to the wait chosen below. A sender held past
+    # its own HTTP timeout (30s default, less for the web UI and the examples)
+    # would be tempted to send the message again (PR #1004 review, P2-2), so
+    # the long wait is for a client that asks for it. The attempt itself keeps
+    # running in the background either way. The hand-off decides who reports a
+    # failure: this POST while it waits, the queued path once it has answered
+    # in_progress.
+    wait_seconds = (
+        INBOX_DELIVERY_OUTCOME_WAIT if wait_for_outcome else INBOX_IMMEDIATE_DELIVERY_WAIT
+    )
     loop = asyncio.get_running_loop()
-    dispatched = asyncio.Event()
+    settled = asyncio.Event()
+    hand_off = DeliveryHandOff()
 
-    def _mark_dispatched() -> None:
-        loop.call_soon_threadsafe(dispatched.set)
+    def _on_outcome(message_id: int, outcome: DeliveryOutcome, error: Optional[str]) -> None:
+        if message_id == inbox_msg.id and hand_off.offer(outcome, error):
+            loop.call_soon_threadsafe(settled.set)
 
     delivery = asyncio.create_task(
         asyncio.to_thread(
             inbox_service.deliver_pending,
             receiver_id,
             registry=get_plugin_registry(request),
-            after_dispatch=_mark_dispatched,
+            on_outcome=_on_outcome,
+            report_to_sender=inbox_msg.id,
+            hand_off=hand_off,
         )
     )
 
-    def _log_outcome(task: "asyncio.Task[None]") -> None:
+    def _log_outcome(task: "asyncio.Task[int]") -> None:
         if not task.cancelled() and task.exception() is not None:
             logger.warning(
                 f"Immediate delivery attempt failed for {receiver_id}: {task.exception()}"
             )
 
     delivery.add_done_callback(_log_outcome)
+    settled_wait = asyncio.create_task(settled.wait())
     try:
-        await asyncio.wait_for(dispatched.wait(), timeout=INBOX_IMMEDIATE_DELIVERY_WAIT)
-    except asyncio.TimeoutError:
-        logger.debug(
-            "Immediate delivery attempt for %s still waiting after %ss; answering "
-            "while it continues in the background",
-            receiver_id,
-            INBOX_IMMEDIATE_DELIVERY_WAIT,
+        await asyncio.wait(
+            {delivery, settled_wait},
+            timeout=wait_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
         )
+    finally:
+        settled_wait.cancel()
+    # The outcome offered so far decides, also when the bound passed at the
+    # same moment; with none, a later failure of this message is handled as
+    # queued, and the answer below says so.
+    outcome = hand_off.abandon()
+    error: Optional[str] = None
+    if outcome is not None:
+        delivery_value = _INBOX_DELIVERY_VALUES[outcome[0]]
+        if outcome[0] == DeliveryOutcome.FAILED:
+            error = outcome[1] or outcome[0].value
+        elif outcome[0] == DeliveryOutcome.UNCERTAIN:
+            # Some or all of the text may be in the terminal: lead with that, so
+            # the sender checks before it sends the message again.
+            error = (
+                f"May have been delivered: {outcome[1] or outcome[0].value}. "
+                "Check the receiver's terminal before you send it again."
+            )
+    elif delivery.done():
+        # The attempt left this message alone, or raised (logged above).
+        delivery_value = "queued"
+    else:
+        logger.debug(
+            "Immediate delivery attempt for %s has no outcome after %ss; answering "
+            "in_progress while it continues in the background",
+            receiver_id,
+            wait_seconds,
+        )
+        delivery_value = "in_progress"
 
     return {
-        "success": True,
+        "success": error is None,
         "message_id": inbox_msg.id,
         "sender_id": inbox_msg.sender_id,
         "receiver_id": inbox_msg.receiver_id,
         "created_at": inbox_msg.created_at.isoformat(),
+        "delivery": delivery_value,
+        "error": error,
     }
+
+
+# What the inbox POST answers for an outcome of its own message. RETRYING
+# cannot reach a POST that still waits (its failures are never retried); it
+# reads as queued should a caller of deliver_pending report one anyway.
+_INBOX_DELIVERY_VALUES = {
+    DeliveryOutcome.DELIVERED: "delivered",
+    DeliveryOutcome.FAILED: "failed",
+    DeliveryOutcome.UNCERTAIN: "uncertain",
+    DeliveryOutcome.RETRYING: "queued",
+}
 
 
 @app.get("/terminals/{terminal_id}/inbox/messages")
@@ -10861,6 +11000,14 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             return False
         return True
 
+    async def _release_own_pane() -> None:
+        """End the turn a successful ``_select_own_pane`` began."""
+        assert input_focus is not None
+        try:
+            await asyncio.to_thread(get_backend().release_web_input, input_focus[1])
+        except Exception as e:  # noqa: BLE001 — the next focus retries the release
+            logger.warning(f"Could not end the input turn for terminal {terminal_id}: {e}")
+
     # Create PTY pair for backend attach
     master_fd, slave_fd = pty.openpty()
 
@@ -10890,7 +11037,8 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # terminal's pane so its cursor starts on the right agent.
     if input_window is not None:
         async with input_window.turn(input_owner):
-            await _select_own_pane()
+            if await _select_own_pane():
+                await _release_own_pane()
 
     # Make master_fd non-blocking for event-driven reads
     flag = fcntl.fcntl(master_fd, fcntl.F_GETFL)
@@ -10998,8 +11146,11 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
                         if not await _select_own_pane():
                             # Dropped: never deliver keys to another agent's pane.
                             continue
-                        await _write_input(raw)
-                        drained = await _wait_for_pty_drain(slave_path)
+                        try:
+                            await _write_input(raw)
+                            drained = await _wait_for_pty_drain(slave_path)
+                        finally:
+                            await _release_own_pane()
                         input_window.after_write(input_owner, raw, escape_hold_s)
                         if not drained:
                             if not drain_timeout_logged:
@@ -11771,22 +11922,17 @@ async def get_memory_endpoint(
     _require_memory_enabled()
     svc = _get_memory_service()
     try:
-        memories = await svc.recall(
-            query=key,
+        memory = await svc.read_exact_key(
+            key,
             scope=scope.value if scope else None,
-            limit=1000,
+            scope_id=scope_id,
             scan_all=True,
-            search_mode="metadata",
             record_access=not is_non_accessing_inspection_enabled(),
         )
-        for mem in memories:
-            if mem.key != key:
-                continue
-            if scope_id is not None and not _memory_matches_scope_id(mem, scope_id, svc.base_dir):
-                continue
+        if memory is not None:
             return MemoryDetail(
-                content=mem.content,
-                **_to_memory_summary(mem, svc.base_dir).model_dump(),
+                content=memory.content,
+                **_to_memory_summary(memory, svc.base_dir).model_dump(),
             )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"Memory '{key}' not found"
@@ -12431,7 +12577,7 @@ def main():
     parser.add_argument(
         "--terminal",
         type=str,
-        choices=["tmux", "herdr"],
+        choices=["tmux", "herdr", "herdr-app"],
         default=None,
         help="Terminal backend to use, overriding terminal_backend in config.json",
     )

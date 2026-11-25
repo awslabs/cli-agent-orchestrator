@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  merge_group:
 
 permissions:
   contents: read
@@ -29,6 +30,28 @@ env:
   UV_LOCKED: "1"
 
 jobs:
+  changed-paths:
+    name: Changed paths for filtered jobs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      antigravity: ${{ steps.paths.outputs.antigravity }}
+      claude: ${{ steps.paths.outputs.claude }}
+      codex: ${{ steps.paths.outputs.codex }}
+      kiro: ${{ steps.paths.outputs.kiro }}
+      transport: ${{ steps.paths.outputs.transport }}
+      factory: ${{ steps.paths.outputs.factory }}
+      docs: ${{ steps.paths.outputs.docs }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect changed paths
+        id: paths
+        run: python3 scripts/ci_changed_paths.py
+
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
@@ -73,13 +96,14 @@ jobs:
           fi
           # CI intentionally includes integration-marked tests except for the Kiro
           # provider test, which requires an authenticated external CLI.
-          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ \
+          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ examples/remote/ec2/tests/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \
             --cov=src/cli_agent_orchestrator \
             --cov-branch \
             --cov-report=xml \
+            --cov-report=json \
             --cov-fail-under=80 \
             --cov-report=term-missing \
             -v
@@ -89,7 +113,7 @@ jobs:
         # line % that run (today: 89.28 branch vs 93.10 line, so blended is a
         # harder bar at 80 -- not an invariant, just the current numbers). The
         # authoritative, separately-floored line metric is the ratchet's
-        # (.coverage-baseline.json, python.floor_pct = 87.0) in the cao-mcp-apps
+        # (.coverage-baseline.json, python.floor_pct = 87.0) in the coverage-ratchet
         # job below. If the blend lands under 80 on a first run, lower THIS
         # number -- do not drop the branch data, and do not touch the line floor.
 
@@ -108,6 +132,11 @@ jobs:
       - name: Check CAO agent plugin packages
         run: make check-agent-plugin
 
+      # Per built package, not the source tree (#1384): a link that resolves in the
+      # repository but escapes the installed package fails here.
+      - name: Check links inside each built agent plugin package
+        run: make check-agent-plugin-links
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
@@ -117,6 +146,14 @@ jobs:
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload coverage ratchet report
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-ratchet-python
+          path: coverage.json
+          retention-days: 1
 
   web-build:
     name: Web UI Build
@@ -240,11 +277,12 @@ jobs:
   cao-mcp-apps:
     name: CAO MCP Apps
     runs-on: ubuntu-latest
-    # Bounds a hung test (#1273 review). "Backend coverage" below runs the same
-    # pytest suite as Unit Tests; over 60 runs this job took a mean of 33.3 min
-    # and a max of 37.9, so 60 matches Unit Tests and is 1.6x the slowest.
+    # Bounds a hung step (#1273 review). Since the coverage ratchet moved to its
+    # own job (#1387), this job no longer runs the Python suite: it took 55 s in
+    # this PR's run. It still runs `uv sync` for the HTTP-only guard, and one
+    # `uv sync` took 15.5 min on 2026-11-17, so 30 leaves room for that.
     # Unbounded, a hang held the runner for GitHub's default of 360 min.
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     # Per-tier test timing budgets (Requirement 20.3), surfaced as env so the
     # vitest tiers (Phase II+) and CI can enforce them:
@@ -270,7 +308,7 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
 
-      - name: Install Python deps (for the HTTP-only guard + coverage ratchet)
+      - name: Install Python deps (for the HTTP-only guard)
         run: uv sync --locked --all-extras --dev
 
       - name: Install MCP-apps deps
@@ -308,20 +346,38 @@ jobs:
       - name: HTTP-only MCP boundary guard
         run: uv run pytest test/test_http_only_boundary.py -q
 
-      - name: Backend coverage (for the ratchet floor)
-        # Produces coverage.json (python line + branch floors) consumed by
-        # coverage:ratchet. --cov-branch adds num_branches/covered_branches to
-        # totals; the ratchet floors line and branch SEPARATELY (#1005).
-        run: |
-          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ \
-            --ignore=test/providers/test_kiro_cli_integration.py \
-            --ignore=test/e2e \
-            -m "not e2e" \
-            --cov=src/cli_agent_orchestrator \
-            --cov-branch \
-            --cov-report=json \
-            --cov-fail-under=80 \
-            -q
+      - name: Upload coverage ratchet summary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-ratchet-frontend
+          path: cao_mcp_apps/coverage/coverage-summary.json
+          retention-days: 1
+
+  coverage-ratchet:
+    name: Coverage ratchet
+    needs: [test, cao-mcp-apps]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "20"
+
+      - name: Download Python coverage report
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage-ratchet-python
+
+      - name: Download frontend coverage summary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage-ratchet-frontend
+          path: cao_mcp_apps/coverage
 
       - name: Coverage ratchet
         working-directory: cao_mcp_apps
@@ -333,7 +389,7 @@ jobs:
     timeout-minutes: 30
     # Playwright's pinned image (the @playwright/test version the job uses): the browsers
     # and their system libraries are already in it, so no apt install runs here.
-    container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f
+    container: mcr.microsoft.com/playwright:v1.65.0-noble@sha256:9beb546099e11f52d62e505537914870e01a67e0e6b00ae41da4775324e73dbe
 
     # E2E tier budget (Requirement 20.3): 60s per test (enforced in
     # playwright.config.ts via `timeout: 60_000`).
@@ -430,7 +486,7 @@ jobs:
     timeout-minutes: 30
     # Playwright's pinned image (the @playwright/test version the job uses): the browsers
     # and their system libraries are already in it, so no apt install runs here.
-    container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f
+    container: mcr.microsoft.com/playwright:v1.65.0-noble@sha256:9beb546099e11f52d62e505537914870e01a67e0e6b00ae41da4775324e73dbe
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -494,7 +550,7 @@ jobs:
     timeout-minutes: 30
     # Playwright's pinned image (the @playwright/test version the job uses): the browsers
     # and their system libraries are already in it, so no apt install runs here.
-    container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f
+    container: mcr.microsoft.com/playwright:v1.65.0-noble@sha256:9beb546099e11f52d62e505537914870e01a67e0e6b00ae41da4775324e73dbe
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -555,7 +611,7 @@ jobs:
     timeout-minutes: 30
     # Playwright's pinned image (the @playwright/test version the job uses): the browsers
     # and their system libraries are already in it, so no apt install runs here.
-    container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f
+    container: mcr.microsoft.com/playwright:v1.65.0-noble@sha256:9beb546099e11f52d62e505537914870e01a67e0e6b00ae41da4775324e73dbe
     env:
       # run.sh's JSON assertions use this interpreter; uv sync above creates it.
       CAO_DOGFOOD_PYTHON: ${{ github.workspace }}/.venv/bin/python
@@ -703,8 +759,9 @@ jobs:
     name: AG-UI operator dashboard
     runs-on: ubuntu-latest
     # Playwright's pinned image (the @playwright/test version the job uses): the browsers
-    # and their system libraries are already in it, so no apt install runs here.
-    container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f
+    # and their system libraries are already in it. The only apt use is the cold-cache
+    # tmux build below; with a warm cache no apt runs in this job.
+    container: mcr.microsoft.com/playwright:v1.65.0-noble@sha256:9beb546099e11f52d62e505537914870e01a67e0e6b00ae41da4775324e73dbe
     # Bounds a hung e2e: the job normally takes a few minutes.
     timeout-minutes: 15
     defaults:
@@ -715,14 +772,31 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The keyless e2e drives real mock_cli terminals, which need tmux. The Playwright
-      # image does not ship it, so the step below installs it (bounded, see its comment).
+      # image does not ship it, so a statically linked tmux is built once from the
+      # upstream release tarball (SHA-256 pinned in scripts/build_tmux.sh) and cached.
+      # The key carries the container image digest and the build script, so a new image
+      # or a new tmux version rebuilds (test_ci_tmux_cache.py fails if the digest here
+      # drifts from the job's container). A warm cache runs no apt.
+      - name: Restore cached tmux
+        id: tmux-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /opt/tmux-cache
+          key: tmux-${{ runner.arch }}-sha256-9beb546099e11f52d62e505537914870e01a67e0e6b00ae41da4775324e73dbe-${{ hashFiles('scripts/build_tmux.sh') }}
+
+      - name: Build tmux (cold cache only)
+        if: steps.tmux-cache.outputs.cache-hit != 'true'
+        # apt runs as root (the image has no sudo), bounded inside the script by
+        # retries and a short per-request timeout; this step has its own time bound.
+        timeout-minutes: 10
+        working-directory: .
+        run: scripts/build_tmux.sh /opt/tmux-cache
+
       - name: Install tmux
-        # apt runs as root (the image has no sudo), with retries and a short per-request
-        # timeout; the step has its own time bound, so a stalled mirror fails fast.
-        timeout-minutes: 5
+        timeout-minutes: 2
         run: |
-          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
-          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y --no-install-recommends tmux
+          install -m 0755 /opt/tmux-cache/tmux /usr/local/bin/tmux
+          tmux -V
 
       - name: Install uv
         timeout-minutes: 10
@@ -1156,3 +1230,511 @@ jobs:
         uses: ./.github/actions/codeql
         with:
           language: ${{ matrix.language }}
+
+  provider-antigravity:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.antigravity == 'true' }}
+    permissions:
+      contents: read
+    name: Antigravity provider tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Run unit tests with coverage
+        run: |
+          uv run pytest test/providers/test_antigravity_cli_*.py \
+            --cov=src/cli_agent_orchestrator/providers/antigravity_cli.py \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  provider-antigravity-lint:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.antigravity == 'true' }}
+    permissions:
+      contents: read
+    name: Antigravity provider lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Check code formatting with black
+        run: uv run black --check src/ test/
+
+      - name: Check import sorting with isort
+        run: uv run isort --check-only src/ test/
+
+      - name: Run type checker with mypy
+        run: uv run mypy src/
+        continue-on-error: true
+
+  provider-claude:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.claude == 'true' }}
+    permissions:
+      contents: read
+    name: Claude provider tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Run unit tests with coverage
+        run: |
+          # The busy-pattern guard (GH #974) runs here too: this gate fires on a
+          # claude_code.py-only change, which is exactly when a spinner pattern
+          # can be widened back onto settled output. It is named in full because
+          # it sits outside the test_claude_code_* glob.
+          uv run pytest test/providers/test_claude_code_*.py \
+            test/providers/test_busy_pattern_settled_output_guard.py \
+            --cov=src/cli_agent_orchestrator/providers/claude_code.py \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  provider-claude-lint:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.claude == 'true' }}
+    permissions:
+      contents: read
+    name: Claude provider lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Check code formatting with black
+        run: uv run black --check src/ test/
+
+      - name: Check import sorting with isort
+        run: uv run isort --check-only src/ test/
+
+      - name: Run type checker with mypy
+        run: uv run mypy src/
+        continue-on-error: true
+
+  provider-codex:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.codex == 'true' }}
+    permissions:
+      contents: read
+    name: Codex provider tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Run unit tests with coverage
+        run: |
+          uv run pytest test/providers/test_codex_*.py \
+            --cov=src/cli_agent_orchestrator/providers/codex.py \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  provider-codex-lint:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.codex == 'true' }}
+    permissions:
+      contents: read
+    name: Codex provider lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Check code formatting with black
+        run: uv run black --check src/ test/
+
+      - name: Check import sorting with isort
+        run: uv run isort --check-only src/ test/
+
+      - name: Run type checker with mypy
+        run: uv run mypy src/
+        continue-on-error: true
+
+  provider-kiro:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.kiro == 'true' }}
+    permissions:
+      contents: read
+    name: Kiro provider tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Run unit tests with coverage
+        run: |
+          uv run pytest test/providers/test_kiro_cli_*.py \
+            --cov=src/cli_agent_orchestrator/providers/kiro_cli.py \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  provider-kiro-lint:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.kiro == 'true' }}
+    permissions:
+      contents: read
+    name: Kiro provider lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Check code formatting with black
+        run: uv run black --check src/ test/
+
+      - name: Check import sorting with isort
+        run: uv run isort --check-only src/ test/
+
+      - name: Run type checker with mypy
+        run: uv run mypy src/
+        continue-on-error: true
+
+  robotics-transport:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.transport == 'true' }}
+    permissions:
+      contents: read
+    name: Transport simulator
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "examples/robotics/cross-zone-transport/uv.lock"
+      - name: Run measured simulation and MCP boundary tests
+        working-directory: examples/robotics/cross-zone-transport
+        run: uv run --locked --python "${{ matrix.python-version }}" pytest
+
+  robotics-factory:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.factory == 'true' }}
+    permissions:
+      contents: read
+    name: Factory simulator
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "examples/robotics/hierarchical-factory/uv.lock"
+      - name: Run the factory simulation, MCP boundary, and setup tests
+        working-directory: examples/robotics/hierarchical-factory
+        run: uv run --locked --python "${{ matrix.python-version }}" pytest
+
+  docs-build:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.docs == 'true' }}
+    name: Docs site build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docusaurus/package-lock.json
+
+      - name: Install dependencies
+        run: cd docusaurus && npm ci
+
+      - name: Typecheck
+        run: cd docusaurus && npm run typecheck
+
+      - name: Build website
+        run: cd docusaurus && npm run build
+
+  filtered-gate:
+    name: Filtered jobs gate
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    needs:
+      - changed-paths
+      - provider-antigravity
+      - provider-antigravity-lint
+      - provider-claude
+      - provider-claude-lint
+      - provider-codex
+      - provider-codex-lint
+      - provider-kiro
+      - provider-kiro-lint
+      - robotics-transport
+      - robotics-factory
+      - docs-build
+    permissions: {}
+    env:
+      NEEDS_JSON: ${{ toJSON(needs) }}
+    steps:
+      - name: Verify selected jobs succeeded
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          paths = needs["changed-paths"].get("outputs", {})
+          filtered_jobs = {
+              "provider-antigravity": "antigravity",
+              "provider-antigravity-lint": "antigravity",
+              "provider-claude": "claude",
+              "provider-claude-lint": "claude",
+              "provider-codex": "codex",
+              "provider-codex-lint": "codex",
+              "provider-kiro": "kiro",
+              "provider-kiro-lint": "kiro",
+              "robotics-transport": "transport",
+              "robotics-factory": "factory",
+              "docs-build": "docs",
+          }
+          failures = []
+          for job_id, outcome in needs.items():
+              result = outcome["result"]
+              skipped_by_paths = (
+                  job_id in filtered_jobs
+                  and result == "skipped"
+                  and needs["changed-paths"]["result"] == "success"
+                  and paths.get(filtered_jobs[job_id]) == "false"
+              )
+              if result != "success" and not skipped_by_paths:
+                  failures.append(f"{job_id}: {result}")
+
+          if failures:
+              print("Filtered jobs failed:", ", ".join(failures))
+              sys.exit(1)
+          PY
+
+  # Advisory aggregate only: branch protections do not require this job.
+  ci-gate:
+    name: CI gate (advisory)
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    needs:
+      - test
+      - web-build
+      - aidlc-portfolio-example
+      - cao-mcp-apps
+      - coverage-ratchet
+      - cao-mcp-apps-e2e
+      - lint
+      - ag-ui-demo
+      - ag-ui-construct-demos
+      - agent-plugins-dogfood
+      - ag-ui-stock-client-live
+      - ag-ui-operator-dashboard
+      - rust
+      - security
+      - dependency-security
+      - dependency-review
+      - codeql
+      - changed-paths
+      - filtered-gate
+    permissions: {}
+    env:
+      NEEDS_JSON: ${{ toJSON(needs) }}
+      EVENT_NAME: ${{ github.event_name }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Verify every CI job succeeded
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          event_name = os.environ["EVENT_NAME"]
+          repository = os.environ["REPOSITORY"]
+          failures = []
+
+          for job_id, outcome in needs.items():
+              result = outcome["result"]
+              skipped_is_allowed = (
+                  result == "skipped"
+                  and job_id == "dependency-review"
+                  # Mirrors dependency-review's job-level `if:` condition.
+                  and (event_name != "pull_request"
+                       or repository != "awslabs/cli-agent-orchestrator")
+              )
+              if result != "success" and not skipped_is_allowed:
+                  failures.append(f"{job_id}: {result}")
+
+          if failures:
+              print("CI gate found unsuccessful jobs:", ", ".join(failures))
+              sys.exit(1)
+          PY

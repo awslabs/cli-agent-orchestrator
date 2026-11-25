@@ -83,6 +83,7 @@ from cli_agent_orchestrator.utils.tool_mapping import (
     kiro_v3_granted_mcp_servers,
     kiro_v3_rules,
     resolve_allowed_tools,
+    with_cao_callback_tools,
 )
 
 logger = logging.getLogger(__name__)
@@ -1792,7 +1793,7 @@ def _materialize_opencode_mcp(
         # server that was not delivered.
         grantable = set(granted_mcp_servers(allowed_tools, merged_servers))
         for mcp_name, mcp_cfg in merged_servers.items():
-            opencode_mcp_cfg = translate_mcp_server_config(dict(mcp_cfg))
+            opencode_mcp_cfg = translate_mcp_server_config(dict(mcp_cfg), name=mcp_name)
             existing = existing_before.get(mcp_name)
             if (
                 mcp_name in plugin_derived
@@ -2174,6 +2175,11 @@ def install_agent(
         # it goes missing.
         mcp_server_names = grantable_server_names(profile, delivered=plugin_mcp)
         allowed_tools = resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
+        if provider == ProviderType.KIRO_CLI.value:
+            # Kiro hides every tool its ``tools`` list leaves out, so a pinned
+            # allowlist without @cao-mcp-server would also hide the callback tools
+            # the tool gate always allows (workflow_return, send_message, ...).
+            allowed_tools = with_cao_callback_tools(allowed_tools, mcp_server_names)
 
         # A v3-enabled Kiro install (#1167) is decided here; it is refused and
         # validated after the context preflight below, still before this

@@ -14,14 +14,18 @@ explicit fixtures in ``TestStepReceiverShapeTotality`` instead. A safety net
 aimed at a different failure mode is not a safety net for this one.
 """
 
-import time
+import ast
+import re
+import sys
+from pathlib import Path
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from cli_agent_orchestrator.constants import SCRIPT_LINT_MAX_SOURCE_CHARS
+from cli_agent_orchestrator.constants import SCRIPT_LINT_MAX_SOURCE_CHARS, WORKFLOW_NAME_RE
 from cli_agent_orchestrator.models.workflow import LintFinding, ScriptValidationResult
+from cli_agent_orchestrator.services import script_lint as script_lint_module
 from cli_agent_orchestrator.services.script_lint import lint_script
 
 
@@ -362,6 +366,46 @@ class TestLiteralStepIdRule:
         assert _findings_by_rule(result, "invalid-step-id") == []
         assert result.status == "pass"
 
+    @pytest.mark.parametrize(
+        "step_id",
+        [
+            'f"summarize:{filename}"',
+            'f"review:{a}-{b}"',
+            'f"{name}.txt"',
+            'f"{name} copy"',
+            'f"a:b"',
+            'f"step-{n}-' + "x" * 64 + '"',
+        ],
+    )
+    def test_fstring_whose_text_breaks_the_rule_is_a_blocking_error(self, step_id):
+        """Regression for #1396: no interpolated value can remove the bad text."""
+        source = SHIM_IMPORT + f"step('p', 'a', 'x', step_id={step_id}, recovery='idempotent')\n"
+        result = lint_script(source, "s.py")
+
+        findings = _findings_by_rule(result, "invalid-step-id")
+        assert result.status == "fail"
+        assert len(findings) == 1
+        assert findings[0].severity == "error"
+        assert findings[0].line == 3
+        assert "[A-Za-z0-9_-]" in findings[0].message
+
+    @pytest.mark.parametrize(
+        "step_id",
+        [
+            'f"summarize-{filename}"',
+            'f"{name}"',
+            'f"{a}_{b}"',
+            'f"item-{i:03d}"',
+            'f"item-{label!r}"',
+        ],
+    )
+    def test_fstring_with_valid_text_is_left_to_runtime_validation(self, step_id):
+        source = SHIM_IMPORT + f"step('p', 'a', 'x', step_id={step_id}, recovery='idempotent')\n"
+        result = lint_script(source, "s.py")
+
+        assert _findings_by_rule(result, "invalid-step-id") == []
+        assert result.status == "pass"
+
     def test_unrelated_run_step_method_is_not_blocked(self):
         source = "runner.run_step('p', 'a', 'x', step_id='not:a:cao:id')\n"
         result = lint_script(source, "s.py")
@@ -435,6 +479,51 @@ class TestLiteralStepIdRule:
 
         assert _findings_by_rule(result, "invalid-step-id") == []
         assert result.status == "pass"
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+# (file, name of the step-id helper its fan-out example defines)
+_FANOUT_EXAMPLES = [
+    ("skills/cao-workflow/SKILL.md", "summary_step_id"),
+    ("src/cli_agent_orchestrator/skills/cao-workflow/SKILL.md", "summary_step_id"),
+    ("docs/workflows.md", "step_id_for"),
+]
+
+
+def _fanout_example(relpath: str) -> str:
+    text = (_REPO_ROOT / relpath).read_text(encoding="utf-8")
+    blocks = re.findall(r"```python\n(.*?)```", text, re.S)
+    matches = [b for b in blocks if "ThreadPoolExecutor" in b and "def summarize" in b]
+    assert len(matches) == 1, relpath
+    return matches[0]
+
+
+class TestShippedFanOutExamples:
+    """The fan-out example agents copy must pass the same gate as their script (#1396)."""
+
+    @pytest.mark.parametrize("relpath,helper", _FANOUT_EXAMPLES)
+    def test_example_passes_the_lint_gate(self, relpath, helper):
+        result = lint_script(_fanout_example(relpath), "example.py")
+
+        assert result.errors == []
+        assert _findings_by_rule(result, "invalid-step-id") == []
+
+    @pytest.mark.parametrize("relpath,helper", _FANOUT_EXAMPLES)
+    def test_example_step_ids_are_valid_and_distinct(self, relpath, helper):
+        tree = ast.parse(_fanout_example(relpath))
+        func = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == helper)
+        namespace: dict = {}
+        exec(
+            compile(ast.Module(body=[func], type_ignores=[]), relpath, "exec"),
+            {"re": re, "hashlib": __import__("hashlib")},
+            namespace,
+        )
+        names = ["notes.txt", "a b", "a.b", "a_b", "report (final).md", "x" * 200, "é.txt"]
+
+        ids = [namespace[helper](name) for name in names]
+
+        assert all(re.fullmatch(WORKFLOW_NAME_RE, i) for i in ids), ids
+        assert len(set(ids)) == len(ids)
 
 
 class TestMissingRecoveryPolicyRule:
@@ -790,9 +879,9 @@ class TestSyntaxRuleIdIsNotBorrowed:
 
 
 class TestPerformanceSanity:
-    def test_thousand_line_script_under_one_second(self):
-        # The proportionate bound from performance-requirements.md: a sanity
-        # ceiling against an accidental quadratic re-walk, not a tuned budget.
+    def test_thousand_line_script_is_walked_once(self, monkeypatch):
+        # The linter's performance contract is one AST walk. Count that work
+        # directly: a wall-clock ceiling measures CI scheduling delays too.
         lines = []
         for i in range(250):
             lines.append(f"import json  # block {i}")
@@ -801,8 +890,59 @@ class TestPerformanceSanity:
             lines.append(f"v_{i} = f_{i}({i})")
         source = "\n".join(lines) + "\n"
         assert source.count("\n") == 1000
-        start = time.monotonic()
-        result = lint_script(source, "big.py")
-        elapsed = time.monotonic() - start
+
+        original_walk = ast.walk
+        walk_calls = 0
+        nodes_yielded = 0
+
+        def counting_walk(root):
+            nonlocal walk_calls, nodes_yielded
+            walk_calls += 1
+            for node in original_walk(root):
+                nodes_yielded += 1
+                yield node
+
+        # Restore ast.walk before assertions so a deliberate failure cannot
+        # interfere with pytest's own traceback rendering.
+        with monkeypatch.context() as context:
+            context.setattr(script_lint_module.ast, "walk", counting_walk)
+            result = lint_script(source, "big.py")
+
         assert result.status == "pass"
-        assert elapsed < 1.0
+        assert walk_calls == 1
+        assert nodes_yielded == sum(1 for _ in original_walk(ast.parse(source)))
+
+    def test_linter_work_scales_linearly(self):
+        """Count total Python calls so helpers cannot hide a quadratic loop."""
+
+        def source_with_blocks(blocks):
+            lines = []
+            for i in range(blocks):
+                lines.append(f"import json  # block {i}")
+                lines.append(f"def f_{i}(x):")
+                lines.append(f"    return x + {i}")
+                lines.append(f"v_{i} = f_{i}({i})")
+            return "\n".join(lines) + "\n"
+
+        def lint_with_call_count(source):
+            calls = 0
+
+            def count_calls(frame, event, arg):
+                nonlocal calls
+                if event == "call":
+                    calls += 1
+
+            original_profile = sys.getprofile()
+            sys.setprofile(count_calls)
+            try:
+                result = lint_script(source, "big.py")
+            finally:
+                sys.setprofile(original_profile)
+            return result, calls
+
+        small_result, small_calls = lint_with_call_count(source_with_blocks(125))
+        large_result, large_calls = lint_with_call_count(source_with_blocks(250))
+
+        assert small_result.status == "pass"
+        assert large_result.status == "pass"
+        assert large_calls / small_calls <= 2.5

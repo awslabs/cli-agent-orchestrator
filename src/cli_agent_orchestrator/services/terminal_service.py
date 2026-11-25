@@ -36,7 +36,11 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 import requests
 from pydantic import ValidationError
 
-from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome
+from cli_agent_orchestrator.backends.base import (
+    InputNotSentError,
+    TerminalCleanupOutcome,
+    TerminalNotFoundError,
+)
 from cli_agent_orchestrator.backends.registry import get_backend
 
 # Compatibility/test seam: creation no longer bulk-deletes with this helper, but older
@@ -66,6 +70,7 @@ from cli_agent_orchestrator.clients.database import (
     get_kept_terminal,
     get_session_incarnation,
     get_terminal_metadata,
+    list_all_terminals,
     list_pending_deferred_init_external_owner_terminal_ids,
     list_pending_initial_delivery_terminal_ids,
     list_siblings_by_group_prefix,
@@ -779,6 +784,48 @@ def inject_memory_context(
     return first_message
 
 
+def _memory_start_prompt(skill_prompt: Optional[str], terminal_id: str) -> Optional[str]:
+    """Add memory to an interactive provider's launch prompt exactly once.
+
+    A configured context manager needs the real first task, so those terminals
+    stay on ``inject_memory_context``.  Uncurated interactive launches have no
+    CAO-delivered first message; their provider start prompt is the only
+    available injection seam.
+    """
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    if not is_memory_enabled():
+        return skill_prompt
+
+    service = MemoryService()
+    try:
+        terminal_context = service._get_terminal_context(terminal_id)
+        session_name = (terminal_context or {}).get("session_name")
+        if session_name and service._find_context_manager_terminal(session_name):
+            return skill_prompt
+    except Exception as e:
+        logger.warning(f"Failed to check memory manager for terminal {terminal_id}: {e}")
+
+    with _memory_injected_lock:
+        if terminal_id in _memory_injected_terminals:
+            return skill_prompt
+
+    try:
+        context = memory_context_for_terminal(terminal_id)
+    except Exception as e:
+        # Leave the terminal unmarked so a later CAO-delivered first message
+        # can retry through the established injection path.
+        logger.warning(f"Failed to inject start memory for terminal {terminal_id}: {e}")
+        return skill_prompt
+
+    with _memory_injected_lock:
+        _memory_injected_terminals.add(terminal_id)
+
+    if not context:
+        return skill_prompt
+    return f"{context}\n\n{skill_prompt}" if skill_prompt else context
+
+
 class OutputMode(str, Enum):
     """Output mode for terminal history retrieval.
 
@@ -799,6 +846,7 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CLAUDE_CODE.value,
     ProviderType.CODEX.value,
     ProviderType.KIMI_CLI.value,
+    ProviderType.QWEN_CLI.value,
     ProviderType.ANTIGRAVITY_CLI.value,
     ProviderType.OMP.value,
     ProviderType.GROK_CLI.value,
@@ -1411,6 +1459,7 @@ def _request_fingerprint(
     description: Optional[str] = None,
     caller_ceiling: Optional[List[str]] = None,
     delegating_terminal_id: Optional[str] = None,
+    inject_memory_at_start: bool = False,
 ) -> str:
     """Fingerprint the create-terminal request an idempotency key stands for.
 
@@ -1618,6 +1667,8 @@ def _request_fingerprint(
         )
     if delegating_terminal_id is not None:
         parts.extend(["delegating_terminal_id", delegating_terminal_id])
+    if inject_memory_at_start:
+        parts.extend(["inject_memory_at_start", "1"])
     return hashlib.sha256(
         "\x00".join(_fingerprint_component(part) for part in parts).encode("utf-8")
     ).hexdigest()
@@ -1952,6 +2003,8 @@ async def create_terminal(
     launch_plan: "LaunchPlan | None" = None,
     delegating_terminal_id: Optional[str] = None,
     caller_ceiling: Optional[list[str]] = None,
+    *,
+    inject_memory_at_start: bool = False,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -2064,12 +2117,14 @@ async def create_terminal(
             hashed or excluded-with-a-reason. Adding a parameter to either
             endpoint means classifying it here.
 
-            HASHED (11) -- these determine what the terminal IS, or what
+            HASHED (14) -- these determine what the terminal IS, or what
             privileges and context it launches with:
             ``provider``, ``agent_profile``, ``session_name``,
             ``working_directory``, ``caller_id``, ``model``, ``use_worktree``,
             ``engine``, ``allowed_tools``, ``env_vars``,
-            ``resume_session_id``.
+            ``resume_session_id``, ``initial_message``,
+            ``initial_message_orchestration_type``,
+            ``inject_memory_at_start``.
 
             EXCLUDED, each for a checked reason:
 
@@ -2080,10 +2135,6 @@ async def create_terminal(
               the ``update_metadata`` MCP tool, so a create-time key is not
               their integrity boundary -- a caller who cares about their value
               cannot rely on creation to fix it anyway.
-            - ``initial_message`` and ``initial_message_orchestration_type``.
-              The delivered payload and its routing, not the terminal: neither
-              is persisted on the row, and a genuine retry re-sends the same
-              message. These create endpoints do not own the prompt.
             - ``delegation_message`` and ``delegation_kind``. These never reach
               this function: the handler converts them into a launch plan that
               selects a decision, not the terminal's identity. A genuine retry
@@ -2239,6 +2290,7 @@ async def create_terminal(
             launch_plan=launch_plan,
             delegating_terminal_id=delegating_terminal_id,
             caller_ceiling=caller_ceiling,
+            inject_memory_at_start=inject_memory_at_start,
             ephemeral_state=state,
         )
     except BaseException as exc:
@@ -2283,6 +2335,7 @@ async def _create_terminal_unguarded(
     delegating_terminal_id: Optional[str] = None,
     caller_ceiling: Optional[list[str]] = None,
     *,
+    inject_memory_at_start: bool = False,
     ephemeral_state: _EphemeralLaunchState,
 ) -> Terminal:
     """Create body; the caller compensates an unbound claim or a cancelled bind."""
@@ -2319,6 +2372,7 @@ async def _create_terminal_unguarded(
             description,
             caller_ceiling=caller_ceiling,
             delegating_terminal_id=delegating_terminal_id,
+            inject_memory_at_start=inject_memory_at_start,
         )
         # Issue #944: look up, store and delete under the fingerprint-scoped
         # key, never the bare one. A different request under the same key
@@ -2792,6 +2846,7 @@ async def _create_terminal_unguarded(
             and "*" not in allowed_tools
         ):
             from cli_agent_orchestrator.utils.tool_mapping import (
+                CAO_CALLBACK_REFS,
                 kiro_agent_tools,
                 kiro_universal_tools,
             )
@@ -2823,7 +2878,13 @@ async def _create_terminal_unguarded(
                     if installed_kiro_agent_is_universal(agent_profile)
                     else kiro_agent_tools(allowed_tools)
                 )
-                wider = [tool for tool in installed if tool not in permitted]
+                # The callback references a Kiro install adds are not wider: the
+                # tool gate allows those tools to every bound terminal.
+                wider = [
+                    tool
+                    for tool in installed
+                    if tool not in permitted and tool not in CAO_CALLBACK_REFS
+                ]
                 if wider:
                     raise InstalledPolicyExceedsAllowlistError(
                         f"Delegation refused: the installed Kiro agent '{agent_profile}' "
@@ -3368,29 +3429,7 @@ async def _create_terminal_unguarded(
         # socket events and their pipe_pane is a no-op, so skip the FIFO there and
         # rely on the herdr inbox registration below.
         if not get_backend().supports_event_inbox():
-            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
-
-            # Reader must exist BEFORE pipe-pane starts so it captures from the
-            # start. Enroll it in the pipe-pane liveness watchdog (issue #388):
-            # supply a probe for tmux's live pane content and a re-arm that
-            # re-attaches a stalled forwarder. The re-arm does stop-then-start,
-            # NOT a bare pipe_pane() — a stalled pane still reports pane_pipe=1,
-            # so the backend's ``pipe-pane -o`` toggle would just switch the
-            # dead pipe OFF instead of restarting it.
-            def _probe_pane(s=session_name, w=window_name) -> str:
-                return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
-
-            def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
-                get_backend().stop_pipe_pane(s, w)
-                get_backend().pipe_pane(s, w, p)
-
-            fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
-
-            # Configure pipe-pane to stream output to the FIFO. This enables
-            # real-time event-driven processing via StatusMonitor and LogWriter
-            # (LogWriter writes TERMINAL_LOG_DIR/{id}.log from the FIFO). A pane
-            # has a single pipe-pane target, so we pipe ONLY to the FIFO.
-            get_backend().pipe_pane(session_name, window_name, str(fifo_path))
+            attach_output_pipeline(terminal_id, session_name, window_name)
 
             # Nudge the shell so it re-renders its prompt AFTER pipe-pane attaches.
             # pipe-pane only captures output produced after it starts; on a fast
@@ -3444,6 +3483,22 @@ async def _create_terminal_unguarded(
             session_id=fresh_claude_session_id,
             **provider_launch_options,
         )
+        # Interactive prompt-capable providers have no CAO first message, so
+        # inject memory through their launch prompt. Resolve after provider
+        # registration: context lookup can involve a remote owner and must not
+        # widen the row-visible/runtime-missing teardown race. Initialization
+        # has not started yet, so updating the prompt here still precedes command
+        # construction. Immediate orchestrated launches retain the task-aware
+        # first-message path (and workflow frozen-memory semantics).
+        if (
+            inject_memory_at_start
+            and provider in RUNTIME_SKILL_PROMPT_PROVIDERS
+            and initial_message is None
+        ):
+            provider_instance._skill_prompt = await asyncio.to_thread(
+                _memory_start_prompt, skill_prompt, terminal_id
+            )
+
         # The provider owns the helper's home now: its cleanup removes it.
         ephemeral_state.kiro_home = None
 
@@ -3756,7 +3811,14 @@ def _notify_caller_of_deferred_failure(
 
     if caller_id:
         try:
-            create_inbox_message(sender_id=terminal_id, receiver_id=caller_id, message=message)
+            # A notice CAO wrote: marked, so its own failure is not reported
+            # back to the worker, which did not write it.
+            create_inbox_message(
+                sender_id=terminal_id,
+                receiver_id=caller_id,
+                message=message,
+                is_system_notice=True,
+            )
         except Exception as exc:  # noqa: BLE001 — best-effort
             logger.warning(
                 "Deferred-init failure notify: could not enqueue inbox message to "
@@ -4540,6 +4602,120 @@ async def recover_interrupted_initial_deliveries() -> bool:
                 "Could not settle interrupted initial delivery for %s: %s", terminal_id, exc
             )
     return complete
+
+
+def attach_output_pipeline(
+    terminal_id: str,
+    session_name: str,
+    window_name: str,
+    *,
+    replace_existing: bool = False,
+) -> None:
+    """Attach the FIFO reader, liveness watchdog, and pipe-pane for a terminal.
+
+    Reader creation runs BEFORE ``pipe-pane`` starts so it captures from the
+    start, and enrolls the terminal in the pipe-pane liveness watchdog (#388).
+    When ``replace_existing=True`` (re-attaching a surviving pane after a
+    ``cao-server`` restart), any existing pipe on the pane is stopped first so
+    ``tmux pipe-pane -o`` does not toggle a stale pipe off instead of
+    restarting it.
+    """
+    fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+    def _probe_pane(s: str = session_name, w: str = window_name) -> str:
+        return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+    def _rearm_pipe(s: str = session_name, w: str = window_name, p: str = str(fifo_path)) -> None:
+        get_backend().stop_pipe_pane(s, w)
+        get_backend().pipe_pane(s, w, p)
+
+    created = fifo_manager.create_reader(
+        terminal_id,
+        pane_probe=_probe_pane,
+        rearm=_rearm_pipe,
+        cold_start_check=not replace_existing,
+    )
+    if created is False:
+        return
+    try:
+        if replace_existing:
+            get_backend().stop_pipe_pane(session_name, window_name)
+        get_backend().pipe_pane(session_name, window_name, str(fifo_path))
+    except Exception:
+        try:
+            fifo_manager.stop_reader(terminal_id)
+        except Exception:  # noqa: BLE001 — preserve original attach failure
+            pass
+        raise
+
+
+def reattach_surviving_terminals() -> int:
+    """Re-attach FIFO readers and pipe-pane for terminals that outlived a server restart (#1438).
+
+    Runs at startup after the deferred-init, initial-delivery, and ephemeral
+    sweeps so stranded tombstones and ephemeral residue are not re-attached.
+    Event-inbox backends are skipped. Kept children (#1225), ERROR/deferred-init
+    rows, ephemeral residue, and terminals whose session/pane is no longer live
+    are skipped. A per-terminal failure is logged and leaves that terminal alone.
+
+    For each re-attached terminal, seeds ``WAITING_USER_ANSWER`` from the live
+    viewport when a blocking dialog is already open (it produces no new output
+    until answered), leaving all other statuses ``UNKNOWN`` for the stream.
+    """
+    try:
+        backend = get_backend()
+        if backend.supports_event_inbox():
+            return 0
+    except Exception as exc:  # noqa: BLE001 — startup remains resilient
+        logger.warning("Skipping surviving terminal re-attach; backend unavailable: %s", exc)
+        return 0
+
+    try:
+        rows = list_all_terminals()
+    except Exception as exc:  # noqa: BLE001 — startup remains resilient
+        logger.warning("Could not list terminals for surviving re-attach: %s", exc)
+        return 0
+
+    reattached = 0
+    for row in rows:
+        terminal_id = row.get("id")
+        session_name = row.get("tmux_session")
+        window_name = row.get("tmux_window")
+        if not terminal_id or not session_name or not window_name:
+            continue
+        tid = str(terminal_id)
+        sess = str(session_name)
+        win = str(window_name)
+        try:
+            if (
+                row.get("deferred_init_external_owner")
+                or row.get("deferred_init_runtime_reclaimed")
+                or get_deferred_init_failure(tid, row.get("deferred_init_failure")) is not None
+            ):
+                continue
+            if row.get("kept_until") is not None:
+                continue
+            if row.get("ephemeral") and not ephemeral_service.is_live_ephemeral_terminal(tid):
+                continue
+
+            exact = backend.cleanup_terminal_exact(tid, sess, win, close=False)
+            if getattr(exact, "outcome", None) != TerminalCleanupOutcome.STILL_PRESENT:
+                continue
+
+            attach_output_pipeline(tid, sess, win, replace_existing=True)
+            reattached += 1
+            status_monitor.seed_from_viewport(tid, sess, win)
+        except Exception as exc:  # noqa: BLE001 — one terminal must not stop the rest
+            logger.warning(
+                "Failed to re-attach surviving terminal %s (%s:%s): %s",
+                tid,
+                sess,
+                win,
+                exc,
+            )
+    if reattached:
+        logger.info("Re-attached output pipeline for %d surviving terminal(s)", reattached)
+    return reattached
 
 
 def _persist_deferred_init_failure(
@@ -6256,6 +6432,16 @@ def _refuse_if_provider_gone(terminal_id: str, provider: Any, metadata: Dict[str
         )
 
 
+class TerminalRowMissingError(InputNotSentError, ValueError):
+    """``dispatch_input`` found no metadata row, or a step before the send raised ``ValueError``.
+
+    Nothing was typed, and a later attempt cannot get past the same rejection,
+    so the inbox fails such a message at once (reply-delivery-failure F5). It
+    is also a ``ValueError``, so POST /terminals/{id}/input still answers 404,
+    as it did before the send was classified.
+    """
+
+
 def dispatch_input(
     terminal_id: str,
     message: str,
@@ -6295,11 +6481,26 @@ def dispatch_input(
     not logged. It is last and defaulted so existing positional callers (notably
     ``agent_step.run_agent_step``, which passes exactly two arguments) are
     unaffected.
+
+    Raises:
+        TerminalRowMissingError: The terminal has no metadata row. It is both
+            a ``ValueError`` and an ``InputNotSentError``.
+        TerminalInputBlockedError: The terminal refused input (a prompt, a
+            pending identity check, or a provider that exited).
+        TerminalNotFoundError: The backend could not resolve the pane.
+        InputNotSentError: Any other failure before the backend's send call,
+            so nothing was typed (reply-delivery-failure D4); the original
+            exception is its ``__cause__``. A backend may raise it from the
+            send call too, when it proves nothing was written.
+        Exception: Any other failure in or after the send call, when some or
+            all of the text may have reached the terminal.
     """
+    # Set just before the backend's send call: a failure before it typed nothing.
+    sending = False
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
-            raise ValueError(f"Terminal '{terminal_id}' not found")
+            raise TerminalRowMissingError(f"Terminal '{terminal_id}' not found")
 
         # A Kiro terminal is typed into only once its row records that its
         # identity check passed (#1074). Until then the pane may be kiro-cli's
@@ -6440,13 +6641,16 @@ def dispatch_input(
                 provider.mark_input_received()
             provider.record_dispatched_message(message)
 
-        get_backend().send_keys(
+        backend = get_backend()
+        submit_delay = provider.paste_submit_delay if provider else 0.3
+        sending = True
+        backend.send_keys(
             metadata["tmux_session"],
             metadata["tmux_window"],
             message,
             enter_count=enter_count,
             force_bracketed_paste=True,
-            submit_delay=provider.paste_submit_delay if provider else 0.3,
+            submit_delay=submit_delay,
         )
 
         update_last_active(terminal_id)
@@ -6483,6 +6687,17 @@ def dispatch_input(
 
     except Exception as e:
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
+        # Nothing reached the pane before send_keys (reply-delivery-failure D4).
+        # Refusals and an unresolved pane keep their own types: their callers
+        # branch on them. A missing row is already an InputNotSentError. A
+        # ValueError stays one (POST /terminals/{id}/input maps it to 404).
+        if not sending and not isinstance(
+            e, (TerminalInputBlockedError, TerminalNotFoundError, InputNotSentError)
+        ):
+            if isinstance(e, ValueError):
+                # The text is the 404's detail: keep what the ValueError said.
+                raise TerminalRowMissingError(str(e)) from e
+            raise InputNotSentError(f"{type(e).__name__}: {e}") from e
         raise
 
 

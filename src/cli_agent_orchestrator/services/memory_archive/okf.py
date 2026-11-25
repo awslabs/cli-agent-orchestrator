@@ -598,18 +598,16 @@ class OkfArchiveBackend(MemoryArchiveBackend):
                 logger.warning("okf_export_read_failed key=%s: %s", entry["key"], e)
                 continue
 
-            memory = self._svc._parse_wiki_file(wiki_file, file_content, entry)
-            if memory is None:
+            memory, split = self._svc._parse_wiki_file_with_split(wiki_file, file_content, entry)
+            if memory is None or split is None:
                 logger.debug("okf_export_unparseable key=%s", entry["key"])
                 continue
 
-            headings = list(_TIMESTAMP_HEADING_RE.finditer(file_content))
-            latest_text = file_content[headings[-1].end() :].strip()
+            latest_text = split.latest_section
             history_text = ""
-            if include_history and len(headings) > 1:
-                history_text = (
-                    file_content[headings[0].start() : headings[-1].start()].rstrip("\n") + "\n"
-                )
+            if include_history and split.history_range is not None:
+                history_start, history_end = split.history_range
+                history_text = file_content[history_start:history_end].rstrip("\n") + "\n"
 
             gated = self._apply_secret_gate(entry["key"], latest_text, history_text, redact, report)
             if gated is None:

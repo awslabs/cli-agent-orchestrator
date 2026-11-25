@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, within, act } from '@testing-library/react'
 import App from '../App'
-import { ProfilesPanel, SEARCH_DEBOUNCE_MS } from '../components/ProfilesPanel'
+import { ProfilesPanel, SEARCH_DEBOUNCE_MS, PROFILE_FILE_MAX_BYTES, profileFileProblem } from '../components/ProfilesPanel'
+import { useStore } from '../store'
 
 // fetchJSON reads the body via res.text() and parses it itself, so a mock
 // must supply text() (same convention as settingsPanel.test.tsx).
@@ -840,5 +841,193 @@ describe('round-7 review: P3 follow-ups fixed in the same pass (#692)', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+describe('ProfilesPanel — install from file', () => {
+  const PROVIDERS = [
+    { name: 'claude_code', binary: 'claude', installed: true },
+    { name: 'kiro_cli', binary: 'kiro-cli', installed: false },
+  ]
+  const mdFile = (name: string, text = `---\nname: ${name.replace(/\.md$/, '')}\n---\nbody\n`) =>
+    new File([text], name, { type: 'text/markdown' })
+
+  /** Fetch mock that records install bodies and answers per source. */
+  function installFetch(fail: Record<string, string> = {}) {
+    const bodies: any[] = []
+    const fetchMock = routedFetch({
+      '/agents/providers': () => okJson(PROVIDERS),
+      '/ui-presets': () => okJson({}),
+      '/agents/profiles/install': () => {
+        const calls = fetchMock.mock.calls as unknown as [string, RequestInit | undefined][]
+        const body = JSON.parse(String(calls[calls.length - 1][1]?.body))
+        bodies.push(body)
+        return fail[body.source]
+          ? errJson(400, fail[body.source])
+          : okJson({ success: true, message: 'ok', agent_name: body.source })
+      },
+    })
+    return { fetchMock, bodies }
+  }
+
+  async function openInstallRow() {
+    render(<ProfilesPanel />)
+    fireEvent.click(await screen.findByRole('button', { name: /^install$/i }))
+    return screen.getByTestId('install-file-input') as HTMLInputElement
+  }
+
+  beforeEach(() => useStore.setState({ snackbar: null }))
+
+  it('installs every picked file in order, sending stem + text, and reports once', async () => {
+    const { fetchMock, bodies } = installFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    const input = await openInstallRow()
+    expect(input.multiple).toBe(true)
+
+    fireEvent.change(input, { target: { files: [mdFile('analysis_supervisor.md'), mdFile('data_analyst.md')] } })
+
+    const banner = await screen.findByTestId('install-success')
+    expect(bodies.map(b => b.source)).toEqual(['analysis_supervisor', 'data_analyst'])
+    expect(bodies[0].content).toContain('name: analysis_supervisor')
+    expect(bodies[0]).not.toHaveProperty('provider')
+    expect(banner).toHaveTextContent('Installed analysis_supervisor, data_analyst')
+    expect(useStore.getState().snackbar).toBeNull()
+  })
+
+  it('names both the file and the agent when the frontmatter name differs from the stem', async () => {
+    const fetchMock = routedFetch({
+      '/agents/providers': () => okJson(PROVIDERS),
+      '/ui-presets': () => okJson({}),
+      '/agents/profiles/install': () => okJson({ success: true, message: 'ok', agent_name: 'report_generator' }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const input = await openInstallRow()
+
+    fireEvent.change(input, { target: { files: [mdFile('good_one.md')] } })
+
+    expect(await screen.findByTestId('install-success')).toHaveTextContent('Installed good_one.md → report_generator')
+  })
+
+  it('sends the chosen provider with each file', async () => {
+    const { fetchMock, bodies } = installFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    const input = await openInstallRow()
+
+    // Wait for the provider list, then pick from the CustomSelect menu.
+    await waitFor(() => expect(fetchMock.mock.calls.some(c => String(c[0]).includes('/agents/providers'))).toBe(true))
+    fireEvent.click(screen.getByRole('button', { name: /install provider/i }))
+    const menu = await screen.findByTestId('custom-select-menu')
+    const opt = await waitFor(() => {
+      const found = within(menu).getAllByRole('button').find(b => b.textContent?.includes('claude_code'))
+      if (!found) throw new Error('claude_code option not rendered yet')
+      return found
+    })
+    fireEvent.click(opt)
+    fireEvent.change(input, { target: { files: [mdFile('report_generator.md')] } })
+
+    await waitFor(() => expect(bodies).toHaveLength(1))
+    expect(bodies[0].provider).toBe('claude_code')
+  })
+
+  it('skips a badly named file without a request and still installs the rest', async () => {
+    const { fetchMock, bodies } = installFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    const input = await openInstallRow()
+
+    fireEvent.change(input, { target: { files: [mdFile('bad name.md'), mdFile('notes.txt'), mdFile('good.md')] } })
+
+    const banner = await screen.findByTestId('install-error')
+    expect(bodies.map(b => b.source)).toEqual(['good'])
+    const message = banner.textContent ?? ''
+    expect(message).toContain('Installed good.')
+    expect(message).toContain('bad name.md: file name must match')
+    expect(message).toContain('notes.txt: not a .md file')
+    // Install outcomes never go to the auto-dismissing snackbar.
+    expect(useStore.getState().snackbar).toBeNull()
+  })
+
+  it('reports a server refusal by file name in a banner above the Profiles header', async () => {
+    const { fetchMock } = installFetch({ dup: "Profile 'dup' is owned by another install" })
+    vi.stubGlobal('fetch', fetchMock)
+    const input = await openInstallRow()
+
+    fireEvent.change(input, { target: { files: [mdFile('dup.md')] } })
+
+    const banner = await screen.findByTestId('install-error')
+    expect(banner).toHaveTextContent("Failed: dup.md: Profile 'dup' is owned by another install")
+    const heading = screen.getByRole('heading', { name: 'Profiles' })
+    expect(banner.compareDocumentPosition(heading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('joins failures without a doubled ".;" when a server message ends with a period', async () => {
+    const { fetchMock } = installFetch({ dup: 'Rename one of these profiles.' })
+    vi.stubGlobal('fetch', fetchMock)
+    const input = await openInstallRow()
+
+    fireEvent.change(input, { target: { files: [mdFile('dup.md'), mdFile('bad name.md')] } })
+
+    const banner = await screen.findByTestId('install-error')
+    expect(banner.textContent).toContain('dup.md: Rename one of these profiles; bad name.md: file name must match')
+    expect(banner.textContent).not.toContain('.;')
+  })
+
+  it('shows a name/URL install success in the same banner slot, kept until closed', async () => {
+    const fetchMock = routedFetch({
+      '/agents/providers': () => okJson(PROVIDERS),
+      '/ui-presets': () => okJson({}),
+      '/agents/profiles/install': () => okJson({ success: true, message: "Agent 'reviewer' installed successfully", agent_name: 'reviewer' }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    await openInstallRow()
+
+    fireEvent.change(screen.getByRole('textbox', { name: /profile name to install/i }), { target: { value: 'reviewer' } })
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      fireEvent.click(screen.getAllByRole('button', { name: /^install$/i })[1])
+      const banner = await screen.findByTestId('install-success')
+      expect(banner).toHaveTextContent("Agent 'reviewer' installed successfully")
+      const heading = screen.getByRole('heading', { name: 'Profiles' })
+      expect(banner.compareDocumentPosition(heading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+      await act(async () => { vi.advanceTimersByTime(60_000) })
+      expect(screen.getByTestId('install-success')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+    expect(useStore.getState().snackbar).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /dismiss install message/i }))
+    expect(screen.queryByTestId('install-success')).toBeNull()
+  })
+
+  it('keeps the error banner until the user closes it, and clears it on the next attempt', async () => {
+    const { fetchMock } = installFetch({ dup: 'refused' })
+    vi.stubGlobal('fetch', fetchMock)
+    const input = await openInstallRow()
+
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      fireEvent.change(input, { target: { files: [mdFile('dup.md')] } })
+      await screen.findByTestId('install-error')
+      await act(async () => { vi.advanceTimersByTime(60_000) })
+      expect(screen.getByTestId('install-error')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+
+    fireEvent.click(screen.getByRole('button', { name: /dismiss install error/i }))
+    expect(screen.queryByTestId('install-error')).toBeNull()
+
+    fireEvent.change(input, { target: { files: [mdFile('dup.md')] } })
+    await screen.findByTestId('install-error')
+    fireEvent.change(input, { target: { files: [mdFile('ok.md')] } })
+    await waitFor(() => expect(screen.queryByTestId('install-error')).toBeNull())
+  })
+})
+
+describe('profileFileProblem', () => {
+  it('accepts a valid .md file and rejects oversize ones', () => {
+    expect(profileFileProblem(new File(['x'], 'ok_name-1.md'))).toBeNull()
+    const big = new File(['x'.repeat(PROFILE_FILE_MAX_BYTES + 1)], 'big.md')
+    expect(profileFileProblem(big)).toBe('larger than 256 KiB')
   })
 })

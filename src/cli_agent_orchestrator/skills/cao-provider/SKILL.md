@@ -158,7 +158,7 @@ See `test/e2e/test_assign.py` for the automated version. Reference: https://gith
 
 ### Step 10: Documentation
 
-Create `docs/new-cli.md` with prerequisites, launch examples, agent profile format, known limitations, and troubleshooting. Update `README.md` provider table and `CHANGELOG.md`.
+Create `docs/new-cli.md` with prerequisites, launch examples, agent profile format, known limitations, and troubleshooting. Update `README.md` provider table and add a one-line `changelog.d/<PR>.Added.md` fragment.
 
 ## File Checklist
 
@@ -175,4 +175,4 @@ When your provider is complete, verify you've touched all these files:
 - [ ] `test/e2e/test_*.py` — E2E test classes
 - [ ] `docs/new-cli.md` — Provider documentation
 - [ ] `README.md` — Provider table
-- [ ] `CHANGELOG.md` — New provider entry
+- [ ] `changelog.d/<PR>.Added.md` — One-line new provider entry

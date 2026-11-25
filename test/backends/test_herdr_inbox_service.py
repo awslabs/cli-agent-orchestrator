@@ -15,8 +15,10 @@ from sqlalchemy import event
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.services.herdr_inbox_service import (
     HerdrInboxService,
+    _ResubscribeRequested,
     _retain_deferred_failure_tombstone,
 )
+from cli_agent_orchestrator.services.inbox_service import DELIVERY_DEFERRED
 
 
 def _run_async(coro):
@@ -125,13 +127,24 @@ class TestHerdrInboxServiceDelivery:
     """Test message delivery callback invocation."""
 
     def test_deliver_calls_callback(self):
-        """_deliver should invoke the delivery_callback with terminal_id."""
+        """_deliver should invoke the delivery_callback with terminal_id and source."""
         callback = MagicMock()
         service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
 
         service._deliver("tid1")
 
-        callback.assert_called_once_with("tid1")
+        callback.assert_called_once_with("tid1", "herdr")
+
+    def test_deliver_passes_trigger_source(self):
+        """The trigger source reaches the callback, so a log reader can tell an
+        event-driven delivery from the reconciliation sweep's (the event path
+        dying silently is how herdr 0.9.x degraded unnoticed)."""
+        callback = MagicMock()
+        service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
+
+        service._deliver("tid1", source="herdr-event")
+
+        callback.assert_called_once_with("tid1", "herdr-event")
 
     def test_deliver_handles_callback_error(self):
         """_deliver should log and not raise if callback fails."""
@@ -147,37 +160,222 @@ class TestHerdrInboxServiceDelivery:
         service._deliver("tid1")  # Should not raise
 
 
+_SUBSCRIBE_OK_ACK = b'{"id": "sub_all", "result": {"type": "subscription_started"}}\n'
+
+
+def _run_subscribe_with_ack(service, extra_lines=b"", ack=_SUBSCRIBE_OK_ACK):
+    """Run _subscribe_all_events with a real StreamReader pre-loaded with the ack.
+
+    The reader must be constructed inside a running loop (Python 3.13 removed
+    the implicit loop), so this wraps the whole call.
+    """
+
+    async def run():
+        reader = asyncio.StreamReader()
+        reader.feed_data(extra_lines + ack)
+        service._reader = reader
+        await service._subscribe_all_events()
+
+    _run_async(run())
+
+
 class TestHerdrInboxServiceSubscription:
     """Test combined event subscription message format.
 
-    herdr 0.7.5 resets the connection on a second events.subscribe, so all
-    subscriptions must be sent in a SINGLE events.subscribe call. The
-    subscription is a broadcast pane.updated (no pane_id) that carries
-    agent_status for every pane, plus the two lifecycle events.
+    herdr resets the connection on a second events.subscribe (measured on 0.7.5
+    and 0.9.5), so all subscriptions must be sent in a SINGLE events.subscribe
+    call: one pane.agent_status_changed per managed pane (herdr ≥0.9 accepts a
+    broadcast pane.updated subscription but no longer emits it on agent-status
+    transitions), the broadcast pane.updated kept for older herdr versions,
+    plus the two lifecycle events. The response must be read: herdr answers a
+    subscription naming an unknown pane with pane_not_found and then resets the
+    connection.
     """
 
-    def test_subscribe_all_events_sends_single_broadcast_message(self):
-        """One events.subscribe with broadcast pane.updated + lifecycle, NO pane_id.
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_subscribe_clears_pending_resubscribe_request(self, mock_snap):
+        """A pending resubscribe request is consumed by the subscribe itself.
 
-        herdr 0.7.5 resets the connection on a second events.subscribe, so this
-        must stay a single call. pane.updated is a broadcast (no pane_id) that
-        carries agent_status for every pane, so per-pane subscriptions are gone.
+        Without the clear, the request that triggered this connection would
+        recycle the NEXT connection immediately too: an endless recycle loop
+        (one every backoff-free iteration) re-running the blocking snapshot
+        subprocess on the API event loop, while every suite stays green.
         """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._writer = AsyncMock()
-        # Empty map: the broadcast subscription shape must NOT depend on any
-        # registered panes — it is a single pane.updated with no per-pane entries.
-        service._pane_to_terminal = {}
+        service._pane_to_terminal = {"pane-1": "tid1"}
+        mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
 
-        _run_async(service._subscribe_all_events())
+        async def run():
+            service._resubscribe_requested = asyncio.Event()
+            service._resubscribe_requested.set()
+            reader = asyncio.StreamReader()
+            reader.feed_data(_SUBSCRIBE_OK_ACK)
+            service._reader = reader
+            await service._subscribe_all_events()
+            return service._resubscribe_requested.is_set()
+
+        assert _run_async(run()) is False
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_subscribe_sends_per_pane_and_broadcast_in_one_call(self, mock_snap):
+        """One events.subscribe carrying per-pane agent-status subs + broadcast + lifecycle."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._writer = AsyncMock()
+        service._pane_to_terminal = {"pane-1": "tid1", "pane-2": "tid2"}
+        mock_snap.return_value = {
+            "panes": [
+                {"pane_id": "pane-1", "agent_status": "working"},
+                {"pane_id": "pane-2", "agent_status": "idle"},
+                {"pane_id": "pane-unmanaged", "agent_status": "idle"},
+            ]
+        }
+        _run_subscribe_with_ack(service)
 
         service._writer.write.assert_called_once()
         msg = json.loads(service._writer.write.call_args[0][0].decode().strip())
         assert msg["method"] == "events.subscribe"
-        types = {s["type"] for s in msg["params"]["subscriptions"]}
-        assert types == {"pane.updated", "pane.closed", "workspace.closed"}
-        # Broadcast subscriptions carry no pane_id.
-        assert all("pane_id" not in s for s in msg["params"]["subscriptions"])
+        subs = msg["params"]["subscriptions"]
+        per_pane = {s["pane_id"] for s in subs if s["type"] == "pane.agent_status_changed"}
+        assert per_pane == {"pane-1", "pane-2"}
+        broadcast_types = {s["type"] for s in subs if "pane_id" not in s}
+        assert broadcast_types == {"pane.updated", "pane.closed", "workspace.closed"}
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_subscribe_filters_stale_panes_against_snapshot(self, mock_snap):
+        """A mapped pane herdr no longer knows is left out of the subscription:
+        herdr answers pane_not_found for it and then RESETS the connection, so
+        one stale map entry must not be able to poison every retry."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._writer = AsyncMock()
+        service._pane_to_terminal = {"pane-1": "tid1", "pane-gone": "tid2"}
+        mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
+        _run_subscribe_with_ack(service)
+
+        msg = json.loads(service._writer.write.call_args[0][0].decode().strip())
+        per_pane = {
+            s["pane_id"]
+            for s in msg["params"]["subscriptions"]
+            if s["type"] == "pane.agent_status_changed"
+        }
+        assert per_pane == {"pane-1"}
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_subscribe_raises_when_snapshot_unavailable(self, mock_snap):
+        """No snapshot means the per-pane set cannot be validated; fail the
+        connection attempt so _socket_loop retries with backoff instead of
+        sending a subscription herdr may reject and reset."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._writer = AsyncMock()
+        service._pane_to_terminal = {"pane-1": "tid1"}
+        mock_snap.return_value = None
+
+        with pytest.raises(ConnectionError):
+            _run_async(service._subscribe_all_events())
+        service._writer.write.assert_not_called()
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_subscribe_error_ack_raises(self, mock_snap):
+        """An error ack means the subscription is NOT active; carrying on would
+        silently degrade every delivery to the reconciliation sweep, which is
+        exactly the failure mode the fire-and-forget subscribe hid."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._writer = AsyncMock()
+        service._pane_to_terminal = {"pane-1": "tid1"}
+        mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
+        with pytest.raises(ConnectionError, match="pane_not_found"):
+            _run_subscribe_with_ack(
+                service,
+                ack=b'{"id": "sub_all", "error": {"code": "pane_not_found", '
+                b'"message": "pane pane-1 not found"}}\n',
+            )
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_subscribe_caps_pre_ack_event_flood(self, mock_snap):
+        """A flood of event lines before the ack is bounded, not accumulated."""
+        from cli_agent_orchestrator.services import herdr_inbox_service as mod
+
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._writer = AsyncMock()
+        service._pane_to_terminal = {"pane-1": "tid1"}
+        mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
+        flood = (
+            json.dumps({"event": "pane.scroll_changed", "data": {"pane_id": "pane-1"}}).encode()
+            + b"\n"
+        ) * (mod._PRE_ACK_BUFFER_CAP + 5)
+
+        with pytest.raises(ConnectionError, match="ack not seen"):
+            _run_subscribe_with_ack(service, ack=flood)  # ack never arrives
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_one_bad_buffered_event_does_not_drop_the_rest(self, mock_snap):
+        """A failing replayed pre-ack event is logged and the rest still dispatch."""
+        delivered = []
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock",
+            delivery_callback=lambda tid, source: (delivered.append(tid) or 0),
+        )
+        service._writer = AsyncMock()
+        service._pane_to_terminal = {"pane-1": "tid1", "pane-2": "tid2"}
+        mock_snap.return_value = {
+            "panes": [
+                {"pane_id": "pane-1", "agent_status": "idle"},
+                {"pane_id": "pane-2", "agent_status": "idle"},
+            ]
+        }
+        ev1 = json.dumps(
+            {
+                "event": "pane.agent_status_changed",
+                "data": {"pane_id": "pane-1", "agent_status": "idle"},
+            }
+        ).encode()
+        ev2 = json.dumps(
+            {
+                "event": "pane.agent_status_changed",
+                "data": {"pane_id": "pane-2", "agent_status": "idle"},
+            }
+        ).encode()
+        strays = ev1 + b"\n" + ev2 + b"\n"
+
+        calls = {"n": 0}
+        real_dispatch = service._dispatch_event
+
+        async def flaky_dispatch(event):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient DB error on first buffered event")
+            await real_dispatch(event)
+
+        with (
+            patch.object(service, "_record_agent_status", new=AsyncMock()),
+            patch.object(service, "_dispatch_event", side_effect=flaky_dispatch),
+        ):
+            _run_subscribe_with_ack(service, extra_lines=strays)
+
+        # The second buffered event was still delivered despite the first failing.
+        assert "tid2" in delivered
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_subscribe_ack_wait_dispatches_stray_event_lines(self, mock_snap):
+        """An event line arriving before the ack is dispatched, not dropped."""
+        callback = MagicMock()
+        service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
+        service._writer = AsyncMock()
+        service._pane_to_terminal = {"pane-1": "tid1"}
+        mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
+        stray = (
+            json.dumps(
+                {
+                    "event": "pane.agent_status_changed",
+                    "data": {"pane_id": "pane-1", "agent_status": "idle"},
+                }
+            ).encode()
+            + b"\n"
+        )
+        with patch.object(service, "_record_agent_status", new=AsyncMock()):
+            _run_subscribe_with_ack(service, extra_lines=stray)
+
+        callback.assert_called_once_with("tid1", "herdr-event")
 
 
 class TestHerdrInboxServiceEventParsing:
@@ -251,7 +449,7 @@ class TestHerdrInboxServiceEventParsing:
 
         # Only idle and done events on managed pane should trigger delivery
         assert callback.call_count == 2
-        callback.assert_any_call("tid1")
+        callback.assert_any_call("tid1", "herdr-event")
 
     def test_event_loop_ignores_flat_format_without_data_wrapper(self):
         """Events without 'data' wrapper (old flat format) are silently ignored."""
@@ -308,7 +506,7 @@ class TestHerdrInboxServiceEventParsing:
         except ConnectionError:
             pass  # EOF raises ConnectionError("Socket closed") — expected
 
-        callback.assert_called_once_with("tid1")
+        callback.assert_called_once_with("tid1", "herdr-event")
 
     def test_event_loop_ignores_pane_updated_for_unmanaged_pane(self):
         """Broadcast now delivers events for ALL panes; the managed-pane filter
@@ -355,12 +553,14 @@ class TestHerdrInboxServiceEventParsing:
 class TestHerdrInboxServiceReconnect:
     """Test reconnect re-subscribe behavior: a single combined subscribe per connection."""
 
-    def test_reconnect_resubscribe_sends_single_call_for_all_panes(self):
-        """On reconnect, the broadcast subscription is re-sent in ONE events.subscribe call.
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_reconnect_resubscribe_sends_single_call_for_all_panes(self, mock_snap):
+        """On reconnect, every managed pane is re-subscribed in ONE events.subscribe call.
 
-        herdr resets the connection on a second events.subscribe, so re-subscribing
-        must be one combined call. The subscription is a broadcast pane.updated
-        (no pane_id) covering every pane, plus the two lifecycle events.
+        herdr resets the connection on a second events.subscribe, so
+        re-subscribing must be one combined call: a pane.agent_status_changed
+        per managed pane, the broadcast pane.updated for older herdr versions,
+        plus the two lifecycle events.
         """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._writer = AsyncMock()
@@ -369,16 +569,25 @@ class TestHerdrInboxServiceReconnect:
         service._pane_to_terminal["pane-1"] = "tid1"
         service._terminal_to_pane["tid2"] = "pane-2"
         service._pane_to_terminal["pane-2"] = "tid2"
+        mock_snap.return_value = {
+            "panes": [
+                {"pane_id": "pane-1", "agent_status": "working"},
+                {"pane_id": "pane-2", "agent_status": "working"},
+            ]
+        }
+        _run_subscribe_with_ack(service)
 
-        _run_async(service._subscribe_all_events())
-
-        # Exactly ONE broadcast subscribe message (not one per pane).
+        # Exactly ONE subscribe message (not one per pane).
         service._writer.write.assert_called_once()
         msg = json.loads(service._writer.write.call_args[0][0].decode().strip())
-        types = {s["type"] for s in msg["params"]["subscriptions"]}
-        assert types == {"pane.updated", "pane.closed", "workspace.closed"}
-        # Broadcast subscriptions carry no pane_id.
-        assert all("pane_id" not in s for s in msg["params"]["subscriptions"])
+        per_pane = {
+            s["pane_id"]
+            for s in msg["params"]["subscriptions"]
+            if s["type"] == "pane.agent_status_changed"
+        }
+        assert per_pane == {"pane-1", "pane-2"}
+        broadcast_types = {s["type"] for s in msg["params"]["subscriptions"] if "pane_id" not in s}
+        assert broadcast_types == {"pane.updated", "pane.closed", "workspace.closed"}
         # Mapping should be unchanged
         assert service._terminal_to_pane["tid1"] == "pane-1"
         assert service._terminal_to_pane["tid2"] == "pane-2"
@@ -409,7 +618,7 @@ class TestHerdrInboxServiceKiroSupplement:
         ):
             _run_async(service.check_kiro_supplements())
 
-        callback.assert_called_once_with("tid_kiro")
+        callback.assert_called_once_with("tid_kiro", "kiro-supplement")
 
     @patch("subprocess.run")
     def test_kiro_supplement_skips_under_threshold(self, mock_run):
@@ -487,7 +696,8 @@ class TestHerdrInboxServiceReconcile:
         """
         delivered = []
         service = HerdrInboxService(
-            socket_path="/tmp/test.sock", delivery_callback=delivered.append
+            socket_path="/tmp/test.sock",
+            delivery_callback=lambda tid, source: delivered.append((tid, source)),
         )
         service.register_terminal("tid1", "pane-1")
         service.register_terminal("tid2", "pane-2")
@@ -502,7 +712,7 @@ class TestHerdrInboxServiceReconcile:
 
         _run_async(service._deliver_settled_panes())
 
-        assert sorted(delivered) == ["tid1", "tid2"]
+        assert sorted(delivered) == [("tid1", "settled-sweep"), ("tid2", "settled-sweep")]
         # The working latch is cleared, same as the live-event path.
         assert "tid1" not in service._working_since
 
@@ -1138,16 +1348,361 @@ class TestHerdrInboxServiceSingleSubscribePerConnection:
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         assert not hasattr(service, "_subscribe_lifecycle_events")
 
-    def test_socket_setup_issues_exactly_one_subscribe(self):
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_socket_setup_issues_exactly_one_subscribe(self, mock_snap):
         """A full connect cycle (reconcile already done) writes exactly one subscribe."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._writer = AsyncMock()
         service._pane_to_terminal = {"pane-1": "tid1"}
         service._terminal_to_pane = {"tid1": "pane-1"}
-
-        _run_async(service._subscribe_all_events())
+        mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
+        _run_subscribe_with_ack(service)
 
         service._writer.write.assert_called_once()
+
+
+class TestHerdrInboxServiceResubscribeOnRegistration:
+    """A pane registered after connect must join the per-pane subscription set.
+
+    herdr allows one events.subscribe per connection, so the socket loop
+    recycles the connection when the pane set changes; the wake-up is an
+    asyncio.Event set thread-safely because register_terminal runs on request
+    threads.
+    """
+
+    def test_register_after_start_wakes_event_loop(self):
+        """register_terminal sets the resubscribe event; _event_loop raises the
+        internal control-flow exception so _socket_loop reconnects."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+
+        async def run():
+            service._loop = asyncio.get_running_loop()
+            service._resubscribe_requested = asyncio.Event()
+            reader = asyncio.StreamReader()  # never fed: readline blocks forever
+            service._reader = reader
+            loop_task = asyncio.create_task(service._event_loop())
+            await asyncio.sleep(0)  # let the loop start waiting
+            service.register_terminal("tid-late", "pane-late")
+            with pytest.raises(_ResubscribeRequested):
+                await asyncio.wait_for(loop_task, timeout=2)
+
+        _run_async(run())
+
+    def test_event_loop_processes_buffered_line_before_resubscribing(self):
+        """A completed event line is handled before the recycle, so a buffered
+        idle/done is not dropped on the floor by the reconnect."""
+        callback = MagicMock()
+        service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
+        service._pane_to_terminal = {"w1:p1": "tid1"}
+        frame = {
+            "event": "pane.agent_status_changed",
+            "data": {"pane_id": "w1:p1", "agent_status": "idle"},
+        }
+
+        async def run():
+            service._loop = asyncio.get_running_loop()
+            service._resubscribe_requested = asyncio.Event()
+            service._resubscribe_requested.set()
+            reader = asyncio.StreamReader()
+            reader.feed_data((json.dumps(frame) + "\n").encode())
+            service._reader = reader
+            with patch.object(service, "_record_agent_status", new=AsyncMock()):
+                with pytest.raises(_ResubscribeRequested):
+                    await asyncio.wait_for(service._event_loop(), timeout=2)
+
+        _run_async(run())
+        callback.assert_called_once_with("tid1", "herdr-event")
+
+    def test_socket_loop_recycles_without_backoff_on_resubscribe(self):
+        """The intentional recycle must not pay the error backoff, and must
+        re-run the full setup (connect → subscribe → reconcile → sweep)."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid1", "pane-1")
+        order = []
+        sleeps = []
+        cycle = 0
+
+        async def _record(name):
+            order.append(name)
+
+        async def _event_loop():
+            nonlocal cycle
+            cycle += 1
+            order.append(f"event_loop_{cycle}")
+            if cycle == 1:
+                raise _ResubscribeRequested()
+            raise asyncio.CancelledError()  # end the test on the second cycle
+
+        async def _sleep(delay):
+            sleeps.append(delay)
+
+        with (
+            patch.object(service, "_connect", lambda: _record("connect")),
+            patch.object(service, "_subscribe_all_events", lambda: _record("subscribe")),
+            patch.object(service, "_reconcile", lambda: _record("reconcile")),
+            patch.object(service, "_deliver_settled_panes", lambda: _record("sweep")),
+            patch.object(service, "_event_loop", _event_loop),
+            patch("asyncio.sleep", new=AsyncMock(side_effect=_sleep)),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                _run_async(service._socket_loop())
+
+        assert order == [
+            "connect",
+            "subscribe",
+            "reconcile",
+            "sweep",
+            "event_loop_1",
+            "connect",
+            "subscribe",
+            "reconcile",
+            "sweep",
+            "event_loop_2",
+        ]
+        # Only the short coalesce pause, never the error backoff.
+        from cli_agent_orchestrator.services.herdr_inbox_service import (
+            _BACKOFF_BASE,
+            _RESUBSCRIBE_COALESCE_DELAY,
+        )
+
+        assert sleeps == [_RESUBSCRIBE_COALESCE_DELAY]
+        assert _RESUBSCRIBE_COALESCE_DELAY < _BACKOFF_BASE
+
+    def test_register_before_start_is_safe(self):
+        """Before start() there is no loop or event; registration must not raise."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid-early", "pane-early")
+        assert service._pane_to_terminal["pane-early"] == "tid-early"
+
+
+class TestHerdrInboxServiceSettleRetries:
+    """An idle/done event must carry delivery across the provider flush-wait.
+
+    herdr sends ONE pane.agent_status_changed per transition, but the provider
+    can report PROCESSING for a ~10s post-turn flush wait, so a single delivery
+    attempt at the event instant finds the gate closed and (without the retry)
+    only the 30s reconciliation sweep re-opens it. These tests pin the bounded
+    re-delivery that closes that gap.
+    """
+
+    @pytest.mark.parametrize(
+        "result, should_arm", [(0, False), (DELIVERY_DEFERRED, True), (1, False)]
+    )
+    @pytest.mark.parametrize("source", ["herdr-event", "settled-sweep"])
+    @pytest.mark.parametrize("status", ["idle", "done"])
+    def test_only_deferred_delivery_arms_retries(self, result, should_arm, source, status):
+        callback = MagicMock(return_value=result)
+        service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
+        service._pane_to_terminal = {"w1:p1": "tid1"}
+        pane = {"pane_id": "w1:p1", "agent_status": status}
+
+        async def run():
+            with (
+                patch.object(service, "_arm_settle_retries") as arm,
+                patch.object(service, "_record_agent_status", new=AsyncMock()),
+                patch.object(service, "_fetch_snapshot", return_value={"panes": [pane]}),
+            ):
+                if source == "herdr-event":
+                    await service._dispatch_event(
+                        {"event": "pane.agent_status_changed", "data": pane}
+                    )
+                else:
+                    await service._deliver_settled_panes()
+                callback.assert_called_once_with("tid1", source)
+                if should_arm:
+                    arm.assert_called_once_with("tid1")
+                else:
+                    arm.assert_not_called()
+
+        _run_async(run())
+
+    def test_idle_event_arms_bounded_retries(self):
+        """A done event delivers once immediately, then re-delivers at each
+        tick with the herdr-settle source."""
+        from cli_agent_orchestrator.services import herdr_inbox_service as mod
+
+        calls = []
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock",
+            delivery_callback=lambda tid, source: (calls.append((tid, source)), DELIVERY_DEFERRED)[
+                1
+            ],
+        )
+        service._pane_to_terminal = {"w1:p1": "tid1"}
+        service._terminal_to_pane = {"tid1": "w1:p1"}
+        frame = {
+            "event": "pane.agent_status_changed",
+            "data": {"pane_id": "w1:p1", "agent_status": "done"},
+        }
+
+        async def run():
+            service._loop = asyncio.get_running_loop()
+            with (
+                patch.object(mod, "_SETTLE_RETRY_INTERVAL", 0.0),
+                patch.object(mod, "_SETTLE_RETRY_TICKS", 3),
+                patch.object(service, "_record_agent_status", new=AsyncMock()),
+            ):
+                await service._dispatch_event(frame)
+                await asyncio.gather(*list(service._settle_tasks.values()))
+
+        _run_async(run())
+
+        # One immediate herdr-event delivery + three herdr-settle retries.
+        assert calls[0] == ("tid1", "herdr-event")
+        assert calls[1:] == [("tid1", "herdr-settle")] * 3
+
+    def test_settle_retry_stops_on_first_successful_delivery(self):
+        """Once a delivery lands (callback returns >0), the loop stops instead of
+        running out its whole window — no more redundant get_status subprocesses."""
+        from cli_agent_orchestrator.services import herdr_inbox_service as mod
+
+        ticks = {"n": 0}
+
+        def callback(tid, source):
+            ticks["n"] += 1
+            # Not ready on the first tick, delivers on the second.
+            return 1 if ticks["n"] >= 2 else DELIVERY_DEFERRED
+
+        service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
+        service._terminal_to_pane = {"tid1": "w1:p1"}
+
+        async def run():
+            service._loop = asyncio.get_running_loop()
+            with (
+                patch.object(mod, "_SETTLE_RETRY_INTERVAL", 0.0),
+                patch.object(mod, "_SETTLE_RETRY_TICKS", 9),
+            ):
+                service._arm_settle_retries("tid1")
+                await asyncio.gather(*list(service._settle_tasks.values()))
+
+        _run_async(run())
+        # Stopped at tick 2, did NOT run all 9 ticks.
+        assert ticks["n"] == 2
+
+    def test_event_delivery_landing_does_not_arm_a_retry(self):
+        """If the immediate event delivery already lands (callback returns >0),
+        no settle-retry loop is armed — arming would just fire one redundant
+        attempt (fanhongy P3; matches the loop's own >0 stop rule)."""
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock",
+            delivery_callback=lambda tid, source: 1,  # delivered
+        )
+        service._pane_to_terminal = {"w1:p1": "tid1"}
+        frame = {
+            "event": "pane.agent_status_changed",
+            "data": {"pane_id": "w1:p1", "agent_status": "idle"},
+        }
+
+        async def run():
+            service._loop = asyncio.get_running_loop()
+            service._resubscribe_requested = asyncio.Event()
+            with patch.object(service, "_record_agent_status", new=AsyncMock()):
+                await service._dispatch_event(frame)
+
+        _run_async(run())
+        assert service._settle_tasks == {}, "a settle-retry was armed despite delivery landing"
+
+    def test_second_event_does_not_stack_a_second_loop(self):
+        """A terminal that flaps done→working→done fires several events, but only
+        ONE retry loop runs at a time (no multiplied readiness checks)."""
+        from cli_agent_orchestrator.services import herdr_inbox_service as mod
+
+        service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=lambda *a: None)
+        service._terminal_to_pane = {"tid1": "w1:p1"}
+
+        async def run():
+            service._loop = asyncio.get_running_loop()
+            with (
+                patch.object(mod, "_SETTLE_RETRY_INTERVAL", 10.0),  # keep the loop alive
+                patch.object(mod, "_SETTLE_RETRY_TICKS", 6),
+            ):
+                service._arm_settle_retries("tid1")
+                first = service._settle_tasks["tid1"]
+                service._arm_settle_retries("tid1")  # second event, loop still active
+                second = service._settle_tasks["tid1"]
+                assert first is second  # not replaced, not stacked
+                assert len(service._settle_tasks) == 1
+                first.cancel()
+
+        _run_async(run())
+
+    def test_settle_retry_stops_when_terminal_unregistered(self):
+        """A retry that finds the terminal gone stops rather than delivering."""
+        from cli_agent_orchestrator.services import herdr_inbox_service as mod
+
+        calls = []
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock",
+            delivery_callback=lambda tid, source: calls.append((tid, source)),
+        )
+        service._terminal_to_pane = {}  # terminal already gone
+
+        async def run():
+            service._loop = asyncio.get_running_loop()
+            with (
+                patch.object(mod, "_SETTLE_RETRY_INTERVAL", 0.0),
+                patch.object(mod, "_SETTLE_RETRY_TICKS", 3),
+            ):
+                service._arm_settle_retries("tid-gone")
+                await asyncio.gather(*list(service._settle_tasks.values()))
+
+        _run_async(run())
+        assert calls == []
+        # The loop removed itself from the registry on exit.
+        assert service._settle_tasks == {}
+
+    def test_close_connection_cancels_settle_retries(self):
+        """A connection recycle cancels in-flight retries (the new connection's
+        settled-pane sweep re-arms whatever still matters)."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._terminal_to_pane = {"tid1": "w1:p1"}
+
+        async def run():
+            service._loop = asyncio.get_running_loop()
+            service._arm_settle_retries("tid1")  # long sleeps by default
+            assert len(service._settle_tasks) == 1
+            await service._close_connection()
+            assert service._settle_tasks == {}
+
+        _run_async(run())
+
+    def test_arm_is_safe_before_start(self):
+        """No event loop captured yet (service never start()ed) — arming is a no-op."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._arm_settle_retries("tid1")  # must not raise
+        assert service._settle_tasks == {}
+
+
+class TestHerdrProtocolObservability:
+    """herdr's protocol is logged and an untested protocol warns loudly:
+    0.9.x changed the event contract (stopped emitting broadcast pane.updated)
+    without any error, so version drift must at least be visible."""
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_untested_protocol_warns(self, mock_snap, caplog):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_snap.return_value = {"panes": [], "protocol": 99, "version": "9.9.9"}
+        with caplog.at_level("WARNING"):
+            service._list_live_pane_ids()
+        assert "outside the tested range" in caplog.text
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_tested_protocol_logs_info_only(self, mock_snap, caplog):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_snap.return_value = {"panes": [], "protocol": 22, "version": "0.9.5"}
+        with caplog.at_level("INFO"):
+            service._list_live_pane_ids()
+        assert "socket protocol 22" in caplog.text
+        assert "outside the tested range" not in caplog.text
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_protocol_logged_once(self, mock_snap, caplog):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_snap.return_value = {"panes": [], "protocol": 99, "version": "9.9.9"}
+        with caplog.at_level("WARNING"):
+            service._list_live_pane_ids()
+            service._list_live_pane_ids()
+        assert caplog.text.count("outside the tested range") == 1
 
 
 class TestHerdrInboxServiceLifecycleEvents:
@@ -1795,7 +2350,46 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         _run_async(run())
 
-        callback.assert_called_once_with("tid-a")
+        callback.assert_called_once_with("tid-a", "herdr-event")
+
+    def test_event_loop_per_pane_agent_status_real_shape_delivers(self):
+        """The real herdr 0.9.5 per-pane event shape (captured off the live
+        socket: event=pane.agent_status_changed with a FLAT data payload)
+        triggers delivery. This is the only agent-status event protocol 22
+        emits — it never sends broadcast pane.updated, even though it acks a
+        subscription for it."""
+        callback = MagicMock()
+        service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
+        service.register_terminal("tid-a", "w1:p1", is_kiro=False)
+
+        idle_event = (
+            json.dumps(
+                {
+                    "data": {
+                        "agent": "claude",
+                        "agent_status": "idle",
+                        "pane_id": "w1:p1",
+                        "workspace_id": "w1",
+                    },
+                    "event": "pane.agent_status_changed",
+                }
+            ).encode()
+            + b"\n"
+        )
+
+        async def run():
+            reader = asyncio.StreamReader()
+            service._reader = reader
+            reader.feed_data(idle_event)
+            reader.feed_eof()
+            try:
+                await service._event_loop()
+            except ConnectionError:
+                pass
+
+        _run_async(run())
+
+        callback.assert_called_once_with("tid-a", "herdr-event")
 
 
 class TestHerdrInboxServiceReconcileLiveTerminal:
@@ -1849,6 +2443,50 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
         assert service._terminal_to_pane.get("tid1") == "pane-new"
         # Old (renumbered-away) pane_id is gone from the map.
         assert "pane-old" not in service._pane_to_terminal
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_reconcile_remap_requests_resubscribe(
+        self, mock_meta, mock_delete, mock_snap, mock_run, mock_get_backend
+    ):
+        """A re-map changes a managed pane_id, so the active subscription (keyed
+        on the old pane_id) must be refreshed — otherwise that terminal gets no
+        agent-status events until another registers (fanhongy P3). The re-map
+        must request a resubscribe."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid1", "pane-old")
+        mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-1"}
+        mock_snap.return_value = {
+            "panes": [{"pane_id": "pane-new"}],
+            "tabs": [{"label": "win-1", "workspace_id": "ws-1"}],
+            "workspaces": [],
+        }
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({"result": {"tabs": [{"label": "win-1", "workspace_id": "ws-1"}]}}),
+            stderr="",
+        )
+        mock_backend = MagicMock()
+        mock_backend.get_pane_id.return_value = "pane-new"
+        mock_get_backend.return_value = mock_backend
+
+        async def run():
+            # start() wiring: a loop + event must exist for the request to land.
+            service._loop = asyncio.get_running_loop()
+            service._resubscribe_requested = asyncio.Event()
+            await service._reconcile()
+            # _request_resubscribe schedules the set via call_soon_threadsafe;
+            # let the loop tick so the scheduled callback runs.
+            await asyncio.sleep(0)
+            return service._resubscribe_requested.is_set()
+
+        assert _run_async(run()) is True, (
+            "a reconcile re-map did not request a resubscribe; the re-mapped "
+            "terminal would silently lose its per-pane subscription"
+        )
 
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")

@@ -49,7 +49,7 @@ def command_responses(box: RemoteBox) -> dict[tuple[str, ...], RunResult]:
     return {
         ("aws", "--version"): RunResult(0, "aws-cli/2.17.1 Python/3"),
         ("session-manager-plugin", "--version"): RunResult(0, "1.2.0"),
-        ("ssh", "-V"): RunResult(0, "", "OpenSSH_9.8"),
+        ("ssh", "-o", "ForwardAgent=no", "-V"): RunResult(0, "", "OpenSSH_9.8"),
         ("herdr", "--version"): RunResult(0, "herdr 0.9.3"),
         ("aws", "configure", "list-profiles"): RunResult(0, "work\n"),
         ("aws", "sts", "get-caller-identity", "--profile", "work"): RunResult(0, "{}"),
@@ -83,12 +83,26 @@ def command_responses(box: RemoteBox) -> dict[tuple[str, ...], RunResult]:
             "--output",
             "text",
         ): RunResult(0, "Online\n"),
-        ("ssh", "-o", "BatchMode=yes", host, "true"): RunResult(0),
-        ("ssh", "-o", "BatchMode=yes", host, "herdr", "--version"): RunResult(0, "herdr 0.9.3"),
+        ("ssh", "-o", "ForwardAgent=no", "-G", host): RunResult(
+            0,
+            f"hostname {box.instance_id}\nidentityfile ~/.ssh/cao-{box.name}_ed25519\n",
+        ),
+        ("ssh", "-o", "BatchMode=yes", "-o", "ForwardAgent=no", host, "true"): RunResult(0),
         (
             "ssh",
             "-o",
             "BatchMode=yes",
+            "-o",
+            "ForwardAgent=no",
+            host,
+            "bash -lc 'herdr --version'",
+        ): RunResult(0, "herdr 0.9.3"),
+        (
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ForwardAgent=no",
             host,
             "curl",
             "-fsS",
@@ -135,7 +149,7 @@ def test_every_check_ok_path(box, tmp_path):
     [
         (("aws", "--version"), "aws-cli"),
         (("session-manager-plugin", "--version"), "session-manager-plugin"),
-        (("ssh", "-V"), "ssh"),
+        (("ssh", "-o", "ForwardAgent=no", "-V"), "ssh"),
         (("herdr", "--version"), "herdr"),
         (("aws", "configure", "list-profiles"), "aws-profile"),
         (("aws", "sts", "get-caller-identity", "--profile", "work"), "aws-login"),
@@ -196,6 +210,10 @@ def test_local_ssh_fix_paths_skip_ssh_stage(box, tmp_path, missing):
         (home / ".ssh" / "config").unlink()
         expected = "ssh-config"
     runner = FakeRunner(command_responses(box))
+    if missing == "config":
+        runner.responses[("ssh", "-o", "ForwardAgent=no", "-G", "cao-box-1")] = RunResult(
+            0, "hostname cao-box-1\n"
+        )
     checks = checks_by_name(check_box(box, runner, home))
     assert checks[expected].status == "FIX"
     assert checks["cao-server /health"].status == "SKIP"
@@ -229,9 +247,17 @@ def test_long_lived_key_is_fix_and_canary_never_reaches_text_or_json(box, tmp_pa
 @pytest.mark.parametrize(
     ("remote_command", "expected_name"),
     [
-        (("ssh", "-o", "BatchMode=yes", "cao-box-1", "true"), "ssh"),
+        (("ssh", "-o", "BatchMode=yes", "-o", "ForwardAgent=no", "cao-box-1", "true"), "ssh"),
         (
-            ("ssh", "-o", "BatchMode=yes", "cao-box-1", "herdr", "--version"),
+            (
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ForwardAgent=no",
+                "cao-box-1",
+                "bash -lc 'herdr --version'",
+            ),
             "herdr-version",
         ),
         (
@@ -239,6 +265,8 @@ def test_long_lived_key_is_fix_and_canary_never_reaches_text_or_json(box, tmp_pa
                 "ssh",
                 "-o",
                 "BatchMode=yes",
+                "-o",
+                "ForwardAgent=no",
                 "cao-box-1",
                 "curl",
                 "-fsS",
@@ -277,12 +305,35 @@ def test_full_check_uses_only_read_only_allowlisted_argv(box, tmp_path):
         assert forbidden not in flattened
 
 
+def test_every_ssh_call_disables_agent_forwarding(box, tmp_path):
+    runner = FakeRunner(command_responses(box))
+    check_box(box, runner, ready_home(tmp_path, box))
+    ssh_commands = [argv for argv in runner.argv if argv[0] == "ssh"]
+    assert ssh_commands
+    assert all(
+        any(argv[index : index + 2] == ("-o", "ForwardAgent=no") for index in range(len(argv) - 1))
+        for argv in ssh_commands
+    )
+
+
 def test_tmux_mode_uses_tmux_version_check(box, tmp_path):
     tmux_box = RemoteBox(box.name, box.instance_id, box.region, box.aws_profile, mode="tmux")
     responses = command_responses(box)
     responses.pop(("herdr", "--version"))
-    responses.pop(("ssh", "-o", "BatchMode=yes", "cao-box-1", "herdr", "--version"))
-    responses[("ssh", "-o", "BatchMode=yes", "cao-box-1", "tmux", "-V")] = RunResult(0, "tmux 3.4")
+    responses.pop(
+        (
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ForwardAgent=no",
+            "cao-box-1",
+            "bash -lc 'herdr --version'",
+        )
+    )
+    responses[
+        ("ssh", "-o", "BatchMode=yes", "-o", "ForwardAgent=no", "cao-box-1", "tmux", "-V")
+    ] = RunResult(0, "tmux 3.4")
     checks = checks_by_name(check_box(tmux_box, FakeRunner(responses), ready_home(tmp_path, box)))
     assert checks["tmux"].status == "OK"
     assert "herdr" not in checks
@@ -302,6 +353,42 @@ def test_runner_missing_binary_and_timeout_are_fix_without_traceback(box, tmp_pa
     )
     assert checks_by_name(checks)["aws-cli"].status == "FIX"
     assert "Traceback" not in "\n".join(check.rendered() for check in checks)
+
+
+def test_runner_uses_a_real_executable_on_the_callers_path(tmp_path, monkeypatch):
+    tool = tmp_path / "remote-path-probe"
+    tool.write_text("#!/bin/sh\nprintf 'found\\n'\n", encoding="utf-8")
+    tool.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.defpath}")
+    assert Runner().run([tool.name]) == RunResult(0, "found\n")
+
+
+def test_runner_drops_ambient_aws_credentials_but_keeps_required_environment(tmp_path, monkeypatch):
+    tool = tmp_path / "remote-environment-probe"
+    names = (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_PROFILE",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SECURITY_TOKEN",
+        "AWS_SESSION_TOKEN",
+    )
+    tool.write_text(
+        "#!/bin/sh\n"
+        + "\n".join(f'printenv "{name}" >/dev/null && printf present\\n' for name in names)
+        + '\nprintf "%s\\n" "$SSH_AUTH_SOCK" "$HTTPS_PROXY" "$AWS_CA_BUNDLE"\n',
+        encoding="utf-8",
+    )
+    tool.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.defpath}")
+    for index, name in enumerate(names):
+        monkeypatch.setenv(name, f"ambient{index}")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "ssh-marker")
+    monkeypatch.setenv("HTTPS_PROXY", "proxy-marker")
+    monkeypatch.setenv("AWS_CA_BUNDLE", "ca-marker")
+    result = Runner().run([tool.name])
+    assert result.returncode == 0
+    assert result.stdout == "ssh-marker\nproxy-marker\nca-marker\n"
 
 
 def test_remote_add_list_remove_and_private_file(tmp_path, monkeypatch):
@@ -397,6 +484,98 @@ def test_remote_add_validates_arguments(tmp_path, monkeypatch):
     assert "box must match" in result.output
 
 
+def test_remote_add_rejects_control_characters_in_user_and_profile(tmp_path, monkeypatch, box):
+    monkeypatch.setattr(registry, "CAO_HOME_DIR", tmp_path)
+    for user, profile in (("bad\nuser", "work"), ("user", "bad\tprofile")):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "remote",
+                "add",
+                box.name,
+                "--instance-id",
+                box.instance_id,
+                "--region",
+                box.region,
+                "--profile",
+                profile,
+                "--user",
+                user,
+            ],
+        )
+        assert result.exit_code == 2
+
+
+def test_ssh_checks_use_ssh_config_resolution_and_its_identity_file(box, tmp_path):
+    home = tmp_path
+    ssh = home / ".ssh"
+    ssh.mkdir()
+    key = ssh / "work-key"
+    key.touch()
+    (ssh / "config").write_text("Include config.d/*\n", encoding="utf-8")
+    responses = command_responses(box)
+    responses[("ssh", "-o", "ForwardAgent=no", "-G", "cao-box-1")] = RunResult(
+        0, f"hostname {box.instance_id}\nidentityfile {key}\n"
+    )
+    runner = FakeRunner(responses)
+    checks = checks_by_name(check_box(box, runner, home))
+    assert checks["ssh-key"].status == "OK"
+    assert checks["ssh-config"].status == "OK"
+    assert ("ssh", "-o", "ForwardAgent=no", "-G", "cao-box-1") in runner.argv
+
+
+def test_malformed_configured_aws_files_are_fix_not_traceback(box, tmp_path, monkeypatch):
+    home = ready_home(tmp_path, box)
+    for content in ("not an ini file", "[work]\na = b\n[work]\nc = d\n"):
+        configured = tmp_path / "configured-credentials"
+        configured.write_text(content, encoding="utf-8")
+        monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(configured))
+        checks = checks_by_name(check_box(box, FakeRunner(command_responses(box)), home))
+        assert checks["aws-credentials"].status == "FIX"
+        assert str(configured) in checks["aws-credentials"].detail
+
+
+def test_tmux_version_accepts_3_3_or_newer(box, tmp_path):
+    tmux_box = RemoteBox(box.name, box.instance_id, box.region, box.aws_profile, mode="tmux")
+    home = ready_home(tmp_path, box)
+    for version in ("tmux 3.3a", "tmux 3.10", "tmux 4.0", "tmux next-3.6"):
+        responses = command_responses(box)
+        responses.pop(("herdr", "--version"))
+        responses.pop(
+            (
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ForwardAgent=no",
+                "cao-box-1",
+                "bash -lc 'herdr --version'",
+            )
+        )
+        responses[
+            ("ssh", "-o", "BatchMode=yes", "-o", "ForwardAgent=no", "cao-box-1", "tmux", "-V")
+        ] = RunResult(0, version)
+        checks = checks_by_name(check_box(tmux_box, FakeRunner(responses), home))
+        assert checks["tmux"].status == "OK"
+
+
+def test_remote_docs_describe_ssh_sessions_and_no_setup_commands():
+    docs = Path(__file__).parents[3] / "docs" / "remote-cli.md"
+    content = docs.read_text(encoding="utf-8")
+    assert "can open SSM sessions (up to three during a full check)" in content
+    assert "remote setup command" in content
+
+
+def test_remote_changelog_line_is_under_bracketed_unreleased_heading():
+    changelog = (Path(__file__).parents[3] / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "## Unreleased\n\n- Add experimental `cao remote`" not in changelog
+    unreleased = changelog.split("## [Unreleased]\n", maxsplit=1)[1]
+    assert (
+        "- Add experimental `cao remote` local box registry and read-only prerequisite checks."
+        in unreleased
+    )
+
+
 @pytest.mark.parametrize(
     ("checks", "expected_exit"),
     [([Check("OK", "aws-cli", "2.x")], 0), ([Check("FIX", "aws-cli", "install")], 1)],
@@ -429,3 +608,30 @@ def test_load_and_remove_missing_raise_clear_error(tmp_path, monkeypatch):
         load("box-1")
     with pytest.raises(RemoteConfigError, match="not registered"):
         remove("box-1")
+
+
+def test_bad_registration_is_usage_error_and_list_keeps_others(tmp_path, monkeypatch, box):
+    monkeypatch.setattr(registry, "CAO_HOME_DIR", tmp_path)
+    for content in (
+        json.dumps({"instance_id": box.instance_id, "name": box.name, "region": box.region}),
+        "null",
+        '"x"',
+        None,
+    ):
+        save(RemoteBox("box-2", box.instance_id, box.region, "work"))
+        target = tmp_path / "remote" / f"{box.name}.json"
+        if content is None:
+            target.mkdir()
+        else:
+            target.write_text(content, encoding="utf-8")
+        runner = CliRunner()
+        checked = runner.invoke(cli, ["remote", "check", box.name])
+        listed = runner.invoke(cli, ["remote", "list"])
+        assert checked.exit_code == 2
+        assert "invalid configuration" in checked.output
+        assert listed.exit_code == 0
+        assert listed.output.startswith("box-2\t")
+        if target.is_file():
+            target.unlink()
+        else:
+            target.rmdir()

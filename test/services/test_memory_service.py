@@ -378,10 +378,10 @@ class TestGetContextRespectsBudget:
 
         if context:
             # Should contain cao-memory tags
-            assert "<cao-memory>" in context
+            assert "<cao-memory " in context
             assert "</cao-memory>" in context
             # Content between tags should be under budget
-            inner = context.split("<cao-memory>")[1].split("</cao-memory>")[0]
+            inner = context.split(">", 1)[1].split("</cao-memory>")[0]
             assert len(inner) <= 600  # some overhead for tags/headers is OK
 
 
@@ -1266,6 +1266,148 @@ class TestSessionScopeIdRoundTrip:
         assert results == []
 
 
+class TestReadExactKeyScopeId:
+    """Exact reads honor the native folder identity selected by the caller."""
+
+    @pytest.mark.asyncio
+    async def test_native_project_alias_reads_legacy_folder(self, tmp_path, monkeypatch):
+        from cli_agent_orchestrator.clients.database import record_project_alias
+        from cli_agent_orchestrator.services import memory_service, settings_service
+
+        service = MemoryService(base_dir=tmp_path / "native")
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(
+            settings_service, "get_vault_config", lambda: VaultConfig(enabled=False)
+        )
+        monkeypatch.setattr(
+            service,
+            "resolve_scope_id",
+            lambda scope, _context: "legacy-project" if scope == "project" else None,
+        )
+
+        await service.store(
+            content="legacy native project note",
+            scope="project",
+            memory_type="reference",
+            key="legacy-note",
+            terminal_context=_make_terminal_context(),
+        )
+        record_project_alias("canonical-project", "legacy-project", "cwd_hash")
+
+        memory = await service.read_exact_key(
+            "legacy-note",
+            scope="project",
+            scope_id="legacy-project",
+            scan_all=True,
+        )
+
+        assert memory is not None
+        assert memory.content == "legacy native project note"
+
+    @pytest.mark.asyncio
+    async def test_native_project_exact_key_rejects_another_project(self, tmp_path, monkeypatch):
+        from cli_agent_orchestrator.services import memory_service, settings_service
+
+        service = MemoryService(base_dir=tmp_path / "native")
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(
+            settings_service, "get_vault_config", lambda: VaultConfig(enabled=False)
+        )
+
+        await service.store(
+            content="project one note",
+            scope="project",
+            memory_type="reference",
+            key="shared-key",
+            terminal_context=_make_terminal_context(cwd=str(tmp_path / "project-one")),
+        )
+
+        assert (
+            await service.read_exact_key(
+                "shared-key",
+                scope="project",
+                scope_id="project-two",
+                scan_all=True,
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_native_session_exact_key_rejects_another_session(self, tmp_path, monkeypatch):
+        from cli_agent_orchestrator.services import memory_service, settings_service
+
+        service = MemoryService(base_dir=tmp_path / "native")
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(
+            settings_service, "get_vault_config", lambda: VaultConfig(enabled=False)
+        )
+
+        await service.store(
+            content="session one note",
+            scope="session",
+            memory_type="reference",
+            key="shared-key",
+            terminal_context=_make_terminal_context(session_name="session-one"),
+        )
+
+        assert (
+            await service.read_exact_key(
+                "shared-key",
+                scope="session",
+                scope_id="session-two",
+                scan_all=True,
+            )
+            is None
+        )
+
+
+class TestReadExactKeyScopeOrder:
+    """Unscoped exact reads preserve the scope precedence before recency."""
+
+    @pytest.mark.asyncio
+    async def test_unscoped_exact_key_prefers_session_over_newer_global(
+        self, tmp_path, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import memory_service, settings_service
+
+        service = MemoryService(base_dir=tmp_path / "native")
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(
+            settings_service, "get_vault_config", lambda: VaultConfig(enabled=False)
+        )
+        session = await service.store(
+            content="session note",
+            scope="session",
+            memory_type="reference",
+            key="shared-key",
+            terminal_context=_make_terminal_context(),
+        )
+        _backdate_memory(
+            Path(session.file_path),
+            service,
+            "session",
+            "test-session",
+            "2020-01-01T00:00:00Z",
+        )
+        await service.store(
+            content="newer global note",
+            scope="global",
+            memory_type="reference",
+            key="shared-key",
+        )
+
+        session_memory = service._load_related_memory("shared-key", "session", "test-session")
+        global_memory = service._load_related_memory("shared-key", "global", None)
+        assert session_memory is not None
+        assert global_memory is not None
+        assert session_memory.updated_at < global_memory.updated_at
+
+        memory = await service.read_exact_key("shared-key", scan_all=True)
+
+        assert memory is not None
+        assert memory.content == "session note"
+
+
 class TestVaultScopeAuthority:
     """Configured vault mappings replace native visibility for their identity."""
 
@@ -1311,6 +1453,93 @@ class TestVaultScopeAuthority:
         monkeypatch.setattr(settings_service, "get_vault_config", lambda: config)
 
         assert await service.recall(search_mode="metadata", limit=10) == []
+
+    @pytest.mark.asyncio
+    async def test_unscoped_exact_key_hides_native_replica_for_index_disabled_mapping(
+        self, tmp_path, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import memory_service, settings_service
+
+        service = MemoryService(base_dir=tmp_path / "native")
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(
+            settings_service, "get_vault_config", lambda: VaultConfig(enabled=False)
+        )
+        await service.store(
+            content="retained native global replica",
+            scope="global",
+            memory_type="reference",
+            key="native-replica",
+        )
+
+        vault_root = tmp_path / "vault"
+        vault_root.mkdir()
+        config = VaultConfig(
+            enabled=True,
+            vaults=[
+                VaultSpec(
+                    id="scope-test",
+                    root=str(vault_root),
+                    managed_folder="CAO",
+                    mappings=[
+                        FolderMapping(folder="Mapped", scope="global", index=False),
+                        FolderMapping(
+                            folder="CAO", scope="agent", scope_id="writer", writable=True
+                        ),
+                    ],
+                )
+            ],
+        )
+        monkeypatch.setattr(settings_service, "get_vault_config", lambda: config)
+
+        assert await service.read_exact_key("native-replica", scan_all=True) is None
+
+    @pytest.mark.asyncio
+    async def test_unscoped_exact_key_rejects_vault_global_for_other_scope_id(
+        self, tmp_path, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import memory_service, settings_service
+
+        vault_root = tmp_path / "vault"
+        vault_root.mkdir()
+        config = VaultConfig(
+            enabled=True,
+            vaults=[
+                VaultSpec(
+                    id="scope-test",
+                    root=str(vault_root),
+                    managed_folder="CAO",
+                    mappings=[
+                        FolderMapping(folder="Mapped", scope="global"),
+                        FolderMapping(
+                            folder="CAO", scope="agent", scope_id="writer", writable=True
+                        ),
+                    ],
+                )
+            ],
+        )
+        service = MemoryService(base_dir=tmp_path / "native")
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(settings_service, "get_vault_config", lambda: config)
+        vault_memory = Memory(
+            id="global:vault-key",
+            key="vault-key",
+            memory_type="reference",
+            scope="global",
+            scope_id=None,
+            file_path=str(vault_root / "Mapped" / "vault-key.md"),
+            created_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            updated_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            content="vault global note",
+            source_kind="vault",
+        )
+
+        def load_vault_memory(*_args, **_kwargs):
+            return vault_memory
+
+        monkeypatch.setattr(service, "_load_related_vault_memory", load_vault_memory)
+
+        assert await service.read_exact_key("vault-key", scope_id="other", scan_all=True) is None
 
     @pytest.mark.asyncio
     async def test_unscoped_recall_only_uses_callers_project_vault_mapping(

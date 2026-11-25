@@ -34,14 +34,21 @@ def canonical_root(root: Union[str, Path]) -> Optional[str]:
     """Realpath-canonicalize a plugin root.
 
     Returns ``None`` when the path cannot be canonicalized at all (a symlink
-    loop on the root itself, or an OS-level failure). Callers treat that as
-    "this is not a usable plugin root" rather than propagating the error —
-    validation is total.
+    loop on the root itself, an embedded NUL byte, a non-string path, or an
+    OS-level failure). Callers treat that as "this is not a usable plugin root"
+    rather than propagating the error — validation is total.
     """
     try:
-        return os.path.realpath(os.path.abspath(os.fspath(root)))
-    except OSError as exc:  # pragma: no cover - ELOOP/ENAMETOOLONG on the root
-        logger.warning("Could not canonicalize plugin root '%s': %s", root, exc)
+        raw = os.fspath(root)
+    except TypeError:
+        return None
+    if not isinstance(raw, str):
+        return None
+
+    try:
+        return os.path.realpath(os.path.abspath(raw))
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not canonicalize plugin root %r: %s", root, exc)
         return None
 
 
@@ -73,18 +80,20 @@ def resolve_within_root(
         raw = os.fspath(candidate)
     except TypeError:
         return None
-
-    if not os.path.isabs(raw):
-        raw = os.path.join(root_real, raw)
+    if not isinstance(raw, str):
+        return None
 
     try:
+        if not os.path.isabs(raw):
+            raw = os.path.join(root_real, raw)
+
         # os.path.realpath is recognized by CodeQL as a PathNormalization,
         # transitioning taint to NormalizedUnchecked; the guard below is the
         # matching SafeAccessCheck. Non-strict, so a broken or looping symlink
         # resolves as far as it can instead of raising.
         candidate_real = os.path.realpath(os.path.abspath(raw))
-    except OSError as exc:
-        logger.debug("Could not canonicalize '%s' under '%s': %s", candidate, root, exc)
+    except (OSError, ValueError) as exc:
+        logger.debug("Could not canonicalize %r under %r: %s", candidate, root, exc)
         return None
 
     if candidate_real == root_real:

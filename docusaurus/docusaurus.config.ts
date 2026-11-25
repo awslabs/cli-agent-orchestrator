@@ -1,6 +1,8 @@
 import {themes as prismThemes} from 'prism-react-renderer';
 import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
+// Records the npm packages in the client bundle, for the shipped-only dependency gate (#1398).
+import {docusaurusClientPackagesPlugin} from '../scripts/shipped-packages.mjs';
 
 const config: Config = {
   title: 'CLI Agent Orchestrator',
@@ -29,6 +31,8 @@ const config: Config = {
     defaultLocale: 'en',
     locales: ['en'],
   },
+
+  plugins: [docusaurusClientPackagesPlugin],
 
   presets: [
     [

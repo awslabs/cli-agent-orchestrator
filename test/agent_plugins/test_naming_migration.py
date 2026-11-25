@@ -2,16 +2,15 @@
 
 **Validates: Requirements 21.4, 21.5**
 
-Two things are asserted here, and neither resolves a maintainer decision.
+Two things are asserted here.
 
 The **docs vocabulary rule** — "event plugin" and "agent plugin" are always
 qualified, bare "plugin" only inside a document whose title already scopes it —
 is checked mechanically, because a rule enforced by review alone decays.
 
-The **retirement step** for renaming ``cao-plugin`` to ``cao-event-plugin`` is
-built and tested while its rename map stays empty. M4 is unresolved, so
-activating it must be a data edit rather than a migration project; the tests
-below drive the mechanism through a synthetic rename to prove that.
+The **retirement step** for renaming ``cao-plugin`` to ``cao-event-plugin``
+(decision M4) is active. The tests below drive the mechanism through a synthetic
+rename, and then through the real upgrade of an install that holds the old name.
 """
 
 from __future__ import annotations
@@ -25,6 +24,7 @@ from cli_agent_orchestrator.cli.commands import init as init_module
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DOCS = REPO_ROOT / "docs"
+V2_5_4_TREE = Path(__file__).parent / "fixtures" / "cao_plugin_v2_5_4_tree.json"
 
 
 class TestDocsVocabulary:
@@ -99,6 +99,7 @@ _UNSCOPED_DOCS = [
     # Gained an agent-plugin transport note in review 4 on #584 (item 5). Same
     # situation as the three above: CAO's own noun throughout, no vendor "Plugin".
     "kimi-cli.md",
+    "qwen-cli.md",
     # Gained an agent-plugin working-directory note in review 4 on #584 (item 4).
     # Each had ZERO plugin occurrences before, so the strict rule applies cleanly.
     "antigravity-cli.md",
@@ -108,10 +109,19 @@ _UNSCOPED_DOCS = [
     # PR #1000 (#827): "What an approval does not cover" names agent-plugin MCP
     # delivery as a launch input outside plan_id. CAO's own noun, qualified.
     "workflows.md",
+    # #1062: gained one agent-plugin reference, naming `cao-ops` as the operator
+    # context the ops-MCP gate leaves unchanged. It had ZERO plugin occurrences
+    # before, so the strict rule applies cleanly. (tool-restrictions.md gained the
+    # same reference but also carries a third party's bare noun: see
+    # _THIRD_PARTY_DOCS_CITING_AGENT_PLUGINS.)
+    "decisions.md",
     # PR #652: the weekly release does not count the bot's
     # `chore(agent-plugin): repin packages to vX.Y.Z` commit, and the doc quotes that
     # subject so an operator can recognise it. CAO's own noun, inside a code span.
     "RELEASING.md",
+    # Remote CAO guide: the only occurrences are AWS's own `session-manager-plugin`
+    # program, inside code spans. No CAO plugin system is mentioned.
+    "remote.md",
 ]
 
 #: Docs whose H1 scopes the noun ("# Event Plugins", "# Agent Plugins"), so bare
@@ -135,9 +145,13 @@ _VOCABULARY_BACKLOG_DOCS = [
     # Its one bare "plugin" is the operator's Claude Code plugins (the subagent bullet:
     # "can be any agent in the operator's Claude Code agent store or plugins"). That is
     # Claude Code's own extension system, not a CAO agent plugin, so no CAO qualifier fits.
-    # The doc does not cite CAO agent plugins, so it stays out of
-    # _THIRD_PARTY_DOCS_CITING_AGENT_PLUGINS.
+    # Since #1062 the doc ALSO cites CAO's agent plugins (the `cao-ops` operator
+    # context), so it is declared in _THIRD_PARTY_DOCS_CITING_AGENT_PLUGINS too.
     "tool-restrictions.md",
+    # Its two bare "plugin" mentions are Claude Code plugins and plugins installed in
+    # Kiro Crew, both reaching the CAO Shelf relay chat's model: third-party extension
+    # systems, not CAO agent or event plugins. It does not cite CAO agent plugins.
+    "kiro-crew.md",
 ]
 
 #: Third-party-plugin docs that **also** legitimately reference CAO's agent
@@ -165,6 +179,10 @@ _THIRD_PARTY_DOCS_CITING_AGENT_PLUGINS = [
     # Its bare noun is Cursor's own plugin manifest, which no CAO qualifier fits, so
     # it takes the narrower promise here rather than moving to _UNSCOPED_DOCS.
     "cursor-cli.md",
+    # #1062 names `cao-ops` in the operator agent-plugin as the operator context the
+    # ops-MCP gate leaves unchanged (qualified spelling). Its one bare noun is the
+    # operator's Claude Code plugins, which no CAO qualifier fits.
+    "tool-restrictions.md",
 ]
 
 #: Every spelling that counts as *qualified* when naming CAO's agent plugins.
@@ -376,27 +394,233 @@ class TestNoPluginDocIsSilentlyExempt:
     # OpenCode line.
 
 
-class TestRenameRetirementIsPreparedNotActivated:
-    """Requirement 21.5 — the mechanism exists; the decision does not."""
+class TestCaoPluginRenameIsActive:
+    """Decision M4: ``cao-plugin`` is now ``cao-event-plugin``."""
 
-    def test_the_rename_map_is_empty_pending_m4(self):
-        """This document does not settle M4, so nothing is renamed yet."""
-        assert init_module.SKILL_RENAMES == {}
+    def test_the_rename_map_holds_the_m4_pair(self):
+        assert init_module.SKILL_RENAMES == {"cao-plugin": "cao-event-plugin"}
 
-    def test_sync_skills_still_ships_the_current_name(self):
-        """No rename has been applied to the shipped allowlist either."""
+    def test_sync_skills_ships_only_the_new_name(self):
         import sys
 
         sys.path.insert(0, str(REPO_ROOT / "scripts"))
         import sync_skills
 
-        assert "cao-plugin" in sync_skills.SHIPPED_SKILLS
-        assert "cao-event-plugin" not in sync_skills.SHIPPED_SKILLS
+        assert "cao-event-plugin" in sync_skills.SHIPPED_SKILLS
+        assert "cao-plugin" not in sync_skills.SHIPPED_SKILLS
 
     def test_the_coupling_is_documented_where_a_renamer_would_look(self):
         """A future renamer reads the allowlist; the warning has to be there."""
         source = (REPO_ROOT / "scripts" / "sync_skills.py").read_text(encoding="utf-8")
         assert "SKILL_RENAMES" in source
+
+    def test_the_shipped_digests_are_pinned(self):
+        """Every tree a release shipped as ``cao-plugin``, from
+        ``scripts/skill_rename_digests.py``. A change here needs that script's
+        output, not a hand edit."""
+        assert init_module.SKILL_RENAME_SHIPPED_DIGESTS == {
+            "cao-plugin": frozenset(
+                {
+                    # v2.3.0 to v2.5.4 (git tree 99f6dbd)
+                    "28f1086f18e4f27759d4b0b79a7531c78b857e0f85d665533b381163da68ab42",
+                    # v2.5.5 (git tree 904a55c)
+                    "1e795b3964a4b6663526368f6bdfe3f2a02e9df01df4c2a3623e861608c90a81",
+                }
+            )
+        }
+
+    def test_every_renamed_skill_has_a_digest_entry(self):
+        assert set(init_module.SKILL_RENAME_SHIPPED_DIGESTS) == set(init_module.SKILL_RENAMES)
+
+    def test_the_v2_5_4_fixture_is_the_tagged_tree(self):
+        """The fixture is the release's bytes, when the checkout has the tag."""
+        import json
+        import subprocess
+
+        files = json.loads(V2_5_4_TREE.read_text(encoding="utf-8"))["files"]
+        prefix = "src/cli_agent_orchestrator/skills/cao-plugin"
+        try:
+            listing = subprocess.run(
+                ["git", "ls-tree", "-r", "--name-only", "v2.5.4", prefix],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.split()
+        except (OSError, subprocess.CalledProcessError):
+            pytest.skip("release tag v2.5.4 is not in this checkout")
+        if not listing:
+            pytest.skip("release tag v2.5.4 is not in this checkout")
+        assert sorted(n[len(prefix) + 1 :] for n in listing) == sorted(files)
+        for name in listing:
+            blob = subprocess.run(
+                ["git", "show", f"v2.5.4:{name}"], cwd=REPO_ROOT, check=True, capture_output=True
+            ).stdout
+            assert blob.decode("utf-8") == files[name[len(prefix) + 1 :]], name
+
+    def test_the_v2_5_4_fixture_has_the_recorded_digest(self, tmp_path):
+        folder = TestUpgradeFromTheOldSkillName._install_release_copy(tmp_path)
+        assert (
+            init_module._skill_tree_digest(folder)
+            in init_module.SKILL_RENAME_SHIPPED_DIGESTS["cao-plugin"]
+        )
+
+
+class TestUpgradeFromTheOldSkillName:
+    """An install that holds the old ``cao-plugin`` folder ends with the new one."""
+
+    @pytest.fixture
+    def store(self, tmp_path, monkeypatch):
+        path = tmp_path / "skills"
+        path.mkdir()
+        monkeypatch.setattr(init_module, "SKILLS_DIR", path)
+        return path
+
+    @staticmethod
+    def _install_old_copy(store: Path) -> Path:
+        """What a pre-rename ``cao init`` from unreleased ``main`` left behind:
+        today's skill under the old name."""
+        import shutil
+        from importlib import resources
+
+        with resources.as_file(
+            resources.files("cli_agent_orchestrator.skills") / "cao-event-plugin"
+        ) as packaged:
+            old = store / "cao-plugin"
+            shutil.copytree(packaged, old)
+        skill_md = old / "SKILL.md"
+        text = skill_md.read_text(encoding="utf-8").replace(
+            "name: cao-event-plugin", "name: cao-plugin", 1
+        )
+        skill_md.write_text(text, encoding="utf-8")
+        return old
+
+    @staticmethod
+    def _install_release_copy(store: Path) -> Path:
+        """What ``cao init`` from v2.3.0 to v2.5.4 left behind: the exact bytes of
+        the v2.5.4 ``cao-plugin`` tree, whose text is not today's (#1119 changed it)."""
+        import json
+
+        old = store / "cao-plugin"
+        files = json.loads(V2_5_4_TREE.read_text(encoding="utf-8"))["files"]
+        for rel, text in files.items():
+            target = old / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(text.encode("utf-8"))
+        return old
+
+    def test_old_folder_is_replaced_and_no_stale_dir_remains(self, store):
+        old = self._install_old_copy(store)
+
+        init_module.seed_default_skills()
+
+        assert (store / "cao-event-plugin" / "SKILL.md").is_file()
+        assert not old.exists()
+        assert not (store / "cao-plugin").exists()
+
+    def test_the_rename_is_idempotent(self, store):
+        self._install_old_copy(store)
+
+        init_module.seed_default_skills()
+        first = sorted(p.name for p in store.iterdir())
+        assert init_module.seed_default_skills() == 0
+        assert sorted(p.name for p in store.iterdir()) == first
+        assert "cao-plugin" not in first
+
+    def test_a_customized_old_folder_is_kept(self, store, caplog):
+        old = self._install_old_copy(store)
+        (old / "notes.md").write_text("mine", encoding="utf-8")
+
+        with caplog.at_level("WARNING"):
+            init_module.seed_default_skills()
+
+        assert (store / "cao-event-plugin").is_dir()
+        assert (old / "notes.md").is_file()
+        assert "may hold local edits" in caplog.text
+
+    def test_a_release_seeded_copy_is_retired_without_a_warning(self, store, caplog):
+        """Every install seeded by v2.3.0 to v2.5.4 holds this tree. It differs
+        from today's skill, but its digest is a shipped one, so it is retired."""
+        old = self._install_release_copy(store)
+        assert init_module._trees_differ(old, self._packaged_new()), "fixture must be older text"
+
+        with caplog.at_level("WARNING"):
+            init_module.seed_default_skills()
+
+        assert (store / "cao-event-plugin" / "SKILL.md").is_file()
+        assert not old.exists()
+        assert "cao-plugin" not in caplog.text
+
+    def test_a_release_copy_is_not_retired_before_its_replacement_exists(self, store):
+        """A shipped digest is not enough on its own: with no ``cao-event-plugin``
+        folder, retiring ``cao-plugin`` would leave the store with neither."""
+        old = self._install_release_copy(store)
+
+        assert init_module._retire_renamed_skills() == []
+        assert old.is_dir()
+
+    def test_an_edited_release_copy_is_kept_with_a_warning(self, store, caplog):
+        """The same release tree with one edited line is no longer a shipped tree."""
+        old = self._install_release_copy(store)
+        skill_md = old / "SKILL.md"
+        skill_md.write_text(
+            skill_md.read_text(encoding="utf-8") + "\nMy own note.\n", encoding="utf-8"
+        )
+
+        with caplog.at_level("WARNING"):
+            init_module.seed_default_skills()
+
+        assert (store / "cao-event-plugin" / "SKILL.md").is_file()
+        assert (old / "SKILL.md").is_file()
+        assert "cao-plugin" in caplog.text and "may hold local edits" in caplog.text
+        assert "local modifications" not in caplog.text
+
+    @pytest.mark.parametrize("extra", ["notes.md", ".notes"])
+    def test_a_release_copy_with_an_extra_file_is_kept(self, store, caplog, extra):
+        """The digest decides a deletion, so it must cover every file, dotfiles
+        included: a release tree plus one file of the operator's is not shipped."""
+        old = self._install_release_copy(store)
+        (old / extra).write_text("mine", encoding="utf-8")
+
+        with caplog.at_level("WARNING"):
+            init_module.seed_default_skills()
+
+        assert (old / extra).is_file()
+        assert "may hold local edits" in caplog.text
+
+    def test_a_release_copy_that_cannot_be_read_is_kept(self, store, caplog, monkeypatch):
+        """An unreadable file gives no digest, and no digest is never "shipped".
+
+        ``_trees_differ`` walks a set, so whether it reaches the unreadable file
+        (and raises, which also keeps the folder) or ``SKILL.md`` first depends on
+        the process's hash seed. It is pinned to "differs", which the v2.5.4 text
+        does anyway, so the digest alone decides here.
+        """
+        import os
+
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            pytest.skip("root can read a mode-000 file")
+        monkeypatch.setattr(init_module, "_trees_differ", lambda left, right: True)
+        old = self._install_release_copy(store)
+        unreadable = old / "references" / "plugin-template.md"
+        unreadable.chmod(0)
+        try:
+            assert init_module._skill_tree_digest(old) is None
+            with caplog.at_level("WARNING"):
+                init_module.seed_default_skills()
+            assert unreadable.exists()
+            assert "may hold local edits" in caplog.text
+        finally:
+            unreadable.chmod(0o644)
+
+    @staticmethod
+    def _packaged_new() -> Path:
+        from importlib import resources
+
+        with resources.as_file(
+            resources.files("cli_agent_orchestrator.skills") / "cao-event-plugin"
+        ) as packaged:
+            return Path(packaged)
 
 
 class TestRetirementMechanism:
@@ -441,7 +665,7 @@ class TestRetirementMechanism:
 
         assert retired == []
         assert (skills_dir / "old-name").exists()
-        assert "local modifications" in caplog.text
+        assert "may hold local edits" in caplog.text
 
     def test_nothing_is_retired_before_the_replacement_exists(self, skills_dir, monkeypatch):
         self._write(skills_dir / "old-name", "old-name")
@@ -458,6 +682,47 @@ class TestRetirementMechanism:
 
         assert init_module._retire_renamed_skills() == []
         assert (skills_dir / "old-name").exists()
+
+    def test_a_missing_file_counts_as_a_modification(self, skills_dir, monkeypatch):
+        """An old copy the operator deleted a reference file from is an edit."""
+        old = self._write(skills_dir / "old-name", "old-name")
+        new = self._write(skills_dir / "new-name", "new-name")
+        (new / "references").mkdir()
+        (new / "references" / "guide.md").write_text("v1", encoding="utf-8")
+        assert not (old / "references").exists()
+        monkeypatch.setattr(init_module, "SKILL_RENAMES", {"old-name": "new-name"})
+
+        assert init_module._retire_renamed_skills() == []
+        assert (skills_dir / "old-name").exists()
+
+    def test_a_body_name_line_is_content(self, skills_dir, monkeypatch):
+        """Only the frontmatter ``name:`` line is ignored; one in the body, such as
+        a YAML example, is content, so an edit to it keeps the folder."""
+        self._write(skills_dir / "old-name", "old-name", body="```yaml\nname: my-edit\n```")
+        self._write(skills_dir / "new-name", "new-name", body="```yaml\nname: example\n```")
+        monkeypatch.setattr(init_module, "SKILL_RENAMES", {"old-name": "new-name"})
+
+        assert init_module._retire_renamed_skills() == []
+        assert (skills_dir / "old-name").exists()
+
+    def test_a_listed_digest_retires_a_folder_that_differs(self, skills_dir, monkeypatch):
+        old = self._write(skills_dir / "old-name", "old-name", body="Release text.")
+        self._write(skills_dir / "new-name", "new-name", body="Current text.")
+        monkeypatch.setattr(init_module, "SKILL_RENAMES", {"old-name": "new-name"})
+        monkeypatch.setattr(
+            init_module,
+            "SKILL_RENAME_SHIPPED_DIGESTS",
+            {"old-name": frozenset({init_module._skill_tree_digest(old)})},
+        )
+
+        assert init_module._retire_renamed_skills() == ["old-name"]
+
+    def test_the_digest_ignores_only_the_frontmatter_name(self, tmp_path):
+        a = self._write(tmp_path / "a", "a")
+        b = self._write(tmp_path / "b", "b")
+        c = self._write(tmp_path / "c", "c", body="Different.")
+        assert init_module._skill_tree_digest(a) == init_module._skill_tree_digest(b)
+        assert init_module._skill_tree_digest(a) != init_module._skill_tree_digest(c)
 
     def test_reference_files_are_compared_too(self, skills_dir, monkeypatch):
         old = self._write(skills_dir / "old-name", "old-name")
@@ -492,7 +757,8 @@ class TestRetirementMechanism:
 
         assert init_module._retire_renamed_skills() == []  # logged, not raised
 
-    def test_an_empty_map_is_a_no_op(self, skills_dir):
+    def test_an_empty_map_is_a_no_op(self, skills_dir, monkeypatch):
+        monkeypatch.setattr(init_module, "SKILL_RENAMES", {})
         self._write(skills_dir / "cao-plugin", "cao-plugin")
 
         assert init_module._retire_renamed_skills() == []

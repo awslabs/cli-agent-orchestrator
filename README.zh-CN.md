@@ -422,7 +422,7 @@ Plugins 是 observer-only 的 Python 扩展，会在 `cao-server` 内部响应 s
 
 - **安装、事件、故障排查**：[docs/plugins.md](docs/plugins.md)
 - **可直接运行的示例**：[examples/plugins/cao-discord/](examples/plugins/cao-discord/)
-- **编写自己的 plugin**：[cao-plugin skill](skills/cao-plugin/SKILL.md)
+- **编写自己的 plugin**：[cao-event-plugin skill](skills/cao-event-plugin/SKILL.md)
 - **plugins 与 inbound surfaces 的关系**：[docs/control-planes.md](docs/control-planes.md)
 
 ## 安全

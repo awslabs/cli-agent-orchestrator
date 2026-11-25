@@ -36,10 +36,10 @@ def _addopts() -> str:
 
 
 def _ci_coverage_invocations() -> list[str]:
-    """Each multi-line ``uv run pytest ... --cov=...`` block in ci.yml."""
+    """The package-wide coverage run, excluding provider-only coverage targets."""
     text = CI_WORKFLOW.read_text()
     blocks = re.findall(r"uv run pytest(?:[^\n]*\\\n)*[^\n]*", text)
-    return [b for b in blocks if "--cov=src/cli_agent_orchestrator" in b]
+    return [b for b in blocks if re.search(r"--cov=src/cli_agent_orchestrator(?:\s|\\)", b)]
 
 
 class TestBranchCoverageIsCollected:
@@ -49,11 +49,11 @@ class TestBranchCoverageIsCollected:
             "invisible in term-missing until CI"
         )
 
-    def test_both_ci_invocations_request_branch_data(self):
+    def test_ci_invocation_requests_branch_data(self):
         invocations = _ci_coverage_invocations()
-        assert len(invocations) == 2, (
-            "expected exactly the two package-coverage pytest invocations in ci.yml "
-            f"(build-and-test and the ratchet feed); found {len(invocations)} -- "
+        assert len(invocations) == 1, (
+            "expected the Unit Tests package-coverage pytest invocation in ci.yml; "
+            f"found {len(invocations)} -- "
             "update this guard along with the workflow"
         )
         missing = [i.splitlines()[0] for i in invocations if "--cov-branch" not in i]

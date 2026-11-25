@@ -1,0 +1,30 @@
+{
+  "session": {
+    "id": "cao-infra-audit",
+    "name": "cao-infra-audit",
+    "status": "detached"
+  },
+  "terminals": [
+    {
+      "id": "3cfe1532",
+      "tmux_session": "cao-infra-audit",
+      "tmux_window": "conductor",
+      "provider": "mock_cli",
+      "agent_profile": "supervisor",
+      "description": null,
+      "model": null,
+      "model_honored": null,
+      "ephemeral": false,
+      "working_directory": "/work/example",
+      "engine": null,
+      "deferred_init_failure": null,
+      "deferred_init_external_owner": false,
+      "deferred_init_runtime_reclaimed": false,
+      "session_incarnation_id": "9cdbd333",
+      "kept_until": null,
+      "last_active": "2026-11-06T12:00:00.000000Z",
+      "pending_inbox_count": 0,
+      "status": "idle"
+    }
+  ]
+}

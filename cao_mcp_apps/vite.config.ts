@@ -17,6 +17,7 @@ import { resolve } from "node:path";
 import react from "@vitejs/plugin-react";
 import { defineConfig, type UserConfig } from "vite";
 import { viteSingleFile } from "vite-plugin-singlefile";
+import { bundledPackagesPlugin } from "../scripts/shipped-packages.mjs";
 
 // Absolute path to the package-shipped artifact directory.
 export const APPS_STATIC_DIR = resolve(
@@ -33,7 +34,18 @@ export const APPS_STATIC_DIR = resolve(
 export function makeViewConfig(view: string, htmlName: string): UserConfig {
   return defineConfig({
     root: resolve(__dirname, "src", view),
-    plugins: [react(), viteSingleFile()],
+    plugins: [
+      react(),
+      viteSingleFile(),
+      // Records the npm packages this view bundles, for the shipped-only dependency gate (#1398).
+      bundledPackagesPlugin({ project: "cao_mcp_apps", config: view, projectRoot: __dirname }),
+    ],
+    // Worker bundles are built in a separate pass; record them too (no worker today, so no record).
+    worker: {
+      plugins: () => [
+        bundledPackagesPlugin({ project: "cao_mcp_apps", config: `${view}-worker`, projectRoot: __dirname }),
+      ],
+    },
     build: {
       target: "es2021",
       outDir: APPS_STATIC_DIR,

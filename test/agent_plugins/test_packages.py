@@ -194,10 +194,10 @@ class TestContributorPackage:
         assert manifest_of(CONTRIBUTOR_DIR)["name"] == "cao-contributor"
 
     def test_it_ships_the_authoring_skills(self):
-        """Requirement 2.3, under the current pre-M4 skill name."""
+        """Requirement 2.3."""
         names = set(validate_plugin(CONTRIBUTOR_DIR).skill_names)
         assert "cao-provider" in names
-        assert "cao-plugin" in names or "cao-event-plugin" in names
+        assert "cao-event-plugin" in names
 
     def test_it_excludes_operator_skills(self):
         """Requirement 2.4."""
