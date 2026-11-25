@@ -865,6 +865,15 @@ class TestReadOnRealHerdrBackend:
         ]
 
 
+def _status_writes(update: MagicMock) -> List[Any]:
+    """``update_message_status`` calls as (message id, status).
+
+    Positional arguments only, so a keyword the claim grows (#1497 adds
+    ``expected_status``) does not break the tests that count the writes.
+    """
+    return [c.args for c in update.call_args_list]
+
+
 def _inbox_message() -> InboxMessage:
     from datetime import datetime
 
@@ -901,9 +910,9 @@ class TestInboxHoldsThenDelivers:
             service.deliver_pending("term-1")
 
             backend.send_keys.assert_not_called()
-            assert update.call_args_list == [
-                call(1, MessageStatus.DELIVERED),
-                call(1, MessageStatus.PENDING),
+            assert _status_writes(update) == [
+                (1, MessageStatus.DELIVERED),
+                (1, MessageStatus.PENDING),
             ]
 
             # The human answers; the pane is an ordinary idle prompt again.
@@ -914,7 +923,7 @@ class TestInboxHoldsThenDelivers:
 
             backend.send_keys.assert_called_once()
             assert MESSAGE in backend.send_keys.call_args.args[2]
-            assert update.call_args_list == [call(1, MessageStatus.DELIVERED)]
+            assert _status_writes(update) == [(1, MessageStatus.DELIVERED)]
 
 
 class TestBareEnterRecovery:
@@ -1165,7 +1174,7 @@ class TestHoldEpisodeLogging:
 
             backend.send_keys.assert_called_once()
             assert MESSAGE in backend.send_keys.call_args.args[2]
-            assert update.call_args_list == [call(1, MessageStatus.DELIVERED)]
+            assert _status_writes(update) == [(1, MessageStatus.DELIVERED)]
             released = [r.getMessage() for r in caplog.records if RELEASED in r.getMessage()]
             assert released == [
                 "Native-status pane check released term-1: no dialog on screen any more"
