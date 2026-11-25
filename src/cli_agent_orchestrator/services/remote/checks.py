@@ -27,17 +27,21 @@ def _ok(result: RunResult) -> bool:
 
 
 def _version(result: RunResult) -> str:
-    return (
-        (result.stdout or result.stderr).strip().splitlines()[0]
-        if (result.stdout or result.stderr)
-        else ""
-    )
+    output = result.stdout.strip() or result.stderr.strip()
+    return output.splitlines()[0] if output else ""
 
 
-def _has_access_key(profile: str, aws_dir: Path) -> tuple[bool, Path | None]:
+def _home_path(value: str, home: Path) -> Path:
+    return home / value[2:] if value.startswith("~/") else Path(value)
+
+
+def _has_access_key(profile: str, home: Path) -> tuple[bool, Path | None]:
+    aws_dir = home / ".aws"
+    credentials_env = os.environ.get("AWS_SHARED_CREDENTIALS_FILE", "").strip()
+    config_env = os.environ.get("AWS_CONFIG_FILE", "").strip()
     filenames = (
-        Path(os.environ.get("AWS_SHARED_CREDENTIALS_FILE", aws_dir / "credentials")),
-        Path(os.environ.get("AWS_CONFIG_FILE", aws_dir / "config")),
+        _home_path(credentials_env, home) if credentials_env else aws_dir / "credentials",
+        _home_path(config_env, home) if config_env else aws_dir / "config",
     )
     for filename in filenames:
         parser = configparser.RawConfigParser()
@@ -45,7 +49,7 @@ def _has_access_key(profile: str, aws_dir: Path) -> tuple[bool, Path | None]:
             parser.read(filename, encoding="utf-8")
         except OSError:
             continue
-        except configparser.Error:
+        except (configparser.Error, UnicodeDecodeError):
             return False, filename
         sections = (profile, f"profile {profile}")
         if any(parser.has_option(section, "aws_access_key_id") for section in sections):
@@ -65,7 +69,7 @@ def _ssh_options(result: RunResult) -> dict[str, list[str]]:
 
 
 def _identity_path(value: str, home: Path) -> Path:
-    return home / value[2:] if value.startswith("~/") else Path(value)
+    return _home_path(value, home)
 
 
 def _tmux_supported(result: RunResult) -> bool:
@@ -100,18 +104,19 @@ def check_box(
     checks.append(
         Check("OK" if _ok(ssh) else "FIX", "ssh", "installed" if _ok(ssh) else "install OpenSSH")
     )
-    laptop_herdr = RunResult(1)
+    laptop_herdr_version = ""
     if box.mode == "herdr":
         laptop_herdr = runner.run(["herdr", "--version"])
+        laptop_herdr_version = _version(laptop_herdr) if _ok(laptop_herdr) else ""
         checks.append(
             Check(
-                "OK" if _ok(laptop_herdr) else "FIX",
+                "OK" if laptop_herdr_version else "FIX",
                 "herdr",
-                _version(laptop_herdr) if _ok(laptop_herdr) else "install herdr on the laptop",
+                laptop_herdr_version or "install herdr on the laptop",
             )
         )
     profile_listing = runner.run(["aws", "configure", "list-profiles"])
-    exists = box.aws_profile in profile_listing.stdout.splitlines()
+    exists = _ok(profile_listing) and box.aws_profile in profile_listing.stdout.splitlines()
     checks.append(
         Check(
             "OK" if exists else "FIX",
@@ -119,7 +124,7 @@ def check_box(
             box.aws_profile if exists else f"run aws configure sso --profile {box.aws_profile}",
         )
     )
-    has_key, invalid_aws_file = _has_access_key(box.aws_profile, home / ".aws")
+    has_key, invalid_aws_file = _has_access_key(box.aws_profile, home)
     checks.append(
         Check(
             "FIX" if has_key or invalid_aws_file else "OK",
@@ -240,7 +245,11 @@ def check_box(
                 "bash -lc 'herdr --version'",
             ]
         )
-        matching = _ok(remote_herdr) and _version(remote_herdr) == _version(laptop_herdr)
+        matching = (
+            _ok(remote_herdr)
+            and bool(laptop_herdr_version)
+            and _version(remote_herdr) == laptop_herdr_version
+        )
         checks.append(
             Check(
                 "OK" if matching else "FIX",
