@@ -110,9 +110,9 @@ class TestPackagingParity:
         missing = set(SHIPPED_SKILLS) - package_skill_dirs
         assert not missing, f"Shipped skills missing from package: {sorted(missing)}."
 
-    @pytest.mark.parametrize("name", ["cao-plugin", "cao-provider"])
+    @pytest.mark.parametrize("name", ["cao-event-plugin", "cao-provider"])
     def test_plugin_and_provider_skills_are_packaged(self, name):
-        """Workstream B: cao-plugin / cao-provider must ship so `cao init` seeds them."""
+        """Workstream B: cao-event-plugin / cao-provider must ship so `cao init` seeds them."""
         assert (PACKAGE_SKILLS_DIR / name / "SKILL.md").is_file()
         validate_skill_folder(PACKAGE_SKILLS_DIR / name)
 
@@ -127,10 +127,10 @@ class TestSeedDefaultSkillsClassroom:
         seeded_count = seed_default_skills()
 
         assert seeded_count >= len(SHIPPED_SKILLS)
-        for name in ["cao-mcp-apps", "mcp-apps-builder", "cao-plugin", "cao-provider"]:
+        for name in ["cao-mcp-apps", "mcp-apps-builder", "cao-event-plugin", "cao-provider"]:
             assert (skill_store / name / "SKILL.md").is_file(), f"{name} not seeded by cao init"
         # references/ subdirs must survive the seed copy.
-        assert (skill_store / "cao-plugin" / "references").is_dir()
+        assert (skill_store / "cao-event-plugin" / "references").is_dir()
         assert (skill_store / "cao-provider" / "references").is_dir()
 
 

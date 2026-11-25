@@ -511,7 +511,7 @@ AG-UI client on CAO without CAO-specific integration code:
 | Package | Install this if you are… | Skills | Also ships |
 |---|---|---|---|
 | [`cao`](../agent-plugin/cao) | **an operator** driving CAO from another client | `cao-session-management`, `cao-agent-routing`, `cao-supervisor-protocols`, `cao-worker-protocols` | the `cao-ops` MCP server |
-| [`cao-contributor`](../agent-plugin/cao-contributor) | **a contributor** extending CAO itself | `cao-provider`, `cao-plugin`, `cao-contributing` | — |
+| [`cao-contributor`](../agent-plugin/cao-contributor) | **a contributor** extending CAO itself | `cao-provider`, `cao-event-plugin`, `cao-contributing` | — |
 | [`cao-agent-plugin-lifecycle`](../agent-plugin/cao-agent-plugin-lifecycle) | **an author** writing a new Agent Plugins 1.0.0 package or auditing an existing one | `cao-agent-plugin-creator`, `cao-agent-plugin-audit` | — |
 | [`cao-ag-ui-builder`](../agent-plugin/cao-ag-ui-builder) (name provisional) | **a builder** writing a UI or client on CAO's AG-UI surface, against CAO `main` | `agui-author` | — |
 

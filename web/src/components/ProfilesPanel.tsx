@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { api, AgentProfileInfo, AgentProfileDetail, ProfileSearchResult, ProfileValidationMessage } from '../api'
-import { Package, Plus, Search, AlertTriangle, Copy, CopyPlus, FilePen, SlidersHorizontal, Tag, Trash2, Wrench, Loader2, Download } from 'lucide-react'
+import { api, AgentProfileInfo, AgentProfileDetail, ProfileSearchResult, ProfileValidationMessage, ProviderInfo } from '../api'
+import { Package, Plus, Search, AlertTriangle, Copy, CopyPlus, FilePen, FileUp, SlidersHorizontal, Tag, Trash2, Wrench, Loader2, Download, X, CheckCircle2 } from 'lucide-react'
+import { CustomSelect } from './CustomSelect'
 import { ProfileCreateModal } from './ProfileCreateModal'
 import { ProfileEditorModal } from './ProfileEditorModal'
 import { ConfirmModal } from './ConfirmModal'
@@ -14,6 +15,26 @@ import { useGeneration } from '../hooks/useGeneration'
  * Exported so the test can assert the constant rather than duplicate it.
  */
 export const SEARCH_DEBOUNCE_MS = 300
+
+/**
+ * Client-side checks for an install-from-file pick, mirroring the server
+ * (profile names match `[A-Za-z0-9_-]{1,64}`, content is capped at 256 KiB)
+ * so a bad pick is reported by file name instead of as a raw 400 or 422.
+ * Returns the problem, or null when the file can be sent.
+ */
+export const PROFILE_FILE_MAX_BYTES = 262_144
+
+/** The outcome banner above the Profiles header for an install attempt. */
+type InstallNotice = { kind: 'success' | 'error'; message: string }
+const errorNotice = (message: string): InstallNotice => ({ kind: 'error', message })
+const PROFILE_STEM_RE = /^[A-Za-z0-9_-]{1,64}$/
+export function profileFileProblem(file: File): string | null {
+  if (!file.name.endsWith('.md')) return 'not a .md file'
+  const stem = file.name.slice(0, -'.md'.length)
+  if (!PROFILE_STEM_RE.test(stem)) return 'file name must match [A-Za-z0-9_-]{1,64}.md'
+  if (file.size > PROFILE_FILE_MAX_BYTES) return 'larger than 256 KiB'
+  return null
+}
 
 /**
  * A list row is either a full-catalog entry (from `GET /agents/profiles`) or a
@@ -264,6 +285,15 @@ export function ProfilesPanel() {
   const [installOpen, setInstallOpen] = useState(false)
   const [installName, setInstallName] = useState('')
   const [installing, setInstalling] = useState(false)
+  // Provider for a typed-name or file install ('' = the profile's frontmatter
+  // provider, else the server default — the CLI's flag > frontmatter > default).
+  const [installProvider, setInstallProvider] = useState('')
+  const [providers, setProviders] = useState<ProviderInfo[]>([])
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+  // Install outcomes (success and failure) show in a banner at the top of the
+  // pane, not a snackbar: a multi-file report can be long, so it stays until
+  // the user closes it (or the next install attempt replaces it).
+  const [installNotice, setInstallNotice] = useState<InstallNotice | null>(null)
   const [editor, setEditor] = useState<{ mode: 'edit' | 'clone'; name: string } | null>(null)
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
   const [deleting, setDeleting] = useState(false)
@@ -327,6 +357,9 @@ export function ProfilesPanel() {
     if (!installOpen) return
     let cancelled = false
     api.getUiPresets().then(p => { if (!cancelled) setQuickInstalls(p.installs ?? []) })
+    // The provider list is a convenience: on failure the select keeps only
+    // the "profile default" entry and installs still work.
+    api.listProviders().then(p => { if (!cancelled) setProviders(p) }).catch(() => {})
     return () => { cancelled = true }
   }, [installOpen])
 
@@ -334,10 +367,11 @@ export function ProfilesPanel() {
     const source = preset ? preset.source : installName.trim()
     if (!source || installing) return
     setInstalling(true)
+    setInstallNotice(null)
     try {
-      const res = await api.installProfile(source, preset?.provider)
+      const res = await api.installProfile(source, preset ? preset.provider : (installProvider || undefined))
       if (res.success) {
-        showSnackbar({ type: 'success', message: res.message || `Installed '${source}'` })
+        setInstallNotice({ kind: 'success', message: res.message || `Installed '${source}'` })
         // Keep the row open after a chip so a set (e.g. three profiles) is three clicks.
         if (!preset) {
           setInstallOpen(false)
@@ -345,12 +379,64 @@ export function ProfilesPanel() {
         }
         await refreshCatalog()
       } else {
-        showSnackbar({ type: 'error', message: res.message || `Failed to install '${source}'` })
+        setInstallNotice(errorNotice(res.message || `Failed to install '${source}'`))
       }
     } catch (e: any) {
-      showSnackbar({ type: 'error', message: e?.detail || e?.message || `Failed to install '${source}'` })
+      const detail = typeof e?.detail === 'string' ? e.detail : e?.message
+      setInstallNotice(errorNotice(detail || `Failed to install '${source}'`))
     } finally {
       setInstalling(false)
+    }
+  }
+
+  // Install one or more local .md files — the `cao install ./agent.md`
+  // equivalent. The browser reads each file and sends its text with the stem
+  // as the name, so the server never reads a path. Files install one at a
+  // time, in selection order, and one summary reports the outcome.
+  const handleInstallFiles = async (files: File[]) => {
+    if (files.length === 0 || installing) return
+    setInstalling(true)
+    setInstallNotice(null)
+    const installed: string[] = []
+    const failed: string[] = []
+    try {
+      for (const file of files) {
+        const problem = profileFileProblem(file)
+        if (problem) {
+          failed.push(`${file.name}: ${problem}`)
+          continue
+        }
+        const stem = file.name.slice(0, -'.md'.length)
+        try {
+          const res = await api.installProfile(stem, installProvider || undefined, await file.text())
+          // The installed agent takes the frontmatter name, which can differ
+          // from the file stem (the store key), so name both when they differ.
+          if (res.success) {
+            const agent = res.agent_name || stem
+            installed.push(agent === stem ? agent : `${file.name} → ${agent}`)
+          }
+          else failed.push(`${file.name}: ${res.message || 'install failed'}`)
+        } catch (e: any) {
+          const detail = typeof e?.detail === 'string' ? e.detail : e?.message
+          failed.push(`${file.name}: ${detail || 'install failed'}`)
+        }
+      }
+      if (installed.length > 0) {
+        await refreshCatalog()
+        if (failed.length === 0) setInstallOpen(false)
+      }
+      if (failed.length > 0) {
+        const prefix = installed.length > 0 ? `Installed ${installed.join(', ')}. ` : ''
+        // Server messages often end with a period; drop it so the join
+        // reads "...differ; next.md: ..." rather than "...differ.; next.md".
+        setInstallNotice(errorNotice(`${prefix}Failed: ${failed.map(f => f.replace(/\.+\s*$/, '')).join('; ')}`))
+      } else {
+        setInstallNotice({ kind: 'success', message: `Installed ${installed.join(', ')}` })
+      }
+    } finally {
+      setInstalling(false)
+      // Clear the input so picking the same file again fires onChange.
+      if (fileInputRef.current) fileInputRef.current.value = ''
     }
   }
 
@@ -480,6 +566,35 @@ export function ProfilesPanel() {
 
   return (
     <div className="space-y-4">
+      {installNotice && (
+        <div
+          role={installNotice.kind === 'error' ? 'alert' : 'status'}
+          data-testid={installNotice.kind === 'error' ? 'install-error' : 'install-success'}
+          className={`flex items-start gap-2 p-3 rounded-lg border text-sm ${
+            installNotice.kind === 'error'
+              ? 'bg-red-900/20 border-red-700/40 text-red-300'
+              : 'bg-emerald-900/20 border-emerald-700/40 text-emerald-300'
+          }`}
+        >
+          {installNotice.kind === 'error'
+            ? <AlertTriangle size={16} className="mt-0.5 shrink-0" aria-hidden="true" />
+            : <CheckCircle2 size={16} className="mt-0.5 shrink-0" aria-hidden="true" />}
+          <span className="flex-1 break-words">{installNotice.message}</span>
+          <button
+            type="button"
+            onClick={() => setInstallNotice(null)}
+            aria-label={installNotice.kind === 'error' ? 'Dismiss install error' : 'Dismiss install message'}
+            className={`shrink-0 rounded p-0.5 ${
+              installNotice.kind === 'error'
+                ? 'text-red-300 hover:bg-red-900/40 hover:text-red-100'
+                : 'text-emerald-300 hover:bg-emerald-900/40 hover:text-emerald-100'
+            }`}
+          >
+            <X size={16} aria-hidden="true" />
+          </button>
+        </div>
+      )}
+
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2.5">
           <Package size={20} className="text-blue-400" />
@@ -529,11 +644,22 @@ export function ProfilesPanel() {
             value={installName}
             onChange={e => setInstallName(e.target.value)}
             onKeyDown={e => { if (e.key === 'Enter') handleInstall() }}
-            placeholder="Profile name to install (e.g. reviewer)"
+            placeholder="Profile name or https:// URL (e.g. reviewer)"
             aria-label="Profile name to install"
             className="flex-1 bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-1.5 focus:border-emerald-500 focus:outline-none"
             autoFocus
           />
+          <div className="w-48 shrink-0">
+            <CustomSelect
+              ariaLabel="Install provider"
+              value={installProvider}
+              onChange={setInstallProvider}
+              options={[
+                { value: '', label: 'Profile default' },
+                ...providers.map(p => ({ value: p.name, label: p.name, sublabel: p.installed ? undefined : 'Not installed' })),
+              ]}
+            />
+          </div>
           <button
             onClick={() => handleInstall()}
             disabled={installing || !installName.trim()}
@@ -542,6 +668,25 @@ export function ProfilesPanel() {
             {installing ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
             {installing ? 'Installing…' : 'Install'}
           </button>
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={installing}
+            title="Install one or more local .md profile files, like `cao install ./agent.md`"
+            className="flex items-center gap-1.5 px-3 py-1.5 border border-gray-700 hover:bg-gray-800 disabled:opacity-40 text-gray-200 text-sm font-medium rounded-lg transition-colors"
+          >
+            <FileUp size={13} aria-hidden="true" /> From file…
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".md,text/markdown"
+            multiple
+            hidden
+            data-testid="install-file-input"
+            aria-label="Profile files to install"
+            onChange={e => handleInstallFiles(Array.from(e.target.files ?? []))}
+          />
         </div>
       )}
 

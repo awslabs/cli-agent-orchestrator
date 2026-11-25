@@ -25,7 +25,7 @@ Each step ends with a check, so a failure shows up at that step instead of three
 - [3. Create the AWS resources](#3-create-the-aws-resources)
 - [4. SSH over SSM, as the admin user](#4-ssh-over-ssm-as-the-admin-user)
 - [5. On the box: checkout, settings, bootstrap](#5-on-the-box-checkout-settings-bootstrap)
-- [6. Start the services and connect herdr](#6-start-the-services-and-connect-herdr)
+- [6. Check the services and connect herdr](#6-check-the-services-and-connect-herdr)
   - [6e. Attaching to the remote session](#6e-attaching-to-the-remote-session)
 - [7. The user's logins](#7-the-users-logins)
 - [8. The first agent](#8-the-first-agent)
@@ -84,7 +84,7 @@ to every `aws` command on the laptop; it is left out below to keep the lines sho
 3. Create the AWS resources (after the user's OK).
 4. SSH over SSM, as the admin user.
 5. On the box: the checkout, the settings file, `bootstrap.sh`, the user's key.
-6. Start the services, check them, and connect herdr.
+6. Check the services and connect herdr.
 7. The user's logins.
 8. The first agent.
 9. Optional: the CAO TUI.
@@ -638,7 +638,7 @@ mode 0700 and `authorized_keys` mode 0600, without duplicating the key.
 file has the one public key line (a public key is not a secret, but don't paste private keys
 anywhere).
 
-## 6. Start the services and connect herdr
+## 6. Check the services and connect herdr
 
 **6a. Check the units and `/health`** (README quick start, step 8). From the admin shell:
 the box user has no sudo, and shouldn't.
