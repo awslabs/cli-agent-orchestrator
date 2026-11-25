@@ -48,7 +48,7 @@ A flow that runs at regular intervals with a static prompt (no script needed).
 ```yaml
 ---
 name: daily-standup
-schedule: "0 9 * * 1-5"  # 9am weekdays
+schedule: "0 9 * * mon-fri"  # 9am weekdays
 agent_profile: developer
 provider: kiro_cli  # Optional, defaults to kiro_cli
 engine: v2          # Optional Kiro engine; v2 is the default, v3 (alias kas) is not launchable yet
@@ -56,6 +56,8 @@ engine: v2          # Optional Kiro engine; v2 is the default, v3 (alias kas) is
 
 Review yesterday's commits and create a standup summary.
 ```
+
+The scheduler (APScheduler) counts the day of week from Monday as `0`, so write weekdays as names (`mon-fri`), because a numeric `1-5` runs Tuesday through Saturday.
 
 ## Example 2: conditional execution with a health check
 
@@ -114,6 +116,55 @@ cao schedule run daily-standup
 # Remove a flow
 cao schedule remove daily-standup
 ```
+
+## Manage flows over the API
+
+`cao-server` has routes to check, create, and edit a flow, so you do not have to write the flow file yourself. [API Overview](api.md#flows) lists every flow route and its scopes. These three are the authoring routes.
+
+**Check a definition.** `POST /flows/validate` checks a definition and writes nothing. It takes `name`, `schedule`, `agent_profile`, `provider` (default `kiro_cli`), and `prompt_template`, and it needs the read, write, or admin scope.
+
+```bash
+curl -s -X POST http://localhost:9889/flows/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "daily-standup", "schedule": "0 9 * * mon-fri", "agent_profile": "developer"}'
+```
+
+The answer is `200` for any JSON object, whatever its values:
+
+```json
+{"valid": true, "errors": [], "next_runs": ["2026-11-23T09:00:00-08:00", "2026-11-24T09:00:00-08:00", "2026-11-25T09:00:00-08:00"]}
+```
+
+- `errors` holds one `{field, message}` entry for each field that fails: a name outside `^[A-Za-z0-9_-]{1,64}$`, a schedule the scheduler refuses, a schedule longer than 256 characters, a schedule that does not fire within 41 years (`this schedule never fires`), a control character in `schedule`, `agent_profile`, or `provider`, an empty or non-string `agent_profile` or `provider`, or a name that a registered flow already uses.
+- `next_runs` holds the next three fire times in the server's local time zone, computed by the scheduler. It is empty when the schedule has an error.
+- The route never writes a file or a row, takes no `script` field, and checks no path.
+
+**Create a flow.** `POST /flows` takes the same fields, plus an optional `enabled` boolean that defaults to `true`. Send `"enabled": false` to register the flow without arming it, then enable it with `POST /flows/{name}/enable` or `cao schedule enable`.
+
+**Edit a flow.** `PUT /flows/{name}` changes `schedule`, `agent_profile`, `provider`, and `prompt_template`. Each is optional, and a field you leave out keeps its stored value.
+
+```bash
+curl -s -X PUT http://localhost:9889/flows/daily-standup \
+  -H 'Content-Type: application/json' \
+  -d '{"schedule": "30 8 * * mon-fri"}'
+```
+
+- The server merges your fields over the stored flow, validates the result with the same rules as validate, and rewrites the flow file through a temporary file and a rename.
+- It edits only the front-matter keys you send, so `script`, `engine`, and any other key stay as they are. The server re-serializes the whole file, so comments inside the front matter are not kept.
+- An enabled flow gets a new `next_run`. A disabled flow stays disabled and keeps its stored `next_run`.
+- If the flow's file is not under `$CAO_HOME_DIR/flows` (by default `~/.aws/cli-agent-orchestrator/flows`), or no longer exists, the server answers `409` and does not touch the file. That includes flows you added with `cao schedule add ~/.cao/flows/<file>.md`. To edit such a flow through the API, move its file into `$CAO_HOME_DIR/flows`, then run `cao schedule remove <name>` and `cao schedule add <new path>`. The remove drops only the registration, and adding the flow again enables it. You can also edit the file by hand.
+- The body accepts only those four fields. Any other field, including `script`, answers `422`.
+- It needs the write or admin scope.
+
+### Changes for existing callers
+
+These changes affect `POST /flows` and `cao schedule add`. A request with a valid definition behaves as before.
+
+- **A bad definition answers 422 and writes nothing.** Before, a schedule the scheduler refused answered `404` after the flow file was already written. Now the route validates first and answers `422` with `{"detail": {"errors": [{"field": "...", "message": "..."}]}}`, and no file is created.
+- **The 422 body has more than one shape.** A body that fails parsing (a missing field, a wrong type, a `name` that contains `/`, `\`, or `..`, a control character in `schedule`, `agent_profile`, or `provider`, or an empty `agent_profile` or `provider`) keeps FastAPI's shape: `detail` is a list of `{loc, msg, type}` entries. A definition that parses but fails validation uses `detail.errors`. Any other `ValueError` while the server registers the file answers `422` with `detail` as a message string (it was `404`). Check whether `detail` is a list, an object, or a string before you read it.
+- **A name that is already registered answers 409.** Before, the route overwrote the existing flow file and then answered `500`. Now it answers `409` and leaves the file and the row unchanged. It also answers `409` when the new flow's file is the file another flow is registered from. A definition error takes precedence: a taken name with a bad schedule answers `422`.
+- **`enabled` is new and optional.** Callers that omit it still create enabled flows.
+- **`cao schedule add` applies the same checks.** It also refuses an empty `agent_profile` or `provider`, a control character in `schedule`, `agent_profile`, or `provider`, and a value that is not a string, such as an unquoted number as the name. The messages for a bad name or schedule start with the same text as before.
 
 ## Workflow scheduling example
 

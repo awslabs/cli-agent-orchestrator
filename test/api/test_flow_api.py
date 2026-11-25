@@ -144,6 +144,8 @@ class TestCreateFlow:
                 },
             )()
 
+            mock_svc.validate_flow_definition.return_value = []
+            mock_svc.find_create_conflict.return_value = None
             mock_svc.add_flow.return_value = sample_flow
 
             response = client.post(
@@ -164,6 +166,8 @@ class TestCreateFlow:
     def test_create_flow_server_error(self, client):
         """POST /flows returns 500 on internal error."""
         with patch("cli_agent_orchestrator.api.main.flow_service") as mock_svc:
+            mock_svc.validate_flow_definition.return_value = []
+            mock_svc.find_create_conflict.return_value = None
             mock_svc.add_flow.side_effect = Exception("DB error")
 
             # The endpoint writes a file first, so patch CAO_HOME_DIR too
@@ -211,26 +215,14 @@ class TestCreateFlow:
             )
             assert response.status_code == 422, f"Expected 422 for name={bad_name!r}"
 
-    def test_create_flow_value_error(self, client):
-        """POST /flows returns 404 when add_flow raises ValueError."""
-        with (
-            patch("cli_agent_orchestrator.api.main.flow_service") as mock_svc,
-            patch("cli_agent_orchestrator.api.main.CAO_HOME_DIR") as mock_home,
-        ):
-            mock_home.__truediv__ = lambda self, x: type(
-                "FakePath",
-                (),
-                {
-                    "mkdir": lambda self, **kw: None,
-                    "__truediv__": lambda self, x: type(
-                        "FakeFile",
-                        (),
-                        {"write_text": lambda self, t: None},
-                    )(),
-                },
-            )()
-
-            mock_svc.add_flow.side_effect = ValueError("Invalid flow file")
+    def test_create_flow_definition_error_is_422(self, client, sample_flow, tmp_path, monkeypatch):
+        """A definition that fails validation answers 422 with detail.errors and writes nothing."""
+        monkeypatch.setattr("cli_agent_orchestrator.api.main.CAO_HOME_DIR", tmp_path)
+        with patch("cli_agent_orchestrator.api.main.flow_service") as mock_svc:
+            mock_svc.validate_flow_definition.return_value = [
+                {"field": "schedule", "message": "bad cron"}
+            ]
+            mock_svc.add_flow.return_value = sample_flow
 
             response = client.post(
                 "/flows",
@@ -243,8 +235,40 @@ class TestCreateFlow:
                 },
             )
 
-            assert response.status_code == 404
-            assert "Invalid flow file" in response.json()["detail"]
+            assert response.status_code == 422
+            assert response.json()["detail"] == {
+                "errors": [{"field": "schedule", "message": "bad cron"}]
+            }
+            mock_svc.add_flow.assert_not_called()
+            assert not list(tmp_path.rglob("*.flow.md"))
+
+    def test_create_flow_asks_the_flow_service_whether_the_name_or_file_is_taken(
+        self, client, sample_flow, tmp_path, monkeypatch, isolated_memory_db
+    ):
+        """The route reads the registered flows only through flow_service, so a test that
+        replaces flow_service never touches a real flows table, and a conflict it reports
+        answers 409 before anything is written."""
+        monkeypatch.setattr("cli_agent_orchestrator.api.main.CAO_HOME_DIR", tmp_path)
+        with patch("cli_agent_orchestrator.api.main.flow_service") as mock_svc:
+            mock_svc.validate_flow_definition.return_value = []
+            mock_svc.find_create_conflict.return_value = "Flow 'taken-flow' already exists"
+            mock_svc.add_flow.return_value = sample_flow
+
+            response = client.post(
+                "/flows",
+                json={
+                    "name": "taken-flow",
+                    "schedule": "0 * * * *",
+                    "agent_profile": "developer",
+                    "provider": "kiro_cli",
+                    "prompt_template": "Do work.",
+                },
+            )
+
+            assert response.status_code == 409
+            assert mock_svc.find_create_conflict.call_args.args[0] == "taken-flow"
+            mock_svc.add_flow.assert_not_called()
+            assert not list(tmp_path.rglob("*.flow.md"))
 
     def test_create_flow_rejects_schedule_with_newline(self, client, tmp_path, monkeypatch):
         """A schedule embedding a newline and script key is rejected with 422 and
@@ -274,6 +298,8 @@ class TestCreateFlow:
         frontmatter.load with a single-line schedule and no script key."""
         monkeypatch.setattr("cli_agent_orchestrator.api.main.CAO_HOME_DIR", tmp_path)
         with patch("cli_agent_orchestrator.api.main.flow_service") as mock_svc:
+            mock_svc.validate_flow_definition.return_value = []
+            mock_svc.find_create_conflict.return_value = None
             mock_svc.add_flow.return_value = sample_flow
 
             response = client.post(

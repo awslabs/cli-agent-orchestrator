@@ -29,8 +29,11 @@ _MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 # travels in a JSON body — and mutate nothing (schema check / template render).
 # ``/agents/profiles/validate`` is the same shape: the profile content travels in
 # a JSON body and is checked against the profile schema without being persisted.
+# ``POST /flows/validate`` checks a flow definition and writes nothing; it is gated at the
+# read floor.
 _EXEMPT = {
     ("POST", "/workflows/validate"),
+    ("POST", "/flows/validate"),
     ("POST", "/agents/profiles/templates/validate"),
     ("POST", "/agents/profiles/templates/preview"),
     ("POST", "/agents/profiles/validate"),
