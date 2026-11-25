@@ -2262,6 +2262,63 @@ async def memory_get(
 
 
 @mcp.tool()
+async def memory_related(
+    key: str = Field(description="Key of the memory whose neighbours to inspect"),
+    scope: Optional[str] = Field(
+        default=None,
+        description=('Optional scope: "global", "project", "session", "agent", or "federated"'),
+    ),
+    depth: int = Field(default=1, description="Traversal depth, capped at 2", ge=1),
+    types: Optional[List[str]] = Field(
+        default=None,
+        description="Optional relationship types to follow",
+    ),
+    direction: str = Field(
+        default="both",
+        description='Traversal direction: "in", "out", or "both"',
+    ),
+    limit: int = Field(default=20, description="Maximum neighbours to return", ge=1, le=100),
+) -> Dict[str, Any]:
+    """Return content-free relationship edges and one-line neighbour hooks.
+
+    Traversal follows active edges only, in both directions by default, and is
+    capped at two hops. The caller's recall policy filters every neighbour.
+    """
+    from cli_agent_orchestrator.services.memory_gateway import (
+        related_memory,
+        remote_memory_url,
+    )
+    from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    if not is_memory_enabled():
+        return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
+    try:
+        terminal_context = _get_terminal_context_from_env()
+        if remote_memory_url():
+            return await related_memory(
+                key=key,
+                scope=scope,
+                depth=depth,
+                types=types,
+                direction=direction,
+                limit=limit,
+                terminal_context=terminal_context,
+            )
+        return await MemoryService().related(
+            key,
+            scope=scope,
+            depth=depth,
+            types=types,
+            direction=direction,
+            limit=limit,
+            terminal_context=terminal_context,
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
 async def memory_forget(
     key: str = Field(description="Key of the memory to remove (e.g. 'prefer-pytest')"),
     scope: str = Field(

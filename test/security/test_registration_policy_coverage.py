@@ -228,6 +228,7 @@ _CAO_MCP_EXEMPT: Dict[str, str] = {
     "memory_store": _IDENTITY_LOCAL,
     "memory_recall": _IDENTITY_LOCAL,
     "memory_get": _IDENTITY_LOCAL,
+    "memory_related": _READ_ONLY,
     "memory_forget": _IDENTITY_LOCAL,
     "report_outcome": _IDENTITY_LOCAL,
     "store_lesson": _IDENTITY_LOCAL,

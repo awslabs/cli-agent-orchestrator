@@ -6,7 +6,8 @@ CAO's memory system gives agents persistent, cross-session storage. Agents store
 ## Capabilities
 
 - **Five scopes** (`global`, `project`, `session`, `agent`, `federated`) and four type labels.
-- **Store** via the `memory_store` MCP tool; **recall / forget** via MCP tools or the `cao memory` CLI.
+- **Store / recall / related / forget** via MCP tools; **list / show / delete** via
+  the `cao memory` CLI.
 - **Markdown wiki storage** with a SQLite metadata index.
 - **Search**: keyword (BM25), recency, or hybrid; results ranked by recency, a
   composite 3-factor score (BM25 + recency + usage), or usage.
@@ -294,6 +295,35 @@ setting off and `detail="full"`, the pinned recall response is unchanged.
 article, while `edited_at` is the latest.
 For remote recall, enable `memory.recall.v2_fields` on both the worker and
 the memory-owner node; otherwise the worker omits the optional v2 fields.
+
+### `memory_related`
+
+Traverse active, same-scope relationships around one memory without returning
+memory bodies.
+
+```
+memory_related(
+  key="testing-framework",
+  scope="project",                 # optional; omission must resolve unambiguously
+  depth=1,                         # optional: 1 or 2
+  types=["relates_to"],            # optional relationship-type filter
+  direction="both",                # "in", "out", or "both"
+  limit=20                         # optional, maximum returned neighbours
+)
+```
+
+The result contains deterministic `edges` plus deduplicated `neighbours`; it
+includes each walked edge to a returned neighbour.
+Neighbour records carry identity, type, status, and a short content-derived
+`hook`; full memory content is deliberately omitted. Traversal applies the
+same recall visibility and eligibility rules at every hop, so a hidden memory
+cannot appear or bridge two visible memories. Only active edges participate;
+proposals are neither followed nor returned. An omitted scope returns
+`ambiguous_scope` when more than one visible memory has the key, and an absent
+key returns `not_found`. `memory_related` shows existing active edges from any
+producer, including human, compiler, and `content_link`; the
+`memory.relationships.content_links` setting controls only future authored-link
+edge production.
 
 ### `memory_forget`
 
@@ -602,7 +632,34 @@ shift. A later memory-v2 phase adds BM25 as the default ranking mode.
 Memories are linked by typed, provenance-tagged edges (`relates_to`,
 `contradiction`, `supersedes`) held in a durable store rather than inferred at
 read time. Each edge records its `origin` — `compiler`, `wiki_lint`, `human`,
-`legacy_related_keys`, `external_import`, or `vault` — and a `status`.
+`legacy_related_keys`, `external_import`, `vault`, or `content_link` — and a
+`status`.
+
+With `memory.relationships.content_links=true` (opt-in), native topic content
+is also a relationship producer. On store and repair, same-scope
+`[[wikilinks]]` and links under `## See Also` become active `relates_to` edges
+with `content_link` origin. Missing and cross-scope targets do not create an
+edge; `cao memory lint` reports them as stale claims. Recomputing content links
+replaces only that source/type/origin set and preserves human and other
+producer edges. CAO's own canonical generated `## See Also` projection is
+excluded from parsing so it cannot make a deleted edge self-sustaining. Generated
+lines are removed individually from a mixed `## See Also` section, leaving
+hand-authored lines available for parsing. Generated links use
+`- [key](../<scope_id or scope>/<key>.md)`: project, session, and agent notes
+use their scope ID as the folder; global notes use `global`. A hand-written
+bullet in that exact generated shape is also treated as generated; use
+`[[key]]` for an authored link. A `../<folder>/` link is cross-scope when the
+folder is neither the note's scope name nor its scope ID. With the setting on,
+compilation hides the `## See Also` section from the model and writes authored
+lines back afterward, including fenced blocks and their markers.
+
+Existing notes can be indexed after opting in by running `cao memory repair --apply`.
+Set the option to `true` (or set
+`CAO_MEMORY_RELATIONSHIPS_CONTENT_LINKS=true`) to enable future production.
+Previously produced edges remain until they are removed with
+`cao memory relationships reject <relationship-id>`; list them first with
+`cao memory relationships list --format json`. `memory_related` continues to
+show those and other existing active edges while content links are disabled.
 
 Writes are **producer-scoped**: when the compiler or linter recomputes its edges
 for a source memory, it replaces only rows carrying its own origin and type, so a

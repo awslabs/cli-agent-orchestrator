@@ -1749,7 +1749,14 @@ class TestMidBurstProcessingProbe:
         sm._schedule_screen_detection("t1", provider)  # mid-burst probe: spinner visible
         assert sm._last_status["t1"] == TerminalStatus.PROCESSING
 
-    def test_probe_is_rate_limited_and_never_applies_ready(self):
+    def test_probe_is_rate_limited_and_never_applies_ready(self, monkeypatch):
+        # The window is real time.monotonic(): on a loaded runner (pytest-xdist,
+        # #1408) more than the default 1.0 s passed between two calls and the
+        # third call probed again. Widen the module's own constant so "within
+        # the window" holds by construction, not by scheduling.
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.status_monitor.PYTE_MIDBURST_PROBE_S", 3600.0
+        )
         sm = self._bursting_monitor()
         # False == "this half-drawn frame does not show work", e.g. a frame
         # caught mid-repaint that still parses as the previous response box.

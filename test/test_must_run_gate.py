@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 from test._must_run import ENV_VAR, MARKER, active_gates, marker_gates
 from textwrap import dedent
+from types import SimpleNamespace
 
 import pytest
 
@@ -238,17 +239,153 @@ def test_marker_without_a_gate_name_is_reported_as_misuse(tmp_path, gates):
     assert "with no gate name" in result.stdout
 
 
-def test_gate_fails_closed_under_pytest_xdist(tmp_path):
-    """Under -n, collection runs on the xdist workers, not this controller plugin
-    instance -- it must fail closed rather than report "0 test(s) ... ran as
-    required" and exit 0 for a gate it never actually checked."""
+XDIST = ("-p", "xdist", "-n", "2", "--dist", "loadgroup")
+
+
+def test_skipped_must_run_test_fails_the_session_under_pytest_xdist(tmp_path):
+    """Under -n, collection and execution run on the workers. Each worker runs the
+    gate and the controller merges what they report, so a skip is still a failure."""
     _scratch_session(tmp_path, SKIPPING_TEST)
-    result = _run(tmp_path, "-p", "xdist", "-n", "2", gates="unit")
+    result = _run(tmp_path, *XDIST, gates="unit")
 
     assert result.returncode != 0, result.stdout + result.stderr
     assert "must_run: VIOLATION" in result.stdout
-    assert "pytest-xdist" in result.stdout
+    assert "SKIPPED (precondition vanished)" in result.stdout
     assert "ran as required" not in result.stdout
+
+
+def test_clean_run_passes_and_says_so_under_pytest_xdist(tmp_path):
+    _scratch_session(tmp_path, PASSING_TEST)
+    result = _run(tmp_path, *XDIST, gates="unit")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 test(s) for gate(s) ['unit'] ran as required" in result.stdout
+
+
+def test_deselected_must_run_test_fails_the_session_under_pytest_xdist(tmp_path):
+    _scratch_session(tmp_path, PASSING_TEST)
+    result = _run(tmp_path, *XDIST, "-k", "nothing_matches_this", gates="unit")
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "DESELECTED" in result.stdout or "no must_run test was collected" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("body", "passes"), [(PASSING_TEST, True), (SKIPPING_TEST, False)], ids=["pass", "skip"]
+)
+def test_the_gate_loads_and_enforces_without_pytest_xdist(tmp_path, body, passes):
+    """``pytest_testnodedown`` is an xdist hook. Without ``optionalhook`` a session
+    with xdist disabled refused the plugin (INTERNALERROR, exit 3)."""
+    _scratch_session(tmp_path, body)
+    result = _run(tmp_path, "-p", "no:xdist", gates="unit")
+    out = result.stdout + result.stderr
+
+    assert "INTERNALERROR" not in out
+    if passes:
+        assert result.returncode == 0, out
+        assert "1 test(s) for gate(s) ['unit'] ran as required" in out
+    else:
+        assert result.returncode == 1, out
+        assert "must_run: VIOLATION" in out
+
+
+CRASHING_WORKER_TEST = """
+    import os
+    from pathlib import Path
+
+    import pytest
+
+    @pytest.mark.must_run("unit")
+    def test_assurance():
+        assert True
+
+    def test_crash_one_worker_once():
+        flag = Path(os.environ["HOME"]) / "crashed-once"
+        if not flag.exists():
+            flag.write_text("1")
+            os._exit(1)
+"""
+
+
+def test_a_crashed_worker_fails_the_gate_through_real_controller_detection(tmp_path):
+    """The real controller detection (``hasplugin("dsession")``), not a hand-set
+    ``_is_controller``: one worker dies without reporting, so the gate must say
+    that only 1 of 2 workers reported rather than "ran as required"."""
+    _scratch_session(tmp_path, CRASHING_WORKER_TEST)
+    result = _run(tmp_path, *XDIST, "--max-worker-restart=0", gates="unit")
+    out = result.stdout + result.stderr
+
+    assert result.returncode != 0, out
+    assert "only 1 of 2 pytest-xdist worker(s) reported" in out
+    assert "ran as required" not in out
+
+
+def test_xdist_controller_fails_closed_when_no_worker_reports():
+    """A controller that enforces a gate but heard from no worker has checked nothing."""
+    from test._must_run import MustRunGate
+
+    gate = MustRunGate({"unit"})
+    gate._is_controller = True
+    session = SimpleNamespace(config=SimpleNamespace(), exitstatus=0)
+
+    gate.pytest_sessionfinish(session, 0)
+
+    assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+    assert any("no pytest-xdist worker reported" in v for v in gate.violations)
+
+
+def test_xdist_controller_fails_closed_when_one_worker_goes_down_unreported():
+    """One worker reporting is not enough if another went down without reporting."""
+    from test._must_run import WORKER_OUTPUT_KEY, MustRunGate
+
+    gate = MustRunGate({"unit"})
+    gate._is_controller = True
+    ok = SimpleNamespace(
+        workeroutput={WORKER_OUTPUT_KEY: {"violations": [], "misuses": [], "owned": ["a"]}}
+    )
+    crashed = SimpleNamespace(workeroutput={})
+    gate.pytest_testnodedown(ok, None)
+    gate.pytest_testnodedown(crashed, None)
+    session = SimpleNamespace(config=SimpleNamespace(), exitstatus=0)
+
+    gate.pytest_sessionfinish(session, 0)
+
+    assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+    assert any("only 1 of 2" in v for v in gate.violations)
+
+
+def test_xdist_controller_passes_when_every_worker_reported():
+    from test._must_run import WORKER_OUTPUT_KEY, MustRunGate
+
+    gate = MustRunGate({"unit"})
+    gate._is_controller = True
+    report = {"violations": [], "misuses": [], "owned": ["a"]}
+    for _ in range(2):
+        gate.pytest_testnodedown(SimpleNamespace(workeroutput={WORKER_OUTPUT_KEY: report}), None)
+    session = SimpleNamespace(config=SimpleNamespace(), exitstatus=0)
+
+    gate.pytest_sessionfinish(session, 0)
+
+    assert session.exitstatus == 0
+    assert gate.violations == []
+
+
+def test_xdist_controller_merges_worker_reports_without_duplicates():
+    from test._must_run import WORKER_OUTPUT_KEY, MustRunGate
+
+    gate = MustRunGate({"unit"})
+    report = {
+        "violations": ["a: SKIPPED"],
+        "misuses": [],
+        "owned": ["a", "b"],
+    }
+    for _ in range(2):  # every worker collects the same items
+        node = SimpleNamespace(workeroutput={WORKER_OUTPUT_KEY: report})
+        gate.pytest_testnodedown(node, None)
+
+    assert gate.violations == ["a: SKIPPED"]
+    assert gate.owned == ["a", "b"]
+    assert gate._workers_reported == 2
 
 
 # ---------------------------------------------------------------------------

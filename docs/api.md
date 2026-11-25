@@ -39,6 +39,8 @@ unaffected.
   peer node can rely on; `delegation_ceiling` means this node bounds created
   terminals by the caller's delegation ceiling and honours `caller_ceiling` (see
   [Tool Restrictions](tool-restrictions.md#cross-provider-inheritance)).
+  Its `instance_label` is the operator's name for this server
+  (`CAO_INSTANCE_LABEL`, null when unset), which the web UI shows in its header.
 - `GET /.well-known/oauth-protected-resource` publishes OAuth protected
   resource metadata when applicable.
 

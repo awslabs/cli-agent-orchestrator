@@ -1,0 +1,57 @@
+name: Nightly shuffled-order tests
+
+on:
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_LOCKED: "1"
+
+concurrency:
+  group: nightly-shuffled-order
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python 3.12 shuffled-order tests
+    if: github.repository == 'awslabs/cli-agent-orchestrator'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Run shuffled unit tests
+        run: |
+          while IFS= read -r name; do
+            case "$name" in
+              CAO_*) unset "$name" ;;
+            esac
+          done < <(compgen -e)
+          # This is the canary's one intentional CAO_* setting. Its value is
+          # printed by pytest and can reproduce a failed run locally.
+          export CAO_TEST_SHUFFLE_SEED="${{ github.run_id }}"
+          # CI intentionally includes integration-marked tests except for the Kiro
+          # provider test, which requires an authenticated external CLI.
+          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ examples/remote/ec2/tests/ \
+            --ignore=test/providers/test_kiro_cli_integration.py \
+            --ignore=test/e2e \
+            -m "not e2e" \
+            -v

@@ -13,8 +13,8 @@ available to a brand-new agent in a later session — even on a different provid
 the user never has to repeat themselves.
 
 These are CAO's cross-provider memory tools (`memory_store`, `memory_recall`,
-`memory_get`, `memory_forget`), exposed by the CAO MCP server. They are **distinct from any
-provider-native memory** the CLI tool may have.
+`memory_get`, `memory_related`, `memory_forget`), exposed by the CAO MCP server. They are
+**distinct from any provider-native memory** the CLI tool may have.
 
 ## Scopes and types
 
@@ -47,6 +47,13 @@ latest entry; pass `include_history=True` to fetch available history.
 Omit `scope` to search all scopes (results follow precedence session → project → global → agent → federated).
 Filter with `scope=` or `memory_type=` when you know where to look. Recall is for searching
 *beyond* what was auto-injected (see below) — don't re-recall what's already in front of you.
+
+Use `memory_related(key=..., scope=...)` to follow a stored memory's active
+relationships without loading full memory bodies. It returns short hooks and edge
+metadata, follows at most two hops, and does not surface proposed relationships.
+It shows existing human, compiler, and authored content-link edges; the
+opt-in `memory.relationships.content_links` setting only controls future
+authored-link edge production.
 
 ## Store — save anything worth remembering, immediately
 

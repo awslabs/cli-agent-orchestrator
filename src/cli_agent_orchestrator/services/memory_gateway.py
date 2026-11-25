@@ -51,9 +51,10 @@ def _post(path: str, body: dict[str, Any]) -> dict[str, Any]:
     )
     if response.status_code >= 400:
         try:
-            error = response.json()
+            raw_error = response.json()
         except (TypeError, ValueError):
-            error = {}
+            raw_error = {}
+        error: dict[str, Any] = raw_error if isinstance(raw_error, dict) else {}
         if error.get("error_kind") == MemoryPartialWriteError.error_kind:
             partial = error.get("partial_write")
             if isinstance(partial, dict):
@@ -67,6 +68,12 @@ def _post(path: str, body: dict[str, Any]) -> dict[str, Any]:
                             scope_id=scope_id,
                             file_path=partial["file_path"],
                         )
+        if path == "/internal/memory/related" and error.get("error_kind") in {
+            "not_found",
+            "ambiguous_scope",
+            "invalid_argument",
+        }:
+            return error
         if error.get("error_kind") == MemoryAmbiguousScopeError.error_kind:
             scopes = error.get("scopes")
             if isinstance(scopes, list) and all(isinstance(scope, str) for scope in scopes):
@@ -205,6 +212,42 @@ async def get_memory(
     )
     result: dict[str, Any] = payload["memory"]
     return result
+
+
+async def related_memory(
+    *,
+    key: str,
+    scope: Optional[str],
+    depth: int,
+    types: Optional[list[str]],
+    direction: str,
+    limit: int,
+    terminal_context: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    if not remote_memory_url():
+        return await MemoryService().related(
+            key,
+            scope=scope,
+            depth=depth,
+            types=types,
+            direction=direction,
+            limit=limit,
+            terminal_context=terminal_context,
+        )
+    body = {
+        name: value
+        for name, value in {
+            "key": key,
+            "scope": scope,
+            "depth": depth,
+            "types": types,
+            "direction": direction,
+            "limit": limit,
+            "terminal_context": terminal_context,
+        }.items()
+        if value is not None
+    }
+    return await asyncio.to_thread(_post, "/internal/memory/related", body)
 
 
 async def forget_memory(

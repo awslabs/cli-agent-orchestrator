@@ -63,6 +63,7 @@ Every derived path resolves from this value, so one override moves everything â€
     "explain_enabled": true,
     "non_accessing_inspection": true,
     "lifecycle": {"enabled": false},
+    "relationships": {"content_links": false},
     "compile_timeout_s": 120.0
   },
   "terminal": {
@@ -231,6 +232,7 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 | `injection.v1_fixes` | `true` | Enable project-alias traversal, per-scope clipping, and skip-oversized injection hygiene fixes. |
 | `injection.write_project_files` | `false` | Opt into legacy provider memory writes under the terminal working directory. By default, CAO delivers memory through the first-message or provider start-prompt route and cleans up its old project-file blocks. |
 | `ranking.default_sort` | `"recency"` | Default query recall ranking: `recency` preserves hybrid recall, while `bm25` opts into BM25-first results. No-query listings remain recency ordered. Nested under `memory.ranking`. |
+| `relationships.content_links` | `false` | Opt into parsing same-scope `[[wikilinks]]` and authored `## See Also` links into active `content_link` relationships during store and repair. Env override: `CAO_MEMORY_RELATIONSHIPS_CONTENT_LINKS`. Missing/cross-scope targets remain unlinked and lint-visible. Disabling affects future production only: `memory_related` still shows existing human, compiler, and content-link edges. |
 | `non_accessing_inspection` | `true` | CLI list/show and HTTP GET memory views skip access counters when on. MCP recall still counts; internal recall defaults to counting but accepts `record_access=false`. Env override: `CAO_MEMORY_NON_ACCESSING_INSPECTION`; read errors leave non-accessing inspection on. |
 | `explain_enabled` | `true` | On-demand `cao memory list --query Q --explain` diagnostic. Env override: `CAO_MEMORY_EXPLAIN_ENABLED` (env > file > default). Does not alter recall defaults or gate `sort_by="relevance"`. |
 | `flush_threshold` | `0.85` | Context-usage fraction that triggers a memory flush. |
@@ -553,6 +555,7 @@ Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved t
 | `CAO_LOG_LEVEL` | `logging.level` | str |
 | `CAO_MEMORY_ENABLED` | `memory.enabled` | bool |
 | `CAO_MEMORY_LIFECYCLE_ENABLED` | `memory.lifecycle.enabled` | bool |
+| `CAO_MEMORY_RELATIONSHIPS_CONTENT_LINKS` | `memory.relationships.content_links` | bool |
 | `CAO_MEMORY_NON_ACCESSING_INSPECTION` | `memory.non_accessing_inspection` | bool |
 | `CAO_MEMORY_EXPLAIN_ENABLED` | `memory.explain_enabled` | bool |
 | `CAO_MEMORY_COMPILE_MODE` | `memory.compile_mode` | str (`llm`/`append`) |
@@ -599,6 +602,7 @@ A number of other `CAO_*` variables (runtime/process-identity vars like `CAO_TER
 | Env var | Default | Type | Purpose |
 |---|---|---|---|
 | `CAO_HOME_DIR` | `~/.aws/cli-agent-orchestrator` | str (path) | Base directory for all CAO state. See [Data directory](#data-directory-cao_home_dir) above. |
+| `CAO_INSTANCE_LABEL` | *(none)* | str | A short name for this server, such as `Cluster Mode`. `GET /health` reports it as `instance_label`, and the web UI shows it beside the title and in the browser tab, so two open UIs (a local server and a cluster supervisor) can be told apart. Display only. `/health` is open in every auth mode, so anyone who can reach the server can read it: do not put anything private in it. |
 
 Rendered-screen status detection adds `CAO_PYTE_STATUS` (default `true`) and `CAO_PYTE_MIDBURST_PROBE_S` (default `1.0`, the minimum interval between mid-burst PROCESSING probes; see [Event-Driven Architecture](event-driven-architecture.md#status-monitor-servicesstatus_monitorpy--publisher--consumer)), both read in `constants.py`. The pipe-pane liveness watchdog (issue #388, `services/fifo_reader.py`) adds six more of these ad-hoc vars, read directly via `_env_int`/`_env_float` in `constants.py` rather than through `ConfigService` â€” they have no `settings.json` mapping like the rows in the table above:
 
