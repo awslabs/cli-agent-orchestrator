@@ -705,6 +705,23 @@ def test_f_pull_request_without_a_base_fails_closed(repository, tmp_path, monkey
     assert code == 2 and report["status"] == "error"
 
 
+def test_f_merge_group_without_a_base_fails_closed(repository, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "merge_group")
+    code, report, _ = run_gate(tmp_path, monkeypatch, trivy_report())
+    assert code == 2 and report["status"] == "error"
+    assert "base revision" in report["error"]
+
+
+def test_f_merge_group_with_a_base_checks_the_base(repository, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "merge_group")
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    monkeypatch.setenv("CAO_DEPSEC_BASE_REV", base)
+    code, report, _ = run_gate(tmp_path, monkeypatch, trivy_report())
+    assert code == 0 and report["status"] == "passed"
+
+
 def test_f_control_push_without_a_base_passes(repository, tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
     code, _, _ = run_gate(tmp_path, monkeypatch, trivy_report())

@@ -88,6 +88,48 @@ describe('WorkspacePanel', () => {
     await waitFor(() => expect(screen.queryByTestId('pane-1')).toBeNull())
   })
 
+  it('picking 2 or 4 panes fills the empty panes with the session\'s agents', async () => {
+    details['cao-alpha'].terminals.push(term('a3', 'tester', 'idle'))
+    render(<WorkspacePanel />)
+    await screen.findByRole('tablist', { name: 'Agents in cao-alpha' })
+    await waitFor(() => expect(created).toContain('a1'))
+
+    fireEvent.click(screen.getByRole('button', { name: '2 panes' }))
+    await waitFor(() => expect(screen.getByTestId('pane-1').querySelector('[data-terminal="a2"]')).not.toBeNull())
+    expect(screen.getByTestId('pane-0').querySelector('[data-terminal="a1"]')).not.toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: '4 panes' }))
+    await waitFor(() => expect(screen.getByTestId('pane-2').querySelector('[data-terminal="a3"]')).not.toBeNull())
+    expect(screen.getByTestId('pane-3').querySelector('[data-terminal]')).toBeNull()
+    expect(within(screen.getByTestId('pane-3')).getByText('Empty pane')).toBeInTheDocument()
+
+    // Closing a pane is not undone by the poll; re-picking 4 panes refills.
+    fireEvent.click(screen.getByRole('button', { name: 'Close pane 2' }))
+    await waitFor(() => expect(screen.queryByTestId('pane-2')).toBeNull())
+    await poll()
+    expect(screen.queryByTestId('pane-2')).toBeNull()
+    expect(document.querySelector('[data-terminal="a2"]')?.closest('[data-testid^="pane-"]') ?? null).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '4 panes' }))
+    await waitFor(() => expect(screen.getByTestId('pane-2').querySelector('[data-terminal="a2"]')).not.toBeNull())
+  })
+
+  it('shrinking or picking 1 pane never fills an empty pane', async () => {
+    details['cao-alpha'].terminals.push(term('a3', 'tester', 'idle'))
+    render(<WorkspacePanel />)
+    await screen.findByRole('tablist', { name: 'Agents in cao-alpha' })
+    await waitFor(() => expect(created).toContain('a1'))
+
+    // 4 panes holding only a1 (the others' agents went away), then shrink.
+    act(() => useWorkspace.setState(s => ({ layouts: { ...s.layouts, 'cao-alpha': { count: 4, panes: ['a1', null, null, null], focused: 0 } } })))
+    fireEvent.click(screen.getByRole('button', { name: '2 panes' }))
+    await waitFor(() => expect(screen.queryByTestId('pane-2')).toBeNull())
+    expect(screen.getByTestId('pane-1').querySelector('[data-terminal]')).toBeNull()
+
+    act(() => useWorkspace.setState(s => ({ layouts: { ...s.layouts, 'cao-alpha': { count: 1, panes: [null], focused: 0 } } })))
+    fireEvent.click(screen.getByRole('button', { name: '1 pane' }))
+    expect(screen.getByTestId('pane-0').querySelector('[data-terminal]')).toBeNull()
+  })
+
   it('flags an off-screen agent that finished, and clears it once viewed', async () => {
     render(<WorkspacePanel />)
     await screen.findByRole('tablist', { name: 'Agents in cao-alpha' })
