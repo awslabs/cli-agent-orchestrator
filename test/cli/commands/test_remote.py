@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
@@ -708,3 +709,42 @@ def test_bad_registration_is_usage_error_and_list_keeps_others(tmp_path, monkeyp
     assert removed.exit_code == 2
     assert "invalid configuration" in removed.output
     target.rmdir()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        PermissionError(errno.EACCES, "Permission denied", "/hidden/registration.json"),
+        OSError(errno.EROFS, "Read-only file system"),
+        OSError("Device busy"),
+    ],
+)
+def test_remote_remove_reports_unlink_system_error(tmp_path, monkeypatch, error):
+    monkeypatch.setattr(registry, "CAO_HOME_DIR", tmp_path)
+
+    def fail_unlink(_path: Path) -> None:
+        raise error
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", fail_unlink)
+        removed = CliRunner().invoke(cli, ["remote", "remove", "box-1"])
+    assert removed.exit_code == 2
+    assert (
+        "could not remove remote box 'box-1': " + (error.strerror or str(error)) in removed.output
+    )
+    assert "invalid configuration" not in removed.output
+    assert str(tmp_path) not in removed.output
+    assert "/hidden/registration.json" not in removed.output
+
+
+def test_remote_remove_non_directory_parent_is_invalid_configuration(tmp_path, monkeypatch):
+    monkeypatch.setattr(registry, "CAO_HOME_DIR", tmp_path)
+
+    def fail_unlink(_path: Path) -> None:
+        raise NotADirectoryError()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", fail_unlink)
+        removed = CliRunner().invoke(cli, ["remote", "remove", "box-1"])
+    assert removed.exit_code == 2
+    assert "remote box 'box-1' has invalid configuration" in removed.output

@@ -127,5 +127,9 @@ def remove(name: str) -> None:
         path_for(name).unlink()
     except FileNotFoundError as exc:
         raise RemoteConfigError(f"remote box '{name}' is not registered") from exc
-    except OSError as exc:
+    except (IsADirectoryError, NotADirectoryError) as exc:
         raise RemoteConfigError(f"remote box '{name}' has invalid configuration") from exc
+    except OSError as exc:
+        raise RemoteConfigError(
+            f"could not remove remote box '{name}': {exc.strerror or str(exc)}"
+        ) from exc
