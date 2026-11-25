@@ -42,10 +42,23 @@ test("request shape: curl through exec on the CAO machine against 127.0.0.1", ()
   assert.equal(exec.cmd, "curl");
   assert.equal(exec.opts.on, "cao");
   assert.ok(exec.opts.timeout > 10_000);
-  assert.deepEqual(exec.args.slice(0, 5), ["-sS", "-w", "\n%{http_code}", "--max-time", "10"]);
+  assert.deepEqual(exec.args.slice(0, 6), ["-q", "-sS", "-w", "\n%{http_code}", "--max-time", "10"]);
   assert.equal(exec.args.at(-1), "http://127.0.0.1:9889/flows");
   assert.ok(!exec.args.includes("-X"));
   assert.ok(!exec.args.includes("--data-binary"));
+});
+
+test("curl reads no ~/.curlrc and uses no proxy: -q is the first argument and --noproxy * sits beside --globoff", () => {
+  for (const spec of [{ path: "/flows" }, { method: "POST", path: "/sessions", query: { a: "b" }, body: { initial_message: "hi" } }]) {
+    for (const stdin of [false, true]) {
+      const { exec } = curlRequest({ ...CFG, stdin }, spec);
+      assert.equal(exec.args[0], "-q", "-q only takes effect as the first argument");
+      const at = exec.args.indexOf("--noproxy");
+      assert.ok(at > 0, "no --noproxy");
+      assert.deepEqual(exec.args.slice(at - 1, at + 2), ["--globoff", "--noproxy", "*"]);
+      assert.ok(exec.args.at(-1).startsWith("http://127.0.0.1:"), "the URL stays the last argument");
+    }
+  }
 });
 
 test("props machine and port are used as given, and the exec timeout outlasts --max-time", () => {

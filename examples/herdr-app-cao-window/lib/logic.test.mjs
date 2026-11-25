@@ -598,6 +598,11 @@ test("Label write does not land: silence for 5 s switches to the local map", () 
   assert.deepEqual(seenVerify(PENDING, null, 1000 + 4999), PENDING, "still waiting");
   assert.deepEqual(seenVerify(PENDING, null, 1000 + 5001), { mode: "local", pending: null });
 });
+test("seenVerify: a pushed value that reached the written turn verifies the write whenever it is looked at, even after 5 s", () => {
+  // The label landed at once, but the window was not looked at again until later (switch away and back).
+  assert.deepEqual(seenVerify(PENDING, { id: "c1", seen: 10 }, 1000 + 6000), { mode: "write", pending: null });
+  assert.deepEqual(seenVerify(PENDING, { id: "c1", seen: "11" }, 1000 + 600000), { mode: "write", pending: null });
+});
 test("seenVerify: a push with the old value, or for another terminal, does not verify", () => {
   assert.deepEqual(seenVerify(PENDING, { id: "c1", seen: 9 }, 1000 + 5001), { mode: "local", pending: null });
   assert.deepEqual(seenVerify(PENDING, { id: "c1", seen: 9 }, 2000), PENDING, "wrong value inside the window keeps waiting");
@@ -794,9 +799,10 @@ test("a zero count is hidden except sessions, which shows even at zero", () => {
   assert.equal(BAR(statusCounts(two, never)), `cao ${DOT} 2 sessions`);
   assert.equal(BAR(statusCounts([], never)), `cao ${DOT} 0 sessions`);
 });
-test("A counts blocked terminals, workers and agents alike, one each", () => {
-  const list = [sess("a", [T("c", "a", { state: "blocked" }), worker("w1", "a", "c", { state: "blocked" }), worker("w2", "a", "c", { state: "blocked" })]), sess("b", [T("d", "b")])];
-  assert.match(BAR(statusCounts(list, never)), new RegExp(`2 sessions ${DOT} 3 asking$`));
+test("A counts the sessions that have a blocked terminal, one each however many are blocked, as the asking filter lists them", () => {
+  const list = [sess("a", [T("c", "a", { state: "blocked" }), worker("w1", "a", "c", { state: "blocked" }), worker("w2", "a", "c", { state: "blocked" })]), sess("b", [T("d", "b")]), sess("e", [T("f", "e", { state: "blocked" })])];
+  assert.match(BAR(statusCounts(list, never)), new RegExp(`3 sessions ${DOT} 2 asking$`));
+  assert.equal(statusCounts(list, never).asking, filterSessions(list, "asking", never).length, "the number on the bar and the sessions the filter lists differ");
 });
 test("R counts replied talkable agents only; a replied worker is not counted", () => {
   const list = [sess("a", [T("c", "a"), worker("w", "a", "c", { state: "done", turn: 2, seen: 1 })]), sess("b", [T("d", "b")])];
@@ -1187,11 +1193,13 @@ test("a focus event with no terminal is not a hand-off, and a later working focu
   assert.deepEqual(step(s, focusEv("working"), 60_000)[1], [], "the first focus on a terminal has no previous focus to hand off from");
   assert.equal(shows(handOff(step(s, focusEv("idle"), 61_000)[0], 70_000)[1]).length, 1, "a real hand-off still works afterwards");
 });
-test("a pushed value that arrives after the 5 s limit does not verify the write: the window goes local", () => {
+test("a pushed value still short of the written turn after the 5 s limit makes the window go local; one that reached it verifies, whenever it is looked at", () => {
   const pending = { mode: "write", pending: { id: "c1", turn: 10, at: 1000 } };
-  assert.deepEqual(seenVerify(pending, { id: "c1", seen: 10 }, 7500), { mode: "local", pending: null });
-  assert.deepEqual(seenVerify(pending, { id: "c1", seen: "10" }, 1000 + 5001), { mode: "local", pending: null });
-  assert.deepEqual(seenVerify(pending, { id: "c1", seen: 10 }, 1000 + 4999), { mode: "write", pending: null }, "inside the limit it still verifies");
+  assert.deepEqual(seenVerify(pending, { id: "c1", seen: 9 }, 7500), { mode: "local", pending: null });
+  assert.deepEqual(seenVerify(pending, { id: "c1", seen: "9" }, 1000 + 5001), { mode: "local", pending: null });
+  assert.deepEqual(seenVerify(pending, { id: "other", seen: 10 }, 1000 + 5001), { mode: "local", pending: null }, "another terminal's value verifies nothing");
+  assert.deepEqual(seenVerify(pending, { id: "c1", seen: 10 }, 1000 + 4999), { mode: "write", pending: null }, "inside the limit it verifies");
+  assert.deepEqual(seenVerify(pending, { id: "c1", seen: 10 }, 7500), { mode: "write", pending: null }, "the label landed at once and is read late");
 });
 test("TOAST_PASS_THROUGH_DEFAULT is true (holding was never tried against a real Herdr)", () => {
   assert.equal(L.TOAST_PASS_THROUGH_DEFAULT, true);

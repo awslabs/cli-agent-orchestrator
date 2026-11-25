@@ -76,8 +76,11 @@ export function curlRequest(cfg, spec) {
   } catch {
     return refused("refused", "bad request query");
   }
-  // --globoff: curl must not read [1-2] or {a,b} in a path as a range or a list.
-  const args = ["-sS", "-w", "\n%{http_code}", "--max-time", String(maxTime), "--globoff"];
+  // -q first (it only takes effect as the first argument): curl must not read ~/.curlrc on the CAO machine, where a line such
+  // as `include` or `-L` would change the text the window parses. --globoff: curl must not read [1-2] or {a,b} in a path as a
+  // range or a list. --noproxy "*": the URL is always loopback, so no http_proxy of the exec environment may carry a request
+  // (and its first message) to a proxy.
+  const args = ["-q", "-sS", "-w", "\n%{http_code}", "--max-time", String(maxTime), "--globoff", "--noproxy", "*"];
   const opts = { on: machine, timeout: Math.ceil(maxTime + 2) * 1000 };
   if (method !== "GET") args.push("-X", method);
   if (body !== undefined) {

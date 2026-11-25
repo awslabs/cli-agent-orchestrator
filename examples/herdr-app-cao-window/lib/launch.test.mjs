@@ -596,9 +596,21 @@ test("the message is only in the body, byte for byte, whatever it holds (shell c
   assert.ok(built.exec.args.includes(JSON.stringify({ initial_message: nasty })));
 });
 
-test("no message means no body; an empty message is not sent (the server refuses an empty initial_message)", () => {
-  assert.equal(launch.buildRequest(form({ idempotencyKey: "k" }), ctxOf()).body, undefined);
-  assert.equal(launch.buildRequest(form({ message: "", idempotencyKey: "k" }), ctxOf()).body, undefined);
+// `cao launch` (src/cli_agent_orchestrator/cli/commands/launch.py) sends {"inject_memory_at_start": true} whenever the launch has no
+// first message to deliver; the field's server default is false, which is for other callers. The window's launch is the same launch as
+// the `cao launch --headless` line it offers to copy, so it follows the CLI.
+test("no message asks for start memory as cao launch does; an empty message is not sent (the server refuses an empty initial_message)", () => {
+  assert.deepEqual(launch.buildRequest(form({ idempotencyKey: "k" }), ctxOf()).body, { inject_memory_at_start: true });
+  assert.deepEqual(launch.buildRequest(form({ message: "", idempotencyKey: "k" }), ctxOf()).body, { inject_memory_at_start: true });
+  const prompted = launch.buildRequest(form({ idempotencyKey: "k" }), ctxOf({ stdin: false }));
+  assert.ok(curlRequest({ machine: "cao", port: 9889, stdin: false }, prompted).exec.args.includes(JSON.stringify({ inject_memory_at_start: true })));
+});
+
+test("a launch with a message sends the message and not the start-memory flag, as cao launch does; env rows join either body", () => {
+  assert.deepEqual(launch.buildRequest(form({ message: "Run the tests", idempotencyKey: "k" }), ctxOf()).body, { initial_message: "Run the tests" });
+  const env = [{ key: "A", value: "1" }];
+  assert.deepEqual(launch.buildRequest(form({ env, idempotencyKey: "k" }), ctxOf({ stdin: true })).body, { inject_memory_at_start: true, env_vars: { A: "1" } });
+  assert.deepEqual(launch.buildRequest(form({ env, message: "go", idempotencyKey: "k" }), ctxOf({ stdin: true })).body, { initial_message: "go", env_vars: { A: "1" } });
 });
 
 test("--async is not a request field: it only changes the command and the result card", () => {
@@ -621,7 +633,7 @@ test("env_vars are never in the request while stdin is off, even when rows are f
   const r = launch.buildRequest(f, ctxOf({ stdin: false }));
   assert.ok(!JSON.stringify(r).includes("example.test"));
   assert.ok(!JSON.stringify(r).includes("env_vars"));
-  assert.equal(r.body, undefined);
+  assert.deepEqual(r.body, { inject_memory_at_start: true }, "no message and no env: only the start-memory flag, as cao launch sends");
 });
 
 test("with stdin on, env values go in the body only and never in the query", () => {

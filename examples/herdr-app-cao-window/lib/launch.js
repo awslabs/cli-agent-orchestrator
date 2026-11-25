@@ -208,10 +208,12 @@ export function buildRequest(form, ctx = {}) {
   else if (form.allowedTools.length) query.allowed_tools = form.allowedTools.join(",");
   if (form.memory) query.memory_manager = "true";
   query.idempotency_key = form.idempotencyKey;
-  let body;
-  if (form.message) body = { initial_message: form.message };
+  // The same launch as the `cao launch --headless` line: with a first message the CLI sends it (and no start-memory flag); with none
+  // it sends {"inject_memory_at_start": true}, so a prompt-capable provider starts with CAO's memory. The field defaults to false in
+  // the server, which is the default for other callers, not the one `cao launch` uses (cli/commands/launch.py).
+  const body = form.message ? { initial_message: form.message } : { inject_memory_at_start: true };
   const env = filledEnv(form);
-  if (ctx.stdin && env.length) body = { ...(body ?? {}), env_vars: Object.fromEntries(env.map((r) => [r.key, r.value])) };
+  if (ctx.stdin && env.length) body.env_vars = Object.fromEntries(env.map((r) => [r.key, r.value]));
   return { method: "POST", path: "/sessions", query, body, cli: "cao launch" };
 }
 // The key is made once per submission and reused on its retry. The form it is given is not changed.

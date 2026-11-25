@@ -523,16 +523,16 @@ export function seenWrite(t, focused, windowActive, machine, mode = SEEN_MODE_DE
 }
 
 // state {mode, pending: null | {id, turn, at}}; ev: a pushed {id, seen}, {failed: true}, or null (a tick).
-// A pushed value that reaches the written turn within 5 s verifies the write. A failed call, or 5 s
-// without that value (a value that arrives later does not count), switches to the local map for the
-// rest of the run.
+// A pushed value that has reached the written turn verifies the write, whenever it is looked at: the label may have landed at once
+// and be read only after the window was switched away from and back. A failed call, or 5 s without that value, switches to the
+// local map for the rest of the run.
 export function seenVerify(state, ev, now) {
   const p = state.pending;
   if (!p) return state;
   if (ev?.failed) return { ...state, mode: "local", pending: null };
-  if (now - p.at >= SEEN_VERIFY_MS) return { ...state, mode: "local", pending: null };
   const landed = finiteNumber(ev?.seen);
   if (ev && ev.id === p.id && landed !== undefined && landed >= p.turn) return { ...state, pending: null };
+  if (now - p.at >= SEEN_VERIFY_MS) return { ...state, mode: "local", pending: null };
   return state;
 }
 
@@ -677,8 +677,9 @@ export function readOfThisTurn(t, read) {
 
 // ---------- status bar ----------
 
-// S sessions, A asking terminals, R replied talkable agents, W working sessions (one with a waiting terminal counts); recorded draft
-// author sessions are in none of them, and an `error` terminal is not asking.
+// S sessions, A asking sessions (one with a blocked terminal counts once, however many are blocked, as the asking filter lists it),
+// R replied talkable agents, W working sessions (one with a waiting terminal counts); recorded draft author sessions are in none of
+// them, and an `error` terminal is not asking.
 // `unknown(t)` is true for a talkable agent whose seen state is unknown (seenState); those are
 // counted apart, never as replied.
 export function statusCounts(sessions, replied, unknown = () => false) {
@@ -686,7 +687,7 @@ export function statusCounts(sessions, replied, unknown = () => false) {
   const total = (count) => live.reduce((n, s) => n + count(s), 0);
   return {
     sessions: live.length,
-    asking: total((s) => s.terms.filter((t) => t.state === "blocked").length),
+    asking: total((s) => (s.terms.some((t) => t.state === "blocked") ? 1 : 0)),
     replied: total((s) => s.talkable.filter((t) => replied(t)).length),
     repliedUnknown: total((s) => s.talkable.filter((t) => unknown(t)).length),
     working: total((s) => (s.terms.some(isWorking) ? 1 : 0)),
