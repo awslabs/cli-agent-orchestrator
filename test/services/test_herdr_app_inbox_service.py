@@ -665,6 +665,37 @@ class TestReconcile:
         svc._reconcile()
         assert ghosts == [] and not backend.kill_address.called
 
+    @pytest.mark.parametrize(
+        "role_labels",
+        [
+            {},
+            {"cao.profile": "developer"},
+            {"cao.profile": "reviewer", "cao.caller": "aaaa0001"},
+            {"cao.caller": "gone0000"},
+        ],
+        ids=["none", "root", "worker", "caller-only"],
+    )
+    def test_role_labels_do_not_change_what_is_kept_or_pruned(self, env, monkeypatch, role_labels):
+        """herdr-app-role-labels, "Reconcile ignores the new labels"."""
+        svc, backend, *_ = env
+        core_with(
+            backend,
+            rec("t1", "aaaa0001", **role_labels),  # live with a row: kept
+            rec("t5", "orphan01", **role_labels),  # live without a row: killed
+            finished("t6", "ghost001", **role_labels),  # finished with a row: dropped
+        )
+        rows = [
+            {"id": "aaaa0001", "tmux_session": "cao-a"},
+            {"id": "ghost001", "tmux_session": "cao-a"},
+        ]
+        monkeypatch.setattr(mod, "_rows_by_session", lambda: {"cao-a": rows})
+        monkeypatch.setattr(mod, "_rows_for", lambda s: rows)
+        ghosts = []
+        monkeypatch.setattr(mod, "_drop_ghost_row", lambda tid: ghosts.append(tid))
+        svc._reconcile()
+        assert ghosts == ["ghost001"]
+        backend.kill_address.assert_called_once_with("t5")
+
     def test_holds_the_session_lock(self, env, monkeypatch):
         svc, backend, *_ = env
         held = []

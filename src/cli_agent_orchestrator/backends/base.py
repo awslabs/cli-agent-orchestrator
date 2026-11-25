@@ -7,7 +7,7 @@ Core services depend only on this ABC, never on a concrete backend directly.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
@@ -98,6 +98,8 @@ class TerminalBackend(ABC):
         terminal_id: str,
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        *,
+        extra_labels: Optional[Mapping[str, str]] = None,
     ) -> str:
         """Create a new terminal session with an initial window.
 
@@ -106,6 +108,9 @@ class TerminalBackend(ABC):
             window_name: Name for the initial window/tab
             terminal_id: Unique terminal identifier to inject into the environment
             working_directory: Optional starting directory
+            extra_labels: Optional labels a backend that has labels attaches to the
+                terminal (the herdr-app backend writes them in the same
+                ``terminal.run`` call). Backends without labels accept and ignore it.
 
         Returns:
             The actual window name assigned by the backend
@@ -217,6 +222,8 @@ class TerminalBackend(ABC):
         working_directory: Optional[str] = None,
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        *,
+        extra_labels: Optional[Mapping[str, str]] = None,
     ) -> str:
         """Create a new window/tab in an existing session.
 
@@ -226,6 +233,9 @@ class TerminalBackend(ABC):
             terminal_id: Unique terminal identifier to inject into the environment
             working_directory: Optional starting directory
             window_shell: Optional shell command to run instead of default shell
+            extra_labels: Optional labels a backend that has labels attaches to the
+                terminal (the herdr-app backend writes them in the same
+                ``terminal.run`` call). Backends without labels accept and ignore it.
 
         Returns:
             The actual window name assigned by the backend

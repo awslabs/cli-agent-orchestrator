@@ -16,7 +16,7 @@ import secrets
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from cli_agent_orchestrator.backends.base import (
     InputNotSentError,
@@ -44,6 +44,11 @@ LAYOUT_DOC = "herdr-app"
 DOC_WRITE_ATTEMPTS = 5
 DOC_RETRY_DELAY_S = 0.1
 MANAGED = {"cao.managed": "1"}
+# Keys a caller of create_session/create_window may not set through extra_labels:
+# placement (herdr.*) and CAO's own identity labels.
+RESERVED_LABEL_KEYS = frozenset(
+    {"cao.managed", "cao.home", "cao.terminal_id", "cao.session", "cao.window"}
+)
 RPC_TIMEOUT_S = 10.0
 # herdr-core error kinds that answer terminal.send before typing anything: a
 # send waiting on a fresh terminal's output gives `unavailable` (see the
@@ -87,6 +92,11 @@ def cao_home_label() -> str:
 def space_id_for(session_name: str) -> str:
     """Stable Herdr space id for a CAO session (no storage needed)."""
     return "sp" + hashlib.sha256(f"cao:{session_name}".encode("utf-8")).hexdigest()[:32]
+
+
+def _is_reserved_label(key: str) -> bool:
+    """Whether ``extra_labels`` may not set ``key``: placement or CAO identity."""
+    return key.startswith("herdr.") or key in RESERVED_LABEL_KEYS
 
 
 def _terminals_in(node: Any) -> List[str]:
@@ -251,24 +261,31 @@ class HerdrAppBackend(TerminalBackend):
         working_directory: Optional[str],
         window_shell: Optional[str],
         extra_env: Optional[Dict[str, str]],
+        extra_labels: Optional[Mapping[str, str]] = None,
     ) -> str:
         cwd = working_directory or os.getcwd()
         if not os.path.isdir(cwd):
             raise ValueError(f"working_directory does not exist: {cwd}")
+        labels: Dict[str, str] = {
+            "herdr.space": space_id_for(session_name),
+            "herdr.tab": "tb" + secrets.token_hex(16),
+            **self._managed,
+            "cao.terminal_id": terminal_id,
+            "cao.session": session_name,
+            "cao.window": window_name,
+        }
+        for key, value in (extra_labels or {}).items():
+            if _is_reserved_label(key):
+                logger.warning("Ignoring reserved extra label %s", key)
+                continue
+            labels[key] = value
         params: Dict[str, Any] = {
             "name": f"cao-{terminal_id}",
             "no_parent": True,
             "no_notify": True,
             "cwd": cwd,
             "env": self._env(terminal_id, session_name, extra_env),
-            "labels": {
-                "herdr.space": space_id_for(session_name),
-                "herdr.tab": "tb" + secrets.token_hex(16),
-                **self._managed,
-                "cao.terminal_id": terminal_id,
-                "cao.session": session_name,
-                "cao.window": window_name,
-            },
+            "labels": labels,
         }
         if window_shell:
             params["line"] = window_shell
@@ -286,9 +303,17 @@ class HerdrAppBackend(TerminalBackend):
         terminal_id: str,
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        *,
+        extra_labels: Optional[Mapping[str, str]] = None,
     ) -> str:
         return self._run_terminal(
-            session_name, window_name, terminal_id, working_directory, None, extra_env
+            session_name,
+            window_name,
+            terminal_id,
+            working_directory,
+            None,
+            extra_env,
+            extra_labels=extra_labels,
         )
 
     def create_window(
@@ -299,9 +324,17 @@ class HerdrAppBackend(TerminalBackend):
         working_directory: Optional[str] = None,
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        *,
+        extra_labels: Optional[Mapping[str, str]] = None,
     ) -> str:
         return self._run_terminal(
-            session_name, window_name, terminal_id, working_directory, window_shell, extra_env
+            session_name,
+            window_name,
+            terminal_id,
+            working_directory,
+            window_shell,
+            extra_env,
+            extra_labels=extra_labels,
         )
 
     def restore_session_env(self, session_name: str, key: str, launch_value: str) -> None:

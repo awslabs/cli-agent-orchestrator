@@ -1975,6 +1975,19 @@ def _keep_kiro_home_out_of_session(session_name: str, kiro_launch: Optional[Kiro
         )
 
 
+def _role_labels(agent_profile: str, caller_id: Optional[str]) -> dict[str, str]:
+    """Labels written with a terminal: its profile and, for a worker, its caller.
+
+    An empty profile or caller adds no key, so a label never carries an empty value.
+    """
+    labels: dict[str, str] = {}
+    if agent_profile:
+        labels["cao.profile"] = agent_profile
+    if caller_id:
+        labels["cao.caller"] = caller_id
+    return labels
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -3189,6 +3202,8 @@ async def _create_terminal_unguarded(
         deferred_delete_on_failure: bool | None = None
         session_incarnation_id: str | None = None
 
+        role_labels = _role_labels(agent_profile, caller_id)
+
         def _create_session_or_window_locked() -> Tuple[str, bool, bool]:
             """Runs under the lifecycle lock on a worker thread.
 
@@ -3258,6 +3273,7 @@ async def _create_terminal_unguarded(
                         terminal_id,
                         resolved_working_directory,
                         extra_env=effective_env or None,
+                        extra_labels=role_labels,
                     )
                     created_window_name = window_name
                     created_session, created_window = True, False
@@ -3290,6 +3306,7 @@ async def _create_terminal_unguarded(
                         terminal_id,
                         resolved_working_directory,
                         extra_env=effective_env,
+                        extra_labels=role_labels,
                     )
                     created_session, created_window = False, True
 
