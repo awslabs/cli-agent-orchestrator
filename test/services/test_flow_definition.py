@@ -7,7 +7,6 @@ reports its own missing symbol instead of one collection error for the whole fil
 
 import os
 import stat
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -210,13 +209,15 @@ def test_a_schedule_one_past_the_length_cap_is_refused_as_too_long():
     assert "too long" in errors["schedule"]
 
 
-def test_a_long_schedule_that_never_fires_is_refused_quickly():
-    started = time.monotonic()
+def test_a_long_schedule_that_never_fires_is_refused_within_the_scan_bound(fire_time_scans):
+    # 80 repeats fit under the length cap (250 would be refused as too long before any scan).
+    schedule = never_firing(80)
+    assert len(schedule) <= SCHEDULE_CAP
+    errors = errors_for(schedule=schedule)
 
-    errors = errors_for(schedule=never_firing(250))
-
-    assert time.monotonic() - started < 1
     assert set(errors) == {"schedule"}
+    assert fire_time_scans.spans
+    assert max(fire_time_scans.spans) <= flow_service._LONGEST_FIRE_GAP
 
 
 @pytest.mark.parametrize("field", ["schedule", "agent_profile", "provider"])
@@ -402,13 +403,12 @@ def test_a_leap_day_on_a_weekday_fires_across_the_forty_year_gap():
     ]
 
 
-def test_a_long_list_that_never_fires_stops_scanning_quickly():
-    started = time.monotonic()
-
+def test_a_long_list_that_never_fires_stops_scanning_at_the_bound(fire_time_scans):
     times = flow_service.next_fire_times(never_firing(250), 3, WEDNESDAY_AFTER_NINE)
 
-    assert time.monotonic() - started < 1
     assert times == []
+    assert fire_time_scans.spans
+    assert max(fire_time_scans.spans) <= flow_service._LONGEST_FIRE_GAP
 
 
 @pytest.mark.parametrize(

@@ -6,7 +6,6 @@ CAO home, so a route that writes the wrong file, or writes at all, shows up on d
 
 import os
 import stat
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -383,23 +382,27 @@ class TestValidateRoute:
         assert response.status_code == 200 and response.json()["valid"] is True
         assert files_under(flows_home) == []
 
-    def test_a_huge_garbage_schedule_is_refused_quickly(self, client, flows_home):
-        started = time.monotonic()
-
+    def test_a_huge_garbage_schedule_is_refused_without_being_parsed(
+        self, client, flows_home, fire_time_scans
+    ):
         body = validated(client, {**GOOD, "schedule": "1-," * 100_000})
 
-        assert time.monotonic() - started < 5
+        assert fire_time_scans.parsed == []
         assert body["valid"] is False
         assert [e["field"] for e in body["errors"]] == ["schedule"]
 
-    def test_a_list_schedule_that_never_fires_is_refused_quickly(self, client, flows_home):
-        # 31 February, listed 250 times: it parses, so only the fire-time scan can refuse it.
-        never = "0 0 " + ",".join(["31"] * 250) + " 2 *"
-        started = time.monotonic()
+    def test_a_list_schedule_that_never_fires_is_refused_within_the_scan_bound(
+        self, client, flows_home, fire_time_scans
+    ):
+        # 31 February, listed 80 times: it parses and fits the length cap, so only the fire-time
+        # scan can refuse it.
+        never = "0 0 " + ",".join(["31"] * 80) + " 2 *"
+        assert len(never) <= SCHEDULE_CAP
 
         body = validated(client, {**GOOD, "schedule": never})
 
-        assert time.monotonic() - started < 1
+        assert fire_time_scans.spans
+        assert max(fire_time_scans.spans) <= flow_service._LONGEST_FIRE_GAP
         assert body["valid"] is False
         assert [e["field"] for e in body["errors"]] == ["schedule"]
         assert body["next_runs"] == []

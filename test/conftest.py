@@ -1046,3 +1046,33 @@ def isolated_memory_db(tmp_path, monkeypatch):
         # Land this test's queued status-event writes in its own database.
         _drain_launch_status_writes()
         engine.dispose()
+
+
+@pytest.fixture
+def fire_time_scans(monkeypatch):
+    """Record the work ``flow_service`` asks of the cron scheduler, instead of timing it.
+
+    ``parsed`` lists every expression handed to ``CronTrigger.from_crontab``; ``spans`` holds,
+    for each ``get_next_fire_time``, how far past its start the scan may look. A schedule that
+    never fires costs time in proportion to that span, so asserting on it guards against a
+    runaway scan without a wall-clock limit that a slow runner could trip.
+    """
+    from types import SimpleNamespace
+
+    from cli_agent_orchestrator.services import flow_service
+
+    scans = SimpleNamespace(parsed=[], spans=[])
+    real_parse = flow_service.CronTrigger.from_crontab
+    real_next = flow_service.CronTrigger.get_next_fire_time
+
+    def parse(expression, *args, **kwargs):
+        scans.parsed.append(expression)
+        return real_parse(expression, *args, **kwargs)
+
+    def next_fire_time(self, previous_fire_time, now):
+        scans.spans.append(self.end_date - now.astimezone(self.timezone))
+        return real_next(self, previous_fire_time, now)
+
+    monkeypatch.setattr(flow_service.CronTrigger, "from_crontab", parse)
+    monkeypatch.setattr(flow_service.CronTrigger, "get_next_fire_time", next_fire_time)
+    return scans
