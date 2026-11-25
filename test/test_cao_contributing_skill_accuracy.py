@@ -569,11 +569,11 @@ class TestQuotedCommandsAreReal:
 
         Every token of CI's command is compared except those that only shape CI's
         output (``--cov-report=xml`` feeds the Codecov upload, ``-v`` is
-        verbosity). A missing path means a local run skips tests CI runs; a
-        missing ``--cov-branch`` or ``--cov-fail-under`` means a local pass on a
-        coverage figure CI does not use.
+        verbosity, ``--durations=25`` prints the slowest tests). A missing path means a
+        local run skips tests CI runs; a missing ``--cov-branch`` or ``--cov-fail-under``
+        means a local pass on a coverage figure CI does not use.
         """
-        output_only = {"--cov-report=xml", "-v"}
+        output_only = {"--cov-report=xml", "-v", "--durations=25"}
         command = _unit_tests_pytest_command()
         start = command.index("uv run pytest")
         joined = command[start:].replace("\\\n", " ")  # shell line continuations

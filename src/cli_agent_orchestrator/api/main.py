@@ -90,6 +90,7 @@ from cli_agent_orchestrator.constants import (
     INBOX_IMMEDIATE_DELIVERY_WAIT,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
+    INSTANCE_LABEL_ENV,
     MODEL_ID_MAX_LEN,
     MODEL_ID_RE,
     OTEL_SERVICE_NAME,
@@ -2355,6 +2356,9 @@ async def health_check():
         # can compare the two here when the client runs with a different
         # environment or on another host.
         "provider_init_timeout": int(get_server_settings()["provider_init_timeout"]),
+        # The operator's name for this server (CAO_INSTANCE_LABEL), so the web UI
+        # can say which server it is talking to. Read per request: display only.
+        "instance_label": os.environ.get(INSTANCE_LABEL_ENV, "").strip() or None,
         "components": {
             "cao": "ok",
             "herdr": _probe("herdr"),
@@ -3366,7 +3370,7 @@ async def agui_resume_interrupt(
         decision_enum = ApprovalDecision(body.decision)
     except ValueError:  # pragma: no cover - validate_decision 422s bad values first
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail=f"Invalid decision: {body.decision}",
         )
 
@@ -3378,7 +3382,7 @@ async def agui_resume_interrupt(
         )
     except ValueError as e:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail=str(e),
         )
     except DeliveryError as e:
@@ -4601,7 +4605,7 @@ async def install_agent_plugin(
         # server fault: return the full report so the panel can render every
         # finding rather than a bare error string.
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail=_with_untrusted_warning(outcome.to_dict()),
         )
     return _with_untrusted_warning(outcome.to_dict())
@@ -7799,14 +7803,14 @@ def _script_root(value: Optional[str]) -> str:
     root = os.path.realpath(value if value is not None else os.getcwd())
     if not os.path.isdir(root):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail="working_directory must name an existing directory",
         )
     try:
         return resolve_and_validate_path(root, description="working_directory")
     except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail="working_directory must not be a blocked system directory",
         ) from None
 
@@ -10240,7 +10244,7 @@ async def export_graph_endpoint(
     hit = secret_gate.scan_json_for_secrets(view.to_dict())
     if hit is not None:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail=f"export rejected: secret pattern '{hit}' detected",
         )
 

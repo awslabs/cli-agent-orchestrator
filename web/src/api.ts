@@ -144,6 +144,8 @@ export interface HealthInfo {
   components?: Record<string, string>
   /** The server's installed package version. Absent on an older server. */
   version?: string
+  /** The operator's name for this server (`CAO_INSTANCE_LABEL`). Null when unset, absent on an older server. */
+  instance_label?: string | null
 }
 
 // ── Create budgets, sized from the server's provider_init_timeout ───────────
