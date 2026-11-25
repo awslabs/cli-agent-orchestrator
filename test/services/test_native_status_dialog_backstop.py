@@ -469,8 +469,9 @@ class TestNamedSessionPadding:
     trailing blanks does not reach them, and 5 of them put a one-row footer
     outside the 6-row footer window. herdr reports ``idle`` on these pages.
 
-    Every frame here is a real capture with blank rows added above its rule, or
-    two real captures joined; none was captured at that height.
+    The frames in ``PADDED`` and the mixed page are real captures with blank rows
+    added above the rule, or two real captures joined. The two in ``LIVE`` were
+    captured at their real height afterwards.
     """
 
     PADDED = [
@@ -500,6 +501,39 @@ class TestNamedSessionPadding:
                 provider.get_status_from_screen(pane.split("\n"))
                 == TerminalStatus.WAITING_USER_ANSWER
             )
+
+    # Captured live after the review (herdr 0.9.5, Claude Code 2.1.330, 120x40,
+    # session named with /rename). herdr reported ``idle`` on both.
+    # - page 2 of a two-question call whose page 1 had a tall preview, cursor on
+    #   "Chat about this": 13 blank rows between the footer and the rule.
+    # - the review page of a four-question call whose questions and answers all
+    #   wrap: the heading is 19 non-blank rows above the choices. The capture's
+    #   first three rows (a startup notice and a blank) are cut.
+    LIVE = [
+        "named_session_page2_padded_13_rows",
+        "review_page_wrapped_named_session",
+    ]
+
+    @pytest.mark.parametrize("shape", LIVE)
+    def test_live_capture_is_seen_by_all_three_readers(self, shape):
+        pane = _herdr(shape)
+        backend = _backend("", native=None, event_inbox=False)
+        with patch("cli_agent_orchestrator.backends.registry._backend", backend):
+            provider = _claude()
+            assert provider.shows_user_answer_dialog(pane) is True
+            assert provider.get_status(pane) == TerminalStatus.WAITING_USER_ANSWER
+            assert (
+                provider.get_status_from_screen(pane.split("\n"))
+                == TerminalStatus.WAITING_USER_ANSWER
+            )
+
+    @pytest.mark.parametrize("shape", LIVE)
+    def test_live_capture_is_refused_and_nothing_is_typed(self, shape):
+        pane = _herdr(shape)
+        backend = _backend(pane, native=TerminalStatus.IDLE)
+        with _terminal(_claude(), backend) as monitor:
+            assert monitor.get_status("term-1") == TerminalStatus.IDLE
+            _assert_refused(backend, orchestration_type=OrchestrationType.SEND_MESSAGE)
 
     def test_shorter_second_page_is_refused_and_nothing_is_typed(self):
         pane = _mixed_height_second_page()
