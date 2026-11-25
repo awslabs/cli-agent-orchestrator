@@ -11,6 +11,7 @@ from cli_agent_orchestrator.services import memory_gateway
 from cli_agent_orchestrator.services.memory_service import (
     ForgetResult,
     MemoryAmbiguousScopeError,
+    MemoryNotFoundError,
     MemoryPartialWriteError,
 )
 
@@ -177,6 +178,37 @@ async def test_remote_snippet_falls_back_to_content_from_older_owner(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_remote_recall_detects_owner_v2_field_presence(monkeypatch):
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner:9889")
+
+    async def run_inline(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(memory_gateway.asyncio, "to_thread", run_inline)
+    payload = _memory().model_dump(mode="json")
+    payload.pop("fact_date", None)
+    post = Mock(return_value={"memories": [payload]})
+    monkeypatch.setattr(memory_gateway, "_post", post)
+
+    async def recall():
+        return await memory_gateway.recall_memory(
+            query=None,
+            scope="project",
+            memory_type=None,
+            limit=10,
+            terminal_context=None,
+            search_mode=None,
+            sort_by=None,
+            include_related=False,
+            detail="full",
+        )
+
+    assert (await recall())[0].v2_fields_present is False
+    post.return_value = {"memories": [{**payload, "fact_date": None}]}
+    assert (await recall())[0].v2_fields_present is True
+
+
+@pytest.mark.asyncio
 async def test_remote_memory_get_parity(monkeypatch):
     monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner:9889")
 
@@ -242,6 +274,34 @@ async def test_remote_memory_get_preserves_key_in_ambiguity_error(monkeypatch):
         await memory_gateway.get_memory(
             key="shared-fact",
             scope=None,
+            include_history=False,
+            max_chars=8000,
+            terminal_context=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_remote_memory_get_preserves_key_in_not_found_error(monkeypatch):
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner:9889")
+
+    async def run_inline(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(memory_gateway.asyncio, "to_thread", run_inline)
+    response = Mock(status_code=404)
+    response.json.return_value = {
+        "error_kind": "not_found",
+        "error": "memory not found: 'no-such-key'",
+        "key": "no-such-key",
+    }
+
+    with (
+        patch.object(memory_gateway.requests, "post", return_value=response),
+        pytest.raises(MemoryNotFoundError, match="^memory not found: 'no-such-key'$"),
+    ):
+        await memory_gateway.get_memory(
+            key="no-such-key",
+            scope="global",
             include_history=False,
             max_chars=8000,
             terminal_context=None,

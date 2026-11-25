@@ -85,18 +85,35 @@ _COMPILED_MARKER_RE = re.compile(
 )
 
 
-def _parseable_entry_boundaries(file_content: str) -> list[tuple[re.Match[str], datetime]]:
-    """Return valid native entry headings, using the parser's canonical rule."""
-    boundaries = []
-    for match in _LEGACY_ENTRY_HEADING_RE.finditer(file_content):
-        try:
-            timestamp = datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(
-                tzinfo=timezone.utc
-            )
-        except ValueError:
-            continue
-        boundaries.append((match, timestamp))
-    return boundaries
+def _parseable_entry_boundaries(
+    file_content: str, *, lenient: bool = True
+) -> list[tuple[re.Match[str], datetime]]:
+    """Return dated canonical headings, or dated lenient headings if none exist."""
+    for pattern, group in (
+        (_LEGACY_ENTRY_HEADING_RE, 1),
+        (_LENIENT_ENTRY_HEADING_RE, "timestamp"),
+    ):
+        if pattern is _LENIENT_ENTRY_HEADING_RE and not lenient:
+            break
+        boundaries = []
+        for match in pattern.finditer(file_content):
+            value = match.group(group)
+            try:
+                timestamp = datetime(
+                    int(value[0:4]),
+                    int(value[5:7]),
+                    int(value[8:10]),
+                    int(value[11:13]),
+                    int(value[14:16]),
+                    int(value[17:19]) if len(value) == 20 else 0,
+                    tzinfo=timezone.utc,
+                )
+            except ValueError:
+                continue
+            boundaries.append((match, timestamp))
+        if boundaries:
+            return boundaries
+    return []
 
 
 # #861: cap hybrid score/usage widening at 200 per source, never below the requested limit.
@@ -2348,6 +2365,7 @@ class MemoryService:
         self,
         primaries: list,
         *,
+        count_entries: bool = False,
         terminal_id: Optional[str] = None,
         policy: Optional[VaultInjectionPolicy] = None,
         eligibility: Optional[memory_eligibility.EligibilityCheck] = None,
@@ -2408,7 +2426,9 @@ class MemoryService:
                         policy=policy,
                     )
                 else:
-                    related_mem = self._load_related_memory(rk, primary.scope, primary_scope_id)
+                    related_mem = self._load_related_memory(
+                        rk, primary.scope, primary_scope_id, count_entries=count_entries
+                    )
                 if related_mem is None:
                     continue
                 related_mem.is_related = True
@@ -2932,6 +2952,7 @@ class MemoryService:
                 scope,
                 limit,
                 include_related=include_related,
+                count_entries=is_memory_recall_v2_fields_enabled(),
                 terminal_context=terminal_context,
                 policy=recall_policy,
                 **eligibility_kwargs,
@@ -2957,8 +2978,8 @@ class MemoryService:
 
     @staticmethod
     def _query_terms(query: Optional[str]) -> list[str]:
-        """Lower-cased query terms in caller order, without duplicates."""
-        return list(dict.fromkeys(term for term in (query or "").lower().split() if term))
+        """Query terms in caller order, retaining Unicode case for matching."""
+        return list(dict.fromkeys((query or "").split()))
 
     @staticmethod
     def _snippet(content: str, terms: list[str], limit: int = 300) -> str:
@@ -2999,7 +3020,11 @@ class MemoryService:
             memory.edited_at = memory.edited_at or memory.updated_at
             memory.match = {
                 "mode": search_mode,
-                "terms": [term for term in terms if term in memory.content.lower()],
+                "terms": [
+                    term.lower() if len(term.lower()) == len(term) else term
+                    for term in terms
+                    if re.search(re.escape(term), memory.content, re.IGNORECASE)
+                ],
                 "rank_reason": f"{search_mode} match",
             }
             memory.status = memory.lifecycle_status or "active"
@@ -3007,7 +3032,9 @@ class MemoryService:
             if detail == "snippet":
                 memory.snippet = self._snippet(memory.content, terms)
                 memory.match["terms"] = [
-                    term for term in memory.match["terms"] if term in memory.snippet.lower()
+                    term
+                    for term in memory.match["terms"]
+                    if re.search(re.escape(term), memory.snippet, re.IGNORECASE)
                 ]
 
     async def get_memory(
@@ -3109,7 +3136,11 @@ class MemoryService:
         result["links_out"] = links_out
         result["links_in"] = links_in
         if include_history:
-            truncated = memory.content_truncated or len(content) > max_chars
+            truncated = (
+                memory.content_truncated
+                or len(content) > max_chars
+                or len(history) < earlier_entries + 1
+            )
             remaining = max_chars
             visible_history = []
             for item in history:
@@ -3142,7 +3173,9 @@ class MemoryService:
             file_content = Path(memory.file_path).read_text(encoding="utf-8")
         except OSError:
             return []
-        boundaries = _parseable_entry_boundaries(file_content)
+        from cli_agent_orchestrator.services.settings_service import is_memory_parser_lenient
+
+        boundaries = _parseable_entry_boundaries(file_content, lenient=is_memory_parser_lenient())
         if not boundaries:
             return [
                 {
@@ -3782,6 +3815,7 @@ class MemoryService:
         include_related: bool = False,
         terminal_context: Optional[dict] = None,
         *,
+        count_entries: bool = False,
         policy: Optional[VaultInjectionPolicy] = None,
         eligibility: Optional[memory_eligibility.EligibilityCheck] = None,
         lifecycle_on: bool = False,
@@ -3815,6 +3849,7 @@ class MemoryService:
             try:
                 sliced = self._expand_related(
                     sliced,
+                    count_entries=count_entries,
                     terminal_id=(terminal_context or {}).get("terminal_id"),
                     policy=policy,
                     **eligibility_kwargs,
@@ -4825,7 +4860,7 @@ class MemoryService:
             )
         )
         timestamp_matches, timestamps, _entry_count = _timestamp_boundaries(timestamp_candidates, 1)
-        if count_entries:
+        if count_entries and compiled:
             entry_count = _parseable_entry_count(
                 list(
                     (
@@ -4846,10 +4881,10 @@ class MemoryService:
                 list(_LENIENT_ENTRY_HEADING_RE.finditer(file_content)),
                 "timestamp",
             )
-            if count_entries:
-                entry_count = _parseable_entry_count(
-                    list(_LENIENT_ENTRY_HEADING_RE.finditer(file_content)), "timestamp"
-                )
+        if count_entries and not compiled:
+            entry_count = len(
+                _parseable_entry_boundaries(file_content, lenient=lenient and not use_legacy_split)
+            )
 
         if timestamps:
             created_at = timestamps[0]

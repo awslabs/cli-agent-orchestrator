@@ -186,6 +186,57 @@ def test_snippets_keep_a_match_after_turkish_capital_i(service: MemoryService) -
             _memory().model_copy(update={"content": content, "match": {"terms": ["target"]}})
         ).lower()
     )
+    query_content = ("z" * 600) + " İstanbul " + ("z" * 600)
+    assert "İstanbul" in service._snippet(query_content, service._query_terms("İstanbul"))
+    assert "İstanbul" in _fallback_snippet(
+        _memory().model_copy(update={"content": query_content, "match": {"terms": ["İstanbul"]}})
+    )
+    memory = _memory().model_copy(update={"content": query_content})
+    service._apply_recall_detail([memory], "İstanbul", "metadata", "snippet")
+    assert "İstanbul" in memory.snippet
+    assert memory.match["terms"] == ["İstanbul"]
+
+
+def test_recall_status_uses_lifecycle_state(service: MemoryService) -> None:
+    memory = _memory().model_copy(update={"lifecycle_status": "superseded"})
+    service._apply_recall_detail([memory], None, "metadata", "full")
+    assert mcp_recall_wire_dict(memory, include_v2_fields=True)["status"] == "superseded"
+
+
+def test_remote_recall_tool_preserves_snippet_detail_and_owner_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cli_agent_orchestrator.mcp_server import server
+    from cli_agent_orchestrator.services import memory_gateway
+
+    memory = _memory().model_copy(update={"v2_fields_present": False, "snippet": "Wire shape"})
+    received = []
+
+    async def remote_recall(**kwargs):
+        received.append(kwargs)
+        return [memory]
+
+    monkeypatch.setattr(memory_gateway, "remote_memory_url", lambda: "http://memory-owner:9889")
+    monkeypatch.setattr(memory_gateway, "recall_memory", remote_recall)
+    monkeypatch.setattr(settings_service, "is_memory_recall_v2_fields_enabled", lambda: True)
+    tool = getattr(server.memory_recall, "fn", server.memory_recall)
+    result = asyncio.run(
+        tool(
+            query="wire",
+            scope="global",
+            memory_type=None,
+            limit=10,
+            search_mode="metadata",
+            sort_by=None,
+            include_related=False,
+            detail="snippet",
+        )
+    )
+
+    assert result["success"] is True
+    assert received[0]["detail"] == "snippet"
+    assert "content" not in result["memories"][0]
+    assert "fact_date" not in result["memories"][0]
 
 
 def test_v2_fields_expose_dates_match_and_hidden_history(
@@ -338,7 +389,10 @@ def test_memory_get_history_uses_only_parseable_entry_boundaries(service: Memory
     ]
 
 
-def test_memory_manager_bm25_fills_limit_from_visible_scopes(service: MemoryService) -> None:
+@pytest.mark.parametrize("search_mode", ["bm25", "metadata"])
+def test_memory_manager_bm25_fills_limit_from_visible_scopes(
+    service: MemoryService, search_mode: str
+) -> None:
     context = {"agent_profile": MEMORY_MANAGER_PROFILE}
     for number in range(3):
         asyncio.run(
@@ -364,7 +418,7 @@ def test_memory_manager_bm25_fills_limit_from_visible_scopes(service: MemoryServ
         service.recall(
             query="cobalt",
             limit=3,
-            search_mode="bm25",
+            search_mode=search_mode,
             terminal_context=context,
             record_access=False,
         )
@@ -372,6 +426,76 @@ def test_memory_manager_bm25_fills_limit_from_visible_scopes(service: MemoryServ
 
     assert len(rows) == 3
     assert {row.scope for row in rows} == {"global"}
+
+
+def test_metadata_pool_excludes_curator_hidden_scopes_before_limit(
+    service: MemoryService,
+) -> None:
+    context = {"agent_profile": MEMORY_MANAGER_PROFILE}
+    asyncio.run(
+        service.store(
+            content="cobalt visible", scope="global", memory_type="reference", key="visible"
+        )
+    )
+    asyncio.run(
+        service.store(
+            content="cobalt private",
+            scope="agent",
+            memory_type="reference",
+            key="private",
+            terminal_context=context,
+        )
+    )
+
+    rows = asyncio.run(
+        service._metadata_recall(
+            query="cobalt",
+            scope=None,
+            memory_type=None,
+            limit=10,
+            terminal_context=context,
+            allowed_scopes={"session", "project", "global"},
+        )
+    )
+
+    assert [row.key for row in rows] == ["visible"]
+
+
+def test_related_v2_rows_count_hidden_entries(
+    service: MemoryService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings_service, "is_memory_recall_v2_fields_enabled", lambda: True)
+    _topic(service, "primary-related", "Primary search body.")
+    _topic(
+        service,
+        "related-history",
+        "",
+        timestamps=(
+            ("2026-01-01T01:02:03Z", "Oldest body."),
+            ("2026-01-02T01:02:03Z", "Middle body."),
+            ("2026-01-03T01:02:03Z", "Newest body."),
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "_related_target_plan",
+        lambda primaries: [(primary, ["related-history"]) for primary in primaries],
+    )
+
+    rows = asyncio.run(
+        service.recall(
+            query="primary-related",
+            scope="global",
+            search_mode="metadata",
+            include_related=True,
+            record_access=False,
+        )
+    )
+
+    related = next(row for row in rows if row.key == "related-history")
+    wire = mcp_recall_wire_dict(related, include_v2_fields=True)
+    assert wire["earlier_entries"] == 2
+    assert wire["content_truncated"] is True
 
 
 def _configure_vault_exact_read(
@@ -631,6 +755,55 @@ def test_compiled_article_keeps_earliest_canonical_fact_date(service: MemoryServ
     assert memory.content_truncated is False
 
 
+def test_compiled_article_accepts_minute_precision_entry_date(service: MemoryService) -> None:
+    path = _topic(
+        service,
+        "compiled-minutes",
+        "<!-- cao-compiled: 2026-11-14T06:00:00Z entries=2 -->\n"
+        "## 2026-11-14T05:54:00Z\n\n"
+        "### Entry 2026-03-01T08:15Z\nEarlier detail.\n\n"
+        "### Entry 2026-11-14T05:54:00Z\nCurrent detail.\n\n"
+        "## Overview\nCurrent compiled article.",
+    )
+    entry = {
+        "key": "compiled-minutes",
+        "scope": "global",
+        "scope_id": None,
+        "memory_type": "reference",
+        "tags": "recall-v2",
+    }
+
+    memory = service._parse_wiki_file(path, path.read_text(encoding="utf-8"), entry)
+
+    assert memory is not None
+    assert memory.fact_date == datetime(2026, 3, 1, 8, 15, tzinfo=timezone.utc)
+
+
+def test_get_links_are_bounded_in_both_directions(
+    service: MemoryService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from cli_agent_orchestrator.services.memory_relationship_service import (
+        MemoryRelationshipService,
+    )
+
+    _topic(service, "bounded-links", "Visible body.")
+    edges = [
+        SimpleNamespace(type="relates_to", source_key="bounded-links", target_key=f"out-{index}")
+        for index in range(7)
+    ] + [
+        SimpleNamespace(type="relates_to", source_key=f"in-{index}", target_key="bounded-links")
+        for index in range(7)
+    ]
+    monkeypatch.setattr(MemoryRelationshipService, "list_relationships", lambda *_args: edges)
+
+    result = asyncio.run(service.get_memory("bounded-links", scope="global"))
+
+    assert [link["key"] for link in result["links_out"]] == [f"out-{index}" for index in range(5)]
+    assert [link["key"] for link in result["links_in"]] == [f"in-{index}" for index in range(5)]
+
+
 def test_memory_get_ambiguous_key_lists_visible_scopes(service: MemoryService) -> None:
     _topic(service, "same-key", "Global body.", scope="global")
     _topic(service, "same-key", "Federated body.", scope="federated")
@@ -710,6 +883,27 @@ def test_memory_get_tool_reports_exact_error_kinds(
     assert ambiguous["error_kind"] == "ambiguous_scope"
     assert ambiguous["scopes"] == ["global", "federated"]
     assert missing["error_kind"] == "not_found"
+    assert missing["error"] == "memory not found: 'missing-note'"
+
+
+def test_memory_get_tool_rejects_bad_scope_before_remote_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cli_agent_orchestrator.mcp_server import server
+    from cli_agent_orchestrator.services import memory_gateway
+
+    async def unexpected_remote_call(**_kwargs):
+        pytest.fail("invalid scope reached remote memory owner")
+
+    monkeypatch.setattr(memory_gateway, "remote_memory_url", lambda: "http://memory-owner:9889")
+    monkeypatch.setattr(memory_gateway, "get_memory", unexpected_remote_call)
+    tool = getattr(server.memory_get, "fn", server.memory_get)
+    result = asyncio.run(
+        tool(key="missing-note", scope="bad-scope", include_history=False, max_chars=8000)
+    )
+
+    assert result["error_kind"] == "not_found"
+    assert result["error"] == "memory not found: 'missing-note'"
 
 
 def test_memory_get_history_is_newest_first_and_capped(service: MemoryService) -> None:
@@ -787,6 +981,114 @@ def test_memory_get_complete_history_is_not_truncated(service: MemoryService) ->
     )
 
     assert len(result["history"]) == 2
+    assert result["content_truncated"] is False
+
+
+def test_memory_get_retains_reader_truncation_with_history(
+    service: MemoryService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def read_with_truncation(*_args, **_kwargs):
+        return _memory().model_copy(
+            update={"content_truncated": True, "lifecycle_status": "superseded"}
+        )
+
+    monkeypatch.setattr(service, "read_exact_key", read_with_truncation)
+    monkeypatch.setattr(
+        service,
+        "_memory_history",
+        lambda _memory: [
+            {"date": "2026-11-14T05:54:00Z", "content": "Wire shape stays unchanged."}
+        ],
+    )
+    result = asyncio.run(service.get_memory("shape-lock", scope="global", include_history=True))
+
+    assert result["content_truncated"] is True
+    assert result["status"] == "superseded"
+
+
+def test_history_shorter_than_entry_count_is_truncated(
+    service: MemoryService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _topic(
+        service,
+        "short-history",
+        "",
+        timestamps=(
+            ("2026-01-01T01:02:03Z", "Earlier body."),
+            ("2026-01-02T01:02:03Z", "Current body."),
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "_memory_history",
+        lambda _memory: [{"date": "2026-01-02T01:02:03Z", "content": "Current body."}],
+    )
+
+    result = asyncio.run(service.get_memory("short-history", scope="global", include_history=True))
+
+    assert result["earlier_entries"] == 1
+    assert len(result["history"]) == 1
+    assert result["content_truncated"] is True
+
+
+def test_default_recall_does_not_count_entry_boundaries(
+    service: MemoryService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cli_agent_orchestrator.services import memory_service
+
+    monkeypatch.setattr(settings_service, "is_memory_recall_v2_fields_enabled", lambda: False)
+    _topic(service, "uncounted-note", "Visible body.")
+
+    def unexpected_count(*_args, **_kwargs):
+        pytest.fail("default recall counted entry headings")
+
+    monkeypatch.setattr(memory_service, "_parseable_entry_boundaries", unexpected_count)
+    rows = asyncio.run(
+        service.recall(query="uncounted-note", scope="global", search_mode="metadata")
+    )
+    assert [row.key for row in rows] == ["uncounted-note"]
+
+
+@pytest.mark.parametrize(
+    ("headings", "bodies"),
+    [
+        (
+            (
+                "## Entry 2026-01-01T01:02:03Z",
+                "## Entry 2026-01-02T01:02:03Z",
+                "## Entry 2026-01-03T01:02:03Z",
+            ),
+            ("First entry.", "Second entry.", "Third entry."),
+        ),
+        (
+            ("## 2026-01-01T01:02Z", "## 2026-01-02T01:02Z"),
+            ("First entry.", "Second entry."),
+        ),
+        (
+            ("### 2026-01-01T01:02Z", "### 2026-01-02T01:02Z"),
+            ("First entry.", "Second entry."),
+        ),
+    ],
+)
+def test_memory_get_lenient_history_uses_counted_boundaries(
+    service: MemoryService, headings: tuple[str, ...], bodies: tuple[str, ...]
+) -> None:
+    path = _topic(service, "lenient-history", "Body to replace.")
+    text = path.read_text(encoding="utf-8")
+    path.write_text(
+        text.replace(
+            "Body to replace.",
+            "\n\n".join(f"{heading}\n{body}" for heading, body in zip(headings, bodies)),
+        ),
+        encoding="utf-8",
+    )
+
+    result = asyncio.run(
+        service.get_memory("lenient-history", scope="global", include_history=True)
+    )
+
+    assert result["earlier_entries"] == len(bodies) - 1
+    assert [item["content"] for item in result["history"]] == list(reversed(bodies))
     assert result["content_truncated"] is False
 
 

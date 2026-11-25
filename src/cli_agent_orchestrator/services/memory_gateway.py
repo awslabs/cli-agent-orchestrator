@@ -72,7 +72,7 @@ def _post(path: str, body: dict[str, Any]) -> dict[str, Any]:
             if isinstance(scopes, list) and all(isinstance(scope, str) for scope in scopes):
                 raise MemoryAmbiguousScopeError(str(body.get("key", "")), scopes)
         if error.get("error_kind") == MemoryNotFoundError.error_kind:
-            raise MemoryNotFoundError(error.get("error", "memory not found"))
+            raise MemoryNotFoundError(str(body.get("key", "")))
     response.raise_for_status()
     result: dict[str, Any] = response.json()
     return result
