@@ -379,6 +379,50 @@ export function isDarkTheme(theme) {
 // The drawing for a theme, as the path `image()` takes (mods/<mod>/<file>, as the other mods name their own drawings).
 export const brandMark = (theme) => `mods/cao-window-brand/${isDarkTheme(theme) ? "cao-mark-dark" : "cao-mark"}.svg`;
 
+// ---------- folding the left sidebar, and the traffic lights ----------
+
+// A block of a layout tree by its id, shown or hidden (null when there is none).
+export function layoutNode(node, id) {
+  if (!node || typeof node !== "object") return null;
+  if (node.id === id) return node;
+  for (const child of Array.isArray(node.children) ? node.children : []) {
+    const hit = layoutNode(child, id);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+// Herdr's mods draw their rail when the sidebar's width is under 160 px (workspace-chrome/main.js:15).
+export const SIDEBAR_RAIL_PX = 160;
+
+// What the fold button does. Herdr's button resizes the sidebar to a 76 px rail, and every sidebar mod then draws its rail form; this
+// window's lists have no rail form, so its sidebar's minimum is 200 px, and the 76 px left the sidebar 200 px wide with Herdr's rail
+// chrome on it (an empty top-left row with no button to unfold on macOS, the footer as two icons) over the full lists. So the button
+// hides the sidebar, as Herdr's layout.toggle:sidebar (Cmd-B) does, and the top bar's button shows it again. A sidebar an earlier fold
+// left under 160 px is given back the width it had (`saved`, else 268), as Herdr's unfold does.
+// -> {command, args}
+export function sidebarFold(root, saved) {
+  const px = layoutNode(root, "sidebar")?.size?.px;
+  if (typeof px === "number" && px < SIDEBAR_RAIL_PX) return { command: "layout.resize", args: { id: "sidebar", px: Number.isFinite(saved) && saved >= SIDEBAR_RAIL_PX ? saved : 268 } };
+  return { command: "layout.hide", args: { id: "sidebar" } };
+}
+
+// Whether the left sidebar is hidden (Cmd-B, or the fold button).
+export const sidebarHidden = (root) => layoutNode(root, "sidebar")?.hidden === true;
+
+// The top bar's left padding. On macOS with Herdr's own title bar off, the window buttons (the traffic lights, at the layout's
+// `traffic_lights` point, 64 px wide with their margin) sit at the window's top-left: over the sidebar's top row while it is shown, over
+// the start of the top bar while it is hidden. Herdr's own tabs mod leaves them that room (mods/tabs/main.js:128-130); this is its rule,
+// with this bar's own 8 px as the least. `zoom` is Herdr's zoom setting (the point is in window points, the bar in zoomed px).
+export function topBarInset(win, root, zoom) {
+  const lights = root?.traffic_lights;
+  if (win?.platform !== "macos" || win?.titlebar !== "none" || win?.fullscreen === true || !Array.isArray(lights) || !Number.isFinite(lights[0])) return 8;
+  const z = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
+  const sidebar = layoutNode(root, "sidebar");
+  const covered = !sidebar || sidebar.hidden === true ? 0 : Number.isFinite(sidebar.size?.px) ? sidebar.size.px : 0;
+  return Math.max(8, (lights[0] + 64) / z - covered);
+}
+
 // What each part of barText's text is, by its wording: [id, pattern, filter]. The lead word and the unreachable
 // notice are text; the four counts are buttons.
 const SH_PARTS = [

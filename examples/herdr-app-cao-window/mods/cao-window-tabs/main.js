@@ -7,7 +7,8 @@
 // the lists' own headers carry the counts).
 // A press opens, switches or closes the right sidebar through the pure reducer rsideStep, and the tick keeps the
 // sidebar's record and the block's real state in step (rsideLayoutStep). This is the one mod that sends
-// layout.show and layout.hide, and the bar is never resized.
+// layout.show and layout.hide for the right sidebar, and the bar is never resized. While the left sidebar is hidden (the brand row's
+// fold button, or Cmd-B), the bar starts after the macOS traffic lights, as Herdr's own tabs do, with the button that shows it again.
 //
 // This mod also polls the two lists, whether or not the sidebar is open, so what the lists show is never blind: GET /flows
 // every 30 s, GET /workflows with its runs every 60 s (5 s while a run is running), and again right after a
@@ -15,7 +16,7 @@
 // Every CAO call goes through callCao; the pollers only read.
 import { View, div, svg } from "gpui-kit";
 import { h_flex, ScrollHandle } from "gpui-base";
-import { exec, spaces, terminals, focused, layout, run, theme, props, shared, setShared, checking } from "herdr";
+import { exec, spaces, terminals, focused, layout, run, theme, props, shared, setShared, checking, window, settings } from "herdr";
 import { callCao } from "./cao.js";
 import { createStore } from "./store.js";
 import { programMark, crownIcon, focusTerminal } from "./ui.js";
@@ -23,7 +24,7 @@ import { tabViews, CROWN_MARK } from "./agents.js";
 import { buildModel, shownBlock, applyOutcome } from "./logic.js";
 import { flowRows, publishedFlows, flowsPollDue } from "./flows.js";
 import { workflowsPollDue, WORKFLOW_RUNS_LIMIT } from "./workflows-view.js";
-import { barButtonLabel, rsideStep, rsideLayoutStep, initialLayoutState, listView, initialSwipe, wheelTabStep } from "./shell.js";
+import { barButtonLabel, rsideStep, rsideLayoutStep, initialLayoutState, listView, initialSwipe, wheelTabStep, topBarInset, sidebarHidden } from "./shell.js";
 
 const RSIDE_BLOCK = "cao-window-panel";
 // The icons of the two buttons: drawings of this mod's own folder (24 grid, outline in the text colour, as Herdr's file.svg and
@@ -195,8 +196,19 @@ export default class CaoTabs extends View {
       .child(label);
   }
 
+  // The left sidebar's button, drawn while the sidebar is hidden: the brand row's fold button (workspace-chrome/main.js:27-31, Herdr's
+  // sidebar drawing, 26 px, muted) in the one place left to draw it. A press shows the sidebar again.
+  sidebarButton(t) {
+    return div().id("cao-show-sidebar").size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.muted)
+      .cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => { run("layout.show", { id: "sidebar" }); cx.notify(); })
+      .child(svg("mods/workspace-chrome/sidebar.svg").size(15));
+  }
+
   render() {
     const t = theme();
+    const tree = layout();
     const ctx = this.shown();
     const rside = this.store.get(KEYS.rside);
     const open = rside?.open === true ? rside.list : null;
@@ -209,8 +221,9 @@ export default class CaoTabs extends View {
     // The strip is Herdr's `tab-scroll` (mods/tabs/main.js:156-158): it takes the room the fixed items leave (flex_1, min_w 0), scrolls
     // sideways with a scrollbar tracked by `this.scroll`, and scrolls the focused tab into view when its own size changes. The wheel handler
     // sits on the bar (:155). The divider and the two buttons are the strip's siblings, so they stay at the right and never scroll.
-    return h_flex().id("cao-tabs").size_full().px(8).gap(4).items_center().bg(t.chrome)
+    return h_flex().id("cao-tabs").size_full().px(8).pl(topBarInset(window(), tree, settings()?.zoom)).gap(4).items_center().bg(t.chrome)
       .on_scroll_wheel((e) => this.wheel(e, ctx))
+      .when(sidebarHidden(tree), (e) => e.child(this.sidebarButton(t)))
       .child(h_flex().id("cao-tab-scroll").flex_1().min_w(0).h_full().items_center().gap(4).overflow_x_scrollbar().track_scroll(this.scroll)
         .on_size_change((_size, cx) => { if (ctx.active >= 0) { this.scroll.scroll_to_item(ctx.active); cx.notify(); } })
         .children(ctx.tabs.map((x, i) => this.tabView(t, x, ctx, i))))

@@ -107,6 +107,51 @@ test("The top-left says CAO: the text the brand mod draws beside the logo is the
 const MARK_LIGHT = "mods/cao-window-brand/cao-mark.svg";
 const MARK_DARK = "mods/cao-window-brand/cao-mark-dark.svg";
 
+// ---- folding the left sidebar, and the traffic lights ----
+// The window's sidebar has no rail (its minimum is 200 px), so the fold button hides the column (`sidebarFold`), and the top bar leaves
+// the macOS traffic lights the room Herdr's own tabs leave (`topBarInset`, mods/tabs/main.js:128-130 of Herdr).
+const tree = (sidebar) => freeze({ id: "root", traffic_lights: [12, 16], children: [{ id: "sidebar", ...sidebar, children: [{ id: "brand" }] }, { id: "work" }] });
+const MAC = freeze({ platform: "macos", titlebar: "none", fullscreen: false });
+
+test("Fold: the button hides the sidebar at any width it can have, instead of asking for a rail the 200 px minimum clamps", () => {
+  for (const px of [200, 268, 299, 640]) assert.deepEqual(S.sidebarFold(tree({ size: { px }, min: 200 }), 268), { command: "layout.hide", args: { id: "sidebar" } }, `${px} px`);
+  assert.deepEqual(S.sidebarFold(tree({ size: { weight: 1 } }), 268), { command: "layout.hide", args: { id: "sidebar" } }, "a width that is not px is not a rail");
+  assert.deepEqual(S.sidebarFold(null, 268), { command: "layout.hide", args: { id: "sidebar" } });
+});
+
+test("Fold: a sidebar an earlier fold left at the rail width (under 160 px) gets the width it had back, or 268", () => {
+  assert.deepEqual(S.sidebarFold(tree({ size: { px: 76 }, min: 200 }), 299), { command: "layout.resize", args: { id: "sidebar", px: 299 } });
+  assert.deepEqual(S.sidebarFold(tree({ size: { px: 44 } }), 299), { command: "layout.resize", args: { id: "sidebar", px: 299 } });
+  for (const saved of [undefined, null, NaN, 76, "299"]) assert.deepEqual(S.sidebarFold(tree({ size: { px: 76 } }), saved), { command: "layout.resize", args: { id: "sidebar", px: 268 } }, String(saved));
+  assert.equal(S.SIDEBAR_RAIL_PX, 160, "Herdr's rail rule (workspace-chrome/main.js:15)");
+});
+
+test("Sidebar hidden: only a sidebar marked hidden", () => {
+  assert.equal(S.sidebarHidden(tree({ hidden: true, size: { px: 268 } })), true);
+  for (const sb of [{ size: { px: 268 } }, { hidden: false }]) assert.equal(S.sidebarHidden(tree(sb)), false);
+  assert.equal(S.sidebarHidden(null), false);
+  assert.equal(S.sidebarHidden({ id: "root", children: [] }), false, "no sidebar in the layout");
+  assert.equal(S.layoutNode(tree({ hidden: true }), "brand")?.id, "brand", "a hidden block is still found");
+});
+
+test("Traffic lights: with the sidebar hidden the top bar starts after the window buttons; with it shown it keeps its own 8 px", () => {
+  // Was: always 8 px, so on macOS the window buttons (12 px from the left, 64 px with their margin) sat on the first tab.
+  assert.equal(S.topBarInset(MAC, tree({ hidden: true, size: { px: 268 } }), 1), 76);
+  assert.equal(S.topBarInset(MAC, tree({ hidden: true, size: { px: 268 } }), 2), 38, "the point is in window points, the bar in zoomed px");
+  assert.equal(S.topBarInset(MAC, tree({ hidden: true }), 1.25), 60.8);
+  for (const px of [200, 268, 640]) assert.equal(S.topBarInset(MAC, tree({ size: { px } }), 1), 8, `the sidebar's ${px} px cover them`);
+  assert.equal(S.topBarInset(MAC, tree({ size: { px: 40 } }), 1), 36, "a sidebar narrower than the buttons covers part of them (Herdr's rule)");
+  assert.equal(S.topBarInset(MAC, { id: "root", traffic_lights: [12, 16], children: [] }, 1), 76, "no sidebar at all");
+  for (const zoom of [undefined, null, 0, -1, NaN]) assert.equal(S.topBarInset(MAC, tree({ hidden: true }), zoom), 76, `zoom ${zoom} is 1`);
+});
+
+test("Traffic lights: off macOS, with the system title bar, fullscreen or no traffic_lights point, the bar keeps its own 8 px", () => {
+  const hidden = tree({ hidden: true });
+  for (const win of [{ ...MAC, platform: "linux" }, { ...MAC, titlebar: "system" }, { ...MAC, fullscreen: true }, null, undefined]) assert.equal(S.topBarInset(win, hidden, 1), 8, JSON.stringify(win));
+  assert.equal(S.topBarInset(MAC, { id: "root", children: [{ id: "sidebar", hidden: true }] }, 1), 8, "no traffic_lights point");
+  assert.equal(S.topBarInset(MAC, { id: "root", traffic_lights: ["12", 16], children: [] }, 1), 8);
+});
+
 test("Brand mark theme rule: exact colours at both ends and either side of the 0.179 luminance line", () => {
   const cases = [
     ["#000000", true], ["#ffffff", false], ["#1e1e2e", true], ["#f4f1e9", false], ["#eff1f5", false], ["#0b1024", true],

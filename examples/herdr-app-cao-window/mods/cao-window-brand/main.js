@@ -7,29 +7,16 @@
 import { View, div, image, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
 import { theme, run, window, shared, setShared, layout } from "herdr";
-import { BRAND_TEXT, BRAND_MARK_SIZE, BRAND_MARK_RADIUS, brandMark } from "./shell.js";
+import { BRAND_TEXT, BRAND_MARK_SIZE, BRAND_MARK_RADIUS, brandMark, sidebarFold } from "./shell.js";
 
-// workspace-chrome/main.js:5-12, a block of the layout by its id.
-function brandFind(node, id) {
-  if (node?.id === id) return node;
-  for (const child of node?.children ?? []) {
-    const found = brandFind(child, id);
-    if (found) return found;
-  }
-  return null;
-}
-
-// workspace-chrome/main.js:15, the rail goes by the sidebar's width, not a flag: dragging its edge narrows it too.
-const brandNarrow = () => (brandFind(layout(), "sidebar")?.size?.px ?? Infinity) < 160;
-
-// workspace-chrome/main.js:18-24, to the rail (on macOS wide enough for the traffic lights), or back to the width it had.
-// The sidebar's range (min 200) clamps the 76 px: the fold button leaves it at 200 px.
+// workspace-chrome/main.js:18-24 is Herdr's fold: to a 76 px rail, or back to the width it had. This window's sidebar has no rail (its
+// lists have no rail form, so its minimum is 200 px, which clamped the 76 px and left Herdr's rail chrome over full lists), so the button
+// hides the sidebar, as Cmd-B does, and the top bar's button shows it again; a sidebar an earlier fold left at the rail width gets its
+// width back (sidebarFold, lib/shell.js).
 function brandToggle() {
-  const width = brandFind(layout(), "sidebar")?.size?.px;
-  const rail = brandNarrow();
-  if (!rail) setShared("sidebar.width", width);
-  setShared("sidebar.collapsed", !rail);   // the flag that mods older than the width rule still read
-  run("layout.resize", { id: "sidebar", px: rail ? (shared("sidebar.width") ?? 268) : window()?.platform === "macos" ? 76 : 44 });
+  const step = sidebarFold(layout(), shared("sidebar.width"));
+  if (step.command === "layout.resize") setShared("sidebar.collapsed", false);   // the flag that mods older than the width rule still read
+  run(step.command, step.args);
 }
 
 export default class CaoBrand extends View {
@@ -41,16 +28,16 @@ export default class CaoBrand extends View {
   }
 
   // workspace-chrome/main.js:48-53, the row: padding, room for the macOS traffic lights, the mark and the text, the search
-  // button and the fold button. On the macOS rail the traffic lights fill the row, and the fold button is not drawn. The text takes the weight of
-  // the person's font_weight setting like the rows of the window; Herdr's own wordmark (:50) says font_semibold.
+  // button and the fold button. The text takes the weight of the person's font_weight setting like the rows of the window; Herdr's own
+  // wordmark (:50) says font_semibold. Herdr's row also has a rail form (no mark, no text, no search, and on macOS no fold button); this
+  // sidebar is never narrower than 200 px, so the row is always drawn whole.
   // The mark is a full-colour `image()` (`svg()` tints one colour), the light or the dark drawing by the theme's brightness (brandMark).
   render() {
     const t = theme();
-    const collapsed = brandNarrow();
-    return h_flex().size_full().bg(t.chrome).pl(collapsed ? 6 : 14).pr(10).gap(4).items_center().text_size(13.5)
-      .when(window()?.platform === "macos" && !window()?.fullscreen && !collapsed, el => el.pl(76))
-      .when(!collapsed, el => el.child(h_flex().flex_1().gap(8).items_center().child(image(brandMark(t)).size(BRAND_MARK_SIZE).rounded(BRAND_MARK_RADIUS)).child(div().text_color(t.foreground).child(BRAND_TEXT))))
-      .when(!collapsed, el => el.child(this.button("search", svg("mods/workspace-chrome/search.svg").size(15), () => run("mod.open", { name: "picker" }))))
-      .when(!(collapsed && window()?.platform === "macos"), el => el.child(this.button("sidebar-toggle", svg("mods/workspace-chrome/sidebar.svg").size(15), brandToggle)));
+    return h_flex().size_full().bg(t.chrome).pl(14).pr(10).gap(4).items_center().text_size(13.5)
+      .when(window()?.platform === "macos" && !window()?.fullscreen, el => el.pl(76))
+      .child(h_flex().flex_1().gap(8).items_center().child(image(brandMark(t)).size(BRAND_MARK_SIZE).rounded(BRAND_MARK_RADIUS)).child(div().text_color(t.foreground).child(BRAND_TEXT)))
+      .child(this.button("search", svg("mods/workspace-chrome/search.svg").size(15), () => run("mod.open", { name: "picker" })))
+      .child(this.button("sidebar-toggle", svg("mods/workspace-chrome/sidebar.svg").size(15), brandToggle));
   }
 }

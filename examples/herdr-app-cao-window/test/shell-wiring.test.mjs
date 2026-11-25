@@ -99,11 +99,29 @@ test("Buttons do not drag the window: the tab and the button each stop the press
   }
 });
 
-test("Hidden at first start: only the top bar sends layout.show and layout.hide, and only what rsideLayoutStep returned", () => {
+test("Traffic lights: the top bar starts where Herdr's own tabs start (topBarInset), and shows the sidebar's button while the sidebar is hidden", () => {
+  // Herdr's tabs mod leaves the macOS window buttons room when the sidebar does not cover them (mods/tabs/main.js:128-130); this bar did
+  // not, so with the sidebar hidden the traffic lights sat on its first tab.
+  const src = tabs();
+  const render = bodyOf(src, "render").replace(/\s+/g, " ");
+  assert.match(render, /h_flex\(\)\.id\("cao-tabs"\)\.size_full\(\)\.px\(8\)\.pl\(topBarInset\(window\(\), tree, settings\(\)\?\.zoom\)\)/);
+  assert.match(render, /const tree = layout\(\);/);
+  assert.match(render, /\.when\(sidebarHidden\(tree\), \(e\) => e\.child\(this\.sidebarButton\(t\)\)\)/, "the button, only while the sidebar is hidden, before the tabs");
+  assert.ok(render.indexOf("sidebarButton") < render.indexOf("cao-tab-scroll"), "first in the bar");
+  const button = bodyOf(src, "sidebarButton");
+  assert.match(button, /on_mouse_down\("left", \(_e, cx\) => cx\.stop_propagation\(\)\)/, "it does not start a window drag");
+  assert.match(button, /svg\("mods\/workspace-chrome\/sidebar\.svg"\)\.size\(15\)/, "Herdr's sidebar drawing, as on the brand row's fold button");
+});
+
+test("Hidden at first start: only the top bar sends layout.show and layout.hide for the right sidebar, and only what rsideLayoutStep returned", () => {
   const src = tabs();
   const apply = bodyOf(src, "applyLayout");
   assert.ok(apply !== null);
-  assert.equal(count(src.keep, /layout\.(show|hide)/g), count(apply, /layout\.(show|hide)/g), "no send outside applyLayout");
+  const again = bodyOf(src, "sidebarButton");
+  assert.ok(again !== null, "the left sidebar's button");
+  assert.equal(count(again, /layout\.(show|hide)/g), 1);
+  assert.match(again, /run\("layout\.show", \{ id: "sidebar" \}\)/, "it shows the left sidebar, not the right one");
+  assert.equal(count(src.keep, /layout\.(show|hide)/g), count(apply, /layout\.(show|hide)/g) + 1, "no send of the right sidebar outside applyLayout");
   assert.equal(count(apply, /layout\.show/g), 1);
   assert.equal(count(apply, /layout\.hide/g), 1);
   const calls = [...src.keep.matchAll(/this\.applyLayout\(([^)]*)\)/g)].map((m) => m[1].trim());
@@ -291,30 +309,29 @@ test("Same search button: it opens the picker with the command Herdr's own butto
   assert.equal(count(src.keep, /svg\("mods\/workspace-chrome\/search\.svg"\)\.size\(15\)/g), 1);
 });
 
-test("Same fold button: it asks Herdr for the rail (76 px on macOS, 44 elsewhere) or the saved width (268 px), and remembers the width it leaves", () => {
+test("Fold button hides the sidebar: it runs sidebarFold's step, which hides the column, or gives a rail an earlier fold left its width back", () => {
+  // Changed on purpose: the button asked for Herdr's 76 px rail, which the sidebar's 200 px minimum clamped, so it left Herdr's rail chrome
+  // (an empty top-left row with no unfold button on macOS, the footer as icons) over the full lists. The step is tested in lib/shell.test.mjs.
   const src = brand();
   const body = bodyOf(src, "brandToggle");
   assert.ok(body !== null, "the fold has one function");
   const text = flat(body);
-  assert.match(text, /run\("layout\.resize", \{ id: "sidebar", px: [^}]*\}\)/);
-  assert.match(text, /\? \(?shared\("sidebar\.width"\) \?\? 268\)? : window\(\)\?\.platform === "macos" \? 76 : 44/, "back to the saved width or 268; to the rail 76 on macOS, else 44");
-  assert.match(text, /setShared\("sidebar\.width", width\)/, "the width it leaves is saved before the rail");
-  assert.match(text, /setShared\("sidebar\.collapsed", /, "the flag older mods still read is kept in step");
-  assert.equal(count(src.keep, /layout\.resize/g), 1, "one resize, in the fold");
+  assert.match(text, /const step = sidebarFold\(layout\(\), shared\("sidebar\.width"\)\);/);
+  assert.match(text, /run\(step\.command, step\.args\)/, "it runs the step and nothing else");
+  assert.equal(count(src.keep, /\brun\(/g), 2, "the fold and the search button");
+  assert.equal(count(src.keep, /layout\.(resize|hide|show|toggle)/g), 1, "the only layout command it names is the one it checks");
   assert.equal(count(src.keep, /svg\("mods\/workspace-chrome\/sidebar\.svg"\)\.size\(15\)/g), 1);
   assert.match(flat(src.keep), /\.child\(this\.button\("sidebar-toggle", svg\([^)]*\)\.size\(15\), brandToggle\)\)/, "the fold button runs the fold");
 });
 
-test("Same rail: the row is narrow when the sidebar is under 160 px, and the wordmark and the search button go with it", () => {
+test("No rail form: the row is always drawn whole, the mark, the text, the search and the fold button, with room for the traffic lights", () => {
   const src = brand();
-  const all = flat(src.keep);
-  assert.match(all, /const brandNarrow = \(\) => \(brandFind\(layout\(\), "sidebar"\)\?\.size\?\.px \?\? Infinity\) < 160;/);
   const render = flat(bodyOf(src, "render"));
-  assert.match(render, /const collapsed = brandNarrow\(\);/);
-  assert.match(render, /\.pl\(collapsed \? 6 : 14\)\.pr\(10\)\.gap\(4\)\.items_center\(\)/, "the padding of Herdr's row");
-  assert.match(render, /\.when\(window\(\)\?\.platform === "macos" && !window\(\)\?\.fullscreen && !collapsed, el => el\.pl\(76\)\)/, "room for the traffic lights, on macOS, not fullscreen, not on the rail");
-  assert.equal(count(render, /\.when\(!collapsed, /g), 2, "the wordmark and the search button show only when it is not the rail");
-  assert.match(render, /\.when\(!\(collapsed && window\(\)\?\.platform === "macos"\), el => el\.child\(this\.button\("sidebar-toggle"/, "on the macOS rail the traffic lights fill the row and the fold button is not drawn");
+  assert.equal(count(src.keep, /brandNarrow|collapsed \?|!collapsed/g), 0, "the sidebar is never narrower than its 200 px minimum, so there is no rail to draw");
+  assert.match(render, /\.pl\(14\)\.pr\(10\)\.gap\(4\)\.items_center\(\)/, "the padding of Herdr's row");
+  assert.match(render, /\.when\(window\(\)\?\.platform === "macos" && !window\(\)\?\.fullscreen, el => el\.pl\(76\)\)/, "room for the traffic lights, on macOS, not fullscreen");
+  assert.equal(count(render, /\.when\(/g), 1, "nothing else is conditional");
+  assert.equal(count(render, /this\.button\(/g), 2, "the search and the fold button are always there");
 });
 
 test("Buttons do not drag the window: the brand row's buttons stop the press, as Herdr's do", () => {
@@ -324,14 +341,15 @@ test("Buttons do not drag the window: the brand row's buttons stop the press, as
   assert.match(body, /\.on_click\(action\)/);
 });
 
-test("Only the brand mod resizes the sidebar column (the side mod folds its own blocks), and the row has no timer or call out", () => {
+test("Only the brand mod folds the sidebar column (the side mod folds its own blocks), and the row has no timer or call out", () => {
   const callers = [];
   for (const mod of readdirSync(join(ROOT, "mods"), { withFileTypes: true }).filter((e) => e.isDirectory())) {
     for (const f of readdirSync(join(ROOT, "mods", mod.name)).filter((x) => x.endsWith(".js"))) {
-      if (count(read("mods", mod.name, f).keep, /layout\.resize",\s*\{\s*id:\s*"sidebar"/g) > 0) callers.push(`mods/${mod.name}/${f}`);
+      const keep = read("mods", mod.name, f).keep;
+      if (count(keep, /layout\.resize",\s*\{\s*id:\s*"sidebar"|\bsidebarFold\(/g) > 0) callers.push(`mods/${mod.name}/${f}`);
     }
   }
-  assert.deepEqual(callers, ["mods/cao-window-brand/main.js"]);
+  assert.deepEqual(callers, ["mods/cao-window-brand/main.js"], "the fold (sidebarFold) is the only resize or hide of the column, and only the brand row runs it");
   assert.equal(count(brand().keep, /\bexec\(|\bcx\.timer\b|\bsetBadge\b|\bsetWindowTitle\b|\bcallCao\b|\bfetch\(/g), 0, "the row only draws two buttons");
   assert.deepEqual(JSON.parse(readFileSync(join(ROOT, "mods", "cao-window-brand", "mod.json"), "utf8")), { place: "none" }, "placed by the layout, like the other cao-window mods");
 });
