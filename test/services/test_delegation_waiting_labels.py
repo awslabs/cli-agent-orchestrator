@@ -34,6 +34,7 @@ from cli_agent_orchestrator.models.delegation import EdgeSource, EdgeState
 from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import delegation_callback_service as svc
+from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.inbox_service import InboxService
 
 MOD = "cli_agent_orchestrator.services.delegation_callback_service"
@@ -352,6 +353,91 @@ class TestEdgesOpenAndClose:
 
 
 # --- the sweep repairs every terminal ---
+
+
+class TestTerminalServiceEdgeCloses:
+    """The two places ``terminal_service`` closes a worker's edges refresh the callers too."""
+
+    @pytest.fixture
+    def row_deletion(self):
+        with (
+            patch.object(terminal_service, "db_delete_terminal", return_value=True),
+            patch.object(terminal_service, "_delete_deferred_failure_fallback"),
+            patch.object(terminal_service, "_delete_deferred_init_complete_fallback"),
+            patch.object(terminal_service, "ephemeral_service"),
+        ):
+            yield
+
+    @pytest.fixture
+    def failing_worker(self):
+        with (
+            patch.object(
+                terminal_service,
+                "get_terminal_metadata",
+                return_value={"caller_id": "sup", "tmux_session": "cao-s"},
+            ),
+            patch.object(terminal_service, "create_inbox_message"),
+            patch.object(terminal_service, "ephemeral_service"),
+        ):
+            yield
+
+    def test_a_deferred_init_failure_publishes_the_callers_lower_count(
+        self, db, backend, failing_worker
+    ):
+        _armed("sup", "w1")
+        create_delegation_edge("sup", "w2", EdgeSource.ASSIGN)
+
+        terminal_service._notify_caller_of_deferred_failure(
+            "w1", "failed to start", None, delete_worker=False
+        )
+
+        assert list_open_edges_into("w1") == []
+        assert backend.calls == [({"sup": 1}, False)]
+
+    def test_a_later_worker_ended_has_nothing_left_to_publish(
+        self, db, env, backend, failing_worker
+    ):
+        _armed("sup", "w1")
+        terminal_service._notify_caller_of_deferred_failure(
+            "w1", "failed to start", None, delete_worker=False
+        )
+        assert backend.calls == [({"sup": 0}, False)]
+
+        svc.handle_worker_ended("w1", "launch_failed")
+
+        assert backend.calls == [({"sup": 0}, False)]
+
+    def test_a_deferred_init_failure_with_no_edge_publishes_nothing(
+        self, db, backend, failing_worker
+    ):
+        terminal_service._notify_caller_of_deferred_failure(
+            "w1", "failed to start", None, delete_worker=False
+        )
+
+        assert backend.calls == []
+
+    def test_deleting_a_row_publishes_the_callers_lower_count(self, db, backend, row_deletion):
+        _armed("sup", "w1")
+        create_delegation_edge("sup", "w2", EdgeSource.ASSIGN)
+
+        terminal_service.delete_terminal_row("w1", None, end_reason="session_teardown")
+
+        assert list_open_edges_into("w1") == []
+        assert backend.calls == [({"sup": 1}, False)]
+
+    def test_deleting_a_row_that_nothing_waits_on_publishes_nothing(
+        self, db, backend, row_deletion
+    ):
+        terminal_service.delete_terminal_row("w1", None, end_reason="session_teardown")
+
+        assert backend.calls == []
+
+    def test_a_failing_label_write_does_not_stop_the_row_deletion(self, db, backend, row_deletion):
+        _armed("sup", "w1")
+        backend.error = RuntimeError("core went away")
+
+        assert terminal_service.delete_terminal_row("w1", None, end_reason="deleted") is True
+        assert list_open_edges_into("w1") == []
 
 
 class TestSweep:

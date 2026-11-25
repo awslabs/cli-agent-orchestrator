@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import requests
 from pydantic import ValidationError
@@ -100,7 +100,7 @@ from cli_agent_orchestrator.constants import (
     TURN_START_CONFIRM_SECONDS,
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
-from cli_agent_orchestrator.models.delegation import EdgeState
+from cli_agent_orchestrator.models.delegation import DelegationEdge, EdgeState
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import (
     KiroEngine,
@@ -3792,6 +3792,16 @@ def _notify_elastic_terminal_ended(terminal_id: str) -> None:
         )
 
 
+def _refresh_waiting_labels_of(closed_edges: Iterable[DelegationEdge]) -> None:
+    """Refresh ``cao.waiting`` of every caller whose edge was just closed.
+
+    The import is local because ``delegation_callback_service`` imports this module.
+    """
+    from cli_agent_orchestrator.services import delegation_callback_service
+
+    delegation_callback_service.refresh_waiting_labels(edge.caller_id for edge in closed_edges)
+
+
 def _notify_caller_of_deferred_failure(
     terminal_id: str,
     message: str,
@@ -3855,7 +3865,8 @@ def _notify_caller_of_deferred_failure(
     # The caller has just been told the worker failed. Close its edges here so
     # neither a forward nor a second worker-ended notice follows.
     try:
-        close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
+        closed = close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
+        _refresh_waiting_labels_of(closed)
     except Exception as exc:  # noqa: BLE001 - best-effort
         logger.warning("Deferred-init failure: could not close edges for %s: %s", terminal_id, exc)
 
@@ -7476,7 +7487,8 @@ def delete_terminal_row(
     # and an edge they left open would stay armed with no terminal behind it,
     # re-evaluated by every sweep. Runs even when another owner deleted the row.
     try:
-        close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
+        closed = close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
+        _refresh_waiting_labels_of(closed)
     except Exception as exc:  # noqa: BLE001 - best-effort; the row is already gone
         logger.warning("Could not close delegation edges of %s: %s", terminal_id, exc)
     if deleted:
