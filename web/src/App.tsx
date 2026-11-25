@@ -15,6 +15,9 @@ import { PLUGINS_TAB_ENABLED } from './featureFlags'
 import { CaoMark } from './components/CaoMark'
 import { Bot, Home, Clock, Settings, Brain, Workflow, Puzzle, PanelsTopLeft, CheckCircle, XCircle, Info, Wifi, WifiOff, Package } from 'lucide-react'
 
+// Kept in step with <title> in web/index.html, which shows before the app loads.
+const APP_TITLE = 'CLI Agent Orchestrator'
+
 type TabKey = 'home' | 'profiles' | 'agents' | 'flows' | 'settings' | 'memory' | 'workflows' | 'plugins' | 'workspace'
 
 // Profiles sits between Home and Agents (#510): browsing/authoring profiles
@@ -104,6 +107,27 @@ export default function App() {
     t => (t.key !== 'memory' || memoryEnabled) && (t.key !== 'plugins' || PLUGINS_TAB_ENABLED)
   )
 
+  // The operator's name for this server (CAO_INSTANCE_LABEL via GET /health). A
+  // local server and a cluster supervisor serve the same build, so without it two
+  // open UIs look identical. Read once; an older server or a failed read shows none.
+  const [instanceLabel, setInstanceLabel] = useState<string | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    api.getHealth()
+      .then(h => {
+        const label = typeof h?.instance_label === 'string' ? h.instance_label.trim() : ''
+        if (!cancelled) setInstanceLabel(label || null)
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
+  useEffect(() => {
+    // Keep the Workspace tab's "(N) " attention prefix, which it adds only when its
+    // flag count changes: a /health that answers late must not wipe it.
+    const prefix = document.title.match(/^\(\d+\)\s*/)?.[0] ?? ''
+    document.title = prefix + (instanceLabel ? `${instanceLabel} · ${APP_TITLE}` : APP_TITLE)
+  }, [instanceLabel])
+
   useEffect(() => {
     fetchSessions()
     api.getMemoryStatus()
@@ -141,9 +165,21 @@ export default function App() {
       {/* Header */}
       <header className="border-b border-gray-800 bg-gray-900/80 backdrop-blur-xs sticky top-0 z-40">
         <div className="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-3">
+          {/* min-w-0 only with a label, so a long one truncates on a narrow window
+              instead of pushing Live/Offline off screen; the logo keeps its size.
+              Without a label, nothing changes. */}
+          <div className={`flex items-center gap-3 ${instanceLabel ? 'min-w-0 [&>svg]:shrink-0' : ''}`}>
             <CaoMark size={32} />
-            <h1 className="text-lg font-bold text-white">CLI Agent Orchestrator</h1>
+            <h1 className="text-lg font-bold text-white">{APP_TITLE}</h1>
+            {instanceLabel && (
+              <span
+                className="min-w-0 max-w-xs truncate rounded-md border border-amber-400/70 bg-amber-500/15 px-2.5 text-lg font-bold text-amber-300"
+                title={instanceLabel}
+                data-testid="instance-label"
+              >
+                {instanceLabel}
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-4">
             <span className="text-xs text-gray-500">{sessions.length} session{sessions.length !== 1 ? 's' : ''}</span>

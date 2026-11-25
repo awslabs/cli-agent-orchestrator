@@ -82,7 +82,7 @@ runs:
       if: ${{ !cancelled() }}
       shell: bash
       env:
-        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
       run: |
         set -euo pipefail
         set -- --no-tags
@@ -100,7 +100,7 @@ runs:
       shell: bash
       env:
         # Empty outside pull requests; the script then skips the base comparisons.
-        CAO_DEPSEC_BASE_REV: ${{ github.event.pull_request.base.sha }}
+        CAO_DEPSEC_BASE_REV: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
       run: uv run --no-sync python scripts/dependency_security.py --output-dir "$RUNNER_TEMP/dependency-security"
 
     - name: Publish dependency inventory and findings

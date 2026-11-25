@@ -497,6 +497,24 @@ def test_audit_reports_and_mitigations_are_not_skipped_after_scanner_setup_failu
     assert "secrets." not in yaml.safe_dump(action)
 
 
+def test_dependency_security_fetches_and_checks_merge_group_base():
+    action = yaml.safe_load(
+        (ROOT / ".github" / "actions" / "dependency-security" / "action.yml").read_text()
+    )
+    steps = action["runs"]["steps"]
+    expected = "${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}"
+    assert (
+        next(step for step in steps if step.get("env", {}).get("BASE_SHA"))["env"]["BASE_SHA"]
+        == expected
+    )
+    assert (
+        next(step for step in steps if step.get("env", {}).get("CAO_DEPSEC_BASE_REV"))["env"][
+            "CAO_DEPSEC_BASE_REV"
+        ]
+        == expected
+    )
+
+
 @pytest.mark.parametrize("project", ["docusaurus", "web", "cao_mcp_apps"])
 def test_all_affected_projects_install_the_shared_patch_and_regressions(project):
     manifest = json.loads((ROOT / project / "package.json").read_text())
@@ -644,3 +662,6 @@ def test_shared_patch_and_tests_trigger_the_docs_build():
         assert {"patches/**", "vendor/**", "scripts/test-braces-security.cjs"} <= set(
             events[event]["paths"]
         )
+    from scripts.ci_changed_paths import FILTERS
+
+    assert {"patches/**", "vendor/**", "scripts/test-braces-security.cjs"} <= set(FILTERS["docs"])
