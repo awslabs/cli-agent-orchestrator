@@ -1,3 +1,13 @@
+---
+feature: remote-ec2
+title: Set up a fresh CAO box on EC2
+applies_to: "this sample's bootstrap.sh and units; the AWS CLI with the Session Manager plugin; herdr"
+user_steps: [0, 2, 7]
+consent_before: [3, 5, 7, 9, 10, 11, 13, 15]
+touches: [cloud, the box, the laptop's SSH config]
+undo: yes
+---
+
 # Set up a fresh CAO box on EC2: a runbook an agent can follow
 
 This page is for the case where a user asks their agent to "set up the remote EC2 box for me".

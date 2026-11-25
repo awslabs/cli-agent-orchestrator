@@ -106,6 +106,13 @@ This auto-detects your install method (PyPI, git, local) and runs the appropriat
 `cao update` requires that CAO was installed as a uv tool. If you installed with pip, use `pip install --upgrade cli-agent-orchestrator` instead.
 :::
 
+## Agent-led setup
+
+To have your agent set a feature up for you, give it one of the
+[setup guides](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/setup/README.md).
+Each guide is a runbook an agent can follow step by step: every step ends with a check, and the
+guide names the steps that need your OK and the ones only you may do, such as logins and keys.
+
 ## What gets installed
 
 | Command | Purpose |

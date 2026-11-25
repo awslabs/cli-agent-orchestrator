@@ -1,3 +1,13 @@
+---
+feature: ephemeral-agents
+title: Set up ephemeral agents and a decider
+applies_to: "cao decisions enable, disable, off and show; the installed_deciders key in cao decisions status"
+user_steps: [5]
+consent_before: [3, 4, 6, 7, 8, 9]
+touches: [settings.json, the server's Python, the decider's key and consent]
+undo: yes
+---
+
 # Set up ephemeral agents and a decider: a runbook an agent can follow
 
 This page is for the case where you ask your agent to "turn on ephemeral agents and set up the
@@ -54,7 +64,8 @@ For what ephemeral agents and decisions are, see [Ephemeral agents](ephemeral-ag
 5. Use the exact package name `cao-decider-jev` from this page or from the user, never a short
    name you heard.
 
-If your shell drops variables between commands, start each later command with
+Steps 1, 2, 3 and 6 use the [shared setup snippets](setup/snippets.md) that every setup guide
+links to. If your shell drops variables between commands, start each later command with
 `CAO_PY='<path from step 2>';`, or paste the literal path.
 
 ## The steps at a glance
@@ -71,43 +82,17 @@ If your shell drops variables between commands, start each later command with
 
 ## 1. Back up `settings.json`
 
-```bash
-SETTINGS="$(cao config path)"
-if [ -f "$SETTINGS" ]; then cp "$SETTINGS" "$SETTINGS.bak.$(date +%s)"; else echo "no settings.json yet: nothing to back up"; fi
-```
-
-Keep the backup path for step 9. On a fresh install there's no file, so "restore the backup"
-later means removing the `settings.json` this setup created. Once the user confirms the setup is
-done, delete the `.bak.*` copies: they are plain copies of an operator-only file.
+Follow [Back up `settings.json`](setup/snippets.md#back-up-settingsjson). Keep the backup path
+for step 9.
 
 ## 2. Preflight
 
-**Find the Python interpreter the running `cao-server` really uses.** Every later check runs in
-it, not in a guessed path and not in your own virtual environment. Take it from the process
-listening on the CAO port. Read only the process's command line, never its environment:
-
-```bash
-PORT="${CAO_API_PORT:-9889}"
-PID="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t | head -n 1)"
-if [ -n "$PID" ]; then
-  ps -o args= -p "$PID"   # e.g. /path/to/venv/bin/python3 /path/to/cao-server
-  CAO_PY="$(ps -o args= -p "$PID" | awk '{print $1}')"
-  "$CAO_PY" -c 'import cli_agent_orchestrator' 2>/dev/null ||   # e.g. a macOS framework Python
-    CAO_PY="$(head -n 1 "$(ps -o args= -p "$PID" | awk '{print $2}')" | sed 's/^#! *//')"
-elif curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null; then
-  echo "/health answers but lsof sees no listener: the server may run as another user: stop and ask"
-else
-  echo "no cao-server on port $PORT: using the uv tool path, unconfirmed"
-  CAO_PY="$(uv tool dir)/cli-agent-orchestrator/bin/python3"
-fi
-"$CAO_PY" -c 'import sys, cli_agent_orchestrator as c; print(sys.prefix); print(c.__file__)'
-readlink -f "$(command -v cao)"; readlink -f "$(dirname "$CAO_PY")/cao"
-```
-
-What you should see: the import succeeds, and the last line prints the same path twice. That
-means the `cao` on your `PATH` is that server's own CLI. If the paths differ, or a path has
-spaces (which `awk` cuts), stop and ask. If no server was running, tell the user the path is a
-guess until step 6 confirms it.
+**Find the Python interpreter the running `cao-server` really uses**, and check the `cao` on
+your `PATH` is that server's own CLI: follow
+[Find the server's Python](setup/snippets.md#find-the-servers-python). Every later check runs
+in that `"$CAO_PY"`. Keep its `ps` line for step 6, and find out how the server is started
+(step 6 restarts it the same way). If no server was running, tell the user the path is a guess
+until step 6 confirms it.
 
 **Check the build has the decision platform.** The version number can't tell you, so probe the
 commands this runbook uses:
@@ -124,36 +109,15 @@ If any of these fails, prints "No such command", or the JSON has no `installed_d
 build is too old. Report that and stop. The fix is the user's call, for example a git install of
 `main`.
 
-**Find out how the server is started:** a foreground terminal, a background process, `launchd`
-or a container. The `ps` line above helps. Step 6 restarts it, and CAO won't start one for you.
-Ask the user if it isn't obvious.
-
 ## 3. Install the decider into the server's Python
 
 The package must land in the **same environment `cao-server` runs from**. The two install
 patterns below only apply when that environment is CAO's `uv tool` environment, which is the
-common case:
-
-```bash
-[ "$("$CAO_PY" -c 'import sys; print(sys.prefix)')" = "$(uv tool dir)/cli-agent-orchestrator" ] \
-  && echo "uv tool venv: patterns A/B apply" || echo "NOT the uv tool venv: stop and ask the user"
-"$CAO_PY" - "$(uv tool dir)/cli-agent-orchestrator/uv-receipt.toml" <<'EOF'
-import re, sys, tomllib
-with open(sys.argv[1], "rb") as f:
-    requirements = tomllib.load(f)["tool"]["requirements"]
-for entry in requirements:  # print only the requirements, with any user:password@ in a URL hidden
-    print({k: re.sub(r"//[^/@]*@", "//<redacted>@", v) if isinstance(v, str) else v
-           for k, v in entry.items()})
-EOF
-```
-
-This prints one line per requirement in uv's install receipt, such as
-`{'name': 'cli-agent-orchestrator', 'git': 'https://github.com/awslabs/cli-agent-orchestrator.git'}`.
-Don't `cat` the receipt: a source URL can carry a credential. If any line shows `<redacted>`,
-stop: the user must run the pattern A reinstall themselves, because you can't copy that source.
-
-If it's another environment (a source checkout's `.venv`, pipx, a plain venv), ask the user how
-it's managed, and install only the way they say.
+common case. Follow [Check an add-on is in uv's receipt](setup/snippets.md#check-an-add-on-is-in-uvs-receipt):
+it checks the environment and prints the receipt's requirements, which pattern A copies. If it
+says the server isn't in the uv tool environment, ask the user how it's managed, and install
+only the way they say. If any receipt line shows `<redacted>`, stop: the user must run the
+pattern A reinstall themselves, because you can't copy that source.
 
 **Always name the package together with its source**, as `"cao-decider-jev @ <source>"`. uv then
 refuses the install if the source turns out to be a different package (`Package metadata name …
@@ -185,9 +149,9 @@ entry in `requirements` gives `<CAO source>`:
 
 `--with` *replaces* the receipt's extra packages; it doesn't add to them. Repeat every other entry
 in its own form (`--with "<name><spec>"`, `--with "git+<url>"`, `--with "<path>"`, or
-`--with-editable "<path>"`), then add the decider. Afterwards, re-run the receipt block above. The CAO
-entry must keep the same field (`editable` stays `editable`), and every earlier entry must still
-be there.
+`--with-editable "<path>"`), then add the decider. Afterwards, print the receipt's requirements
+again with the snippet. The CAO entry must keep the same field (`editable` stays `editable`),
+and every earlier entry must still be there.
 
 **Verify the decider loads in the server's Python:**
 
@@ -196,13 +160,13 @@ be there.
 from importlib.metadata import entry_points
 print([e.name for e in entry_points(group='cao.deciders')])
 "
-grep -q '"cao-decider-jev"' "$(uv tool dir)/cli-agent-orchestrator/uv-receipt.toml" \
-  && echo "recorded" || echo "NOT recorded"
 ```
 
-What you should see: `['fixed_table', 'jev']`. `fixed_table` is CAO's built-in decider. Then
-`recorded` after pattern A, or `NOT recorded` after pattern B. If `jev` is missing, the package
-went into the wrong environment.
+What you should see: `['fixed_table', 'jev']`. `fixed_table` is CAO's built-in decider. If `jev`
+is missing, the package went into the wrong environment. Then run the one-add-on check from
+[the receipt snippet](setup/snippets.md#check-an-add-on-is-in-uvs-receipt) with
+`ADDON='cao-decider-jev'`: it prints `recorded` after pattern A, or `NOT recorded` after
+pattern B.
 
 **Tell the user about upgrades.** The check above shows that the decider loads *now*, and
 whether the receipt records it. Upgrade behavior depends on the source:
@@ -331,50 +295,23 @@ its key.
 
 ## 6. Restart the server and reconnect your MCP
 
-`cao-server` only looks for deciders when it starts. Get the user's OK, then restart it the way
-step 2 found it running:
-
-- a foreground terminal: Ctrl-C, then start it again;
-- a background process: stop it, then start it again;
-- `launchd`: `launchctl kickstart -k gui/$(id -u)/<label>`, with the job label from the user
-  (`-k` stops the running instance first; without it, kickstart leaves a running job alone).
-
-Find the process by its port, never by matching command-line text: your own shell can match that
-text too. Then check the restart. The block waits for the server, trying once a second: about
-30 s if nothing listens, or up to about 90 s if a server accepts the connection but never
-answers.
+`cao-server` only looks for deciders when it starts. Get the user's OK, then follow
+[Restart the server and wait for `/health`](setup/snippets.md#restart-the-server-and-wait-for-health),
+restarting it the way step 2 found it running. Its `ps` line must match step 2's, so the server
+still runs the Python you installed into. Then check the server loaded the decider:
 
 ```bash
-PORT="${CAO_API_PORT:-9889}"
-UP=""
-for i in $(seq 1 30); do
-  if curl -sf --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null; then UP=1; break; fi
-  sleep 1
-done
-if [ -n "$UP" ]; then
-  echo "server answers"
-  PID="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t | head -n 1)"
-  ps -o pid,lstart,etime -p "$PID"                   # the start time must be after your install
-  ps -o args= -p "$PID"                              # must match the ps line you saw in step 2
-  "$(dirname "$CAO_PY")/cao" decisions status | "$CAO_PY" -c "import json,sys; print([d['name'] for d in json.load(sys.stdin)['installed_deciders']])"
-else
-  echo "no answer on port $PORT after 30 tries: stop and report"
-fi
+"$(dirname "$CAO_PY")/cao" decisions status | "$CAO_PY" -c "import json,sys; print([d['name'] for d in json.load(sys.stdin)['installed_deciders']])"
 ```
 
-If it prints `no answer`, the restart failed: stop and report it to the user.
-
-The `ps` line must be the same command as in step 2, so the server still runs the Python you
-installed into. Compare it with step 2's `ps` line, not with `"$CAO_PY"`: when step 2 used the
-shebang fallback, the two differ even after a correct restart. `jev` must be in the last list.
-The server log line `points=model.route=shadow:jev` isn't proof:
-it shows the binding, which reads the same whether or not the package loads. The real proof
-comes in step 7.
+What you should see: `jev` is in the list. The server log line `points=model.route=shadow:jev`
+isn't proof: it shows the binding, which reads the same whether or not the package loads. The
+real proof comes in step 7.
 
 **Your own MCP connection doesn't refresh on its own.** The CAO MCP server only offers
 `create_ephemeral_agent` if `ephemeral.enabled` was already true when the MCP process started.
-In Claude Code, run `/mcp` and reconnect the CAO server. In other providers, restart the agent's
-terminal. Confirm `create_ephemeral_agent` is in your tool list before you go on.
+Follow [Reconnect your MCP connection](setup/snippets.md#reconnect-your-mcp-connection), and
+confirm `create_ephemeral_agent` is in your tool list before you go on.
 
 ## 7. Watch in shadow
 
@@ -462,14 +399,9 @@ Each of these writes settings or restarts the server, so get the user's OK.
    cao decisions off
    ```
    It stays in force until a point is set again.
-2. Put `settings.json` back the way it was. With the server stopped, restore the step 1 backup;
-   if step 1 found no file, delete the `settings.json` this setup created:
-   ```bash
-   SETTINGS="$(cao config path)"
-   ls "$SETTINGS".bak.*                           # pick the one step 1 made
-   cp "$SETTINGS.bak.<timestamp>" "$SETTINGS"     # or, if there was no backup: rm "$SETTINGS"
-   ```
-   If the user wants to keep later, unrelated settings changes, undo only this setup's keys
+2. Put `settings.json` back the way it was. With the server stopped, restore the step 1 backup
+   ([restore it](setup/snippets.md#back-up-settingsjson)); if step 1 found no file, delete the
+   `settings.json` this setup created. If the user wants to keep later, unrelated settings changes, undo only this setup's keys
    instead: `cao config set ephemeral.enabled false`, then
    `cao decisions tier <provider> <tier> --unset` for each mapping this setup added.
 3. Start the server again (step 6's checks), and tell other connected agents that they keep

@@ -74,4 +74,5 @@ A **profile** defines an agent's role, tools, and system prompt. Run `cao profil
 - [Quick Start](getting-started/quick-start.md)
 - [Orchestration Patterns](patterns/handoff.md)
 - [CLI Reference](reference/cli-commands.md)
+- [Setup guides an agent can follow](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/setup/README.md)
 - [GitHub Repository](https://github.com/awslabs/cli-agent-orchestrator)

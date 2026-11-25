@@ -165,6 +165,8 @@ provider override while keeping the same sequence.
   and launches, and their limits.
 - [Ephemeral agents setup runbook](docs/ephemeral-agents-agent-setup.md): step-by-step setup of
   ephemeral agents and a decider, written for an agent to follow.
+- [Setup guides](docs/setup/README.md): the index of setup runbooks an agent can follow, with
+  the planned ones, the template for new ones and the steps they share.
 - [Agent profiles](docs/agent-profile.md): profile schema, discovery, provider
   selection, and overrides.
 - [HTTP API and PTY WebSocket](docs/api.md): route-family overview and terminal

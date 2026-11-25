@@ -429,6 +429,6 @@ Say what you'd like in #1385.
 
 ## Related
 
-- [`examples/remote/ec2/`](../examples/remote/ec2/README.md): the sample this guide builds on. [`AGENT-SETUP.md`](../examples/remote/ec2/AGENT-SETUP.md) is a version written for an agent to follow.
+- [`examples/remote/ec2/`](../examples/remote/ec2/README.md): the sample this guide builds on. [`AGENT-SETUP.md`](../examples/remote/ec2/AGENT-SETUP.md) is a version written for an agent to follow; it's listed with the other [setup guides](setup/README.md).
 - [herdr in CAO](herdr.md) and [tmux](tmux.md).
 - #1316: the sample's PR. #1310: its issue. #1238: remote steering on Kubernetes.
