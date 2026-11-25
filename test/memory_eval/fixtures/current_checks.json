@@ -1,0 +1,7 @@
+[
+  {"id":"C01","query":"cobalt bridge","current":"revision-01-current","stale":"revision-01-stale"},
+  {"id":"C02","query":"amber gate","current":"revision-02-current","stale":"revision-02-stale"},
+  {"id":"C03","query":"lantern crate","current":"revision-03-current","stale":"revision-03-stale"},
+  {"id":"C04","query":"quartz relay","current":"revision-04-current","stale":"revision-04-stale"},
+  {"id":"C05","query":"violet samples","current":"revision-05-current","stale":"revision-05-stale"}
+]

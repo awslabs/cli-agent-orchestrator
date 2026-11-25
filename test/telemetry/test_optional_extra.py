@@ -175,6 +175,7 @@ def test_telemetry_fallback_covered_in_process(monkeypatch) -> None:
         ]
 
     saved = {n: sys.modules[n] for n in _tel_modules()}
+    saved_otel = {n: sys.modules[n] for n in _otel_modules()}
     saved_meta = list(sys.meta_path)
 
     class _BlockOtel(MetaPathFinder):
@@ -208,6 +209,15 @@ def test_telemetry_fallback_covered_in_process(monkeypatch) -> None:
         for n in _tel_modules():
             del sys.modules[n]
         sys.modules.update(saved)
+        # Put the real ``opentelemetry`` modules back too. Leaving them deleted lets
+        # the next ``import opentelemetry.trace`` build a second module with its own
+        # set-once global provider, while the restored CAO modules above still hold
+        # the first one. Which of the two a later test's exporter was attached to
+        # then depended on test order, so telemetry span tests saw zero spans on
+        # some xdist workers (#1408).
+        for n in _otel_modules():
+            del sys.modules[n]
+        sys.modules.update(saved_otel)
 
 
 def test_non_opentelemetry_import_error_is_reraised(monkeypatch) -> None:

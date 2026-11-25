@@ -1,0 +1,8 @@
+{
+ "watch_dir": ".",
+ "watch_path": "watch.json",
+ "ledger_path": "../reviews/ledger.json",
+ "digest_path": "digest.md",
+ "digest_queue_path": "state/digest-pending.json",
+ "wake_journal_path": "state/wake-journal.json"
+}
