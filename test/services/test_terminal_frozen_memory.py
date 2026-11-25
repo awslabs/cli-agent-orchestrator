@@ -177,11 +177,16 @@ def test_send_input_forwards_the_block_unchanged(monkeypatch):
     )
 
     block = "<cao-memory>FROZEN</cao-memory>"
-    # send_input logs and RE-RAISES (terminal_service.py:1353-1355), so the sentinel
-    # surfaces here. It stops execution immediately after forwarding — which is all this
+    # The sentinel stops execution immediately after forwarding — which is all this
     # test needs to observe, and it avoids mocking the tmux paste path that follows.
-    with pytest.raises(RuntimeError, match="stop here"):
+    # It fails before anything is typed, so it surfaces as InputNotSentError with the
+    # sentinel as its cause (reply-delivery-failure D4).
+    from cli_agent_orchestrator.backends import base
+
+    with pytest.raises(base.InputNotSentError) as raised:
         terminal_service.send_input("term-fwd", "hello", frozen_memory=block)
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert "stop here" in str(raised.value.__cause__)
 
     assert seen["frozen_memory"] == block, "the block must arrive unchanged"
     assert seen["message"] == "hello"

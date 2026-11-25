@@ -1,6 +1,6 @@
 ---
 name: cao-agent-plugin-audit
-description: Audit an existing Agent Plugins 1.0.0 package - check its plugin.json manifest and mcp.json against CAO's vendored schemas, and mechanically check every Agent Skill it ships against the name pattern, the 64-character name bound, folder-equals-name, the 1024-character description limit and the 500-line body limit, four of which CAO's validator only warns about. Use when the user says "audit this Agent Plugin", "is this package conformant", "check these skills against the Agent Skills limits", "cao plugin validate says loadable, is it really fine", or "run gate 1 over skills/". Its validator script needs no CAO install and opens no network connection itself; its first run needs its three declared dependencies available. Not for authoring a new Agent Plugin (use cao-agent-plugin-creator). Not for CAO event plugins, the Python packages that react to cao-server lifecycle events (use cao-plugin). Not for auditing a client-specific agent plugin before migrating it (use migrate-agent-plugin).
+description: Audit an existing Agent Plugins 1.0.0 package - check its plugin.json manifest and mcp.json against CAO's vendored schemas, and mechanically check every Agent Skill it ships against the name pattern, the 64-character name bound, folder-equals-name, the 1024-character description limit and the 500-line body limit, four of which CAO's validator only warns about. Use when the user says "audit this Agent Plugin", "is this package conformant", "check these skills against the Agent Skills limits", "cao plugin validate says loadable, is it really fine", or "run gate 1 over skills/". Its validator script needs no CAO install and opens no network connection itself; its first run needs its three declared dependencies available. Not for authoring a new Agent Plugin (use cao-agent-plugin-creator). Not for CAO event plugins, the Python packages that react to cao-server lifecycle events (use cao-event-plugin). Not for auditing a client-specific agent plugin before migrating it (use migrate-agent-plugin).
 ---
 
 # Audit an Agent Plugin
@@ -260,6 +260,6 @@ audit exit non-zero.
 ## Related skills
 
 - `cao-agent-plugin-creator`: author a new Agent Plugin from an empty directory.
-- `cao-plugin`: CAO event plugins, which are unrelated to Agent Plugins.
+- `cao-event-plugin`: CAO event plugins, which are unrelated to Agent Plugins.
 - `migrate-agent-plugin`: convert a client-specific agent plugin to the portable
   structure.

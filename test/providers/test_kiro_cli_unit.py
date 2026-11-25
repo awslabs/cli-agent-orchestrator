@@ -2258,6 +2258,13 @@ class TestKiroCli211Regressions:
         assert re.search(TUI_PROCESSING_PATTERN, "⠹ Thinking... (esc to cancel)")
         # Old form still matches for pre-2.11 kiro
         assert re.search(TUI_PROCESSING_PATTERN, "Kiro is working · Type to steer")
+        # chat.defaultInterruptBehavior=queue swaps the hint words
+        assert re.search(
+            TUI_PROCESSING_PATTERN, "Kiro is working · 12s · Type to queue · Ctrl+S to steer"
+        )
+        assert re.search(
+            TUI_PROCESSING_PATTERN, "Kiro is working · 12s · Type to steer · Ctrl+S to queue"
+        )
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_stale_idle_placeholder_does_not_trigger_completed(self, mock_backend):

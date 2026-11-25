@@ -1199,6 +1199,27 @@ class TestKiroToolsWrittenAtInstall:
         )
         assert cfg["tools"] == ["read", "shell"]
 
+    def test_a_pinned_allowlist_keeps_the_cao_callback_tools(self, install_paths, tmp_path):
+        """The tool gate allows ``workflow_return`` and the other callback tools to every
+        bound terminal. Kiro hides any tool ``tools`` leaves out, so the install adds them."""
+        cfg = self._install(
+            install_paths,
+            tmp_path,
+            _kiro_profile_text(
+                name="aws", role=None, allowed_tools='["execute_bash", "fs_read"]', tools=None
+            ),
+            "aws",
+        )
+        refs = [
+            "@cao-mcp-server/answer_user_prompt",
+            "@cao-mcp-server/complete_assignment",
+            "@cao-mcp-server/send_message",
+            "@cao-mcp-server/workflow_return",
+        ]
+        assert cfg["allowedTools"] == ["execute_bash", "fs_read", *refs]
+        assert [t for t in cfg["tools"] if t.startswith("@cao-mcp-server")] == refs
+        assert cfg["tools"] == kiro_agent_tools(cfg["allowedTools"])
+
     def test_builtin_in_the_policy_does_not_reach_tools_verbatim(self, install_paths, tmp_path):
         """A bare ``@builtin`` in Kiro's ``tools`` means every built-in, shell included."""
         cfg = self._install(

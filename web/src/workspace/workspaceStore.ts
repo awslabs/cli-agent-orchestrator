@@ -10,6 +10,7 @@ import {
   Layout,
   PaneCount,
   closePane,
+  fillEmptyPanes,
   focusPane,
   openInFocused,
   openInSplit,
@@ -58,6 +59,7 @@ interface WorkspaceState {
   open: (sessionName: string, terminalId: string, mode?: 'focused' | 'split') => void
   closePane: (index: number) => void
   focusPane: (index: number) => void
+  /** Change the pane count. Picking 2 or 4 panes (not shrinking) also fills empty panes with the session's agents. */
   setPaneCount: (count: PaneCount) => void
   /** Clear flags for whatever is on screen now (call when the page becomes visible). */
   markVisibleViewed: () => void
@@ -175,7 +177,16 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
 
     closePane: (index) => updateLayout(l => closePane(l, index)),
     focusPane: (index) => updateLayout(l => focusPane(l, index)),
-    setPaneCount: (count) => updateLayout(l => setPaneCount(l, count)),
+    setPaneCount: (count) => {
+      const { selectedSession, details } = get()
+      const ids = (selectedSession && details[selectedSession]?.terminals.map(t => t.id)) || []
+      // Only picking a split layout (2 or 4) at the current size or larger
+      // fills; shrinking and the 1-pane button behave as before.
+      updateLayout(l => {
+        const next = setPaneCount(l, count)
+        return count > 1 && count >= l.count ? fillEmptyPanes(next, ids) : next
+      })
+    },
 
     markVisibleViewed: () => set({ attention: withoutFlags(get().attention, viewedTerminals(get())) }),
 
