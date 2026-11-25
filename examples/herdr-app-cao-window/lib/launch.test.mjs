@@ -2067,9 +2067,11 @@ const MODULE_URLS = { launch: new URL("./launch.js", import.meta.url).href, work
 const bytesOfText = (s) => new TextEncoder().encode(s).length;
 
 // Runs `script` as an ES module in a child node whose globalThis has no TextEncoder, and returns what it printed as JSON.
-function withoutTextEncoder(script) {
-  const prelude = `delete globalThis.TextEncoder;\nif (typeof globalThis.TextEncoder !== "undefined") throw new Error("TextEncoder is still there");\n`;
-  const r = spawnSync(process.execPath, ["--input-type=module", "-e", prelude + script], { encoding: "utf8", timeout: 60000 });
+// `script` is fixed text: `data` reaches it as the JSON on its stdin, read into `input`, so no value is ever built into
+// the child's code.
+function withoutTextEncoder(script, data) {
+  const prelude = `import { readFileSync } from "node:fs";\nconst input = JSON.parse(readFileSync(0, "utf8"));\ndelete globalThis.TextEncoder;\nif (typeof globalThis.TextEncoder !== "undefined") throw new Error("TextEncoder is still there");\n`;
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", prelude + script], { encoding: "utf8", timeout: 60000, input: JSON.stringify(data) });
   assert.equal(r.status, 0, `child failed: ${r.stderr}`);
   return JSON.parse(r.stdout);
 }
@@ -2090,14 +2092,14 @@ test("launch.js and workflows.js load, and their checks count bytes, with no Tex
     ["\uD800", 1], ["\uD800\uD800", 1], ["\uDC00\uD800", 1], ["\uDC00", 1], ["a\uD83D", 1], ["\uD83D\uDE00", 1], ["\uD83D\uDE00\uD83D", 1],
   ];
   const out = withoutTextEncoder(`
-    const launch = await import(${JSON.stringify(MODULE_URLS.launch)});
-    const wf = await import(${JSON.stringify(MODULE_URLS.workflows)});
+    const launch = await import(input.urls.launch);
+    const wf = await import(input.urls.workflows);
     const textOf = ${textOf.toString()};
-    const env = ${JSON.stringify(values)}.map((d) => launch.envCheck([{ key: "K", value: textOf(d) }]));
-    const yaml = ${JSON.stringify(sources)}.map((d) => { const r = wf.sourceCheck("yaml", textOf(d), "wf", true); return { ok: r.ok, bytes: r.bytes }; });
-    const arg = ${JSON.stringify(sources.slice(6, 9))}.map((d) => { const r = wf.sourceCheck("yaml", textOf(d), "wf", false); return { ok: r.ok, bytes: r.bytes }; });
+    const env = input.values.map((d) => launch.envCheck([{ key: "K", value: textOf(d) }]));
+    const yaml = input.sources.map((d) => { const r = wf.sourceCheck("yaml", textOf(d), "wf", true); return { ok: r.ok, bytes: r.bytes }; });
+    const arg = input.argSources.map((d) => { const r = wf.sourceCheck("yaml", textOf(d), "wf", false); return { ok: r.ok, bytes: r.bytes }; });
     console.log(JSON.stringify({ env, yaml, arg }));
-  `);
+  `, { urls: MODULE_URLS, values, sources, argSources: sources.slice(6, 9) });
   values.forEach((d, i) => assert.equal(out.env[i].ok, bytesOfText(textOf(d)) < 2048, `env value #${i} (${bytesOfText(textOf(d))} bytes)`));
   sources.forEach((d, i) => {
     const bytes = bytesOfText(textOf(d));
@@ -2118,9 +2120,9 @@ test("the 128 KiB budget of env rows counts the same bytes for ASCII, CJK and em
   const values = ["a".repeat(1800), "日".repeat(600), "😀".repeat(450)];
   for (const v of values) assert.equal(bytesOfText(v), 1800);
   const out = withoutTextEncoder(`
-    const launch = await import(${JSON.stringify(MODULE_URLS.launch)});
-    console.log(JSON.stringify(${JSON.stringify(values)}.map((v) => launch.envCheck(${JSON.stringify(rowsOf("@"))}.map((r) => ({ ...r, value: v }))))));
-  `);
+    const launch = await import(input.urls.launch);
+    console.log(JSON.stringify(input.values.map((v) => launch.envCheck(input.rows.map((r) => ({ ...r, value: v }))))));
+  `, { urls: MODULE_URLS, values, rows: rowsOf("@") });
   // each row costs 1 + 1800 + 3 = 1804 bytes: 72 rows fit in 131072, the 73rd (index 72) does not, and it is said once
   for (const r of out) {
     assert.equal(r.ok, false);

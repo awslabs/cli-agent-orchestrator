@@ -241,7 +241,9 @@ const assertTwoBlockLayout = (layout) => {
   assert.equal(side.resizable, false, "the blocks inside the sidebar stay locked");
   assert.notEqual(find(layout, "root").resizable, false, "the root row's boundary, the one the user drags, is not locked");
 };
-const baks = (dir, name) => files(dir).filter((f) => new RegExp(`(^|/)${name.replace(/\./g, "\\.")}\\.bak-\\d+$`).test(f));
+// A literal for use inside a RegExp: every character the syntax gives a meaning, a backslash included.
+const reEscape = (text) => text.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+const baks = (dir, name) => files(dir).filter((f) => new RegExp(`(^|/)${reEscape(name)}\\.bak-\\d+$`).test(f));
 const nowEpoch = () => Math.floor(Date.now() / 1000);
 // What a launcher passes to `open`, one entry per argument.
 function launcherArgv(w, launcherPath) {
@@ -2243,7 +2245,7 @@ test("an empty --home or --main-home is refused too, instead of meaning the work
 // ---------------------------------------------------------------------------------------------
 
 // Every backup of a file: <name>.bak-<epoch> and <name>.bak-<epoch>-<n>.
-const anyBaks = (dir, name) => files(dir).filter((f) => new RegExp(`(^|/)${name.replace(/\./g, "\\.")}\\.bak-\\d+(-\\d+)?$`).test(f)).sort();
+const anyBaks = (dir, name) => files(dir).filter((f) => new RegExp(`(^|/)${reEscape(name)}\\.bak-\\d+(-\\d+)?$`).test(f)).sort();
 // A world whose `date +%s` is pinned, so several runs fall in one second.
 function pinnedWorld(epoch) {
   const w = world();
@@ -2600,9 +2602,28 @@ test("icon: the source svg has Herdr's tile (824 px squircle in a 1024 canvas, c
   assert.deepEqual([...new Set((svg.match(/<(\w+)[\s>]/g) ?? []).map((t) => t.slice(1, -1).trim()))].sort(), ["circle", "g", "path", "rect", "svg"], "only plain shapes: no embedded image");
 });
 
+// The text with every <!-- ... --> removed. One pass can join the pieces around a comment into a new
+// opening (`<!<!-- x -->--`), so it repeats until nothing changes. An unclosed comment runs to the end.
+function withoutXmlComments(text) {
+  for (;;) {
+    let out = "";
+    let at = 0;
+    for (;;) {
+      const open = text.indexOf("<!--", at);
+      if (open < 0) { out += text.slice(at); break; }
+      out += text.slice(at, open);
+      const close = text.indexOf("-->", open + 4);
+      if (close < 0) break;
+      at = close + 3;
+    }
+    if (out === text) return out;
+    text = out;
+  }
+}
+
 test("icon: the glyph is the project's own mark, not Herdr's artwork: every coordinate of it is one of cao-mark.svg's", () => {
-  const brand = readFileSync(BRAND_MARK, "utf8").replace(/<!--[\s\S]*?-->/g, "");
-  const mark = readFileSync(ICON_SVG, "utf8").replace(/<!--[\s\S]*?-->/g, "").split("<g transform")[1];
+  const brand = withoutXmlComments(readFileSync(BRAND_MARK, "utf8"));
+  const mark = withoutXmlComments(readFileSync(ICON_SVG, "utf8")).split("<g transform")[1];
   assert.ok(mark, "the glyph group is missing");
   const numbers = (text) => new Set((text.match(/-?\d+(?:\.\d+)?/g) ?? []).map(Number));
   const own = numbers(brand);
@@ -2815,7 +2836,8 @@ test("app copy: a missing codesign, xattr or PlistBuddy stops the install before
     const w = world({ copy: true });
     rmSync(join(w.stubs, tool));
     const r = w.install(["--local"], { PATH: `${w.stubs}:${JQ_DIR}:/usr/bin:/bin` });
-    const real = spawnSync("sh", ["-c", `PATH=${JSON.stringify(`${w.stubs}:${JQ_DIR}:/usr/bin:/bin`)} command -v ${tool}`], { encoding: "utf8" }).stdout.trim();
+    // the path and the tool name reach the shell as arguments, not as text of its command line
+    const real = spawnSync("sh", ["-c", 'PATH="$1" command -v "$2"', "sh", `${w.stubs}:${JQ_DIR}:/usr/bin:/bin`, tool], { encoding: "utf8" }).stdout.trim();
     if (real || tool === "PlistBuddy" && existsSync("/usr/libexec/PlistBuddy")) continue;   // the tool exists on this machine: nothing to refuse
     assert.equal(r.status, 3, `${tool}: ${r.text}`);
     assert.match(r.err, new RegExp(tool));
