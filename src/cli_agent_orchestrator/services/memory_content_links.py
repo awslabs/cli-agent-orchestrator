@@ -29,7 +29,7 @@ def see_also_sections(lines: list[str]) -> list[tuple[int, int, set[int]]]:
                 sections.append((start, index, body))
                 start = None
                 body = set()
-            if _SEE_ALSO_HEADING.fullmatch(line):
+            if _SEE_ALSO_HEADING.fullmatch(line.rstrip()):
                 start = index
         elif start is not None:
             body.add(index)

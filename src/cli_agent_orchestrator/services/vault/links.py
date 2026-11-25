@@ -15,7 +15,8 @@ _INLINE_MD_LINK = re.compile(
     r"(?<![!\\])\[[^\]\\\r\n]{0,256}\]" r"\((?P<destination>[^\s()\\\r\n]{1,256})\)"
 )
 _FENCED_CODE = re.compile(
-    r"^[ ]{0,3}(?P<marker>```|~~~)[^\n]*(?:\n.*?^[ ]{0,3}(?P=marker)[ \t]*(?=\n|$)|\n.*\Z|$)",
+    r"^[ ]{0,3}(?P<marker>(?P<tick>`{3,})|~{3,})(?(tick)[^`\r\n]*|[^\r\n]*)"
+    r"(?:\r?\n.*?^[ ]{0,3}(?P=marker)(?(tick)`*|~*)[ \t]*(?=\r?\n|$)|\r?\n.*\Z|$)",
     re.DOTALL | re.MULTILINE,
 )
 _INLINE_CODE = re.compile(r"`[^`\r\n]*`")

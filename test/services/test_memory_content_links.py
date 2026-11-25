@@ -124,6 +124,46 @@ def test_sentence_case_see_also_is_not_a_generated_section() -> None:
     )
 
 
+def test_heading_with_extra_text_is_not_see_also() -> None:
+    content = "## See Also more\n- [Other](other.md)\n"
+    assert MemoryService._strip_existing_see_also(content) == content
+    assert extract_content_link_targets(content, MemoryService._sanitize_key) == []
+
+
+@pytest.mark.parametrize("whitespace", ["  ", "\t"])
+def test_see_also_heading_with_trailing_whitespace_recall_and_compile(
+    tmp_path, isolated_memory_db, monkeypatch, whitespace
+) -> None:
+    from cli_agent_orchestrator.services import settings_service
+
+    monkeypatch.setattr(settings_service, "is_memory_content_links_enabled", lambda: False)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    _identity_compile_stubs(service, monkeypatch, isolated_memory_db, related_keys=("other",))
+    _run(service.store("Other", scope="global", key="other"))
+    heading = f"## See Also{whitespace}"
+    stored = _run(service.store(f"Fact.\n\n{heading}\n- [[other]]", scope="global", key="source"))
+    recalled = _run(service.recall(scope="global", record_access=False))
+    assert all(heading not in memory.content for memory in recalled if memory.key == "source")
+    assert _run(service.compact(key="source"))["source"] == "applied"
+    assert Path(stored.file_path).read_text(encoding="utf-8").count("## See Also") == 1
+
+
+@pytest.mark.parametrize("whitespace", ["  ", "\t"])
+def test_see_also_heading_with_trailing_whitespace_links_and_compile(
+    tmp_path, isolated_memory_db, monkeypatch, whitespace
+) -> None:
+    _enable_content_links(monkeypatch)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    _identity_compile_stubs(service, monkeypatch, isolated_memory_db)
+    _run(service.store("Other", scope="global", key="other"))
+    content = f"Fact.\n\n## See Also{whitespace}\n- [Other](../global/other.md)"
+    assert extract_content_link_targets(content, MemoryService._sanitize_key) == ["other"]
+    stored = _run(service.store(content, scope="global", key="source"))
+    assert ("source", "other", "content_link") in _edges(isolated_memory_db)
+    assert _run(service.compact(key="source"))["source"] == "applied"
+    assert Path(stored.file_path).read_text(encoding="utf-8").count("## See Also") == 1
+
+
 @pytest.mark.parametrize(
     ("scope", "scope_id", "folder"),
     [
@@ -276,6 +316,21 @@ def test_compile_preserves_repeated_fence_markers_and_blank_lines(
     stored = _run(service.store(content, scope="global", key="source"))
     assert _run(service.compact(key="source"))["source"] == "applied"
     assert fenced in _see_also_section(stored.file_path)
+
+
+def test_repeated_store_and_compile_dedupes_identical_fenced_block(
+    tmp_path, isolated_memory_db, monkeypatch
+) -> None:
+    _enable_content_links(monkeypatch)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    _identity_compile_stubs(service, monkeypatch, isolated_memory_db)
+    _run(service.store("Other", scope="global", key="other"))
+    block = "```text\nkeep once\n```"
+    entry = f"Fact.\n\n## See Also\n- [[other]]\n{block}"
+    for _ in range(3):
+        stored = _run(service.store(entry, scope="global", key="source"))
+        assert _run(service.compact(key="source"))["source"] == "applied"
+        assert _see_also_section(stored.file_path).count(block) == 1
 
 
 def test_sentence_case_heading_survives_compact_with_setting_off(
