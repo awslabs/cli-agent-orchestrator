@@ -1,0 +1,4 @@
+#!/bin/sh
+# herdr-cao: open the CAO window (its own app home and its own core session).
+# Written by examples/herdr-app-cao-window/install.sh. Re-run the installer to change it.
+@@LAUNCH@@
