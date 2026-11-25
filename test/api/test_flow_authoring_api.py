@@ -636,6 +636,39 @@ class TestCreateRoute:
         assert frontmatter.load(str(stray)).metadata["name"] == "b"
         assert database.get_flow("b") is not None
 
+    def test_a_symlink_at_the_target_is_replaced_and_what_it_pointed_to_is_not_written(
+        self, client, flows_home, tmp_path_factory
+    ):
+        outside = tmp_path_factory.mktemp("outside") / "precious.txt"
+        outside.write_text("keep me")
+        target = flow_file(flows_home, "b")
+        target.parent.mkdir(parents=True)
+        target.symlink_to(outside)
+
+        response = client.post("/flows", json={**GOOD, "name": "b"})
+
+        assert response.status_code == 201
+        assert outside.read_text() == "keep me"
+        assert not target.is_symlink()
+        assert frontmatter.load(str(target)).metadata["name"] == "b"
+
+    def test_a_create_leaves_no_temporary_file_behind(self, client, flows_home):
+        assert client.post("/flows", json=GOOD).status_code == 201
+
+        assert files_under(flows_home) == ["flows/daily-report.flow.md"]
+
+    def test_a_stray_file_keeps_its_permission_bits_when_it_is_overwritten(
+        self, client, flows_home
+    ):
+        stray = flow_file(flows_home, "b")
+        stray.parent.mkdir(parents=True)
+        stray.write_text("left over")
+        stray.chmod(0o640)
+
+        assert client.post("/flows", json={**GOOD, "name": "b"}).status_code == 201
+
+        assert stat.S_IMODE(stray.stat().st_mode) == 0o640
+
     def test_a_registered_flow_whose_file_is_gone_does_not_block_another_create(
         self, client, flows_home
     ):

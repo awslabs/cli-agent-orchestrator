@@ -239,6 +239,7 @@ from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils import delegation, server_lock
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.atomic_file import unlocked_atomic_write
 from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
 from cli_agent_orchestrator.utils.forwarded_env import ForwardedEnvError, validate_forwarded_env
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
@@ -11328,7 +11329,8 @@ async def create_flow(
         )
         file_content = "---\n" + frontmatter + "---\n" + body.prompt_template
 
-        file_path.write_text(file_content)
+        # A temp file and a rename, so a symlink at the target is replaced, not written through.
+        unlocked_atomic_write(file_path, file_content)
 
         return flow_service.add_flow(str(file_path), enabled=body.enabled)
     except ValueError:

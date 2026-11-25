@@ -128,6 +128,7 @@ class TestCreateFlow:
         with (
             patch("cli_agent_orchestrator.api.main.flow_service") as mock_svc,
             patch("cli_agent_orchestrator.api.main.CAO_HOME_DIR") as mock_home,
+            patch("cli_agent_orchestrator.api.main.unlocked_atomic_write"),
         ):
             mock_home.__truediv__ = lambda self, x: mock_home
             mock_home.mkdir = lambda **kwargs: None
@@ -139,7 +140,7 @@ class TestCreateFlow:
                     "__truediv__": lambda self, x: type(
                         "FakeFile",
                         (),
-                        {"write_text": lambda self, t: None},
+                        {},
                     )(),
                 },
             )()
