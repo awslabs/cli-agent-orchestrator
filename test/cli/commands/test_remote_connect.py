@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import shutil
 import stat
+import subprocess
 from typing import Sequence
 
 import pytest
@@ -75,7 +77,7 @@ def test_config_create_update_idempotence_backup_mode_and_preservation(box, tmp_
     assert update_ssh_config(box, tmp_path)
     with config.open(encoding="utf-8", newline="") as handle:
         first = handle.read()
-    assert original in first
+    assert first.endswith(original)
     assert "Host cao-box-1" in first
     assert "Host cao-box-1-dash" in first
     assert "\r\n" in first
@@ -93,7 +95,121 @@ def test_config_without_trailing_newline_is_preserved(box, tmp_path):
     config = ssh / "config"
     config.write_text("Host personal\n  User me", encoding="utf-8")
     update_ssh_config(box, tmp_path)
-    assert config.read_text(encoding="utf-8").startswith("Host personal\n  User me\n")
+    assert config.read_text(encoding="utf-8").endswith("Host personal\n  User me")
+
+
+@pytest.mark.parametrize("edit", ["blank", "missing_dash", "moved_main"])
+def test_hand_edits_survive_three_updates(box, tmp_path, edit):
+    config = tmp_path / ".ssh" / "config"
+    config.parent.mkdir()
+    original = "Host *\n  ForwardAgent yes\nHost personal\n  User me\n"
+    config.write_text(original, encoding="utf-8")
+    update_ssh_config(box, tmp_path)
+    content = config.read_text(encoding="utf-8")
+    main_start = content.index("# >>> cao remote: cao-box-1 ")
+    dash_start = content.index("# >>> cao remote: cao-box-1-dash ")
+    dash_end = content.index("\n", content.index("# <<< cao remote: cao-box-1-dash ")) + 1
+    main_end = content.index("\n", content.index("# <<< cao remote: cao-box-1 ")) + 1
+    if edit == "blank":
+        content = content[:main_end] + "\n" + content[main_end:]
+    elif edit == "missing_dash":
+        content = content[:dash_start] + content[dash_end:]
+    else:
+        main = content[main_start:main_end]
+        content = main + content[:main_start] + content[main_end:]
+    content += "Host work\n  User colleague\n"
+    config.write_text(content, encoding="utf-8")
+    for _ in range(2):
+        before = config.read_text(encoding="utf-8")
+        update_ssh_config(box, tmp_path)
+        after = config.read_text(encoding="utf-8")
+        assert "Host work\n  User colleague\n" in after
+        assert "Host *\n  ForwardAgent yes\nHost personal\n  User me\n" in after
+        if after != before:
+            assert (config.parent / "config.cao-backup").read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize("damage", ["missing_end", "duplicate", "out_of_order", "nested"])
+def test_corrupt_markers_fail_closed(box, tmp_path, damage):
+    config = tmp_path / ".ssh" / "config"
+    config.parent.mkdir()
+    update_ssh_config(box, tmp_path)
+    text = config.read_text(encoding="utf-8")
+    start = next(line for line in text.splitlines() if line.startswith("# >>> cao remote:"))
+    end = next(line for line in text.splitlines() if line.startswith("# <<< cao remote:"))
+    if damage == "missing_end":
+        text = text.replace(end + "\n", "")
+    elif damage == "duplicate":
+        text += start + "\nHost duplicate\n" + end + "\n"
+    elif damage == "out_of_order":
+        text = end + "\n" + text.replace(end + "\n", "", 1)
+    else:
+        text = text.replace(start + "\n", start + "\n" + start + "\n", 1)
+    config.write_text(text, encoding="utf-8")
+    backup_path = config.parent / "config.cao-backup"
+    backup = backup_path.read_bytes() if backup_path.exists() else None
+    with pytest.raises(ConnectError):
+        update_ssh_config(box, tmp_path)
+    assert config.read_text(encoding="utf-8") == text
+    assert (backup_path.read_bytes() if backup_path.exists() else None) == backup
+    with pytest.raises(ConnectError):
+        remove_ssh_artifacts(box, tmp_path)
+    assert config.read_text(encoding="utf-8") == text
+
+
+def test_written_blocks_precede_user_hosts_and_share_dashboard_settings(box, tmp_path):
+    config = tmp_path / ".ssh" / "config"
+    config.parent.mkdir()
+    config.write_text("Host *\n  ForwardAgent yes\n", encoding="utf-8")
+    update_ssh_config(box, tmp_path)
+    text = config.read_text(encoding="utf-8")
+    assert text.index("Host cao-box-1") < text.index("Host *")
+    assert "Host cao-box-1 cao-box-1-dash" in text
+    assert "StrictHostKeyChecking yes" in text
+    assert "ForwardAgent no" in text
+    if shutil.which("ssh"):
+        for host in ("cao-box-1", "cao-box-1-dash"):
+            output = subprocess.run(
+                ["ssh", "-G", "-F", str(config), host], capture_output=True, text=True, check=True
+            ).stdout.lower()
+            assert "stricthostkeychecking true" in output or "stricthostkeychecking yes" in output
+            assert "forwardagent no" in output
+            assert "hostkeyalias cao-box-1" in output
+            assert "proxycommand sh -c" in output
+            assert "userknownhostsfile " in output and "/cao_known_hosts" in output
+            if host.endswith("-dash"):
+                assert "localforward 19889 " in output and "9889" in output
+
+
+def test_invalid_profile_and_dash_suffix_rejected(box):
+    from cli_agent_orchestrator.services.remote.registry import RemoteConfigError
+
+    for name, profile in (("box-1", "x$(touch${IFS}file)"), ("dev-dash", "work")):
+        with pytest.raises(RemoteConfigError):
+            RemoteBox(name, box.instance_id, box.region, profile)
+
+
+def test_existing_invalid_registration_is_rejected(box, tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.remote import registry
+
+    monkeypatch.setattr(registry, "CAO_HOME_DIR", tmp_path)
+    for name, profile in (("box-1", "x$(touch${IFS}file)"), ("dev-dash", "work")):
+        entry = tmp_path / "remote" / f"{name}.json"
+        entry.parent.mkdir(exist_ok=True)
+        entry.write_text(
+            json.dumps(
+                dict(
+                    name=name,
+                    instance_id=box.instance_id,
+                    region=box.region,
+                    profile=profile,
+                    mode="herdr",
+                )
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(registry.RemoteConfigError):
+            registry.load(name)
 
 
 @pytest.mark.parametrize(
@@ -151,7 +267,15 @@ def test_attach_argv_per_mode(box):
         "cao-i-0123456789abcdef",
     ]
     tmux = RemoteBox(box.name, box.instance_id, box.region, box.aws_profile, mode="tmux")
-    assert attach_argv(tmux) == ["ssh", "-t", "cao-box-1", "tmux", "attach"]
+    assert attach_argv(tmux) == [
+        "ssh",
+        "-o",
+        "ForwardAgent=no",
+        "-t",
+        "cao-box-1",
+        "tmux",
+        "attach",
+    ]
 
 
 def test_allowlist_uses_no_private_key_read_or_raw_public_key(box, tmp_path, monkeypatch):

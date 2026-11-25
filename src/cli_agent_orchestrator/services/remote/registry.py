@@ -12,6 +12,7 @@ from pathlib import Path
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 
 NAME_RE = re.compile(r"^[a-z0-9-]{1,32}$")
+PROFILE_RE = re.compile(r"^[A-Za-z0-9_.@+-]{1,64}$")
 INSTANCE_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
 REGION_RE = re.compile(r"^[a-z]{2}(?:-gov)?-[a-z]+-\d+$")
 USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
@@ -33,14 +34,14 @@ class RemoteBox:
     def __post_init__(self) -> None:
         if not NAME_RE.fullmatch(self.name):
             raise RemoteConfigError("box must match [a-z0-9-]{1,32}")
+        if self.name.endswith("-dash"):
+            raise RemoteConfigError("box name must not end in -dash")
         if not INSTANCE_RE.fullmatch(self.instance_id):
             raise RemoteConfigError("instance id must look like i-0123456789abcdef")
         if not REGION_RE.fullmatch(self.region):
             raise RemoteConfigError("region must look like us-east-1")
-        if not self.aws_profile:
-            raise RemoteConfigError("profile must not be empty")
-        if any(character.isspace() or ord(character) < 32 for character in self.aws_profile):
-            raise RemoteConfigError("profile must not contain control characters or whitespace")
+        if not PROFILE_RE.fullmatch(self.aws_profile):
+            raise RemoteConfigError("profile must match [A-Za-z0-9_.@+-]{1,64}")
         if self.mode not in {"herdr", "tmux"}:
             raise RemoteConfigError("mode must be herdr or tmux")
         if not self.user:
@@ -57,6 +58,8 @@ def registry_dir() -> Path:
 def path_for(name: str) -> Path:
     if not NAME_RE.fullmatch(name):
         raise RemoteConfigError("box must match [a-z0-9-]{1,32}")
+    if name.endswith("-dash"):
+        raise RemoteConfigError("box name must not end in -dash")
     return registry_dir() / f"{name}.json"
 
 

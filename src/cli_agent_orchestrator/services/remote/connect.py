@@ -47,13 +47,14 @@ def _atomic_write(path: Path, content: str) -> None:
 def _managed_blocks(box: RemoteBox, newline: str) -> str:
     host = f"cao-{box.name}"
     key = f"~/.ssh/{host}_ed25519"
+    profile = shlex.quote(box.aws_profile).replace("%", "%%")
     proxy = (
-        f'ProxyCommand sh -c "aws ssm start-session --profile {box.aws_profile} '
+        f'ProxyCommand sh -c "aws ssm start-session --profile {profile} '
         f"--region {box.region} --target %h --document-name AWS-StartSSHSession "
         "--parameters 'portNumber=%p'\""
     )
     common = [
-        f"Host {host}",
+        f"Host {host} {host}-dash",
         f"  HostName {box.instance_id}",
         f"  HostKeyAlias {host}",
         f"  User {box.user}",
@@ -68,20 +69,64 @@ def _managed_blocks(box: RemoteBox, newline: str) -> str:
     ]
     dash = [
         f"Host {host}-dash",
-        f"  HostName {host}",
         "  LocalForward 19889 127.0.0.1:9889",
         "  ExitOnForwardFailure yes",
     ]
     chunks = [
-        MARKER.format(host=host),
-        *common,
-        END_MARKER.format(host=host),
         MARKER.format(host=f"{host}-dash"),
         *dash,
         END_MARKER.format(host=f"{host}-dash"),
+        MARKER.format(host=host),
+        *common,
+        END_MARKER.format(host=host),
         "",
     ]
     return newline.join(chunks)
+
+
+def _managed_spans(content: str, hosts: tuple[str, ...]) -> list[tuple[int, int]]:
+    lines = content.splitlines(keepends=True)
+    starts = {MARKER.format(host=host): host for host in hosts}
+    ends = {END_MARKER.format(host=host): host for host in hosts}
+    spans: list[tuple[int, int]] = []
+    active: tuple[str, int] | None = None
+    seen: set[str] = set()
+    for index, line in enumerate(lines):
+        marker = line.rstrip("\r\n")
+        if marker.startswith(("# >>> cao remote:", "# <<< cao remote:")):
+            if marker in starts:
+                host = starts[marker]
+                if active or host in seen:
+                    raise ConnectError("SSH config has duplicate or nested CAO markers")
+                active = (host, index)
+            elif marker in ends:
+                host = ends[marker]
+                if active is None or active[0] != host:
+                    raise ConnectError("SSH config has out-of-order CAO markers")
+                spans.append((active[1], index + 1))
+                seen.add(host)
+                active = None
+            elif active:
+                raise ConnectError("SSH config has nested CAO markers")
+    if active:
+        raise ConnectError("SSH config has an unterminated CAO marker")
+    return spans
+
+
+def _without_spans(content: str, spans: list[tuple[int, int]]) -> str:
+    lines = content.splitlines(keepends=True)
+    for start, end in sorted(spans, reverse=True):
+        del lines[start:end]
+    return "".join(lines)
+
+
+def _insert_before_hosts(content: str, block: str, newline: str) -> str:
+    lines = content.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if re.match(r"\s*(?:Host|Match)\s", line, flags=re.IGNORECASE):
+            prefix = "" if index == 0 or lines[index - 1].endswith(("\n", "\r")) else newline
+            return "".join(lines[:index]) + prefix + block + "".join(lines[index:])
+    return content + (newline if content and not content.endswith(("\n", "\r")) else "") + block
 
 
 def update_ssh_config(box: RemoteBox, home: Path) -> bool:
@@ -94,23 +139,13 @@ def update_ssh_config(box: RemoteBox, home: Path) -> bool:
         original = ""
     newline = "\r\n" if "\r\n" in original else "\n"
     host = f"cao-{box.name}"
-    pattern = re.compile(
-        rf"(?P<prefix>^|\r?\n){re.escape(MARKER.format(host=host))}\r?\n.*?"
-        rf"{re.escape(END_MARKER.format(host=host))}\r?\n?"
-        rf"{re.escape(MARKER.format(host=f'{host}-dash'))}\r?\n.*?"
-        rf"{re.escape(END_MARKER.format(host=f'{host}-dash'))}\r?\n?",
-        re.DOTALL,
-    )
+    spans = _managed_spans(original, (host, f"{host}-dash"))
     replacement = _managed_blocks(box, newline)
-    found = pattern.search(original) is not None
-    updated = pattern.sub(lambda match: match.group("prefix") + replacement, original)
-    if found and updated == original:
+    updated = _insert_before_hosts(_without_spans(original, spans), replacement, newline)
+    if updated == original:
         return False
-    if not found:
-        updated = original + ("" if not original or original.endswith(("\n", "\r")) else newline)
-        updated += replacement
     backup = path.with_name("config.cao-backup")
-    if original and not backup.exists():
+    if original:
         _atomic_write(backup, original)
     _atomic_write(path, updated)
     return True
@@ -251,15 +286,9 @@ def remove_ssh_artifacts(box: RemoteBox, home: Path) -> bool:
     if config.exists():
         with config.open(encoding="utf-8", newline="") as handle:
             original = handle.read()
-        updated = original
-        for managed_host in (host, f"{host}-dash"):
-            pattern = re.compile(
-                rf"(?P<prefix>^|\r?\n){re.escape(MARKER.format(host=managed_host))}\r?\n.*?"
-                rf"{re.escape(END_MARKER.format(host=managed_host))}\r?\n?",
-                re.DOTALL,
-            )
-            updated = pattern.sub(lambda match: match.group("prefix"), updated)
+        updated = _without_spans(original, _managed_spans(original, (host, f"{host}-dash")))
         if updated != original:
+            _atomic_write(config.with_name("config.cao-backup"), original)
             _atomic_write(config, updated)
             changed = True
     known_hosts = home / ".ssh" / "cao_known_hosts"
@@ -294,7 +323,7 @@ def attach_argv(box: RemoteBox) -> list[str]:
     host = f"cao-{box.name}"
     if box.mode == "herdr":
         return ["herdr", "--remote", host, "--session", f"cao-{box.instance_id}"]
-    return ["ssh", "-t", host, "tmux", "attach"]
+    return ["ssh", "-o", "ForwardAgent=no", "-t", host, "tmux", "attach"]
 
 
 def ready_lines(box: RemoteBox) -> list[str]:
@@ -348,7 +377,9 @@ def connect(
     if not ask(action):
         return
     ensure_host_key(box, runner, home, rekey)
-    ssh = runner.run(["ssh", "-o", "BatchMode=yes", f"cao-{box.name}", "true"])
+    ssh = runner.run(
+        ["ssh", "-o", "ForwardAgent=no", "-o", "BatchMode=yes", f"cao-{box.name}", "true"]
+    )
     if ssh.returncode and "publickey" in f"{ssh.stdout}\n{ssh.stderr}".lower():
         public_path = home / ".ssh" / f"cao-{box.name}_ed25519.pub"
         if not public_path.exists():
