@@ -15,6 +15,9 @@ import { PLUGINS_TAB_ENABLED } from './featureFlags'
 import { CaoMark } from './components/CaoMark'
 import { Bot, Home, Clock, Settings, Brain, Workflow, Puzzle, PanelsTopLeft, CheckCircle, XCircle, Info, Wifi, WifiOff, Package } from 'lucide-react'
 
+// Kept in step with <title> in web/index.html, which shows before the app loads.
+const APP_TITLE = 'CLI Agent Orchestrator'
+
 type TabKey = 'home' | 'profiles' | 'agents' | 'flows' | 'settings' | 'memory' | 'workflows' | 'plugins' | 'workspace'
 
 // Profiles sits between Home and Agents (#510): browsing/authoring profiles
@@ -104,6 +107,24 @@ export default function App() {
     t => (t.key !== 'memory' || memoryEnabled) && (t.key !== 'plugins' || PLUGINS_TAB_ENABLED)
   )
 
+  // The operator's name for this server (CAO_INSTANCE_LABEL via GET /health). A
+  // local server and a cluster supervisor serve the same build, so without it two
+  // open UIs look identical. Read once; an older server or a failed read shows none.
+  const [instanceLabel, setInstanceLabel] = useState<string | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    api.getHealth()
+      .then(h => {
+        const label = typeof h?.instance_label === 'string' ? h.instance_label.trim() : ''
+        if (!cancelled) setInstanceLabel(label || null)
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
+  useEffect(() => {
+    document.title = instanceLabel ? `${instanceLabel} · ${APP_TITLE}` : APP_TITLE
+  }, [instanceLabel])
+
   useEffect(() => {
     fetchSessions()
     api.getMemoryStatus()
@@ -143,7 +164,16 @@ export default function App() {
         <div className="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <CaoMark size={32} />
-            <h1 className="text-lg font-bold text-white">CLI Agent Orchestrator</h1>
+            <h1 className="text-lg font-bold text-white">{APP_TITLE}</h1>
+            {instanceLabel && (
+              <span
+                className="max-w-xs truncate rounded-md border border-emerald-700/60 bg-emerald-900/30 px-2 py-0.5 text-xs font-semibold text-emerald-300"
+                title={instanceLabel}
+                data-testid="instance-label"
+              >
+                {instanceLabel}
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-4">
             <span className="text-xs text-gray-500">{sessions.length} session{sessions.length !== 1 ? 's' : ''}</span>

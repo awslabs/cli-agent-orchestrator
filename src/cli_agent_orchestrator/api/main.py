@@ -90,6 +90,7 @@ from cli_agent_orchestrator.constants import (
     INBOX_IMMEDIATE_DELIVERY_WAIT,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
+    INSTANCE_LABEL_ENV,
     MODEL_ID_MAX_LEN,
     MODEL_ID_RE,
     OTEL_SERVICE_NAME,
@@ -2355,6 +2356,9 @@ async def health_check():
         # can compare the two here when the client runs with a different
         # environment or on another host.
         "provider_init_timeout": int(get_server_settings()["provider_init_timeout"]),
+        # The operator's name for this server (CAO_INSTANCE_LABEL), so the web UI
+        # can say which server it is talking to. Read per request: display only.
+        "instance_label": os.environ.get(INSTANCE_LABEL_ENV, "").strip() or None,
         "components": {
             "cao": "ok",
             "herdr": _probe("herdr"),

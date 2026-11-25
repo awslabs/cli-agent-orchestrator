@@ -560,6 +560,13 @@ ELASTIC_BROKER_URL_ENV = "CAO_ELASTIC_BROKER_URL"
 ELASTIC_BROKER_TOKEN_ENV = "CAO_ELASTIC_BROKER_TOKEN"
 ELASTIC_BROKER_TOKEN_HEADER = "X-CAO-Broker-Token"
 
+# A short operator-chosen name for this server, e.g. "EKS cluster". GET /health
+# reports it as ``instance_label`` and the web UI shows it beside the title and in
+# the browser tab. It is how a person with two CAO web UIs open (a local server and
+# a cluster supervisor, which are the same build) tells them apart. Display only:
+# nothing branches on it. Unset or blank means no label.
+INSTANCE_LABEL_ENV = "CAO_INSTANCE_LABEL"
+
 
 # Operators can extend network allowlists via the env vars handled below.
 # Same comma-separated pattern as ``CAO_PROFILE_ALLOWED_HOSTS`` in install_service.
