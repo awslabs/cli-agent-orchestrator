@@ -1,0 +1,97 @@
+"""Decide which path-filtered CI jobs must run for the current event."""
+
+import fnmatch
+import json
+import os
+import subprocess
+from pathlib import Path
+
+FILTERS = {
+    "antigravity": (
+        "src/cli_agent_orchestrator/providers/antigravity_cli.py",
+        "test/providers/test_antigravity_cli_*.py",
+        "test/providers/fixtures/agy_*.txt",
+        "pyproject.toml",
+    ),
+    "claude": (
+        "src/cli_agent_orchestrator/providers/claude_code.py",
+        "test/providers/test_claude_code_*.py",
+        "test/providers/test_busy_pattern_settled_output_guard.py",
+        "pyproject.toml",
+    ),
+    "codex": (
+        "src/cli_agent_orchestrator/providers/codex.py",
+        "test/providers/test_codex_*.py",
+        "test/providers/fixtures/codex_*.txt",
+        "pyproject.toml",
+    ),
+    "kiro": (
+        "src/cli_agent_orchestrator/providers/kiro_cli.py",
+        "test/providers/test_kiro_cli_*.py",
+        "test/providers/fixtures/kiro_cli_*.txt",
+        "pyproject.toml",
+    ),
+    "transport": (
+        "examples/robotics/cross-zone-transport/**",
+        "src/cli_agent_orchestrator/schemas/agent_profile.schema.json",
+        "src/cli_agent_orchestrator/models/provider.py",
+        "src/cli_agent_orchestrator/utils/enforcement.py",
+    ),
+    "factory": (
+        "examples/robotics/hierarchical-factory/**",
+        "src/cli_agent_orchestrator/schemas/agent_profile.schema.json",
+        "src/cli_agent_orchestrator/models/provider.py",
+        "src/cli_agent_orchestrator/utils/enforcement.py",
+    ),
+    "docs": (
+        "docusaurus/**",
+        "patches/**",
+        "vendor/**",
+        "scripts/test-braces-security.cjs",
+        "examples/robotics/cross-zone-transport/images/**",
+        "examples/robotics/hierarchical-factory/images/**",
+        ".github/workflows/gh-pages.yml",
+    ),
+}
+
+for name in FILTERS:
+    FILTERS[name] += (".github/workflows/ci.yml", "scripts/ci_changed_paths.py")
+
+
+def changed_revisions(event_name: str, event: dict) -> tuple[str, str]:
+    if event_name == "pull_request":
+        return event["pull_request"]["base"]["sha"], os.environ["GITHUB_SHA"]
+    raise ValueError(f"unsupported event: {event_name}")
+
+
+def matching_filters(paths: list[str]) -> dict[str, bool]:
+    return {
+        name: any(fnmatch.fnmatchcase(path, pattern) for path in paths for pattern in patterns)
+        for name, patterns in FILTERS.items()
+    }
+
+
+def main() -> None:
+    event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+    event_name = os.environ["GITHUB_EVENT_NAME"]
+    if event_name in ("push", "merge_group"):
+        print(f"{event_name}: run every filtered job")
+        results = dict.fromkeys(FILTERS, True)
+    else:
+        base, head = changed_revisions(event_name, event)
+        if not base or not head or base == "0" * 40:
+            raise ValueError("no valid change range; refusing to skip jobs")
+        changes = (
+            subprocess.check_output(["git", "diff", "--name-only", "--no-renames", "-z", base, head])
+            .decode()
+            .split("\0")
+        )
+        results = matching_filters(changes)
+    with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+        for name, matched in results.items():
+            output.write(f"{name}={str(matched).lower()}\n")
+            print(f"{name}: {'run' if matched else 'skip'}")
+
+
+if __name__ == "__main__":
+    main()
