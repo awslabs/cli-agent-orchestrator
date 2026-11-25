@@ -724,6 +724,24 @@ class TestUpdateRoute:
         assert (row.next_run.hour, row.next_run.minute) == (8, 30)
         assert client.get("/flows/daily-report").json()["schedule"] == "30 8 * * *"
 
+    def test_a_flow_removed_while_its_file_is_rewritten_is_a_404(
+        self, client, flows_home, monkeypatch
+    ):
+        register_flow(flows_home)
+        write = flow_service._atomic_write_text
+
+        def write_then_lose_the_row(path, text):
+            write(path, text)
+            database.delete_flow("daily-report")
+
+        monkeypatch.setattr(flow_service, "_atomic_write_text", write_then_lose_the_row)
+
+        response = client.put("/flows/daily-report", json={"schedule": "5 4 * * *"})
+
+        assert response.status_code == 404
+        assert "was removed while its file was being rewritten" in response.json()["detail"]
+        assert database.get_flow("daily-report") is None
+
     def test_every_editable_field_can_change_in_one_request(self, client, flows_home):
         path = register_flow(flows_home)
 
@@ -943,3 +961,90 @@ class TestUpdateRoute:
         assert (
             scoped([]).put("/flows/daily-report", json={"schedule": "7 4 * * *"}).status_code == 403
         )
+
+
+# --------------------------------------------------------------------------- #
+# Exception text stays in the server log
+# --------------------------------------------------------------------------- #
+
+LEAK = "boom at /srv/private/path.py line 42"
+
+
+class TestExceptionTextStaysOutOfResponses:
+    def test_validate_gives_the_fixed_cron_message_and_logs_the_schedulers_text(
+        self, client, flows_home, caplog
+    ):
+        with caplog.at_level("INFO", logger=flow_service.logger.name):
+            response = client.post("/flows/validate", json={**GOOD, "schedule": "* * * *"})
+
+        assert response.status_code == 200
+        assert response.json()["errors"] == [
+            {"field": "schedule", "message": flow_service.SCHEDULE_INVALID_MESSAGE}
+        ]
+        assert "Wrong number of fields" not in response.text
+        assert any(
+            "Wrong number of fields" in str(r.exc_info[1]) for r in caplog.records if r.exc_info
+        )
+
+    def test_validate_does_not_echo_an_exception_the_scheduler_raises(
+        self, client, flows_home, monkeypatch
+    ):
+        def raise_leak(*_args, **_kwargs):
+            raise RuntimeError(LEAK)
+
+        monkeypatch.setattr(flow_service, "next_fire_times", raise_leak)
+
+        response = client.post("/flows/validate", json=GOOD)
+
+        assert response.status_code == 200
+        assert response.json()["errors"] == [
+            {"field": "schedule", "message": flow_service.SCHEDULE_INVALID_MESSAGE}
+        ]
+        assert LEAK not in response.text
+
+    def test_create_does_not_echo_a_registration_error(
+        self, client, flows_home, monkeypatch, caplog
+    ):
+        def refuse(*_args, **_kwargs):
+            raise ValueError(LEAK)
+
+        monkeypatch.setattr(flow_service, "add_flow", refuse)
+
+        with caplog.at_level("WARNING", logger="cli_agent_orchestrator.api.main"):
+            response = client.post("/flows", json=GOOD)
+
+        assert response.status_code == 422
+        assert LEAK not in response.text
+        assert any(r.exc_info and LEAK in str(r.exc_info[1]) for r in caplog.records)
+
+    def test_create_does_not_echo_an_unexpected_error(
+        self, client, flows_home, monkeypatch, caplog
+    ):
+        def fail(*_args, **_kwargs):
+            raise RuntimeError(LEAK)
+
+        monkeypatch.setattr(flow_service, "add_flow", fail)
+
+        with caplog.at_level("ERROR", logger="cli_agent_orchestrator.api.main"):
+            response = client.post("/flows", json=GOOD)
+
+        assert response.status_code == 500
+        assert LEAK not in response.text
+        assert any(r.exc_info and LEAK in str(r.exc_info[1]) for r in caplog.records)
+
+    def test_update_does_not_echo_an_unexpected_error(
+        self, client, flows_home, monkeypatch, caplog
+    ):
+        register_flow(flows_home)
+
+        def fail(*_args, **_kwargs):
+            raise RuntimeError(LEAK)
+
+        monkeypatch.setattr(flow_service, "update_flow", fail)
+
+        with caplog.at_level("ERROR", logger="cli_agent_orchestrator.api.main"):
+            response = client.put("/flows/daily-report", json={"schedule": "5 4 * * *"})
+
+        assert response.status_code == 500
+        assert LEAK not in response.text
+        assert any(r.exc_info and LEAK in str(r.exc_info[1]) for r in caplog.records)

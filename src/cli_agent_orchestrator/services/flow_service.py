@@ -61,6 +61,9 @@ NAME_TAKEN_MESSAGE = "a flow with this name already exists"
 # Far longer than any hand-written cron; it bounds the per-item cost of the fire-time scan.
 SCHEDULE_MAX_LENGTH = 256
 SCHEDULE_TOO_LONG_MESSAGE = f"is too long (at most {SCHEDULE_MAX_LENGTH} characters)"
+SCHEDULE_INVALID_MESSAGE = (
+    "is not a valid cron expression (five fields: minute hour day-of-month month day-of-week)"
+)
 # The scheduler matches day and weekday together, so 29 February on one weekday recurs 28 or
 # 40 years apart (2072 to 2112 skips the non-leap 2100); no schedule that fires waits longer.
 _LONGEST_FIRE_GAP = timedelta(days=366 * 41)
@@ -180,8 +183,11 @@ def validate_flow_definition(fields: Mapping[str, Any], *, must_be_new: bool) ->
             try:
                 if not next_fire_times(value, 1):
                     add(key, "this schedule never fires")
-            except Exception as exc:  # APScheduler raises ValueError subclasses; stay tolerant
-                add(key, str(exc))
+            except Exception:  # APScheduler raises ValueError subclasses; stay tolerant
+                # The scheduler's own text goes to the log, not into a field error that an API
+                # response carries back to the caller.
+                logger.info("Flow schedule %r refused by the scheduler", value, exc_info=True)
+                add(key, SCHEDULE_INVALID_MESSAGE)
         elif not value.strip():
             add(key, "must not be empty")
     return errors

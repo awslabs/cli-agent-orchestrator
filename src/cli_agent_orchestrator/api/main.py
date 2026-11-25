@@ -11328,12 +11328,17 @@ async def create_flow(
         file_path.write_text(file_content)
 
         return flow_service.add_flow(str(file_path), enabled=body.enabled)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
-    except Exception as e:
+    except ValueError:
+        logger.warning("Flow %r was refused at registration", body.name, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="The flow could not be registered; see the server log",
+        )
+    except Exception:
+        logger.exception("Failed to create flow %r", body.name)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create flow: {str(e)}",
+            detail="Failed to create flow; see the server log",
         )
 
 
@@ -11354,10 +11359,11 @@ async def update_flow(
         )
     except (FlowFileOutsideHomeError, FlowFileMissingError) as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except Exception as e:
+    except Exception:
+        logger.exception("Failed to update flow %r", name)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update flow: {str(e)}",
+            detail="Failed to update flow; see the server log",
         )
 
 
