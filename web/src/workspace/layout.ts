@@ -36,6 +36,18 @@ export function setPaneCount(layout: Layout, count: PaneCount): Layout {
   return { count, panes: resize(keep, count), focused: 0 }
 }
 
+/**
+ * Put terminals that are not already on screen into the empty panes, in the
+ * order given (tab order). Filled panes are left alone; with fewer candidates
+ * than empty panes the rest stay empty.
+ */
+export function fillEmptyPanes(layout: Layout, ids: string[]): Layout {
+  const shown = new Set(layout.panes)
+  const queue = ids.filter(id => !shown.has(id))
+  if (queue.length === 0 || !layout.panes.includes(null)) return layout
+  return { ...layout, panes: layout.panes.map(id => id ?? queue.shift() ?? null) }
+}
+
 /** Show a terminal in the focused pane. Already visible elsewhere: focus that pane. */
 export function openInFocused(layout: Layout, id: string): Layout {
   const at = layout.panes.indexOf(id)

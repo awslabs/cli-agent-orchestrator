@@ -1,9 +1,8 @@
 name: Docs site
 
-# Builds the Docusaurus site on every pull request so reviewers get a build
-# signal, and additionally deploys to GitHub Pages when the change lands on
-# main. The deploy job is gated on the event type so pull requests never
-# publish.
+# Builds and deploys the Docusaurus site when a change lands on main.
+# Pull requests to main and merge-queue builds run in ci.yml under the aggregate
+# gate; PRs to other branches retain this workflow's build-only check.
 #
 # The deploy job is ALSO gated so it never runs on a fork by default: forks
 # don't have GitHub Pages enabled (and publish to the fork owner's own Pages
@@ -29,12 +28,12 @@ on:
       - 'examples/robotics/hierarchical-factory/images/**'
       - '.github/workflows/gh-pages.yml'
   pull_request:
+    branches-ignore: [main]
     paths:
       - 'docusaurus/**'
       - 'patches/**'
       - 'vendor/**'
       - 'scripts/test-braces-security.cjs'
-      # The physical AI blog posts embed these images.
       - 'examples/robotics/cross-zone-transport/images/**'
       - 'examples/robotics/hierarchical-factory/images/**'
       - '.github/workflows/gh-pages.yml'
@@ -42,9 +41,9 @@ on:
 
 permissions: {}
 
-# Never cancel an in-flight production deployment; queue behind it instead.
+# Isolate PR builds from production Pages deployments; never cancel a running deploy.
 concurrency:
-  group: pages
+  group: ${{ github.event_name == 'pull_request' && format('docs-pr-{0}', github.ref) || 'pages' }}
   cancel-in-progress: false
 
 jobs:
