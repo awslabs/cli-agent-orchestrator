@@ -89,14 +89,6 @@ HYBRID_CANDIDATE_MIN = 50
 HYBRID_CANDIDATE_MULTIPLIER = 3
 HYBRID_CANDIDATE_MAX = 200
 
-# #1335 change 5: a newly stored note supersedes a same-scope note it links to
-# (a P4 content-link edge) when their unique-token Sørensen–Dice similarity
-# over "key content", with link markup removed, reaches this floor. Calibrated
-# on the synthetic P0 fixture: its five declared current/stale revision pairs
-# score 0.762–0.800, its authored links score 0.000–0.111, and the same-scope
-# median is 0.286. Templated siblings score 0.750–0.875, which is why a link is
-# required as well as similarity.
-AUTO_SUPERSEDE_SIMILARITY_FLOOR = 0.70
 AUTO_SUPERSEDE_ORIGIN = memory_eligibility.AUTO_SUPERSEDE_ORIGIN
 
 
@@ -181,6 +173,10 @@ class MemoryDisabledError(RuntimeError):
     Read paths (recall, get_memory_context_for_terminal) instead return an
     empty result, since silent empty reads are a safer no-op than raising.
     """
+
+
+class MemoryRestoreConflict(RuntimeError):
+    """A concurrent write changed the topic before restore acquired its lock."""
 
 
 class MemoryPartialWriteError(RuntimeError):
@@ -922,6 +918,7 @@ class MemoryService:
         occurred_at: Optional[datetime] = None,
         *,
         auto_supersede: bool = True,
+        _restore_expected_content: Optional[str] = None,
     ) -> Memory:
         """Store or update a memory. Upserts wiki file + index.md.
 
@@ -943,10 +940,9 @@ class MemoryService:
         Raises ``MemoryDisabledError`` when ``memory.enabled`` is False
         (U5 / SC-6) — no filesystem or SQLite writes happen.
 
-        With ``memory.supersede.auto`` on (#1335 change 5), a native store that
-        replaces an existing version lists it in ``Memory.superseded``: a new
-        entry under the same key, or a same-scope note this one links to and
-        closely restates. Nothing is deleted; ``restore()`` undoes either one.
+        With ``memory.supersede.auto`` on in append mode, a changed entry under
+        the same key is reported with a version-pinned undo hint. Other keys
+        are never automatically superseded.
         ``auto_supersede=False`` skips that step (``restore()`` itself).
         """
         if not _is_memory_enabled():
@@ -1083,12 +1079,19 @@ class MemoryService:
 
             # Check if topic file already exists (upsert)
             is_update = wiki_path.exists()
+            if _restore_expected_content is not None and not is_update:
+                raise MemoryRestoreConflict("topic removed before restore")
             memory_id = str(uuid.uuid4())
             created_at = now
 
             if is_update:
                 # Read existing file to get original created_at and id from comment
                 existing_content = wiki_path.read_text(encoding="utf-8")
+                if (
+                    _restore_expected_content is not None
+                    and existing_content != _restore_expected_content
+                ):
+                    raise MemoryRestoreConflict("topic changed before restore")
                 # Try to extract original id
                 id_match = re.search(r"<!-- id: ([a-f0-9\-]+)", existing_content)
                 if id_match:
@@ -1154,6 +1157,8 @@ class MemoryService:
             tmp_path.write_text(new_content, encoding="utf-8")
             os.replace(str(tmp_path), str(wiki_path))
             replaced_version = is_update and self._latest_version_replaced(new_content)
+            sections = self._topic_sections(new_content) if replaced_version else []
+            replaced_at = f"{sections[-2][0]}#{len(sections) - 2}" if sections else None
 
             # LLM wiki compilation, deferred. A coding-agent CLI cold-starts in
             # tens of seconds — far too slow to block store() — so on an "llm"
@@ -1164,10 +1169,12 @@ class MemoryService:
             # topic is never compiled: the LLM has nothing to merge into and
             # would only regurgitate the canonical ``# {key}`` header.
             last_compiled_at: Optional[datetime] = None
+            compile_mode = "llm"
             try:
                 from cli_agent_orchestrator.services.settings_service import get_compile_mode
 
-                if is_update and get_compile_mode() == "llm":
+                compile_mode = get_compile_mode()
+                if is_update and compile_mode == "llm":
                     self._schedule_background_compile(
                         scope=scope,
                         scope_id=scope_id,
@@ -1238,6 +1245,11 @@ class MemoryService:
                     scope,
                 )
 
+            superseded = (
+                await self._auto_supersede(key, scope, scope_id, replaced_at, compile_mode)
+                if auto_supersede
+                else []
+            )
             logger.info(f"Memory {action}: key={key} scope={scope} scope_id={scope_id}")
         finally:
             try:
@@ -1267,10 +1279,7 @@ class MemoryService:
             action=action,
             timestamp_clamped=timestamp_clamped,
         )
-        if auto_supersede:
-            memory.superseded = await self._auto_supersede(
-                key, scope, scope_id, content, replaced_version=replaced_version
-            )
+        memory.superseded = superseded
         return memory
 
     # -------------------------------------------------------------------------
@@ -1287,7 +1296,7 @@ class MemoryService:
         return MemoryRelationshipService(self._db_session_factory or database.SessionLocal)
 
     def _topic_sections(self, text: str) -> list[tuple[str, str]]:
-        """``(timestamp, body)`` per entry heading, in file order, as recall reads them."""
+        """Raw ``(timestamp, body)`` per entry heading, in file order."""
         from cli_agent_orchestrator.services.settings_service import is_memory_parser_lenient
 
         pattern = (
@@ -1297,7 +1306,7 @@ class MemoryService:
         sections: list[tuple[str, str]] = []
         for index, match in enumerate(matches):
             end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-            body = self._strip_existing_see_also(text[match.end() : end]).strip()
+            body = text[match.end() : end].strip()
             sections.append((match.group(1), body))
         return sections
 
@@ -1306,21 +1315,14 @@ class MemoryService:
         if any(_COMPILED_MARKER_RE.fullmatch(line) for line in text.splitlines()):
             return False  # recall shows a compiled topic's whole body
         sections = self._topic_sections(text)
-        return len(sections) >= 2 and sections[-1][1] != sections[-2][1]
-
-    @classmethod
-    def _note_similarity(cls, left: str, right: str) -> float:
-        """Unique-token Sørensen–Dice similarity (the #1335 change 4 metric)."""
-        left_tokens = set(cls._bm25_tokenize(left))
-        right_tokens = set(cls._bm25_tokenize(right))
-        denominator = len(left_tokens) + len(right_tokens)
-        if denominator == 0:
-            return 0.0
-        return 2.0 * len(left_tokens & right_tokens) / denominator
+        return len(sections) >= 2 and (
+            self._strip_existing_see_also(sections[-1][1]).strip()
+            != self._strip_existing_see_also(sections[-2][1]).strip()
+        )
 
     @staticmethod
-    def _undo_hint(key: str, scope: str) -> str:
-        return f"memory_restore(key={key!r}, scope={scope!r})"
+    def _undo_hint(key: str, scope: str, version: str) -> str:
+        return f"memory_restore(key={key!r}, scope={scope!r}, version={version!r})"
 
     async def _record_supersede_history(
         self,
@@ -1340,7 +1342,7 @@ class MemoryService:
             f"{reason} {event.removeprefix('memory_')}",
             key=key,
             scope=scope,
-            scope_id=str(scope_id),
+            scope_id=scope_id or "",
             reason=reason,
             superseded_by=superseded_by,
         )
@@ -1350,22 +1352,24 @@ class MemoryService:
         key: str,
         scope: str,
         scope_id: Optional[str],
-        content: str,
-        *,
-        replaced_version: bool,
+        replaced_at: Optional[str],
+        compile_mode: str,
     ) -> list[SupersededMemory]:
-        """Supersede what this native store replaced. Best-effort: never fails a store."""
+        """Report a changed native entry, only while its history remains append-only."""
         from cli_agent_orchestrator.services.settings_service import (
             is_memory_auto_supersede_enabled,
         )
 
-        if not is_memory_auto_supersede_enabled():
+        if not is_memory_auto_supersede_enabled() or compile_mode != "append":
             return []
         superseded: list[SupersededMemory] = []
-        if replaced_version:
+        if replaced_at:
             superseded.append(
                 SupersededMemory(
-                    key=key, scope=scope, reason="same_key", undo=self._undo_hint(key, scope)
+                    key=key,
+                    scope=scope,
+                    reason="same_key",
+                    undo=self._undo_hint(key, scope, replaced_at),
                 )
             )
             await self._record_supersede_history(
@@ -1376,110 +1380,19 @@ class MemoryService:
                 reason="same_key",
                 superseded_by=key,
             )
-        try:
-            replaced = self._supersede_similar_links(key, scope, scope_id, content)
-        except Exception as error:  # noqa: BLE001 - the store itself is durable
-            logger.warning(
-                "auto supersede skipped after a relationship error (key=%s scope=%s): %s",
-                key,
-                scope,
-                type(error).__name__,
-            )
-            replaced = []
-        for target in replaced:
-            superseded.append(
-                SupersededMemory(
-                    key=target, scope=scope, reason="similar", undo=self._undo_hint(target, scope)
-                )
-            )
-            await self._record_supersede_history(
-                "memory_superseded",
-                key=target,
-                scope=scope,
-                scope_id=scope_id,
-                reason="similar",
-                superseded_by=key,
-            )
         return superseded
-
-    def _supersede_similar_links(
-        self, key: str, scope: str, scope_id: Optional[str], content: str
-    ) -> list[str]:
-        """Create ``auto_supersede`` edges to linked notes this one closely restates.
-
-        A candidate must be an active same-scope ``content_link`` target of
-        ``key`` (P4) that scores at least ``AUTO_SUPERSEDE_SIMILARITY_FLOOR``.
-        Any existing supersedes edge from ``key`` to it (an earlier supersede,
-        an undo, or human curation) leaves it alone. Nothing happens while
-        ``key`` is itself superseded, which also rules out a two-note cycle.
-        """
-        from cli_agent_orchestrator.services.memory_content_links import strip_content_links
-
-        service = self._relationship_service()
-        targets = sorted(
-            {
-                edge.target_key
-                for edge in service.list_relationships(
-                    scope, scope_id, source_key=key, types=["relates_to"]
-                )
-                if edge.origin == "content_link" and edge.target_key != key
-            }
-        )
-        if not targets or service.is_superseded(scope, scope_id, key):
-            return []
-        blocked = {
-            edge.target_key
-            for edge in service.edges_touching(scope, scope_id, key, type="supersedes")
-            if edge.source_key == key
-        }
-        replaced: list[str] = []
-        for target in targets:
-            if target in blocked:
-                continue
-            wiki_path = self.get_wiki_path(scope, scope_id, target)
-            if not wiki_path.is_file():
-                continue
-            existing = self._parse_wiki_file(
-                wiki_path,
-                wiki_path.read_text(encoding="utf-8"),
-                {"key": target, "scope": scope, "scope_id": scope_id},
-            )
-            if existing is None:
-                continue
-            score = self._note_similarity(
-                f"{key} {strip_content_links(content)}",
-                f"{target} {strip_content_links(existing.content)}",
-            )
-            if score < AUTO_SUPERSEDE_SIMILARITY_FLOOR:
-                continue
-            service.create(
-                scope,
-                scope_id,
-                key,
-                target,
-                "supersedes",
-                AUTO_SUPERSEDE_ORIGIN,
-                status="active",
-                confidence=round(score, 3),
-                attributes={"reason": "similar"},
-            )
-            replaced.append(target)
-        return replaced
 
     async def restore(
         self,
         key: str,
         scope: str = "project",
         terminal_context: Optional[dict] = None,
+        version: Optional[str] = None,
     ) -> dict[str, Any]:
         """Undo an automatic supersede of a native note (#1335 change 5).
 
-        If CAO superseded ``key`` with a linked similar note, its active
-        ``auto_supersede`` edges become ``rejected`` (kept, and never
-        re-created by a later store), so the note is visible again. Otherwise,
-        if a newer entry under the same key replaced its previous entry, that
-        previous entry is appended again as the newest one. Nothing is deleted,
-        and each undo is recorded in the history.
+        Restore the requested prior version under the same native key. A version
+        can only replace its immediate successor, and repeated requests are no-ops.
         """
         if not _is_memory_enabled():
             raise MemoryDisabledError(MEMORY_DISABLED_MESSAGE)
@@ -1493,6 +1406,17 @@ class MemoryService:
             )
         canonical = self._sanitize_key(key)
         scope_id = self.resolve_scope_id(scope, terminal_context)
+        from cli_agent_orchestrator.services.settings_service import get_vault_config
+        from cli_agent_orchestrator.services.vault.binding import resolve
+
+        binding = resolve(scope, scope_id, vault_config=get_vault_config())
+        if isinstance(binding, VaultBinding):
+            return {
+                "success": False,
+                "error_kind": "vault_mapped",
+                "error": "restore requires a native memory",
+            }
+        scope_id = binding.scope_id
         not_found = {
             "success": False,
             "error_kind": "not_found",
@@ -1503,37 +1427,43 @@ class MemoryService:
         wiki_path = self.get_wiki_path(scope, scope_id, canonical)
         if not wiki_path.is_file():
             return not_found
-
-        service = self._relationship_service()
-        undone = [
-            edge
-            for edge in service.edges_touching(scope, scope_id, canonical, type="supersedes")
-            if edge.target_key == canonical
-            and edge.origin == AUTO_SUPERSEDE_ORIGIN
-            and edge.status == "active"
-        ]
-        if undone:
-            for edge in undone:
-                service.reject(edge.id)
-            superseded_by = sorted({edge.source_key for edge in undone})
-            await self._record_supersede_history(
-                "memory_supersede_undone",
-                key=canonical,
-                scope=scope,
-                scope_id=scope_id,
-                reason="similar",
-                superseded_by=",".join(superseded_by),
-            )
+        if version is None:
             return {
-                "success": True,
-                "key": canonical,
-                "scope": scope,
-                "restored": "superseded_note",
-                "superseded_by": superseded_by,
+                "success": False,
+                "error_kind": "version_required",
+                "error": "restore requires the exact version from the store undo hint",
             }
 
         text = wiki_path.read_text(encoding="utf-8")
         sections = self._topic_sections(text)
+        if version is not None:
+            stamp, separator, ordinal = version.partition("#")
+            if (
+                not separator
+                or not ordinal.isdecimal()
+                or int(ordinal) >= len(sections)
+                or sections[int(ordinal)][0] != stamp
+            ):
+                return {
+                    "success": False,
+                    "error_kind": "version_not_found",
+                    "error": f"version not found: {version}",
+                }
+            index = int(ordinal)
+            if index < len(sections) - 1 and sections[-1][1] == sections[index][1]:
+                return {
+                    "success": True,
+                    "key": canonical,
+                    "scope": scope,
+                    "restored": "already_restored",
+                    "restored_from": version,
+                }
+            if index != len(sections) - 2:
+                return {
+                    "success": False,
+                    "error_kind": "stale_version",
+                    "error": f"version is not the immediately previous entry: {version}",
+                }
         if not self._latest_version_replaced(text):
             return {
                 "success": False,
@@ -1541,19 +1471,37 @@ class MemoryService:
                 "error": f"memory has no superseded version to restore: {canonical}",
             }
         restored_from, previous = sections[-2]
+        previous = re.sub(r"^_Originally recorded: [^\n]+_\n?", "", previous).strip()
         header = next(
             (match for line in text.splitlines() if (match := TOPIC_HEADER_RE.fullmatch(line))),
             None,
         )
-        await self.store(
-            previous,
-            scope=scope,
-            memory_type=header.group("type").strip() if header else "project",
-            key=canonical,
-            tags=header.group("tags") if header else "",
-            terminal_context=terminal_context,
-            auto_supersede=False,
-        )
+        try:
+            await self.store(
+                previous,
+                scope=scope,
+                memory_type=header.group("type").strip() if header else "project",
+                key=canonical,
+                tags=header.group("tags") if header else "",
+                terminal_context=terminal_context,
+                auto_supersede=False,
+                _restore_expected_content=text,
+            )
+        except MemoryRestoreConflict:
+            current = self._topic_sections(wiki_path.read_text(encoding="utf-8"))
+            if version is not None and current and current[-1][1] == sections[-2][1]:
+                return {
+                    "success": True,
+                    "key": canonical,
+                    "scope": scope,
+                    "restored": "already_restored",
+                    "restored_from": version,
+                }
+            return {
+                "success": False,
+                "error_kind": "stale_version",
+                "error": "topic changed before restore",
+            }
         await self._record_supersede_history(
             "memory_supersede_undone",
             key=canonical,
@@ -1567,7 +1515,7 @@ class MemoryService:
             "key": canonical,
             "scope": scope,
             "restored": "previous_version",
-            "restored_from": restored_from,
+            "restored_from": version or restored_from,
         }
 
     def _store_vault_memory(
@@ -3141,6 +3089,7 @@ class MemoryService:
                 )
             )
         results = self._visible_to_caller(results, terminal_context)
+        self._label_auto_superseded(results)
 
         from cli_agent_orchestrator.services.settings_service import is_memory_lifecycle_enabled
 
@@ -3293,6 +3242,12 @@ class MemoryService:
                     "curated_recall", terminal_context
                 )
             )
+            if check is not None and include_superseded:
+                check = memory_eligibility.EligibilityCheck(
+                    check.request,
+                    [source for source in check._sources if source.name != "supersede.auto"],
+                    check.errors,
+                )
         eligibility_kwargs: dict[str, Any] = {"eligibility": check} if check is not None else {}
         # #1335 change 5: hide auto-superseded notes before any slice. The
         # curator check above already carries the registered source.

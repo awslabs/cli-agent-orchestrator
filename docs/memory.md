@@ -321,69 +321,44 @@ Undo an automatic supersede that a `memory_store` result reported.
 
 ```
 memory_restore(
-  key="bridge-schedule-old",
-  scope="project"           # optional, default: "project"
+  key="bridge-schedule",
+  scope="project",          # optional, default: "project"
+  version="2026-11-25T08:00:00Z#0"  # exact hint from the store result
 )
 ```
 
-If another note superseded this one, the note is visible in recall again, and a
-later store doesn't supersede it again with the same note. The result has
-`restored: "superseded_note"` and `superseded_by`. If a newer entry under this key
-replaced its previous entry, the previous entry is appended again as the newest
-entry, and the result has `restored: "previous_version"` and `restored_from`, the
-timestamp of the entry it copied. Restore checks for a superseding note first, so
-a key that has both needs a second call to bring back its previous entry. An
-absent key returns `not_found`. A key with nothing to restore returns
-`nothing_to_restore`. The caller needs the same write access as `memory_store`.
+The requested previous entry is appended under the same key with authored links
+intact. The version hint includes a timestamp and entry ordinal, so same-second
+writes remain distinct. Repeating the request returns `already_restored` without
+another write; a later replacement makes an old hint return `stale_version`.
+An absent key returns `not_found`. The caller needs the same write access as
+`memory_store`; vault-mapped keys cannot be restored this way.
 
 ### Automatic supersede and undo
 
-When an agent stores a note that replaces an existing one, CAO switches recall to
-the new note at once. There is no proposal and no approval step. Nothing is
-deleted, and every switch can be undone with `memory_restore`.
+Automatic reporting is opt-in. In `append` mode, a changed write under an
+existing key in the same scope reports `reason: "same_key"` with a version-pinned
+undo hint. The previous entry remains in the topic file under its own heading.
+In `llm` compile mode, CAO does not report automatic supersede or offer an undo
+hint: compilation can merge away prior entries. Links and similarity across keys
+never cause automatic supersede; content links remain normal relationships.
+Same-key writes already show their latest entry in recall, so no other key is
+hidden or resurrected by this feature.
 
-The two cases:
-
-- **Same key.** A new entry under an existing key already replaces the previous
-  entry in recall, which shows the newest entry. Every earlier entry stays in the
-  topic file under its own `## <timestamp>` heading. The store result lists the
-  key with `reason: "same_key"`, unless the new entry is identical to the
-  previous one. Compiled topics show their whole body, so they are not counted.
-- **A linked, similar note.** The new note links an existing same-scope note with
-  `[[key]]` or `## See Also`, and the two say nearly the same thing. CAO adds an
-  active `supersedes` edge from the new note to the old one, with the
-  `auto_supersede` origin and the similarity as its confidence. The result lists
-  the old key with `reason: "similar"`. Similarity is the unique-token Sørensen–Dice
-  score over each note's key and content, with link markup removed. It must be at
-  least 0.70. On the synthetic evaluation fixture, real revisions score 0.76–0.80
-  and notes that only cite each other score 0.11 or less. The links come from
-  `memory.relationships.content_links`, so this case needs that opt-in setting on
-  (off by default).
-
-  A link is required as well as similarity. Templated sibling notes, such as the
-  same sentence about different hosts, often score higher than real revisions,
-  so similarity alone would hide them. Nothing happens across scopes, for
-  vault-backed notes, while the new note is itself superseded, or when any
-  `supersedes` edge already exists from the new note to the old one. That last
-  rule covers an earlier undo and human curation.
-
-A note superseded this way is hidden from default recall, `cao memory list`,
-`memory_related` and injection. It is still there:
-`memory_recall(include_superseded=True)` lists it with
-`lifecycle_status: "superseded"`, and
-`cao memory relationships list --scope <scope>` shows its `supersedes` edge to
-operators.
-Forgetting the new note removes its edges, so the old note comes back.
-`memory_restore` sets the edge to `rejected` and keeps it.
+For existing legacy `auto_supersede` edges, exact reads and `memory_related`
+label superseded notes. `cao memory list --include-superseded`,
+`GET /memory?include_superseded=true`, and `memory_recall(include_superseded=True)`
+expose them. Clear includes hidden notes, avoiding later resurrection.
 
 Every supersede and every undo writes one line to the memory audit log
 (`logs/memory/<date>.md`): `memory_superseded` or `memory_supersede_undone`,
 with the key, scope, reason and superseding key. The line never contains note
 content.
 
-`memory.supersede.auto` defaults to `true`. Set it to `false` to stop new
-supersedes, and to show notes that were already superseded in recall and
-injection again. Their edges stay. The setting doesn't change the opt-in
+`memory.supersede.auto` defaults to `false`. Set it to `true` to report same-key
+replacements in append mode. Env override: `CAO_MEMORY_SUPERSEDE_AUTO`.
+Off produces no supersede audit lines and does not hide legacy supersede edges.
+The setting doesn't change the opt-in
 `memory.lifecycle.enabled` rules below, which apply to every active `supersedes`
 edge.
 
@@ -449,7 +424,9 @@ memory, so the recorded block remains the one delivered with the step's first
 message. Another terminal creation does not invalidate that snapshot. A fresh
 workflow run resolves current memory.
 
-Explicit recall retains superseded memories. With lifecycle enabled, recency
+Explicit recall retains lifecycle-superseded memories; legacy auto-supersede
+edges instead require `include_superseded=True` while auto mode is enabled.
+With lifecycle enabled, recency
 moves them last without changing membership; usage demotes them before the
 stable scope pass and slice. Score/relevance keep their existing always-on
 demotion; the flag adds annotation only in those modes. A transient

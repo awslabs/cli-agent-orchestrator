@@ -1653,6 +1653,7 @@ class MemorySummary(BaseModel):
     indexed_at: Optional[datetime] = None
     index_freshness: Optional[str] = None
     content_truncated: bool = False
+    lifecycle_status: Optional[str] = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class MemoryDetail(MemorySummary):
@@ -11430,6 +11431,7 @@ class InternalMemoryRecallRequest(BaseModel):
 class InternalMemoryRestoreRequest(BaseModel):
     key: LenientMemoryKey  # see InternalMemoryStoreRequest.key
     scope: MemoryScope = MemoryScope.PROJECT
+    version: Optional[str] = None
     terminal_context: Optional[InternalMemoryContext] = None
 
 
@@ -11578,6 +11580,7 @@ async def internal_memory_restore(
             await _get_memory_service().restore(
                 body.key,
                 scope=body.scope.value,
+                version=body.version,
                 terminal_context=(
                     body.terminal_context.model_dump(exclude_none=True)
                     if body.terminal_context
@@ -11675,6 +11678,7 @@ def _to_memory_summary(mem, base_dir: Path) -> MemorySummary:
         indexed_at=getattr(mem, "indexed_at", None),
         index_freshness=getattr(mem, "index_freshness", None),
         content_truncated=bool(getattr(mem, "content_truncated", False)),
+        lifecycle_status=getattr(mem, "lifecycle_status", None),
     )
 
 
@@ -11721,6 +11725,7 @@ async def list_memories_endpoint(
     memory_type: Optional[MemoryType] = Query(default=None, alias="type"),
     scope_id: Optional[MemoryScopeId] = None,
     limit: int = Query(default=50, ge=1, le=100),
+    include_superseded: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[MemorySummary]:
     """List stored memories across all projects (mirrors `cao memory list --all`)."""
@@ -11738,6 +11743,7 @@ async def list_memories_endpoint(
             limit=1000,
             scan_all=True,
             search_mode="metadata",
+            **({"include_superseded": True} if include_superseded else {}),
             record_access=not is_non_accessing_inspection_enabled(),
         )
         if scope_id is not None:
@@ -12114,7 +12120,11 @@ async def clear_memories_endpoint(
     svc = _get_memory_service()
     try:
         memories = await svc.recall(
-            scope=scope.value, limit=1000, scan_all=True, search_mode="metadata"
+            scope=scope.value,
+            limit=1000,
+            scan_all=True,
+            search_mode="metadata",
+            include_superseded=True,
         )
     except Exception as e:
         raise HTTPException(

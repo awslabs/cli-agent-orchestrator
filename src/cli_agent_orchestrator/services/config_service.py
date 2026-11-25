@@ -86,7 +86,7 @@ class RelationshipsConfig(BaseModel):
 
 
 class SupersedeConfig(BaseModel):
-    auto: bool = True
+    auto: bool = False
 
 
 class MemoryConfig(BaseModel):

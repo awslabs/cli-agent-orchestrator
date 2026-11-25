@@ -209,10 +209,15 @@ async def restore_memory(
     key: str,
     scope: str,
     terminal_context: Optional[dict[str, Any]],
+    version: Optional[str] = None,
 ) -> dict[str, Any]:
     if not remote_memory_url():
-        return await MemoryService().restore(key, scope=scope, terminal_context=terminal_context)
+        return await MemoryService().restore(
+            key, scope=scope, terminal_context=terminal_context, version=version
+        )
     body: dict[str, Any] = {"key": key, "scope": scope}
+    if version is not None:
+        body["version"] = version
     if terminal_context is not None:
         body["terminal_context"] = terminal_context
     return await asyncio.to_thread(_post, "/internal/memory/restore", body)

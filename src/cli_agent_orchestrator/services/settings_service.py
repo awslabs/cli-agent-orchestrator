@@ -821,7 +821,7 @@ def get_memory_settings() -> Dict[str, Any]:
         "non_accessing_inspection": True,
         "parser": {"lenient": True},
         "relationships": {"content_links": False},
-        "supersede": {"auto": True},
+        "supersede": {"auto": False},
         "lifecycle": {"enabled": False},
         "injection": dict(MEMORY_INJECTION_DEFAULTS),
         "ranking": {"default_sort": "recency"},
@@ -1062,16 +1062,19 @@ def is_memory_content_links_enabled() -> bool:
 
 
 def is_memory_auto_supersede_enabled() -> bool:
-    """Automatic supersede with undo (#1335 change 5): nested file value > True."""
+    """Automatic supersede with undo: env > nested file value > False."""
+    env = os.environ.get("CAO_MEMORY_SUPERSEDE_AUTO")
+    if env is not None:
+        return env.strip().lower() in {"1", "true", "yes", "on"}
     try:
         supersede = get_memory_settings().get("supersede", {})
         if not isinstance(supersede, dict):
-            return True
-        value = supersede.get("auto", True)
-        return value if isinstance(value, bool) else True
+            return False
+        value = supersede.get("auto", False)
+        return value if isinstance(value, bool) else False
     except Exception:
-        logger.warning("Failed to read memory.supersede.auto; defaulting to True")
-        return True
+        logger.warning("Failed to read memory.supersede.auto; defaulting to False")
+        return False
 
 
 def is_memory_lifecycle_enabled() -> bool:

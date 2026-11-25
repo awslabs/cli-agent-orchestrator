@@ -1,403 +1,286 @@
-"""Automatic supersede with undo (#1335 change 5).
-
-Every test runs the real MemoryService, the real relationship store and the
-real audit log against per-test files and a per-test SQLite database.
-"""
-
-from __future__ import annotations
+"""Same-key-only automatic supersede and exact version-pinned restore."""
 
 import asyncio
 import re
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from sqlalchemy.orm import sessionmaker
 
-from cli_agent_orchestrator.clients.database import MemoryRelationshipModel
-from cli_agent_orchestrator.services import audit_log, memory_relationship_service
-from cli_agent_orchestrator.services import memory_service as memory_service_module
-from cli_agent_orchestrator.services import settings_service
+from cli_agent_orchestrator.services import audit_log, settings_service
 from cli_agent_orchestrator.services.memory_service import MemoryService
 
-STALE = "Retired revision one says the cobalt bridge opens at dawn."
-CURRENT = "Current revision one says the cobalt bridge opens at noon. Replaces [[bridge-stale]]."
 
-
-def _run(coro):
-    return asyncio.run(coro)
+def run(coroutine):
+    return asyncio.run(coroutine)
 
 
 @pytest.fixture
-def audit_base(tmp_path: Path, monkeypatch) -> Path:
-    base = tmp_path / "audit-base"
-    base.mkdir()
-    monkeypatch.setattr(audit_log, "MEMORY_BASE_DIR", base)
-    return base
-
-
-@pytest.fixture
-def service(tmp_path: Path, isolated_memory_db, audit_base, monkeypatch) -> MemoryService:
-    # One database for every path, including forget's relationship purge.
-    monkeypatch.setattr(settings_service, "is_memory_content_links_enabled", lambda: True)
-    monkeypatch.setattr(
-        memory_relationship_service, "SessionLocal", sessionmaker(bind=isolated_memory_db)
-    )
+def service(tmp_path: Path, isolated_memory_db, monkeypatch):
+    monkeypatch.setattr(audit_log, "MEMORY_BASE_DIR", tmp_path / "audit")
+    monkeypatch.setattr(settings_service, "is_memory_auto_supersede_enabled", lambda: True)
+    monkeypatch.setattr(settings_service, "get_compile_mode", lambda: "append")
     return MemoryService(base_dir=tmp_path / "memory", db_engine=isolated_memory_db)
 
 
-def _edges(engine) -> list[tuple[str, str, str, str, str]]:
-    with sessionmaker(bind=engine)() as db:
-        return sorted(
-            (row.source_key, row.target_key, row.type, row.origin, row.status)
-            for row in db.query(MemoryRelationshipModel).all()
-            if row.type == "supersedes"
-        )
+def version_from(memory):
+    return re.search(r"version='([^']+)'", memory.superseded[0].undo).group(1)
 
 
-def _history() -> list[str]:
-    return [
-        line
-        for line in audit_log.read_audit_log().splitlines()
-        if "[memory_superseded]" in line or "[memory_supersede_undone]" in line
-    ]
+def test_exact_restore_retains_authored_links_and_is_idempotent(service):
+    authored = "Manual relay.\n\n## See Also\n- [other](other-note.md)"
+    run(service.store(authored, key="relay", scope="global"))
+    revised = run(service.store("Automatic relay.", key="relay", scope="global"))
+    version = version_from(revised)
+    assert revised.superseded[0].reason == "same_key"
+    assert (
+        run(service.restore("relay", scope="global", version=version))["restored_from"] == version
+    )
+    assert run(service.recall(scope="global"))[0].content == "Manual relay."
+    assert (
+        run(service.restore("relay", scope="global", version=version))["restored"]
+        == "already_restored"
+    )
+    text = Path(revised.file_path).read_text()
+    assert text.count("Manual relay.") == 2
+    assert text.count("## See Also\n- [other](other-note.md)") == 2
+    assert audit_log.read_audit_log().count("[memory_supersede_undone]") == 1
 
 
-def _keys(rows) -> list[str]:
-    return [row.key for row in rows]
+def test_stale_hint_refuses_to_restore_wrong_revision(service):
+    run(service.store("First.", key="relay", scope="global"))
+    second = run(service.store("Second.", key="relay", scope="global"))
+    run(service.store("Third.", key="relay", scope="global"))
+    assert (
+        run(service.restore("relay", scope="global", version=version_from(second)))["error_kind"]
+        == "stale_version"
+    )
+    assert run(service.recall(scope="global"))[0].content == "Third."
 
 
-def _store_pair(service: MemoryService, *, current: str = CURRENT):
-    stale = _run(service.store(STALE, scope="global", key="bridge-stale"))
-    new = _run(service.store(current, scope="global", key="bridge-current"))
-    return stale, new
-
-
-# --------------------------------------------------------------------------- #
-# The similarity path: a linked, highly similar note replaces the old one
-# --------------------------------------------------------------------------- #
-
-
-def test_linked_similar_note_supersedes_old_note_at_once(service, isolated_memory_db) -> None:
-    stale, new = _store_pair(service)
-
-    assert stale.superseded == []
-    assert [item.model_dump() for item in new.superseded] == [
-        {
-            "key": "bridge-stale",
-            "scope": "global",
-            "reason": "similar",
-            "undo": "memory_restore(key='bridge-stale', scope='global')",
-        }
-    ]
-    assert _edges(isolated_memory_db) == [
-        ("bridge-current", "bridge-stale", "supersedes", "auto_supersede", "active")
-    ]
-    with sessionmaker(bind=isolated_memory_db)() as db:
-        row = db.query(MemoryRelationshipModel).filter_by(type="supersedes").one()
-        assert row.confidence is not None
-        floor = memory_service_module.AUTO_SUPERSEDE_SIMILARITY_FLOOR
-        assert floor <= row.confidence <= 1.0
-
-    # Recall prefers the new note; the old one is hidden from default recall.
-    assert _keys(_run(service.recall(query="cobalt bridge", scope="global"))) == ["bridge-current"]
-    assert _keys(_run(service.recall(scope="global"))) == ["bridge-current"]
-
-    # ...but it still exists and can be listed, labelled.
-    listed = _run(service.recall(query="cobalt bridge", scope="global", include_superseded=True))
-    assert sorted(_keys(listed)) == ["bridge-current", "bridge-stale"]
-    labels = {row.key: row.lifecycle_status for row in listed}
-    assert labels == {"bridge-current": None, "bridge-stale": "superseded"}
-    assert Path(stale.file_path).read_text(encoding="utf-8").count(STALE) == 1
-
-    history = _history()
-    assert len(history) == 1
-    assert "reason=similar" in history[0]
-    assert "key=bridge-stale" in history[0]
-    assert "superseded_by=bridge-current" in history[0]
-    # History is content-free.
-    assert "cobalt" not in history[0]
-
-
-def test_linked_supersede_requires_p4_link_opt_in(service, isolated_memory_db, monkeypatch) -> None:
-    monkeypatch.setattr(settings_service, "is_memory_content_links_enabled", lambda: False)
-    stale, new = _store_pair(service)
-
-    assert stale.superseded == []
-    assert new.superseded == []
-    assert _edges(isolated_memory_db) == []
-    assert sorted(_keys(_run(service.recall(scope="global")))) == [
-        "bridge-current",
-        "bridge-stale",
-    ]
-
-
-def test_dissimilar_linked_note_does_not_supersede(service, isolated_memory_db) -> None:
-    """The false-positive guard: a link alone is not a replacement."""
-    _run(service.store(STALE, scope="global", key="bridge-stale"))
-    hub = _run(
+def test_links_and_similar_siblings_never_supersede(service, monkeypatch):
+    monkeypatch.setattr(settings_service, "is_memory_content_links_enabled", lambda: True)
+    run(service.store("Host alpha02 runs nightly backup.", key="host-alpha02", scope="global"))
+    sibling = run(
         service.store(
-            "Harbour navigation index for the night shift; see [[bridge-stale]] too.",
+            "Host alpha01 runs nightly backup. Sibling: [[host-alpha02]].",
+            key="host-alpha01",
             scope="global",
-            key="harbour-index",
         )
     )
-
-    assert hub.superseded == []
-    assert _edges(isolated_memory_db) == []
-    assert sorted(_keys(_run(service.recall(scope="global")))) == [
-        "bridge-stale",
-        "harbour-index",
-    ]
-    assert _history() == []
-
-
-def test_link_markup_alone_does_not_make_a_note_similar(service, isolated_memory_db) -> None:
-    """A link names its target; a short note that only cites it is not a restatement."""
-    _run(service.store("deleted-from-text", scope="global", key="deleted-from-text"))
-    citing = _run(service.store("[[deleted-from-text]]", scope="global", key="source"))
-
-    assert citing.superseded == []
-    assert _edges(isolated_memory_db) == []
-
-
-def test_similar_but_unlinked_sibling_does_not_supersede(service, isolated_memory_db) -> None:
-    """Templated siblings score higher than real revisions; without a link they stay."""
-    _run(
-        service.store(
-            "The archive briefly compared beacon alpha01 during maintenance.",
-            scope="global",
-            key="archive-decoy-01",
-        )
-    )
-    sibling = _run(
-        service.store(
-            "The archive briefly compared beacon alpha02 during maintenance.",
-            scope="global",
-            key="archive-decoy-02",
-        )
-    )
-
     assert sibling.superseded == []
-    assert _edges(isolated_memory_db) == []
-    assert len(_run(service.recall(scope="global"))) == 2
-
-
-def test_cross_scope_similar_note_does_not_supersede(service, isolated_memory_db, tmp_path) -> None:
-    _run(service.store(STALE, scope="global", key="bridge-stale"))
-    project = _run(
-        service.store(
-            CURRENT,
-            scope="project",
-            key="bridge-current",
-            terminal_context={"cwd": str(tmp_path / "project")},
-        )
-    )
-
-    assert project.superseded == []
-    assert _edges(isolated_memory_db) == []
-
-
-def test_no_cycle_when_old_note_already_supersedes_new_one(service, isolated_memory_db) -> None:
-    _run(service.store(STALE, scope="global", key="bridge-stale"))
-    _run(service.store("Placeholder.", scope="global", key="bridge-current"))
-    with sessionmaker(bind=isolated_memory_db)() as db:
-        db.add(
-            MemoryRelationshipModel(
-                scope="global",
-                scope_id="",
-                source_key="bridge-stale",
-                target_key="bridge-current",
-                type="supersedes",
-                status="active",
-                origin="human",
-            )
-        )
-        db.commit()
-
-    updated = _run(service.store(CURRENT, scope="global", key="bridge-current"))
-
-    assert [item.reason for item in updated.superseded] == ["same_key"]
-    assert _edges(isolated_memory_db) == [
-        ("bridge-stale", "bridge-current", "supersedes", "human", "active")
+    assert sorted(memory.key for memory in run(service.recall(scope="global"))) == [
+        "host-alpha01",
+        "host-alpha02",
     ]
 
 
-def test_restore_undoes_similarity_supersede_and_undo_sticks(service, isolated_memory_db) -> None:
-    _store_pair(service)
-
-    result = _run(service.restore("bridge-stale", scope="global"))
-
-    assert result == {
-        "success": True,
-        "key": "bridge-stale",
-        "scope": "global",
-        "restored": "superseded_note",
-        "superseded_by": ["bridge-current"],
-    }
-    assert sorted(_keys(_run(service.recall(query="cobalt bridge", scope="global")))) == [
-        "bridge-current",
-        "bridge-stale",
-    ]
-    # Nothing is deleted: the edge stays, as rejected.
-    assert _edges(isolated_memory_db) == [
-        ("bridge-current", "bridge-stale", "supersedes", "auto_supersede", "rejected")
-    ]
-    # Storing the same replacement again does not undo the undo.
-    again = _run(service.store(CURRENT, scope="global", key="bridge-current"))
-    assert again.superseded == []
-    assert _edges(isolated_memory_db) == [
-        ("bridge-current", "bridge-stale", "supersedes", "auto_supersede", "rejected")
-    ]
-    assert len(_run(service.recall(query="cobalt bridge", scope="global"))) == 2
-
-    history = _history()
-    assert [re.search(r"\[(memory_[a-z_]+)\]", line).group(1) for line in history] == [
-        "memory_superseded",
-        "memory_supersede_undone",
-    ]
-    assert "reason=similar" in history[1]
-    assert "superseded_by=bridge-current" in history[1]
-
-
-def test_forgetting_the_replacement_brings_the_old_note_back(service, isolated_memory_db) -> None:
-    _store_pair(service)
-
-    _run(service.forget("bridge-current", scope="global"))
-
-    assert _keys(_run(service.recall(scope="global"))) == ["bridge-stale"]
-
-
-# --------------------------------------------------------------------------- #
-# The same-key path: a new entry under the same key replaces the previous one
-# --------------------------------------------------------------------------- #
-
-
-def test_same_key_update_supersedes_previous_version_and_restore_brings_it_back(
-    service,
-) -> None:
-    first = _run(service.store("The relay is manual.", scope="global", key="relay-mode"))
-    second = _run(service.store("The relay is automatic.", scope="global", key="relay-mode"))
-
-    assert first.superseded == []
-    assert [item.model_dump() for item in second.superseded] == [
-        {
-            "key": "relay-mode",
-            "scope": "global",
-            "reason": "same_key",
-            "undo": "memory_restore(key='relay-mode', scope='global')",
-        }
-    ]
-    assert [m.content for m in _run(service.recall(scope="global"))] == ["The relay is automatic."]
-
-    result = _run(service.restore("relay-mode", scope="global"))
-
-    assert result["success"] is True
-    assert result["restored"] == "previous_version"
-    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", result["restored_from"])
-    assert [m.content for m in _run(service.recall(scope="global"))] == ["The relay is manual."]
-    # Nothing is deleted: all three versions stay in the topic file.
-    text = Path(second.file_path).read_text(encoding="utf-8")
-    assert text.count("The relay is manual.") == 2
-    assert text.count("The relay is automatic.") == 1
-
-    history = _history()
-    assert [re.search(r"\[(memory_[a-z_]+)\]", line).group(1) for line in history] == [
-        "memory_superseded",
-        "memory_supersede_undone",
-    ]
-    assert all("reason=same_key" in line for line in history)
-    assert all("relay is" not in line for line in history)
-
-
-def test_same_key_identical_content_is_not_a_supersede(service) -> None:
-    _run(service.store("The relay is manual.", scope="global", key="relay-mode"))
-    again = _run(service.store("The relay is manual.", scope="global", key="relay-mode"))
-
-    assert again.superseded == []
-    assert _history() == []
-
-
-def test_restore_errors(service) -> None:
-    assert _run(service.restore("missing-note", scope="global")) == {
-        "success": False,
-        "error_kind": "not_found",
-        "error": "memory not found: missing-note",
-    }
-    _run(service.store("Only one version.", scope="global", key="single"))
-    assert _run(service.restore("single", scope="global")) == {
-        "success": False,
-        "error_kind": "nothing_to_restore",
-        "error": "memory has no superseded version to restore: single",
-    }
-
-
-def test_restore_respects_the_scope_write_guard(service, tmp_path) -> None:
-    _run(service.store("The relay is manual.", scope="global", key="relay-mode"))
-    _run(service.store("The relay is automatic.", scope="global", key="relay-mode"))
-
+def test_restore_scope_guard_and_missing_version(service):
+    run(service.store("Original.", key="relay", scope="global"))
+    run(service.store("Revised.", key="relay", scope="global"))
     with pytest.raises(PermissionError):
-        _run(
+        run(
             service.restore(
-                "relay-mode",
+                "relay",
                 scope="global",
-                terminal_context={"caller_scope": "session", "session_name": "s1"},
+                terminal_context={"caller_scope": "session", "session_name": "s"},
             )
         )
-
-
-# --------------------------------------------------------------------------- #
-# Injection and the setting
-# --------------------------------------------------------------------------- #
-
-
-def test_injection_excludes_auto_superseded_note(service, tmp_path) -> None:
-    _store_pair(service)
-    ctx = {"terminal_id": "t-1", "cwd": str(tmp_path / "project")}
-
-    block = service.get_memory_context(ctx)
-
-    assert "[global] bridge-current:" in block
-    assert "[global] bridge-stale:" not in block
-
-
-def test_setting_off_restores_todays_behaviour(service, isolated_memory_db, tmp_path) -> None:
-    settings_service.set_memory_setting("supersede.auto", False)
-
-    first = _run(service.store("The relay is manual.", scope="global", key="relay-mode"))
-    second = _run(service.store("The relay is automatic.", scope="global", key="relay-mode"))
-    stale, new = _store_pair(service)
-
-    assert first.superseded == second.superseded == stale.superseded == new.superseded == []
-    assert _edges(isolated_memory_db) == []
-    assert sorted(_keys(_run(service.recall(scope="global")))) == [
-        "bridge-current",
-        "bridge-stale",
-        "relay-mode",
-    ]
-    assert "[global] bridge-stale:" in service.get_memory_context(
-        {"terminal_id": "t-1", "cwd": str(tmp_path / "project")}
+    with pytest.raises(PermissionError):
+        run(
+            service.restore(
+                "missing",
+                scope="global",
+                terminal_context={"caller_scope": "session", "session_name": "s"},
+            )
+        )
+    assert run(service.restore("relay", scope="global"))["error_kind"] == "version_required"
+    assert (
+        run(service.restore("relay", scope="global", version="2099-01-01T00:00:00Z"))["error_kind"]
+        == "version_not_found"
     )
-    assert _history() == []
 
 
-def test_setting_off_unhides_existing_auto_supersedes(service) -> None:
-    _store_pair(service)
-    settings_service.set_memory_setting("supersede.auto", False)
+def test_llm_mode_does_not_promise_undo(service, monkeypatch):
+    monkeypatch.setattr(settings_service, "get_compile_mode", lambda: "llm")
+    run(service.store("Original.", key="relay", scope="global"))
+    revised = run(service.store("Revised.", key="relay", scope="global"))
+    assert revised.superseded == []
+    assert "[memory_superseded]" not in audit_log.read_audit_log()
 
-    assert sorted(_keys(_run(service.recall(scope="global")))) == [
-        "bridge-current",
-        "bridge-stale",
+
+def test_global_audit_omits_literal_none_scope_id(service):
+    run(service.store("Original.", key="relay", scope="global"))
+    run(service.store("Revised.", key="relay", scope="global"))
+    history = audit_log.read_audit_log()
+    assert "[memory_superseded]" in history
+    assert "scope_id=None" not in history
+
+
+def test_default_off_is_unchanged(service, monkeypatch):
+    monkeypatch.setattr(settings_service, "is_memory_auto_supersede_enabled", lambda: False)
+    first = run(service.store("First.", key="relay", scope="global"))
+    second = run(service.store("Second.", key="relay", scope="global"))
+    assert first.superseded == second.superseded == []
+    assert "superseded" not in second.model_dump()
+    assert "lifecycle_status" not in second.model_dump()
+    assert audit_log.read_audit_log() == ""
+
+
+def test_concurrent_same_key_stores_leave_a_visible_revision(service):
+    run(service.store("Original.", key="relay", scope="global"))
+
+    def write(content):
+        return run(service.store(content, key="relay", scope="global"))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        revisions = list(executor.map(write, ["Revision one.", "Revision two."]))
+    assert all(len(revision.superseded) == 1 for revision in revisions)
+    assert run(service.recall(scope="global"))[0].content in {"Revision one.", "Revision two."}
+    assert audit_log.read_audit_log().count("[memory_superseded]") == 2
+
+
+def test_concurrent_restore_retry_does_not_append_twice(service):
+    run(service.store("Original.", key="relay", scope="global"))
+    revised = run(service.store("Revised.", key="relay", scope="global"))
+    version = version_from(revised)
+
+    def undo(_index):
+        return run(service.restore("relay", scope="global", version=version))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(undo, range(2)))
+    assert {result["restored"] for result in results} == {"previous_version", "already_restored"}
+    assert Path(revised.file_path).read_text().count("Original.") == 2
+
+
+def test_legacy_edges_label_exact_reads_and_curator_include(service):
+    run(service.store("Original.", key="old", scope="global"))
+    run(service.store("New.", key="new", scope="global"))
+    service._relationship_service().create(
+        "global", None, "new", "old", "supersedes", "auto_supersede"
+    )
+    assert [memory.key for memory in run(service.recall(scope="global"))] == ["new"]
+    labelled = run(service.read_exact_key("old", scope="global"))
+    assert labelled.lifecycle_status == "superseded"
+    visible = run(service.recall(scope="global", include_superseded=True))
+    assert sorted(memory.key for memory in visible) == ["new", "old"]
+    curated = run(
+        service.recall(
+            scope="global",
+            include_superseded=True,
+            terminal_context={"agent_profile": "memory-manager"},
+        )
+    )
+    assert sorted(memory.key for memory in curated) == ["new", "old"]
+    related = run(service.related("new", scope="global"))
+    assert any(
+        item["key"] == "old" and item["status"] == "superseded" for item in related["neighbours"]
+    )
+
+
+def test_only_native_auto_edges_hide_and_label(service):
+    from cli_agent_orchestrator.services.memory_eligibility import (
+        AutoSupersedeSource,
+        EligibilityRequest,
+        MemoryIdentity,
+    )
+
+    for key in ("source", "auto-old", "human-old"):
+        run(service.store(key, key=key, scope="global"))
+    relationships = service._relationship_service()
+    relationships.create("global", None, "source", "auto-old", "supersedes", "auto_supersede")
+    relationships.create("global", None, "source", "human-old", "supersedes", "human")
+    assert sorted(memory.key for memory in run(service.recall(scope="global"))) == [
+        "human-old",
+        "source",
     ]
+    listed = run(service.recall(scope="global", include_superseded=True))
+    assert {memory.key: memory.lifecycle_status for memory in listed} == {
+        "auto-old": "superseded",
+        "human-old": None,
+        "source": None,
+    }
+    candidates = [
+        MemoryIdentity("auto-old", "global", None, "native"),
+        MemoryIdentity("auto-old", "global", None, "vault"),
+        MemoryIdentity("human-old", "global", None, "native"),
+    ]
+    verdicts = AutoSupersedeSource(service._db_session_factory).excluded(
+        EligibilityRequest.from_context("curated_recall", None), candidates
+    )
+    assert verdicts == {candidates[0]: "superseded"}
 
 
-def test_supersede_setting_defaults_on_and_round_trips() -> None:
-    from cli_agent_orchestrator.services.config_service import ConfigService, MemoryConfig
+def test_setting_default_off(monkeypatch):
+    from cli_agent_orchestrator.services.config_service import MemoryConfig
 
-    assert MemoryConfig().supersede.auto is True
-    assert settings_service.is_memory_auto_supersede_enabled() is True
-    assert ConfigService.get("memory.supersede.auto") is True
-    ConfigService.set("memory.supersede.auto", False)
-    assert ConfigService.get("memory.supersede.auto") is False
+    monkeypatch.setattr(settings_service, "get_memory_settings", lambda: {})
+    assert MemoryConfig().supersede.auto is False
     assert settings_service.is_memory_auto_supersede_enabled() is False
-    with pytest.raises(ValueError):
-        settings_service.set_memory_setting("supersede.auto", "yes")
+    monkeypatch.setenv("CAO_MEMORY_SUPERSEDE_AUTO", "true")
+    assert settings_service.is_memory_auto_supersede_enabled() is True
+
+
+def test_restore_clamped_entry_removes_provenance_from_content(service):
+    run(
+        service.store(
+            "Original.",
+            key="relay",
+            scope="global",
+            occurred_at=datetime(2020, 1, 2, tzinfo=timezone.utc),
+        )
+    )
+    run(
+        service.store(
+            "Clamped revision.",
+            key="relay",
+            scope="global",
+            occurred_at=datetime(2019, 1, 2, tzinfo=timezone.utc),
+        )
+    )
+    latest = run(service.store("Newest.", key="relay", scope="global"))
+    run(service.restore("relay", scope="global", version=version_from(latest)))
+    assert run(service.recall(scope="global"))[0].content == "Clamped revision."
+
+
+def test_restore_resolves_project_alias_before_native_lookup(service, tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import binding as vault_binding
+
+    context = {"cwd": str(tmp_path / "real-project")}
+    run(service.store("Original.", key="relay", scope="project", terminal_context=context))
+    revised = run(service.store("Revised.", key="relay", scope="project", terminal_context=context))
+    actual_scope_id = revised.scope_id
+    real_resolve = vault_binding.resolve
+    resolved_ids = iter(["old-alias", actual_scope_id])
+    monkeypatch.setattr(service, "resolve_scope_id", lambda scope, context: next(resolved_ids))
+
+    def resolve_alias(scope, scope_id, *, vault_config=None):
+        if scope_id == "old-alias":
+            return vault_binding.NativeBinding(scope=scope, scope_id=actual_scope_id)
+        return real_resolve(scope, scope_id, vault_config=vault_config)
+
+    monkeypatch.setattr(vault_binding, "resolve", resolve_alias)
+    result = run(
+        service.restore(
+            "relay", scope="project", version=version_from(revised), terminal_context=context
+        )
+    )
+    assert result["restored"] == "previous_version"
+
+
+def test_restore_refuses_vault_mapped_scope(service, tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import binding as vault_binding
+    from cli_agent_orchestrator.services.vault.config import FolderMapping
+
+    mapped = vault_binding.VaultBinding(
+        scope="global",
+        scope_id=None,
+        vault_id="test-vault",
+        root=str(tmp_path),
+        mapping=FolderMapping(folder="notes", scope="global"),
+    )
+    monkeypatch.setattr(vault_binding, "resolve", lambda *args, **kwargs: mapped)
+    result = run(service.restore("relay", scope="global", version="2020-01-01T00:00:00Z#0"))
+    assert result["error_kind"] == "vault_mapped"

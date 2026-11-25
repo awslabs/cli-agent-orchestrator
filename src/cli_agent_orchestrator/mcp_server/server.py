@@ -2236,12 +2236,15 @@ async def memory_restore(
             'Scope of the memory: "global", "project", "session", "agent", or "federated"'
         ),
     ),
+    version: Optional[str] = Field(
+        default=None, description="Exact version from the store undo hint"
+    ),
 ) -> Dict[str, Any]:
     """Undo an automatic supersede that a memory_store result reported.
 
-    A note another note superseded becomes visible in recall again, and stays
-    so. A key whose newest entry replaced its previous entry gets that
-    previous entry back as the newest. Nothing is deleted either way.
+    Only a previous version of the same native key can be restored. Pass the
+    version from the store result; retries return already_restored without a
+    second write. A newer version makes the old hint stale.
     """
     from cli_agent_orchestrator.services.memory_gateway import remote_memory_url, restore_memory
     from cli_agent_orchestrator.services.memory_service import MemoryService
@@ -2252,8 +2255,12 @@ async def memory_restore(
     try:
         terminal_context = _get_terminal_context_from_env()
         if remote_memory_url():
-            return await restore_memory(key=key, scope=scope, terminal_context=terminal_context)
-        return await MemoryService().restore(key, scope=scope, terminal_context=terminal_context)
+            return await restore_memory(
+                key=key, scope=scope, terminal_context=terminal_context, version=version
+            )
+        return await MemoryService().restore(
+            key, scope=scope, terminal_context=terminal_context, version=version
+        )
     except MemoryDisabledError as e:
         return {"success": False, "disabled": True, "error": str(e)}
     except Exception as e:

@@ -112,9 +112,8 @@ class MemoryType(str, Enum):
 class SupersededMemory(BaseModel):
     """One note version that a successful store superseded (#1335 change 5).
 
-    ``reason`` is ``same_key`` (a new entry under the same key replaced the
-    previous entry) or ``similar`` (a linked, highly similar note replaced
-    another note). ``undo`` is the ``memory_restore`` call that reverses it.
+    ``reason`` is ``same_key`` (a changed entry under the exact same key).
+    ``undo`` is the version-pinned ``memory_restore`` call that reverses it.
     """
 
     key: str

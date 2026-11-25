@@ -51,8 +51,8 @@ It shows existing human, compiler, and authored content-link edges; the
 opt-in `memory.relationships.content_links` setting only controls future
 authored-link edge production.
 
-A `memory_store` result may list `superseded` notes, which default recall no longer
-returns; `memory_restore(key=..., scope=...)` brings one back.
+A `memory_store` result may report same-key replacement in append mode when enabled.
+Use its version-pinned `memory_restore(key=..., scope=..., version=...)` hint.
 
 ## Store — save anything worth remembering, immediately
 

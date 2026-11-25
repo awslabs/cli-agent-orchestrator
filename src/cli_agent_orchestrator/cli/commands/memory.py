@@ -639,6 +639,7 @@ def vault_migrate(scope, scope_id, do_apply, delete_source, confirm_delete_sourc
 
 
 @memory.command(name="list")
+@click.option("--include-superseded", is_flag=True, help="Include superseded notes with labels.")
 @click.option(
     "--scope",
     type=click.Choice([s.value for s in MemoryScope], case_sensitive=False),
@@ -681,7 +682,9 @@ def vault_migrate(scope, scope_id, do_apply, delete_source, confirm_delete_sourc
     show_default=True,
     help="Output format for --explain.",
 )
-def list_memories(scope, memory_type, scan_all, query, explain, limit, output_format):
+def list_memories(
+    scope, memory_type, scan_all, query, explain, limit, output_format, include_superseded
+):
     """List stored memories.
 
     By default shows global memories and memories for the current working directory.
@@ -738,6 +741,7 @@ def list_memories(scope, memory_type, scan_all, query, explain, limit, output_fo
                 terminal_context=terminal_context,
                 scan_all=scan_all,
                 record_access=not is_non_accessing_inspection_enabled(),
+                include_superseded=include_superseded,
             )
         )
     except Exception as e:
@@ -873,7 +877,9 @@ def clear(scope, yes):
     svc = _get_memory_service()
     ctx = _cwd_context()
     try:
-        memories = _run_async(svc.recall(scope=scope, limit=1000, terminal_context=ctx))
+        memories = _run_async(
+            svc.recall(scope=scope, limit=1000, terminal_context=ctx, include_superseded=True)
+        )
     except Exception as e:
         raise click.ClickException(str(e))
 
