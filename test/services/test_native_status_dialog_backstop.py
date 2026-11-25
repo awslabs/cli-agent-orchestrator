@@ -386,7 +386,8 @@ class TestLiveMisses:
         "footer window of an idle prompt, and a footer is recognised by its text. "
         "The pairing 'Enter to select · <keys> to navigate' on one line is required, "
         "so a mention of the keys alone does not do this. Cost: the message is "
-        "held until the screen moves on; it is not lost.",
+        "held until the screen changes, which for an idle agent means until someone "
+        "types into it; it is not lost.",
         strict=True,
     )
     def test_whole_two_question_footer_quoted_on_the_last_row_of_a_reply(self):
@@ -405,7 +406,8 @@ class TestLiveMisses:
         "always draws its input box under the reply, which is the case "
         "test_new_wording_as_the_last_reply_above_an_idle_prompt_is_delivered[quoted-page] "
         "shows is delivered; this frame needs the quote to be the last thing on "
-        "screen. Cost: the message is held until the screen moves on; it is not lost.",
+        "screen. Cost: the message is held until the screen changes, which for an "
+        "idle agent means until someone types into it; it is not lost.",
         strict=True,
     )
     def test_review_page_quoted_verbatim_with_nothing_under_it(self):
@@ -423,6 +425,205 @@ class TestLiveMisses:
             ]
         )
         assert _claude().shows_user_answer_dialog(pane) is False
+
+
+def _is_session_name_rule(row: str) -> bool:
+    return row.startswith("────") and row.rstrip().endswith(" add-readme-file ─")
+
+
+def _padded_above_session_rule(pane: str, blank_rows: int) -> str:
+    """A real named-session capture with ``blank_rows`` more blank rows above its rule."""
+    rows = pane.rstrip("\n").split("\n")
+    assert _is_session_name_rule(rows[-1])
+    return "\n".join(rows[:-1] + [""] * blank_rows + rows[-1:])
+
+
+def _mixed_height_second_page() -> str:
+    """Question 2 of a call whose question 1 was taller, in a named session.
+
+    Built from two real captures, not captured: the transcript and the session
+    rule of ``named_session_two_question_preview_page1`` (a 19-row preview page)
+    around the dialog rows of ``two_question_page2`` (13 rows, no preview),
+    padded by the 6 rows of difference where Claude Code puts them, under the
+    footer and above the rule.
+    """
+    tall = _herdr("named_session_two_question_preview_page1").rstrip("\n").split("\n")
+    short = _herdr("two_question_page2").rstrip("\n").split("\n")
+    tall_top = next(i for i, row in enumerate(tall) if row.startswith("←")) - 1
+    short_top = next(i for i, row in enumerate(short) if row.startswith("←")) - 1
+    assert tall[tall_top].startswith("────") and short[short_top].startswith("────")
+    assert _is_session_name_rule(tall[-1])
+    tall_dialog, short_dialog = tall[tall_top:-1], short[short_top:]
+    assert (len(tall_dialog), len(short_dialog)) == (20, 14)  # top rule included
+    padding = [""] * (len(tall_dialog) - len(short_dialog))
+    return "\n".join(tall[:tall_top] + short_dialog + padding + tall[-1:])
+
+
+class TestNamedSessionPadding:
+    """A page shorter than an earlier page of the same call, in a named session (#896 review).
+
+    All pages of one AskUserQuestion call keep the height of the tallest. The
+    spare rows are blank, under the footer and above the session-name rule, as
+    two captures show: ``named_session_two_question_preview_page2`` (1 blank row)
+    and ``review_page_named_session`` (8). The rule is the last row, so stripping
+    trailing blanks does not reach them, and 5 of them put a one-row footer
+    outside the 6-row footer window. herdr reports ``idle`` on these pages.
+
+    Every frame here is a real capture with blank rows added above its rule, or
+    two real captures joined; none was captured at that height.
+    """
+
+    PADDED = [
+        ("named_session_single", 5),
+        ("named_session_preview", 5),
+        ("named_session_focus_chat", 5),
+        ("named_session_focus_type_something", 5),
+        ("named_session_two_question_preview_page2", 4),
+        ("named_session_single", 20),
+        ("review_page_named_session", 20),
+    ]
+
+    @pytest.mark.parametrize("shape,blank_rows", PADDED)
+    def test_padded_page_is_seen(self, shape, blank_rows):
+        pane = _padded_above_session_rule(_herdr(shape), blank_rows)
+        assert _claude().shows_user_answer_dialog(pane) is True
+
+    @pytest.mark.parametrize("shape,blank_rows", PADDED)
+    def test_padded_page_agrees_on_all_three_readers(self, shape, blank_rows):
+        """Before the fix the buffer path said COMPLETED and the screen path WAITING."""
+        pane = _padded_above_session_rule(_herdr(shape), blank_rows)
+        backend = _backend("", native=None, event_inbox=False)
+        with patch("cli_agent_orchestrator.backends.registry._backend", backend):
+            provider = _claude()
+            assert provider.get_status(pane) == TerminalStatus.WAITING_USER_ANSWER
+            assert (
+                provider.get_status_from_screen(pane.split("\n"))
+                == TerminalStatus.WAITING_USER_ANSWER
+            )
+
+    def test_shorter_second_page_is_refused_and_nothing_is_typed(self):
+        pane = _mixed_height_second_page()
+        assert _claude().shows_user_answer_dialog(pane) is True
+        backend = _backend(pane, native=TerminalStatus.IDLE)
+        with _terminal(_claude(), backend) as monitor:
+            assert monitor.get_status("term-1") == TerminalStatus.IDLE
+            _assert_refused(backend, orchestration_type=OrchestrationType.SEND_MESSAGE)
+
+    def test_plan_approval_with_the_session_rule_under_it_is_seen(self):
+        """Composed: the plan capture with the rule of a named-session capture under it.
+
+        The rule used to read as "a rule after the question: the agent moved on".
+        """
+        rows = DIALOG_PANES[PLAN_APPROVAL].rstrip("\n").split("\n")
+        rule = _herdr("named_session_single").rstrip("\n").split("\n")[-1]
+        assert _is_session_name_rule(rule)
+        assert _claude().shows_user_answer_dialog("\n".join(rows + [rule])) is True
+
+    @pytest.mark.parametrize("name", sorted(READY_PANES))
+    def test_a_ready_pane_has_no_session_rule_to_drop(self, name):
+        """An idle named session draws its name on the input box's TOP rail, so the
+        last row is never the session-name rule and nothing is dropped."""
+        rows = READY_PANES[name].split("\n")
+        assert ClaudeCodeProvider._without_session_name_rule(rows) is rows
+
+    def test_trailing_blank_rows_of_a_pane_read_are_dropped(self):
+        """A rendered pane pads under the TUI with blank rows, which would push
+        the footer out of the window. No capture ends that way, so they are added."""
+        for name in (ASK_USER_QUESTION, TWO_QUESTION_FOOTER, PLAN_APPROVAL):
+            pane = DIALOG_PANES[name].rstrip("\n") + "\n" * 20
+            assert _claude().shows_user_answer_dialog(pane) is True, name
+
+
+def _review_page_with(questions: int, rows_each: int, *, named: bool = True) -> str:
+    """The captured review page with ``questions`` answered questions of ``rows_each`` rows.
+
+    Built from ``review_page_named_session`` (or ``review_page``), not captured:
+    the question block between the heading and the choices is replaced. A
+    question or an answer longer than the pane wraps, which is what the extra
+    rows stand for; how 2.1.330 indents a wrapped row was not captured.
+    """
+    rows = _herdr("review_page_named_session" if named else "review_page").rstrip("\n").split("\n")
+    heading = next(i for i, row in enumerate(rows) if row.strip() == "Review your answers")
+    submit = next(i for i, row in enumerate(rows) if row.strip() == "❯ 1. Submit answers")
+    block: List[str] = []
+    for q in range(questions):
+        block.append(f" ● Question {q + 1}, long enough that the pane has to wrap it onto")
+        block.extend(f"   continuation row {r + 1} of the question" for r in range(rows_each - 2))
+        block.append("   → The answer that was picked")
+    return "\n".join(rows[: heading + 1] + [""] + block + [""] + rows[submit:])
+
+
+class TestWrappedReviewPage:
+    """The review page prints every question and answer in full, so it has no fixed height (#896 review)."""
+
+    @pytest.mark.parametrize(
+        "questions,rows_each,named",
+        [(2, 2, True), (4, 2, True), (3, 4, True), (4, 3, True), (4, 4, True), (4, 4, False)],
+    )
+    def test_review_page_of_any_height_is_seen(self, questions, rows_each, named):
+        pane = _review_page_with(questions, rows_each, named=named)
+        provider = _claude()
+        assert provider.shows_user_answer_dialog(pane) is True
+        backend = _backend("", native=None, event_inbox=False)
+        with patch("cli_agent_orchestrator.backends.registry._backend", backend):
+            assert provider.get_status(pane) == TerminalStatus.WAITING_USER_ANSWER
+            assert (
+                provider.get_status_from_screen(pane.split("\n"))
+                == TerminalStatus.WAITING_USER_ANSWER
+            )
+
+    def test_tall_review_page_is_refused_and_nothing_is_typed(self):
+        pane = _review_page_with(4, 4)
+        non_blank = [row for row in pane.split("\n") if row.strip()]
+        heading = max(i for i, row in enumerate(non_blank) if row.strip() == "Review your answers")
+        assert len(non_blank) - heading == 20  # outside the old 15-row budget
+        backend = _backend(pane, native=TerminalStatus.IDLE)
+        with _terminal(_claude(), backend):
+            _assert_refused(backend, orchestration_type=OrchestrationType.SEND_MESSAGE)
+
+    @pytest.mark.parametrize("rows_under,seen", [(3, True), (4, False)])
+    def test_choices_are_looked_for_in_the_last_six_non_blank_rows(self, rows_under, seen):
+        """The two choices, the session rule, and room for three rows under it.
+
+        Nothing is drawn under the rule in any capture; the room is slack for a
+        status line. Further up than that, the pair is transcript.
+        """
+        pane = _herdr("review_page_named_session").rstrip("\n")
+        under = "\n".join(f"  status row {n}" for n in range(rows_under))
+        assert _claude().shows_user_answer_dialog(f"{pane}\n{under}") is seen
+
+    @pytest.mark.parametrize("shape", ["review_page", "review_page_named_session"])
+    def test_page_without_the_heading_is_not_the_review_page(self, shape):
+        """The capture with its heading row blanked: two numbered choices under a tab row."""
+        pane = _herdr(shape)
+        assert pane.count("\nReview your answers\n") == 1
+        assert (
+            _claude().shows_user_answer_dialog(pane.replace("\nReview your answers\n", "\n\n"))
+            is False
+        )
+
+    def test_heading_above_the_dialog_is_not_its_heading(self):
+        """The heading search stops at the dialog's top: a "Review your answers"
+        row in the transcript above it does not stand in for the page's own."""
+        pane = _herdr("review_page_named_session")
+        rows = pane.replace("\nReview your answers\n", "\n\n").split("\n")
+        top = next(i for i, row in enumerate(rows) if row.startswith("←")) - 1
+        assert rows[top].startswith("────")
+        rows[top - 1 : top - 1] = ["Review your answers"]
+        assert _claude().shows_user_answer_dialog("\n".join(rows)) is False
+
+    @pytest.mark.parametrize("shape", ["review_page", "review_page_named_session"])
+    @pytest.mark.parametrize("cursors", ["neither", "both"])
+    def test_page_without_exactly_one_cursor_is_not_live(self, shape, cursors):
+        """A live Select has exactly one cursor. The capture with it blanked, or
+        on both choices, and nothing under the page to rule it out otherwise."""
+        pane = _herdr(shape)
+        assert pane.count("❯ 1. Submit answers") == 1 and pane.count("\n  2. Cancel") == 1
+        if cursors == "neither":
+            changed = pane.replace("❯ 1. Submit answers", "  1. Submit answers")
+        else:
+            changed = pane.replace("\n  2. Cancel", "\n❯ 2. Cancel")
+        assert _claude().shows_user_answer_dialog(changed) is False
 
 
 class TestDispatchRefusesIntoUnreportedDialog:
@@ -446,6 +647,14 @@ class TestDispatchRefusesIntoUnreportedDialog:
             provider.mark_input_received()  # an earlier turn: "done" is now post-dispatch
             assert monitor.get_status("term-1") == TerminalStatus.PROCESSING
             _assert_refused(backend, orchestration_type=OrchestrationType.SEND_MESSAGE)
+
+    def test_inbox_delivery_is_refused_when_the_status_is_completed(self):
+        """The inbox delivers on COMPLETED by default, so the check has to run there too."""
+        backend = _backend(DIALOG_PANES[ASK_USER_QUESTION], native=TerminalStatus.COMPLETED)
+        with _terminal(_claude(), backend, status=TerminalStatus.COMPLETED) as monitor:
+            assert monitor.get_status("term-1") == TerminalStatus.COMPLETED
+            _assert_refused(backend, orchestration_type=OrchestrationType.SEND_MESSAGE)
+        assert len(_screen_reads(backend)) == 1
 
     @pytest.mark.parametrize("orchestration_type", list(OrchestrationType), ids=lambda t: t.value)
     def test_every_orchestration_type_is_refused(self, orchestration_type):
@@ -496,9 +705,20 @@ class TestDispatchRefusesIntoUnreportedDialog:
         backend.send_keys.assert_called_once()
         backend.get_history.assert_not_called()
 
-    def test_blocking_provider_without_the_method_is_unaffected(self):
-        """codex blocks at dialogs but inherits the default: cannot tell, so send."""
+    def test_blocking_provider_that_inherits_the_method_is_never_read(self):
+        """codex blocks at dialogs but inherits the default, which answers False
+        for every pane: reading one for it would buy nothing."""
         assert CodexProvider.shows_user_answer_dialog is BaseProvider.shows_user_answer_dialog
+        provider = CodexProvider("term-1", "cao-session", "developer-abcd")
+        assert provider.blocks_orchestrated_input_while_waiting_user_answer is True
+        backend = _backend(DIALOG_PANES[ASK_USER_QUESTION], native=TerminalStatus.IDLE)
+        with _terminal(provider, backend, status=TerminalStatus.IDLE):
+            ts.dispatch_input("term-1", MESSAGE, orchestration_type=OrchestrationType.SEND_MESSAGE)
+        backend.send_keys.assert_called_once()
+        assert _screen_reads(backend) == []
+
+    def test_blocking_provider_whose_method_cannot_tell_is_unaffected(self):
+        """A stand-in is asked, and the default's "cannot tell" sends."""
         provider = MagicMock()
         provider.blocks_orchestrated_input_while_waiting_user_answer = True
         provider.shows_user_answer_dialog.side_effect = lambda text: (

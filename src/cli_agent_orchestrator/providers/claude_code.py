@@ -229,16 +229,22 @@ REVIEW_ANSWERS_CANCEL_PATTERN = re.compile(
 )
 # A row that starts with the prompt glyph: the input box, or an echoed user turn.
 _PROMPT_ROW_PATTERN = re.compile(r"^[ \t]*[❯>](?:[\s\xa0]|$)")
-# How many NON-BLANK rows from the bottom the review page is looked for in. Counted in
-# non-blank rows, not screen rows, because the page keeps the height of the tallest question
-# page before it: in a named session the capture
-# (claude_code_896_herdr_review_page_named_session.txt) has 8 blank rows between "2. Cancel"
-# and the session-name rule under them, which puts the choices 10-11 rows and the heading 18
-# rows from the bottom, outside the 15 screen rows the plan-approval check reads, and a taller
-# preview would push them further. In non-blank rows the same capture needs 8 (heading, two
-# rows per question, two choices, the rule) and each further question adds two; a call may
-# carry four, so 12. 15 leaves three rows for anything drawn under the rule.
-_REVIEW_ANSWERS_BOTTOM_ROWS = 15
+# The tab row that heads every page of a multi-question AskUserQuestion, e.g.
+# "←  ☒ Layout  ☒ Theme  ✔ Submit  →". The review page's heading is below it.
+_ASK_TAB_ROW_PATTERN = re.compile(r"^[ \t]*←.*→[ \t]*$")
+# How many NON-BLANK rows from the bottom the review page's two choices are looked for in:
+# "1. Submit answers", "2. Cancel", the session-name rule a named session draws under them,
+# and three rows for anything drawn under that. Counted in non-blank rows, not screen rows,
+# because the page keeps the height of the tallest question page before it: the named-session
+# capture (claude_code_896_herdr_review_page_named_session.txt) has 8 blank rows between
+# "2. Cancel" and the rule. The heading above the choices has NO row budget: the page prints
+# every question and answer in full, and a long one wraps, so its height is not bounded by
+# the number of questions. The search for it stops at the dialog's own top instead (the tab
+# row, or the rule above it).
+_REVIEW_ANSWERS_CHOICES_BOTTOM_ROWS = 6
+# The rule a NAMED session draws as the last row under a dialog, e.g. "──────── my-session ─"
+# (claude_code_896_herdr_named_session_*.txt). A plain rule has no text in it.
+_SESSION_NAME_RULE_PATTERN = re.compile(r"^[ \t]*─{8,}[ \t]+\S(?:.*\S)?[ \t]+─+[ \t]*$")
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
 # Bedrock model-upgrade nudge, e.g.
@@ -1461,23 +1467,43 @@ class ClaudeCodeProvider(BaseProvider):
         return False
 
     @staticmethod
+    def _without_session_name_rule(lines: List[str]) -> List[str]:
+        """``lines`` without a trailing session-name rule and the blank rows above it.
+
+        A named session draws "──────── <name> ─" as the last row under a dialog.
+        All pages of one AskUserQuestion call keep the height of the tallest page,
+        and the padding goes under the footer, above that rule: a page shorter
+        than an earlier one has blank rows there that no ``rstrip`` can reach.
+        Returns ``lines`` unchanged when the last non-blank row is anything else,
+        so an idle input box (whose last rule is plain) is not touched.
+        """
+        last = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
+        if last is None or not _SESSION_NAME_RULE_PATTERN.match(lines[last]):
+            return lines
+        while last > 0 and not lines[last - 1].strip():
+            last -= 1
+        return lines[:last]
+
+    @staticmethod
     def _review_answers_page_at_bottom(rows: List[str]) -> bool:
         """Whether escape-free screen rows end in AskUserQuestion's "Review your answers" page.
 
-        Structure, all within the last ``_REVIEW_ANSWERS_BOTTOM_ROWS`` non-blank rows:
+        Structure, blank rows dropped first:
 
         - "1. Submit answers" directly followed by "2. Cancel", each alone on its
-          row, and exactly one of the two carrying the selection cursor. A numbered
-          list an agent wrote has no cursor; a live Select always has exactly one.
-        - the heading "Review your answers", alone on a row, above them.
+          row, within the last ``_REVIEW_ANSWERS_CHOICES_BOTTOM_ROWS`` rows, and
+          exactly one of the two carrying the selection cursor. A numbered list an
+          agent wrote has no cursor; a live Select always has exactly one.
+        - the heading "Review your answers", alone on a row, above them, with no
+          rule and no tab row between: the search goes up from the choices and
+          stops at the dialog's own top, however many rows the answers take.
         - below them no prompt row and no response marker: either means the screen
           has moved on and the page is transcript, not a live dialog. The
           session-name rule a named session draws under the page is neither.
-
-        Blank rows are dropped before counting; see ``_REVIEW_ANSWERS_BOTTOM_ROWS``.
         """
-        region = [ln for ln in rows if ln.strip()][-_REVIEW_ANSWERS_BOTTOM_ROWS:]
-        for i in range(len(region) - 1, 0, -1):
+        region = [ln for ln in rows if ln.strip()]
+        floor = max(len(region) - _REVIEW_ANSWERS_CHOICES_BOTTOM_ROWS + 1, 1)
+        for i in range(len(region) - 1, floor - 1, -1):
             submit = REVIEW_ANSWERS_SUBMIT_PATTERN.match(region[i - 1])
             cancel = REVIEW_ANSWERS_CANCEL_PATTERN.match(region[i])
             if submit and cancel:
@@ -1486,7 +1512,12 @@ class ClaudeCodeProvider(BaseProvider):
             return False
         if bool(submit.group("cursor")) == bool(cancel.group("cursor")):
             return False
-        if not any(REVIEW_ANSWERS_HEADING_PATTERN.match(ln) for ln in region[: i - 1]):
+        for row in reversed(region[: i - 1]):
+            if REVIEW_ANSWERS_HEADING_PATTERN.match(row):
+                break
+            if _ASK_TAB_ROW_PATTERN.match(row) or re.match(r"[ \t]*─{20,}", row):
+                return False
+        else:
             return False
         return not any(
             _PROMPT_ROW_PATTERN.match(ln) or EXTRACTION_RESPONSE_PATTERN.search(ln)
@@ -1504,7 +1535,9 @@ class ClaudeCodeProvider(BaseProvider):
         # Anchor dialog detection to the bottom region only. Dialog chrome is
         # always rendered at the bottom; matching the full buffer false-positives
         # on stale scrollback containing "↑/↓ to navigate" (issue #405).
-        lines = output.split("\n")
+        # A named session's rule under the dialog, and the padding a shorter page
+        # leaves above it, would push the footer out of the windows below (#896).
+        lines = ClaudeCodeProvider._without_session_name_rule(output.split("\n"))
         bottom_region = "\n".join(lines[-_DIALOG_BOTTOM_LINES:])
         # AskUserQuestion footer can be pushed down by notes-hint, error banner,
         # or IDE status line — use a 6-line anchor.
@@ -2075,7 +2108,8 @@ class ClaudeCodeProvider(BaseProvider):
         6-line footer window is the tighter of the two against agent prose that
         merely quotes a footer. A rendered pane pads the rows under the TUI with
         blanks, which the buffer path never sees, so they are dropped first to
-        keep the footer inside that window. Trust, bypass and model-upgrade
+        keep the footer inside that window. The shared helper then drops a named
+        session's rule and the padding above it. Trust, bypass and model-upgrade
         dialogs stay excluded, as in ``get_status``: ``initialize`` answers those.
         """
         clean = strip_terminal_escapes(pane_text).rstrip()

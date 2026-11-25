@@ -319,6 +319,18 @@ def _pane_shows_dialog_native_status_missed(
     ).held
 
 
+def _provider_can_see_dialogs(provider: Any) -> bool:
+    """False only when ``provider`` inherits ``BaseProvider.shows_user_answer_dialog``.
+
+    The inherited method answers False for every pane, so reading one for it
+    buys nothing. Anything else, a stand-in object included, is asked.
+    """
+    return (
+        getattr(type(provider), "shows_user_answer_dialog", None)
+        is not BaseProvider.shows_user_answer_dialog
+    )
+
+
 def _check_pane_for_unreported_dialog(
     terminal_id: str,
     provider: Any,
@@ -336,8 +348,10 @@ def _check_pane_for_unreported_dialog(
     ``supports_event_inbox()`` is the signal for "status is native": it is the
     same test ``status_monitor.get_status`` uses to derive status from the
     backend instead of the pane. On tmux it is False, so nothing is captured and
-    nothing changes. The ``is True`` tests keep a provider without
-    ``shows_user_answer_dialog`` (default False), and any stand-in object, out.
+    nothing changes. A provider that inherits the base
+    ``shows_user_answer_dialog`` cannot answer, so its pane is not read at all
+    (``_provider_can_see_dialogs``). The ``is True`` tests keep a stand-in
+    object's truthy non-answer out.
 
     Fails open on purpose: a pane read that raises or comes back empty returns
     False and the send proceeds as it did before this check existed. This is a
@@ -354,6 +368,8 @@ def _check_pane_for_unreported_dialog(
     if not _dialog_blocks_orchestrated_input(
         provider, orchestration_type, TerminalStatus.WAITING_USER_ANSWER
     ):
+        return _NO_PANE_HOLD
+    if not _provider_can_see_dialogs(provider):
         return _NO_PANE_HOLD
     try:
         backend = get_backend()
