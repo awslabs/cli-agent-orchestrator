@@ -193,6 +193,124 @@ class TestInput:
             backend.send_keys("cao-a", "nope", "x")
 
 
+def _fail_send_with(hc, monkeypatch, error):
+    """Make herdr-core answer terminal.send with ``error``; other calls are unchanged."""
+    real = hc.call
+
+    def call(method, params=None, timeout=10.0):
+        if method == "terminal.send":
+            hc.calls.append((method, dict(params or {})))
+            raise error
+        return real(method, params, timeout)
+
+    monkeypatch.setattr(hc, "call", call)
+
+
+class TestInputNotSent:
+    """reply-delivery-failure D4: send_keys says when nothing can have been typed.
+
+    ``InputNotSentError`` and ``HcNotSentError`` are looked up on their modules
+    in each test so each test fails on its own until the names exist.
+    """
+
+    @staticmethod
+    def _not_sent():
+        from cli_agent_orchestrator.backends import base
+
+        return base.InputNotSentError
+
+    @pytest.mark.parametrize("kind", ["unavailable", "invalid_params", "not_found"])
+    def test_send_refused_before_typing_is_not_sent(
+        self, backend, hc, two_windows, monkeypatch, kind
+    ):
+        # Arrange
+        from cli_agent_orchestrator.clients.hc_rpc import HcRpcError
+
+        cause = HcRpcError(kind, "terminal.send refused")
+        _fail_send_with(hc, monkeypatch, cause)
+
+        # Act
+        with pytest.raises(self._not_sent()) as raised:
+            backend.send_keys("cao-a", "w1", "hello")
+
+        # Assert
+        assert raised.value.__cause__ is cause
+        assert hc.calls_to("terminal.keys") == [], "no Enter after a send that typed nothing"
+
+    def test_send_error_of_another_kind_is_not_not_sent(
+        self, backend, hc, two_windows, monkeypatch
+    ):
+        from cli_agent_orchestrator.clients.hc_rpc import HcRpcError
+
+        cause = HcRpcError("internal", "input.rs failed mid-write")
+        _fail_send_with(hc, monkeypatch, cause)
+        with pytest.raises(HcRpcError) as raised:
+            backend.send_keys("cao-a", "w1", "hello")
+        assert raised.value is cause
+        assert not isinstance(raised.value, self._not_sent())
+
+    def test_send_request_never_written_is_not_sent(self, backend, hc, two_windows, monkeypatch):
+        """Spec scenario "Send request never written"."""
+        from cli_agent_orchestrator.clients import hc_rpc
+
+        cause = hc_rpc.HcNotSentError("herdr-core unreachable for terminal.send")
+        _fail_send_with(hc, monkeypatch, cause)
+        with pytest.raises(self._not_sent()) as raised:
+            backend.send_keys("cao-a", "w1", "hello")
+        assert raised.value.__cause__ is cause
+
+    def test_send_request_lost_after_write_is_not_not_sent(
+        self, backend, hc, two_windows, monkeypatch
+    ):
+        """Spec scenario "Send request lost after it was written"."""
+        cause = TerminalBackendError("herdr-core lost terminal.send: herdr-core sent nothing")
+        _fail_send_with(hc, monkeypatch, cause)
+        with pytest.raises(TerminalBackendError) as raised:
+            backend.send_keys("cao-a", "w1", "hello")
+        assert raised.value is cause
+        assert not isinstance(raised.value, self._not_sent())
+
+    @pytest.mark.parametrize("cannot_start", ["popen_oserror", "no_hc_binary"])
+    def test_input_connection_that_cannot_start_is_not_sent(
+        self, backend, two_windows, monkeypatch, cannot_start
+    ):
+        """Spec scenario "Send request never written", through a real HcRpcClient."""
+        from cli_agent_orchestrator.clients import hc_rpc
+
+        if cannot_start == "popen_oserror":
+
+            def no_process(*_args, **_kwargs):
+                raise OSError(24, "Too many open files")
+
+            monkeypatch.setattr(hc_rpc.subprocess, "Popen", no_process)
+        else:
+            monkeypatch.setattr(hc_rpc.shutil, "which", lambda _name: None)
+        monkeypatch.setattr(backend, "_input", lambda _address: hc_rpc.HcRpcClient("cao"))
+
+        with pytest.raises(self._not_sent()) as raised:
+            backend.send_keys("cao-a", "w1", "hello")
+
+        assert isinstance(raised.value.__cause__, hc_rpc.HcNotSentError)
+
+    def test_terminal_lookup_failure_is_not_sent(self, backend, hc, two_windows):
+        hc.fail_methods.add("terminal.list")
+        with pytest.raises(self._not_sent()):
+            backend.send_keys("cao-a", "w1", "hello")
+        assert hc.calls_to("terminal.send") == []
+
+    def test_unknown_window_keeps_terminal_not_found(self, backend, two_windows):
+        with pytest.raises(TerminalNotFoundError) as raised:
+            backend.send_keys("cao-a", "nope", "x")
+        assert not isinstance(raised.value, self._not_sent())
+
+    def test_enter_failure_after_the_paste_is_not_not_sent(self, backend, hc, two_windows):
+        hc.fail_methods.add("terminal.keys")
+        with pytest.raises(TerminalBackendError) as raised:
+            backend.send_keys("cao-a", "w1", "hello", enter_count=2)
+        assert not isinstance(raised.value, self._not_sent())
+        assert len(hc.calls_to("terminal.send")) == 1, "the paste itself went through"
+
+
 class TestOutput:
     def test_history_caps_lines(self, backend, hc, two_windows):
         two_windows[1]["text"] = "hi"

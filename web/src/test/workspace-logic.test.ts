@@ -10,6 +10,7 @@ import {
   openInSplit,
   retainTerminals,
   setPaneCount,
+  fillEmptyPanes,
 } from '../workspace/layout'
 import { DEFAULT_POOL_SIZE, TerminalPool } from '../workspace/terminalPool'
 import { stepFontSize } from '../workspace/workspaceStore'
@@ -74,6 +75,20 @@ describe('layout', () => {
     const l: Layout = { count: 4, panes: ['a', 'b', 'c', 'd'], focused: 2 }
     expect(setPaneCount(l, 1)).toEqual({ count: 1, panes: ['c'], focused: 0 })
     expect(setPaneCount(l, 2)).toEqual({ count: 2, panes: ['c', 'a'], focused: 0 })
+  })
+
+  it('fills empty panes with off-screen terminals in order', () => {
+    const l: Layout = { count: 4, panes: ['b', null, null, null], focused: 0 }
+    expect(fillEmptyPanes(l, ['a', 'b', 'c'])).toEqual({ count: 4, panes: ['b', 'a', 'c', null], focused: 0 })
+    const gap: Layout = { count: 4, panes: ['a', null, 'c', null], focused: 2 }
+    expect(fillEmptyPanes(gap, ['a', 'b', 'c', 'd', 'e'])).toEqual({ count: 4, panes: ['a', 'b', 'c', 'd'], focused: 2 })
+  })
+
+  it('fill is a no-op when nothing is empty or nothing is left', () => {
+    const full: Layout = { count: 2, panes: ['a', 'b'], focused: 0 }
+    expect(fillEmptyPanes(full, ['a', 'b', 'c'])).toBe(full)
+    const allShown: Layout = { count: 2, panes: ['a', null], focused: 0 }
+    expect(fillEmptyPanes(allShown, ['a'])).toBe(allShown)
   })
 
   it('closing collapses a split that no longer needs it', () => {

@@ -9,8 +9,10 @@ exercises is a contract nothing holds anyone to.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -26,6 +28,8 @@ from cli_agent_orchestrator.agent_plugins.models import (
     PluginRecord,
     Severity,
 )
+from cli_agent_orchestrator.agent_plugins.resolver import ResolverError, _apply_subdir
+from cli_agent_orchestrator.agent_plugins.validation import validate_plugin
 from cli_agent_orchestrator.utils.opencode_config import entry_within_roots
 
 
@@ -192,6 +196,74 @@ class TestMalformedMcpEntriesAreSkippedWithAFinding:
             root, data, self._doc({"srv": {"type": "stdio", "command": "demo"}}), provider="codex"
         )
         assert [s.name for s in result.servers] == ["srv"]
+
+    def test_nul_byte_paths_skip_only_affected_entries(self, roots):
+        """A hostile NUL byte in `./command` or `cwd` must isolate to that entry (§7.2.2.2)."""
+        root, data = roots
+        doc = self._doc(
+            {
+                "bad-cmd": {"type": "stdio", "command": "./bin/run\x00evil"},
+                "bad-cwd": {"type": "stdio", "command": "demo", "cwd": "./sub\x00dir"},
+                "bad-data-cwd": {
+                    "type": "stdio",
+                    "command": "demo",
+                    "cwd": "${PLUGIN_DATA}/sub\x00dir",
+                },
+                "good": {"type": "stdio", "command": "demo"},
+            }
+        )
+        result = map_mcp_config(root, data, doc, provider="codex")
+        assert [s.name for s in result.servers] == ["good"]
+        codes = [f.code for f in result.findings]
+        assert codes.count("mcp.command_escapes_root") == 1
+        assert codes.count("mcp.cwd_escapes_root") == 2
+
+    def test_validate_plugin_preserves_skills_when_mcp_has_nul_byte_paths(self, tmp_path):
+        """A NUL byte in mcp.json must not trip the FATAL internal.error backstop."""
+        plugin_root = tmp_path / "plugin"
+        (plugin_root / "skills" / "demo").mkdir(parents=True)
+        (plugin_root / "plugin.json").write_text(
+            json.dumps(
+                {
+                    "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "description": "demo plugin",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (plugin_root / "skills" / "demo" / "SKILL.md").write_text(
+            "---\nname: demo\ndescription: demo skill\n---\nbody\n",
+            encoding="utf-8",
+        )
+        (plugin_root / "mcp.json").write_text(
+            json.dumps(
+                self._doc(
+                    {
+                        "bad-cmd": {"type": "stdio", "command": "./bin/run\x00evil"},
+                        "good": {"type": "stdio", "command": "demo"},
+                    }
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        report = validate_plugin(plugin_root)
+        assert report.loadable is True
+        assert [s.name for s in report.skills] == ["demo"]
+        assert [s.name for s in report.mcp_servers] == ["good"]
+        assert any(f.code == "mcp.command_escapes_root" for f in report.findings)
+        assert all(f.code != "internal.error" for f in report.findings)
+
+    def test_validate_plugin_reports_root_invalid_for_nul_byte_root(self, tmp_path):
+        report = validate_plugin(Path(f"{tmp_path}/bad\x00root"))
+        assert report.loadable is False
+        assert [f.code for f in report.findings] == ["plugin.root_invalid"]
+
+    def test_resolver_apply_subdir_rejects_nul_byte_with_resolver_error(self, tmp_path):
+        with pytest.raises(ResolverError, match="escapes the source tree"):
+            _apply_subdir(tmp_path, "sub\x00dir")
 
 
 class TestEntryWithinRootsToleratesUnusablePaths:

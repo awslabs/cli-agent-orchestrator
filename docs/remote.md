@@ -6,7 +6,7 @@ Remote CAO moves CAO to one always-on Linux box in AWS. The agents run there, un
 
 This page is the user guide. The reference setup is the sample in [`examples/remote/ec2/`](../examples/remote/ec2/README.md) (PR #1316). The guide links its files for the details.
 
-> **What exists today.** The sample, and the by-hand steps below. It runs in **herdr mode** only. The commands `cao remote check` and `cao remote connect` do **not** exist yet. See [Coming next](#coming-next).
+> **What exists today.** This guide uses **herdr mode**. The sample also has a tmux mode. The commands `cao remote check` and `cao remote connect` do **not** exist yet. See [Coming next](#coming-next).
 
 ## Why run CAO on a box
 
@@ -38,7 +38,7 @@ The short version. Each line is explained in [the steps](#the-steps).
 2. Create the instance role, the security group (no inbound rules) and the instance. Optionally create the backup key and bucket.
 3. On the box, as root, run the sample's `bootstrap.sh`. It installs everything and sets up the `cao-herdr` user.
 4. Add your public SSH key for `cao-herdr`, and add the SSH block to `~/.ssh/config`.
-5. Start the services, then log in to your agent CLIs on the box.
+5. Check the services, then log in to your agent CLIs on the box.
 6. On the laptop, run `herdr machine add cao-box --remote-session cao-<instance-id> --label cao-box`, then `herdr`.
 
 Replace every `<...>` placeholder with your own value:
@@ -144,7 +144,7 @@ Skip this if you don't want S3 backups. The box still keeps 14 local copies.
 
 The backups hold message text, so treat the bucket like the box. Do this in order:
 
-1. **Make a KMS key.** With the default key policy, the role's `BackupKey` statement is sufficient. If you write your own key policy, keep the statement that enables IAM policies (see the `BackupKey` statement in the [IAM notes](../examples/remote/ec2/iam/README.md)).
+1. **Make a KMS key.** With the default key policy, the role's `BackupKey` statement (see the [IAM notes](../examples/remote/ec2/iam/README.md)) is sufficient. If you write your own key policy, keep the statement that enables IAM policies.
 
    ```bash
    aws kms create-key --profile <profile> --region <region> --description "CAO box backups" \
@@ -178,7 +178,7 @@ You can drop `s3:GetObject` from the role. Then an agent can't read old backups 
 
 ### 3. Set up the box
 
-`bootstrap.sh` does the setup, as root, from a checkout outside the box user's home. It installs the tools (every download is checked against a sha256), sets up the `cao-herdr` user and the data volume, and writes the config files and the systemd units. It's safe to run again. It enables the units but doesn't start them.
+`bootstrap.sh` does the setup, as root, from a checkout outside the box user's home. It installs the tools (every download is checked against a sha256), sets up the `cao-herdr` user and the data volume, and writes the config files and the systemd units. It's safe to run again. It enables and starts the units, unless you add `--no-start`.
 
 **First, find out where "Session Manager shell" lands.** If Session Manager "Run As" is on in your account, `aws ssm start-session` opens the shell as the Run As user, not as `ssm-user`. On a real box that user was the box user, which has no `sudo`. So the "admin shell" wasn't one.
 
@@ -218,6 +218,7 @@ BOX_USER=cao-herdr
 BOX_UID=2001
 BOX_HOME=/home/cao-herdr
 DATA_MOUNT=/home/cao-herdr
+BOX_SSH_PUBLIC_KEY=<the line from your .pub file>
 DATA_VOLUME_ID=<data-volume-id>
 HERDR_VERSION=<the laptop's herdr version>
 HERDR_SHA256=<sha256 of herdr-linux-aarch64>
@@ -247,7 +248,7 @@ bash /opt/cao-box-src/cli-agent-orchestrator/examples/remote/ec2/bootstrap.sh \
   --settings /opt/cao-box-src/box-settings.env --format-new-volume
 ```
 
-**Your SSH key.** `bootstrap.sh` doesn't install it yet. Add the one `.pub` line as the box user, with the folder at 0700 and the file at 0600:
+**Your SSH key.** `bootstrap.sh` installs `BOX_SSH_PUBLIC_KEY` if the line is missing. Or add the one `.pub` line by hand as the box user, with the folder at 0700 and the file at 0600:
 
 ```bash
 runuser -u cao-herdr -- env HOME=/home/cao-herdr sh -c \
@@ -260,7 +261,7 @@ Never copy a private key to the box.
 
 ### 4. Connect: SSH inside SSM
 
-Put this above any `Host *` block in `~/.ssh/config` on the laptop. It's [`ssh/config.snippet`](../examples/remote/ec2/ssh/config.snippet) with the box user filled in:
+Put this above any `Host *` block in `~/.ssh/config` on the laptop. It's [`ssh/config.snippet`](../examples/remote/ec2/ssh/config.snippet) with your profile, region and key filled in:
 
 ```text
 Host cao-box
@@ -281,6 +282,7 @@ Host cao-box-dash
   User cao-herdr
   IdentityFile ~/.ssh/cao-box_ed25519
   ProxyCommand sh -c "aws ssm start-session --profile <profile> --region <region> --target %h --document-name AWS-StartSSHSession --parameters 'portNumber=%p'"
+  ForwardAgent no
   LocalForward 19889 127.0.0.1:9889
   ExitOnForwardFailure yes
 ```
@@ -289,14 +291,12 @@ Host cao-box-dash
 
 The first time, ssh asks you to accept the host key. To check it instead of trusting it blindly, read the box's key through Run Command (`cat /etc/ssh/ssh_host_ed25519_key.pub`) and compare.
 
-### 5. Start the services and log in
+### 5. Check the services and log in
 
-As root (Run Command, or `sudo -i`):
+`bootstrap.sh` already starts the services. As root (Run Command, or `sudo -i`), check them:
 
 ```bash
-systemctl start herdr-cao.service
-systemctl start cao-server.service     # waits for herdr's socket
-systemctl start cao-backup.timer
+systemctl is-active herdr-cao.service cao-server.service cao-backup.timer
 ```
 
 **Check:** on the laptop, wait for the server to listen:
@@ -394,10 +394,10 @@ No. Only the herdr window and any dashboard tunnel drop while it sleeps. The age
 No. The panes belong to the `herdr-cao` unit. Restarting herdr does end the panes.
 
 **Can I use the tmux backend on the box?**
-Not with the sample today. It sets up herdr mode only. See [Coming next](#coming-next).
+Yes. Set `ATTACH_MODE=tmux` before the first run, and use `User cao-tmux` in the SSH entries. See the sample's tmux mode. This guide uses herdr mode.
 
 **Can I keep my laptop's paths, like `/Users/<you>`?**
-Yes. If your kits, prompts or memory hold absolute laptop paths, set `BOX_HOME=/Users/<you>`. Leave `DATA_MOUNT` out, so it defaults to the parent folder. The user can still be `cao-herdr`.
+Yes. If your kits, prompts or memory hold absolute laptop paths, set `BOX_HOME=/Users/<you>` and `DATA_MOUNT=/Users/<you>`. The user can still be `cao-herdr`.
 
 **Why `cao-herdr`?**
 It's our suggestion: a name that says what the user is for, so the commands in this guide work on any box. The sample takes any name in `BOX_USER`.
@@ -409,7 +409,7 @@ The sample is set up for Sydney and arm64 (Graviton), with Ubuntu 24.04. `bootst
 There's no open port, and the role is narrow. But an agent can read anything the box user owns, and it can use the instance role. Keep both small.
 
 **A `cao` command I ran by hand started its own herdr. Is that a problem?**
-It can be. If herdr is down, `cao` starts one of its own, without the clean start-up. Check `systemctl is-active herdr-cao` before you run `cao` after a problem. A CAO setting to turn the auto-start off is planned.
+It can be. If herdr is down, `cao` starts one of its own, without the clean start-up. Check `systemctl is-active herdr-cao` before you run `cao` after a problem. Set `"herdr_auto_start": false` in the `terminal` object of the box user's `~/.aws/cli-agent-orchestrator/settings.json`. This needs a `CAO_REF` that includes #1411.
 
 **herdr says the box isn't reachable.**
 Run `ssh cao-box true`. The box may be stopped, your AWS login may have expired (`aws sso login --profile <profile>`), or the `session-manager-plugin` program may be old.
@@ -423,11 +423,6 @@ These are **proposals** in issue [#1385](https://github.com/awslabs/cli-agent-or
 
 - `cao remote check`: a read-only check of the laptop's prerequisites and the box.
 - `cao remote connect`: the AWS login, the SSH key, the pinned host key and the SSH config, done for you with your OK.
-- A tmux mode (`ATTACH_MODE=tmux`) with its own `cao-tmux` user.
-- `BOX_SSH_PUBLIC_KEY` in the sample's settings, so `bootstrap.sh` installs your key.
-- `bootstrap.sh` starting the services itself, instead of only enabling them.
-- `cao-herdr` as the sample's default box user.
-- A CAO setting to turn off herdr's auto-start.
 - An optional CloudFormation template for step 2.
 
 Say what you'd like in #1385.

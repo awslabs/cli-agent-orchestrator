@@ -543,6 +543,69 @@ def test_get_provider_no_shell_baseline_when_metadata_missing_shell_command():
     assert provider.shell_baseline is None
 
 
+def test_get_provider_marks_a_restored_claude_code_provider_initialized():
+    """A Claude Code row has no shell_command, and a terminal that outlived a
+    cao-server restart is taken to have finished startup. The rebuilt provider
+    must accept input while processing, or eager inbox delivery is refused for
+    that terminal. A restart during initialize() is a known, accepted gap."""
+    from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+    manager = ProviderManager()
+
+    with patch(
+        "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+        return_value={
+            "provider": ProviderType.CLAUDE_CODE.value,
+            "tmux_session": "s1",
+            "tmux_window": "w1",
+            "agent_profile": None,
+            "shell_command": None,
+        },
+    ):
+        provider = manager.get_provider("t-claude")
+
+    assert isinstance(provider, ClaudeCodeProvider)
+    assert provider.accepts_input_while_processing is True
+    assert provider.shell_baseline is None
+
+
+def test_create_provider_claude_code_starts_uninitialized():
+    """The startup guard: a freshly created Claude Code provider has not run
+    initialize(), so it must not accept input while processing."""
+    manager = ProviderManager()
+
+    provider = manager.create_provider(
+        ProviderType.CLAUDE_CODE.value,
+        terminal_id="t-fresh",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+    )
+
+    assert provider.accepts_input_while_processing is False
+
+
+def test_get_provider_leaves_a_restored_kiro_provider_without_shell_command_uninitialized():
+    """Only Claude Code is marked initialized without a shell_command; Kiro's
+    restore still keys off the persisted shell baseline."""
+    manager = ProviderManager()
+
+    with patch(
+        "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+        return_value={
+            "provider": ProviderType.KIRO_CLI.value,
+            "tmux_session": "s1",
+            "tmux_window": "w1",
+            "agent_profile": "developer",
+            "shell_command": None,
+        },
+    ):
+        provider = manager.get_provider("t-kiro")
+
+    assert provider._initialized is False
+    assert provider.shell_baseline is None
+
+
 def test_create_provider_mock_cli_stores_mapping():
     """The credentials-free mock_cli provider branch (test/CI infra) is wired
     through create_provider and stored in the terminal->provider mapping."""

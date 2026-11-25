@@ -1945,6 +1945,12 @@ def _launched_row(terminal_id: str) -> Optional[dict[str, Any]]:
         return _row(db, str(record.name)) if record is not None else None
 
 
+def is_live_ephemeral_terminal(terminal_id: str) -> bool:
+    """True when ``terminal_id`` is bound to an active ``launched`` ephemeral record."""
+    row = _launched_row(terminal_id)
+    return row is not None and row.get("state") == "launched"
+
+
 def record_kiro_event(terminal_id: str, event: str, **facts: Any) -> None:
     """Append a Kiro helper event to the archive of the name bound to this terminal (#1167).
 

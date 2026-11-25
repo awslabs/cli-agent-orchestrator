@@ -420,6 +420,56 @@ class TestBodySpoofingEscaped:
         report = backend.import_bundle(bundle, "global", "skip", False)
         assert report.bodies_escaped == 0
 
+    @pytest.mark.parametrize(
+        ("body_heading", "expected_bodies_escaped", "expected_updated_at", "expected_content"),
+        [
+            (
+                "## 2027-06-01T00:00Z",
+                0,
+                datetime(2026, 1, 1, tzinfo=timezone.utc),
+                "Body line.\n## 2027-06-01T00:00Z\ntail text",
+            ),
+            (
+                "### 2027-06-01T00:00:00Z",
+                1,
+                datetime(2027, 6, 1, tzinfo=timezone.utc),
+                "tail text",
+            ),
+            (
+                "### Notes 2027-06-01T00:00:00Z",
+                0,
+                datetime(2026, 1, 1, tzinfo=timezone.utc),
+                "Body line.\n### Notes 2027-06-01T00:00:00Z\ntail text",
+            ),
+        ],
+    )
+    def test_lenient_body_heading_does_not_change_imported_topic(
+        self,
+        svc,
+        backend,
+        bundle,
+        body_heading,
+        expected_bodies_escaped,
+        expected_updated_at,
+        expected_content,
+    ):
+        body = f"Body line.\n{body_heading}\ntail text"
+        _write_topic(
+            bundle,
+            "lenient-body-heading",
+            body,
+            fm_extra="timestamp: 2026-01-01T00:00:00Z\n",
+        )
+
+        report = backend.import_bundle(bundle, "global", "skip", False)
+        memories = _run(svc.recall(scope="global", limit=10, scan_all=True))
+
+        assert report.imported == 1
+        assert report.bodies_escaped == expected_bodies_escaped
+        assert len(memories) == 1
+        assert memories[0].updated_at == expected_updated_at
+        assert memories[0].content == expected_content
+
 
 class TestReportEchoesResolvedScope:
     """Design test 13: dry-run report carries the resolved project id."""

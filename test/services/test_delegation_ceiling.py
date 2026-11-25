@@ -312,6 +312,43 @@ async def test_kiro_installed_policy_wider_than_the_row_is_refused(launch, kiro_
 
 
 @pytest.mark.asyncio
+async def test_kiro_installed_callback_tools_are_not_wider_than_the_row(launch, kiro_install):
+    """A Kiro install adds the CAO callback tools to ``tools``. The tool gate allows them
+    to every bound terminal, so a row that omits them is not exceeded."""
+    from cli_agent_orchestrator.utils.tool_mapping import with_cao_callback_tools
+
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    kiro_install("developer", with_cao_callback_tools(["fs_read"], ["cao-mcp-server"]))
+    child = await create_terminal(
+        "kiro_cli",
+        "developer",
+        session_name="cao-sess",
+        new_session=False,
+        caller_id="0000beef",
+        allowed_tools=["fs_read"],
+    )
+    assert child.allowed_tools == ["fs_read"]
+
+
+@pytest.mark.asyncio
+async def test_kiro_installed_cao_tool_beyond_the_callbacks_is_still_refused(launch, kiro_install):
+    from cli_agent_orchestrator.utils.delegation import InstalledPolicyExceedsAllowlistError
+
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    kiro_install("developer", ["fs_read", "@cao-mcp-server/handoff"])
+    with pytest.raises(InstalledPolicyExceedsAllowlistError) as excinfo:
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-sess",
+            new_session=False,
+            caller_id="0000beef",
+            allowed_tools=["fs_read"],
+        )
+    assert excinfo.value.excess == ["@cao-mcp-server/handoff"]
+
+
+@pytest.mark.asyncio
 async def test_kiro_installed_policy_within_the_row_launches(launch, kiro_install):
     _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
     kiro_install("developer", ["fs_read"])

@@ -496,6 +496,11 @@ cao memory lint --scope project --format json
 cao memory compact --scope global
 cao memory compact --key testing-framework
 
+# Rebuild metadata and indexes from canonical topic files
+cao memory repair                         # dry-run
+cao memory repair --apply                 # apply metadata/index repairs
+cao memory repair --apply --add-headings  # also back up and repair missing headings
+
 # Repair lint findings — dry-run by default, --apply to mutate
 cao memory heal --scope project              # dry-run plan
 cao memory heal --scope project --apply
@@ -522,6 +527,43 @@ cao memory relationships inspect <relationship-id>
 cao memory relationships promote <relationship-id>    # proposal -> active
 cao memory relationships reject <relationship-id>     # -> rejected (survives recompute)
 ```
+
+### Native topic visibility
+
+A native topic with a valid metadata header and non-empty body remains recallable even when
+it has no canonical `## YYYY-MM-DDTHH:MM:SSZ` entry heading. This lenient parser is enabled by
+default. Compiled topics use only CAO's exact canonical heading. Other topics first use the
+legacy unanchored `## YYYY-MM-DDTHH:MM:SSZ` match; only when no such match exists does the
+lenient grammar recognize a timestamp, at minute or second precision, anywhere in a level-2
+or deeper heading. Header-only files remain invisible.
+
+In the default mode, recall content omits the derived `## See Also` block for every topic,
+including topics with canonical entry headings. To load related topics with the recalled
+results, call `memory_recall(include_related=true)`.
+
+Set `memory.parser.lenient` to `false` to restore the legacy behavior, where a topic without
+a canonical entry heading is skipped:
+
+```bash
+cao config set memory.parser.lenient false
+```
+
+After a successful LLM compile, CAO post-processes the article to add a
+`cao-compiled` marker and exactly one canonical entry heading. The heading uses the newest
+merged entry's timestamp, not the compile time, so recompiling an old fact does not make it
+look new. Any retained H2-or-deeper timestamp token is rewritten to
+`### Entry <timestamp>`, so it cannot be mistaken for a canonical entry during import or
+after a code rollback. A compiled topic's `created_at` and `updated_at` both come from its
+canonical heading, so both use the newest merged entry timestamp.
+
+`cao memory repair` now reports and indexes a header-valid topic using its loose heading,
+existing database dates, or file modification time as fallbacks. The default dry-run and
+ordinary `--apply` do not alter topic content. Adding `--add-headings` with `--apply` writes
+the original to a sibling `.md.bak` file before adding the canonical heading; repeating the
+command is idempotent.
+
+Because newly visible notes join recall, the default recency-ranked keyword results may
+shift. A later memory-v2 phase adds BM25 as the default ranking mode.
 
 ### Typed relationships
 

@@ -282,7 +282,7 @@ def test_reviewed_docs_describe_the_current_restore_and_tmux_behavior() -> None:
 
     assert "sudo install -D -m 0644 /dev/stdin /etc/cao-box/box.env" in readme
     assert "<instance-id> ssh-ed25519 <base64>" in readme
-    assert "Starts them, unless `--no-start`" in readme
+    assert "Enables and starts the units, unless `--no-start`" in readme
     assert "User cao-tmux" in readme
     assert "cao-tmux.service" in readme
     assert "BOX_SSH_PUBLIC_KEY=ssh-ed25519" in agent_setup
