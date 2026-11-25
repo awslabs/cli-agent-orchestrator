@@ -456,14 +456,16 @@ cao update
 |----------------|------------------------|
 | PyPI (`uv tool install cli-agent-orchestrator`) | Runs `uv tool upgrade cli-agent-orchestrator` |
 | PyPI with version pin (`==2.3.0`, `<3.0`) | Runs `uv tool install cli-agent-orchestrator@latest --upgrade` (unpins) |
-| Git (`uv tool install git+...`) | Runs `uv tool install <git-source> --upgrade --reinstall` |
+| Git (`uv tool install git+...`) | Runs `uv tool upgrade cli-agent-orchestrator --reinstall` (reuses the recorded Git ref and requirements) |
 | Local directory / editable | Prints guidance (cannot auto-update a local install) |
 
 After updating, restart any running `cao-server` to pick up the new version.
 
-Packages you added to CAO's tool environment with `--with`, such as a decider, are kept only by
-the unpinned PyPI path (`uv tool upgrade`). The git and version-pinned paths run without
-`--with` and drop them. Check and reinstall them after an update; see
+Packages you added to CAO's tool environment with `--with`, such as a decider, and extras such as
+`[otel]`, are kept by the Git and unpinned PyPI paths, which both run `uv tool upgrade` and reuse
+uv's receipt. The version-pinned path runs without `--with` and drops those packages, and can
+drop the extras too. Check and reinstall
+them after an update; see
 [the setup runbook](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/ephemeral-agents-agent-setup.md#3-install-the-decider-into-the-servers-python).
 
 ### Examples
@@ -473,7 +475,7 @@ the unpinned PyPI path (`uv tool upgrade`). The git and version-pinned paths run
 cao update
 
 # If installed from git, it will fetch the latest commits:
-# $ uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main --upgrade --reinstall
+# $ uv tool upgrade cli-agent-orchestrator --reinstall
 ```
 
 ---

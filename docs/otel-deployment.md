@@ -2,12 +2,49 @@
 
 CAO emits OTel spans + metrics from
 [`cli_agent_orchestrator.telemetry`](../src/cli_agent_orchestrator/telemetry/).
-Telemetry is **off by default** — set `OTEL_SDK_DISABLED=false` to enable.
-Once on, the SDK honors the standard OTel environment variables, so any
+Telemetry is **off by default**. Turning it on takes two things: the `otel`
+extra installed into `cao-server`'s Python (see
+[Install the `otel` extra](#install-the-otel-extra)), and
+`OTEL_SDK_DISABLED=false` in the server's environment. Once on, the SDK honors
+the standard OTel environment variables, so any
 collector that speaks OTLP works without code changes.
 
 This page documents the supported transports + auth modes and gives
 copy-paste recipes for the common backends.
+
+---
+
+## Install the `otel` extra
+
+A default install doesn't include the OpenTelemetry SDK. The `otel` extra in
+`pyproject.toml` adds `opentelemetry-api`, `opentelemetry-sdk` and
+`opentelemetry-exporter-otlp-proto-grpc`. Without it, setting
+`OTEL_SDK_DISABLED=false` changes nothing: `cao-server` logs
+`OTEL_SDK_DISABLED=false but the OpenTelemetry SDK is not installed; telemetry stays off.`
+and runs without telemetry.
+
+Reinstall CAO as a uv tool with the extra, from the same source you installed it
+from:
+
+```bash
+# Git install (the README's install command):
+uv tool install "cli-agent-orchestrator[otel] @ git+https://github.com/awslabs/cli-agent-orchestrator.git@main" --reinstall
+
+# PyPI install:
+uv tool install "cli-agent-orchestrator[otel]" --reinstall
+```
+
+This replaces what uv recorded for the install, so repeat any other extras and
+`--with` packages listed in `$(uv tool dir)/cli-agent-orchestrator/uv-receipt.toml`.
+The receipt then records the extra. `cao update` keeps it on Git and unpinned
+PyPI installs. On a version-pinned PyPI install it reinstalls from a new
+requirement that can drop it, so run the check below again after an update (see [Updating CAO](updating.md)).
+
+Check that the SDK imports in the tool's Python, then restart `cao-server`:
+
+```bash
+"$(uv tool dir)/cli-agent-orchestrator/bin/python" -c "import opentelemetry.sdk, opentelemetry.exporter.otlp.proto.grpc; print('ok')"
+```
 
 ---
 

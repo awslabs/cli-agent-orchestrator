@@ -6,7 +6,7 @@ Remote CAO moves CAO to one always-on Linux box in AWS. The agents run there, un
 
 This page is the user guide. The reference setup is the sample in [`examples/remote/ec2/`](../examples/remote/ec2/README.md) (PR #1316). The guide links its files for the details.
 
-> **What exists today.** This guide uses **herdr mode**. The sample also has a tmux mode. The commands `cao remote check` and `cao remote connect` do **not** exist yet. See [Coming next](#coming-next).
+> **What exists today.** This guide uses **herdr mode**. The sample also has a tmux mode. [`cao remote check`](remote-cli.md) runs a read-only check of the laptop's prerequisites and the box. `cao remote connect` does **not** exist yet. See [Coming next](#coming-next).
 
 ## Why run CAO on a box
 
@@ -419,9 +419,8 @@ Run `ssh cao-box true`. The box may be stopped, your AWS login may have expired 
 
 ## Coming next
 
-These are **proposals** in issue [#1385](https://github.com/awslabs/cli-agent-orchestrator/issues/1385). They don't exist yet, and this guide doesn't depend on them:
+`cao remote add`, `list`, `check` and `remove` exist now; see the [Remote CLI reference](remote-cli.md). These are still **proposals** in issue [#1385](https://github.com/awslabs/cli-agent-orchestrator/issues/1385). They don't exist yet, and this guide doesn't depend on them:
 
-- `cao remote check`: a read-only check of the laptop's prerequisites and the box.
 - `cao remote connect`: the AWS login, the SSH key, the pinned host key and the SSH config, done for you with your OK.
 - An optional CloudFormation template for step 2.
 
