@@ -288,7 +288,7 @@ uv run mypy src/
 # Format, sort imports, lint for dead code, type check, and run tests
 uv run black src/ test/
 uv run isort src/ test/
-uv run ruff check src/ test/ examples/
+uv run ruff check --config pyproject.toml --no-respect-gitignore src/ test/ examples/
 uv run python scripts/mypy_ratchet.py
 uv run pytest -v
 ```
@@ -339,7 +339,7 @@ uv run pytest test/ --ignore=test/providers/test_kiro_cli_integration.py \
 ```bash
 uv run black src/ test/
 uv run isort src/ test/
-uv run ruff check src/ test/ examples/
+uv run ruff check --config pyproject.toml --no-respect-gitignore src/ test/ examples/
 uv run python scripts/mypy_ratchet.py
 ```
 

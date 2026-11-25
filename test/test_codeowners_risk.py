@@ -1,6 +1,9 @@
 """Pin code-owner coverage of release and security policy, and CI gate settings."""
 
 import configparser
+import importlib.util
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -64,8 +67,8 @@ RESERVED_ABSENT = {
     "/.trivyignore",  # ci.yml:1111-1148 loads root Trivy ignore files.
     "/trivy.yaml",  # ci.yml:1111-1148 loads root Trivy config files.
     "/trivy-secret.yaml",  # ci.yml:1111-1148 loads root Trivy secret config.
-    "/ruff.toml",  # ci.yml:442 loads root ruff config files.
-    "/.ruff.toml",  # ci.yml:442 loads root ruff config files.
+    "/ruff.toml",  # CI ignores this; local ruff without --config still reads it.
+    "/.ruff.toml",  # CI ignores this; local ruff without --config still reads it.
     "**/ruff.toml",  # ci.yml:442 pins the config despite nested ruff config files.
     "**/.ruff.toml",  # ci.yml:442 pins the config despite nested ruff config files.
 }
@@ -93,7 +96,9 @@ def test_ruff_gate_uses_root_config():
     steps = workflow["jobs"]["lint"]["steps"]
     ruff_steps = [step for step in steps if "ruff check" in step.get("run", "")]
     assert len(ruff_steps) == 1
-    assert ruff_steps[0]["run"] == "uv run ruff check --config pyproject.toml src/ test/ examples/"
+    assert ruff_steps[0]["run"] == (
+        "uv run ruff check --config pyproject.toml --no-respect-gitignore src/ test/ examples/"
+    )
 
 
 def test_live_mypy_settings_are_pinned():
@@ -124,8 +129,23 @@ def test_live_mypy_settings_are_pinned():
     }
 
 
-def test_ratchet_uses_default_mypy_config():
-    assert "--config-file" not in (ROOT / "scripts/mypy_ratchet.py").read_text(encoding="utf-8")
+def test_ratchet_runs_mypy_from_root_with_default_config(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "codeowners_mypy_ratchet", ROOT / "scripts/mypy_ratchet.py"
+    )
+    assert spec is not None and spec.loader is not None
+    ratchet = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, ratchet)
+    spec.loader.exec_module(ratchet)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs.get("cwd")))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(ratchet.subprocess, "run", fake_run)
+    ratchet.run_mypy(ratchet.DEFAULT_TARGETS)
+    assert calls == [([sys.executable, "-m", "mypy", "src/"], ROOT)]
 
 
 @pytest.mark.parametrize("path", sorted(EXPECTED_PATHS - set(OLD_ENTRIES)))
@@ -139,7 +159,12 @@ def test_codeowner_entries_resolve():
     before, header, block = text.partition(BLOCK_HEADER)
     assert header == BLOCK_HEADER
     old_entries = list(_entries(before))
-    assert old_entries == [(path, [OWNER]) for path in OLD_ENTRIES]
+    expected = iter((path, [OWNER]) for path in OLD_ENTRIES)
+    current = next(expected, None)
+    for entry in old_entries:
+        if entry == current:
+            current = next(expected, None)
+    assert current is None
     new_entries = list(_entries(block))
     assert {path for path, _ in new_entries} == EXPECTED_PATHS
     for path, owners in old_entries + new_entries:

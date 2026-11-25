@@ -17,7 +17,8 @@
 /.github/dependabot.yml @awslabs/multiq
 /.github/dependency-security/ @awslabs/multiq
 /.gitleaks.toml @awslabs/multiq
-# Root gate configs are owned before they exist.
+# Root gate configs are owned before they exist; CI ignores root ruff.toml and
+# .ruff.toml, but local ruff runs without --config pyproject.toml still read them.
 /.gitleaksignore @awslabs/multiq
 /.trivyignore @awslabs/multiq
 /trivy.yaml @awslabs/multiq
