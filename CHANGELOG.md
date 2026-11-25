@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Workspace split panes fill themselves**. Picking 2 or 4 panes in the Workspace tab now
+  shows the session's other agents in the empty panes, in tab order, instead of leaving them
+  blank. Panes already showing an agent keep it, and clicking the current layout again refills
+  any pane you emptied. Shift+click splits and status polling never fill panes, so a pane you
+  close stays empty, and going down to fewer panes (or picking 1 pane) never fills.
+
+- **Workflow specs open in a large, readable viewer**. The Workflows page now shows
+  Python syntax colouring, line numbers and lint findings in a near-window-size dialog,
+  with line wrapping, real browser full screen, and clear Exit/Esc controls.
+
+- **Kiro CLI installs keep the CAO callback tools**. A profile that declares
+  `cao-mcp-server` and pins `allowedTools` without `@cao-mcp-server` used to install with a
+  `tools` list that hid `send_message`, `complete_assignment`, `workflow_return` and
+  `answer_user_prompt`, though the CAO tool gate always allows them. An assigned worker could
+  not report back, and a structured workflow step could not return its answer. `cao install`
+  now adds `@cao-mcp-server/<tool>` for each of the four the grant does not cover, and the
+  delegation ceiling treats them as granting nothing new. Reinstall such profiles to pick
+  this up.
+
 - Add the Qwen Code (`qwen_cli`) provider with profile, skill, MCP and model support.
+
+- **kiro_cli (v2 TUI): an open permission dialog reads `waiting_user_answer` in the cases #1426 missed**.
+  A dialog Kiro redrew on a tmux attach/resize, or one whose blocked OSC 7501 report the rolling
+  buffer had already dropped, read `processing`; so did one drawn below older working text, such as
+  the spinner line on screen when the dialog opened or agent output quoting "Kiro is working". An
+  approved prompt (blocked report still last, working text after it) now reads `processing`
+  instead of `waiting_user_answer`, Kiro's own later report outranks stale dialog text, and the
+  "/" command menu footer is no longer read as a blocking selector. v3 status is unchanged. Tests
+  replay real 7501 traces (approve, deny, esc, ctrl-c, exit, queue-mode footer).
 
 - **`cao memory show` finds an existing key when recall ranks by BM25** (#1329).
 - **herdr backend: event-driven inbox delivery works again on herdr 0.9.x (protocol 22)**.
@@ -26,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider's post-turn flush-wait, offloaded off the event loop and stopping as soon as the
   message lands.
 
+- Add experimental `cao remote` local box registry and read-only prerequisite checks.
 - **Workflow scripts with an f-string `step_id` whose own text breaks the step id rule are refused** (#1396).
   A `step_id` must be 1-64 characters from `[A-Za-z0-9_-]`. `step_id=f"review:{name}"` used to pass
   validation and then get a 422 from `POST /terminals/run-step` on every call, since no value of
@@ -69,6 +98,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of skipping them, while `--apply --add-headings` first writes a `.md.bak` copy and then adds
   the heading. Recency-ranked keyword results can shift because previously invisible notes now
   participate; a later phase adds the BM25 default.
+- **Synthetic memory-evaluation arms run with their own CAO settings homes**, so
+  future memory phases can measure their setting without changing the legacy baseline (#1329).
+- **Synthetic memory retrieval evaluation fixtures and baseline harness** measure
+  BM25 current-first strictly: a tied current/stale pair counts only when the
+  current note ranks first in both fixed wiki-listing orders, so the measure no
+  longer depends on filesystem listing order. Tokens per recall can still vary
+  slightly by filesystem (#1329).
 - **Provider memory file writes now default off** (#1335). CAO delivers each terminal's
   memory without writing it into project files that can be committed. Interactive
   `cao launch` sessions using a runtime start-prompt provider — Claude Code, Codex,

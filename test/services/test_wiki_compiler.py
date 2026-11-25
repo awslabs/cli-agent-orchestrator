@@ -166,6 +166,21 @@ class TestU17PlanCases:
         assert "entries=" in result.compiled_content
         assert "2026-11-13T04:03:02Z" not in canonical
 
+    def test_postprocess_rewrites_mid_line_minute_timestamp_token(self):
+        compiled = "Build notes ## 2026-01-01T00:00Z first fact\n\nthird fact"
+
+        postprocessed = wiki_compiler._postprocess_compiled(
+            compiled,
+            newest_entry_at="2026-03-01T00:00:00Z",
+            entry_count=3,
+            compiled_at="2026-03-02T00:00:00Z",
+        )
+
+        timestamp_tokens = re.findall(
+            r"## \d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z", postprocessed
+        )
+        assert timestamp_tokens == ["## 2026-03-01T00:00:00Z"]
+
     def test_compaction_preserves_newest_fact_date(self, fake_llm):
         existing = f"{EXISTING_BODY.rstrip()}\n\n## 2025-01-02T03:04:05Z\nOld fact.\n"
         fake_llm.set_response(_good_compiled())

@@ -1095,17 +1095,56 @@ class TestDeleteTerminalEndpoint:
             assert "Failed to delete terminal" in response.json()["detail"]
 
 
+class TestSendInputToAMissingTerminal:
+    """F5 keeps POST /terminals/{id}/input's 404 through the real dispatch_input."""
+
+    def test_missing_terminal_row_answers_404(self, client):
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+            return_value=None,
+        ):
+            response = client.post("/terminals/abcd1234/input", params={"message": "hello"})
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"]
+
+    def test_row_deleted_between_the_two_reads_answers_404(self, client):
+        """get_provider reads the row again; a delete in between is still a 404, not a 500."""
+        meta = {"tmux_session": "cao-s", "tmux_window": "w1", "provider": "claude_code"}
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=meta,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.terminal_input_refusal",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.provider_manager.get_provider",
+                side_effect=ValueError("Terminal abcd1234 not found in database"),
+            ),
+        ):
+            response = client.post("/terminals/abcd1234/input", params={"message": "hello"})
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Terminal abcd1234 not found in database"
+
+
 class TestCreateInboxMessageEndpoint:
     """Test POST /terminals/{receiver_id}/inbox/messages endpoint."""
 
     def test_create_inbox_message_success(self, client):
-        """POST creates an inbox message and starts immediate delivery with the
-        P2-2 contract (#78, PR #1004): deliver_pending gets the app's plugin
-        registry and the endpoint's own after_dispatch callback. That the
-        callback releases the response is proven in
-        test_inbox_messages.py::TestCreateInboxMessageResponseTiming by calling
-        the endpoint directly; through TestClient the per-request loop shutdown
-        waits for the delivery thread, so no timing is asserted here."""
+        """POST creates an inbox message, starts immediate delivery and reports its
+        outcome (reply-delivery-failure D5): deliver_pending gets the app's plugin
+        registry, ``report_to_sender`` naming the new message, and an
+        ``on_outcome`` callback whose report for that message becomes the
+        response's ``delivery``. The wait itself is covered in
+        test_inbox_messages.py by calling the endpoint directly; through
+        TestClient the per-request loop shutdown waits for the delivery thread,
+        so no timing is asserted here."""
+        from cli_agent_orchestrator.models.inbox import DeliveryOutcome
+
         mock_msg = MagicMock()
         mock_msg.id = 1
         mock_msg.sender_id = "sender1"
@@ -1113,9 +1152,9 @@ class TestCreateInboxMessageEndpoint:
         mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
         delivery_calls = []
 
-        def deliver(receiver_id, registry=None, after_dispatch=None):
-            delivery_calls.append((receiver_id, registry, after_dispatch))
-            after_dispatch()  # the paste reached the pane
+        def deliver(receiver_id, **kwargs):
+            delivery_calls.append((receiver_id, kwargs))
+            kwargs["on_outcome"](kwargs["report_to_sender"], DeliveryOutcome.DELIVERED, None)
 
         with (
             patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
@@ -1134,6 +1173,8 @@ class TestCreateInboxMessageEndpoint:
             assert data["success"] is True
             assert data["message_id"] == 1
             assert data["sender_id"] == "sender1"
+            assert data["delivery"] == "delivered"
+            assert data["error"] is None
             mock_create.assert_called_once_with(
                 "sender1",
                 "abcd1234",
@@ -1141,13 +1182,11 @@ class TestCreateInboxMessageEndpoint:
             )
 
         assert len(delivery_calls) == 1
-        receiver_id, registry, after_dispatch = delivery_calls[0]
+        receiver_id, kwargs = delivery_calls[0]
         assert receiver_id == "abcd1234"
-        assert registry is app.state.plugin_registry
-        assert callable(after_dispatch)
-        assert after_dispatch.__qualname__.endswith(
-            "create_inbox_message_endpoint.<locals>._mark_dispatched"
-        ), "deliver_pending must get the endpoint's own post-dispatch marker"
+        assert kwargs["registry"] is app.state.plugin_registry
+        assert kwargs["report_to_sender"] == 1, "the POST reports on its own message"
+        assert callable(kwargs["on_outcome"])
 
     def test_create_inbox_message_delivery_failure_still_succeeds(self, client):
         """Immediate delivery failure should not fail the API response."""

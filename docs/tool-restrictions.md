@@ -411,6 +411,16 @@ own `tools` list keeps it. Enforcement is therefore install-time: change the
 profile, re-run `cao install`. Profiles installed before CAO wrote `tools`
 still carry `["*"]`; `cao launch` warns when it finds one.
 
+Because `tools` hides everything it leaves out, a profile that declares
+`cao-mcp-server` and pins `allowedTools` without `@cao-mcp-server` would also
+hide the four callback tools the CAO tool gate always allows (`send_message`,
+`complete_assignment`, `workflow_return`, `answer_user_prompt`). So `cao install`
+adds `@cao-mcp-server/<tool>` for each one the grant does not already cover, to
+both `allowedTools` and `tools`. No other CAO tool is added, and a profile that
+sets its own `tools` list keeps it unchanged. The delegation ceiling treats these
+four references as granting nothing new, since the gate allows them to every
+bound terminal. Profiles installed before this change lack them until reinstalled.
+
 **Kiro CLI, v3 engine (preview, pending the operator checklist)** — `cao install
 … --engine v3` writes one universal file: the v2 fields above, plus
 `excludedTools` and `permissions.rules`. v3 selects tools by id and by tag, and

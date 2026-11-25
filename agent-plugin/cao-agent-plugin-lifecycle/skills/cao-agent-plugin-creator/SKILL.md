@@ -1,6 +1,6 @@
 ---
 name: cao-agent-plugin-creator
-description: Author a new Agent Plugins 1.0.0 package from an empty directory - write the plugin.json manifest, lay out skills/, optionally add an mcp.json, and check the result with CAO's own validator. Use when the user says "create an Agent Plugin", "scaffold a plugin.json", "package these skills as an Agent Plugin", "which keys does the manifest need", "why is my plugin.json rejected", or "add an mcp.json to my package". States the manifest contract from the schema bytes CAO vendors and pins, and the Agent Skills limits CAO's loader does not check. Not for CAO event plugins, the Python packages that react to cao-server lifecycle events (use cao-plugin). Not for migrating an existing client-specific agent plugin to the portable structure (use migrate-agent-plugin). Not for auditing an existing Agent Plugin package against the limits (use cao-agent-plugin-audit).
+description: Author a new Agent Plugins 1.0.0 package from an empty directory - write the plugin.json manifest, lay out skills/, optionally add an mcp.json, and check the result with CAO's own validator. Use when the user says "create an Agent Plugin", "scaffold a plugin.json", "package these skills as an Agent Plugin", "which keys does the manifest need", "why is my plugin.json rejected", or "add an mcp.json to my package". States the manifest contract from the schema bytes CAO vendors and pins, and the Agent Skills limits CAO's loader does not check. Not for CAO event plugins, the Python packages that react to cao-server lifecycle events (use cao-event-plugin). Not for migrating an existing client-specific agent plugin to the portable structure (use migrate-agent-plugin). Not for auditing an existing Agent Plugin package against the limits (use cao-agent-plugin-audit).
 ---
 
 # Create an Agent Plugin
@@ -20,7 +20,7 @@ CAO has two systems that both use the word. Never write it unqualified.
 | **event plugin** | A Python package running inside `cao-server`, reacting to lifecycle events | `src/cli_agent_orchestrator/plugins/`, `docs/plugins.md` |
 | **Agent Skill** | A directory holding a `SKILL.md`; the unit an Agent Plugin ships | `skills/`, `docs/skills.md` |
 
-This skill is about the first row only. For an event plugin, load `cao-plugin`.
+This skill is about the first row only. For an event plugin, load `cao-event-plugin`.
 To convert an agent plugin that already exists for one client, load
 `migrate-agent-plugin`; this skill starts from nothing.
 
@@ -340,6 +340,6 @@ audit skill as well.
 
 - `cao-agent-plugin-audit`: audit an existing Agent Plugin package, including the
   limits CAO's loader does not check.
-- `cao-plugin`: CAO event plugins, which are unrelated to Agent Plugins.
+- `cao-event-plugin`: CAO event plugins, which are unrelated to Agent Plugins.
 - `migrate-agent-plugin`: convert an existing client-specific agent plugin to the
   portable structure.
