@@ -112,18 +112,39 @@ class TestWhoReadsTheReleaseKey:
         ("release-key-proof.yml", "proof"),
     }
 
-    def test_the_readers_are_exactly_the_known_three(self):
-        found: Set[Tuple[str, str]] = set()
+    @staticmethod
+    def _files() -> list:
         files = sorted(WORKFLOWS.glob("*.yml")) + sorted(WORKFLOWS.glob("*.yaml"))
         assert files
-        for path in files:
+        return files
+
+    def test_the_readers_are_exactly_the_known_three(self):
+        found: Set[Tuple[str, str]] = set()
+        for path in self._files():
             document = yaml.safe_load(path.read_text(encoding="utf-8"))
             for name, job in (document.get("jobs") or {}).items():
-                if KEY in yaml.safe_dump(job):
+                # The bare name, so `secrets['RELEASE_DEPLOY_KEY']` counts too.
+                if "RELEASE_DEPLOY_KEY" in yaml.safe_dump(job):
                     found.add((path.name, name))
         assert found == self.READERS
+
+    def test_the_key_is_named_only_inside_jobs(self):
+        """Not in workflow-level ``env:`` or anywhere else the per-job walk skips."""
+        for path in self._files():
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+            outside_jobs = {key: value for key, value in document.items() if key != "jobs"}
+            assert "RELEASE_DEPLOY_KEY" not in yaml.safe_dump(outside_jobs), path.name
+
+    def test_no_workflow_reads_secrets_wholesale(self):
+        """These reach the key without naming it, so the walk above would miss them."""
+        for path in self._files():
+            text = path.read_text(encoding="utf-8")
+            assert not re.search(r"toJSON\(\s*secrets\s*\)", text, re.IGNORECASE), path.name
+            assert not re.search(r"secrets\s*:\s*inherit", text), path.name
+            for index in re.findall(r"secrets\s*\[([^\]]*)\]", text):
+                assert re.fullmatch(r"\s*'[A-Za-z0-9_]+'\s*", index), (path.name, index)
 
     def test_no_composite_action_reads_it(self):
         actions = REPO_ROOT / ".github" / "actions"
         for path in sorted(actions.rglob("*.y*ml")):
-            assert KEY not in path.read_text(encoding="utf-8"), path
+            assert "RELEASE_DEPLOY_KEY" not in path.read_text(encoding="utf-8"), path

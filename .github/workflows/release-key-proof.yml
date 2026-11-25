@@ -38,6 +38,9 @@ jobs:
             exit 1
           fi
 
+      # The key stays configured for the steps below (the default,
+      # persist-credentials: true): they are what uses it. No step here prints
+      # git config or uploads the workspace, and none should be added.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
