@@ -53,6 +53,17 @@ On failure, rerun the test with the printed `@reproduce_failure` blob pasted
 above it, or use the printed `--hypothesis-seed=<seed>` with the original pytest
 command. Retain the failing example as a regression test when appropriate.
 
+## Changelog entries
+
+For a notable change, add `changelog.d/<PR>.<type>.md` with the pull request number,
+one of `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, or `Security`, and a
+single Markdown bullet on one line. For example, `changelog.d/1469.Changed.md`
+could contain `- Collect pull-request changelog fragments at release time.`
+See [`changelog.d/README.md`](changelog.d/README.md) for the format. The release
+bump collects these fragments alongside any hand-written `[Unreleased]` notes;
+you do not need to edit `CHANGELOG.md` in your pull request.
+
+
 ## Type checking: the mypy ratchet
 
 CI's **Code Quality** job runs `uv run python scripts/mypy_ratchet.py` instead of a bare
