@@ -2596,6 +2596,8 @@ class TestDialogGuardCoversSubmitRecovery:
     #: true of every capture, which is the case the explicit guard is for.
     DIALOG_CAPTURES_THAT_SHOW_A_COMPOSER = {
         "claude_code_896_herdr_named_session_focus_chat.txt": "4. Chat about this",
+        # The same shape, captured later with 13 padding rows above the rule (#1502).
+        "claude_code_896_herdr_named_session_page2_padded_13_rows.txt": "4. Chat about this",
     }
 
     @pytest.mark.parametrize("provider_type", sorted(OVERLAP))
