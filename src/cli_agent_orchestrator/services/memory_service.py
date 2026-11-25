@@ -86,26 +86,24 @@ _COMPILED_MARKER_RE = re.compile(
 _VERSION_METADATA_RE = re.compile(r"^<!-- memory-version: (\{[^\n]*\}) -->\n?", re.MULTILINE)
 
 
-def _strip_version_preamble(text: str) -> str:
-    """Remove CAO metadata only from the canonical header, not user-authored introductions."""
-    import json
-
-    preamble, separator, entries = text.partition("\n## ")
-    if not separator:
-        return text
-    lines = preamble.splitlines(keepends=True)
+def _version_header_end(lines: list[str]) -> int:
     header_end = 0
     for index, line in enumerate(lines):
         if line.startswith("# ") or line.startswith("<!-- id: ") or not line.strip():
             header_end = index + 1
             continue
         break
-    tail = lines[header_end:]
-    kept = lines[:header_end]
-    in_header = True
-    removed = False
-    for line in tail:
-        match = _VERSION_METADATA_RE.fullmatch(line) if in_header else None
+    return header_end
+
+
+def _version_header_metadata(preamble: str) -> list[tuple[int, re.Match[str]]]:
+    import json
+
+    lines = preamble.splitlines(keepends=True)
+    matches = []
+    for index in range(_version_header_end(lines), len(lines)):
+        line = lines[index]
+        match = _VERSION_METADATA_RE.fullmatch(line)
         if match:
             try:
                 metadata = json.loads(match.group(1))
@@ -117,12 +115,31 @@ def _strip_version_preamble(text: str) -> str:
                 and metadata.get("type") in {"user", "feedback", "project", "reference"}
                 and isinstance(metadata.get("tags"), str)
             ):
-                removed = True
+                matches.append((index, match))
                 continue
         if line.strip():
-            in_header = False
-        kept.append(line)
-    return "".join(kept) + separator + entries if removed else text
+            break
+    return matches
+
+
+def _strip_version_preamble(text: str) -> str:
+    """Remove CAO metadata only from the canonical header, not user-authored introductions."""
+    preamble, separator, entries = text.partition("\n## ")
+    if not separator:
+        return text
+    matches = _version_header_metadata(preamble)
+    if not matches:
+        return text
+    removed = {index for index, _ in matches}
+    return (
+        "".join(
+            line
+            for index, line in enumerate(preamble.splitlines(keepends=True))
+            if index not in removed
+        )
+        + separator
+        + entries
+    )
 
 
 # #861: cap hybrid score/usage widening at 200 per source, never below the requested limit.
@@ -1218,7 +1235,7 @@ class MemoryService:
                             prior_index -= 1
                         retained = [
                             match.group(0).strip()
-                            for match in _VERSION_METADATA_RE.finditer(preamble)
+                            for _, match in _version_header_metadata(preamble)
                             if prior_index >= 0
                             and self._metadata_for_version(
                                 match.group(1),
@@ -1239,8 +1256,17 @@ class MemoryService:
                         clean_content = _strip_version_preamble(new_content)
                         clean_preamble, _, clean_entries = clean_content.partition("\n## ")
                         marker = "\n".join([*retained, f"<!-- memory-version: {metadata} -->"])
+                        header_lines = clean_preamble.splitlines(keepends=True)
+                        header_end = sum(
+                            len(line) for line in header_lines[: _version_header_end(header_lines)]
+                        )
                         new_content = (
-                            clean_preamble.rstrip() + "\n" + marker + "\n## " + clean_entries
+                            clean_preamble[:header_end]
+                            + marker
+                            + "\n"
+                            + clean_preamble[header_end:]
+                            + "\n## "
+                            + clean_entries
                         )
             entry_body = appended.entry_body
             timestamp = appended.section_at.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1625,7 +1651,7 @@ class MemoryService:
         previous = re.sub(r"^_Originally recorded: [^\n]+_\n?", "", previous).strip()
         metadata = None
         preamble = text.split("\n## ", 1)[0]
-        for metadata_match in _VERSION_METADATA_RE.finditer(preamble):
+        for _, metadata_match in _version_header_metadata(preamble):
             metadata = metadata or self._metadata_for_version(metadata_match.group(1), version)
         header = next(
             (match for line in text.splitlines() if (match := TOPIC_HEADER_RE.fullmatch(line))),

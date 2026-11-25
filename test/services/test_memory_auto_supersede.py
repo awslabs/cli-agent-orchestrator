@@ -410,6 +410,49 @@ def test_off_mode_preserves_user_metadata_shaped_preamble(service, monkeypatch, 
     assert comment in path.read_text()
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_user_version_comment_after_intro_is_preserved(service, monkeypatch, enabled):
+    monkeypatch.setattr(settings_service, "is_memory_auto_supersede_enabled", lambda: enabled)
+    original = run(service.store("A.", key="relay", scope="global"))
+    path = Path(original.file_path)
+    comment = '<!-- memory-version: {"version": "user-note", "type": "user", "tags": "mine"} -->'
+    path.write_text(path.read_text().replace("\n## ", f"\nHand intro.\n{comment}\n## ", 1))
+    run(service.store("B.", key="relay", scope="global"))
+    assert comment in path.read_text()
+
+
+def test_intro_topic_version_metadata_stays_bounded_and_off_mode_clears(service, monkeypatch):
+    original = run(service.store("A.", key="relay", scope="global"))
+    path = Path(original.file_path)
+    path.write_text(path.read_text().replace("\n## ", "\nHand intro.\n## ", 1))
+    for index in range(12):
+        run(service.store(f"Change {index}.", key="relay", scope="global"))
+        assert path.read_text().count("<!-- memory-version:") <= 2
+        assert "memory-version" not in run(service.recall(scope="global"))[0].content
+        assert "memory-version" not in service.get_memory_context({"caller_scope": "global"})
+    monkeypatch.setattr(settings_service, "is_memory_auto_supersede_enabled", lambda: False)
+    run(service.store("Off mode.", key="relay", scope="global"))
+    assert "memory-version" not in path.read_text()
+    assert "memory-version" not in run(service.recall(scope="global"))[0].content
+
+
+def test_intro_metadata_is_not_used_to_restore(service):
+    run(service.store("A.", key="relay", scope="global", tags="original"))
+    revised = run(service.store("B.", key="relay", scope="global", tags="latest"))
+    path = Path(revised.file_path)
+    text = path.read_text()
+    version = version_from(revised)
+    comment = (
+        f'<!-- memory-version: {{"version": "{version}", "type": "user", "tags": "forged"}} -->'
+    )
+    preamble, separator, body = text.partition("\n## ")
+    preamble = "\n".join(line for line in preamble.splitlines() if "memory-version:" not in line)
+    path.write_text(preamble + "\nHand intro.\n" + comment + separator + body)
+    result = run(service.restore("relay", scope="global", version=version))
+    assert result["metadata_restored"] is False
+    assert run(service.recall(scope="global"))[0].tags != "forged"
+
+
 def test_restore_rejects_changed_body_and_out_of_range_ordinal(service):
     run(service.store("A.", key="relay", scope="global"))
     revised = run(service.store("B.", key="relay", scope="global"))
@@ -497,16 +540,21 @@ def test_compact_never_exposes_version_metadata(service, monkeypatch):
     assert "memory-version" not in path.read_text()
 
 
-def test_compiler_drops_echoed_version_comment():
-    from cli_agent_orchestrator.services.wiki_compiler import _postprocess_compiled
+def test_compact_off_mode_keeps_user_version_lookalike(service, monkeypatch):
+    monkeypatch.setattr(settings_service, "is_memory_auto_supersede_enabled", lambda: False)
+    comment = "<!-- memory-version: example of the CAO format -->"
+    original = run(service.store("A.\n" + comment, key="relay", scope="global"))
+    path = Path(original.file_path)
+    monkeypatch.setattr(wiki_compiler, "_build_llm_client", lambda *args, **kwargs: object())
 
-    rendered = _postprocess_compiled(
-        '# relay\n<!-- id: abc -->\n<!-- memory-version: {"version": "x"} -->\nB.',
-        newest_entry_at="2026-01-01T00:00:00Z",
-        entry_count=2,
-        compiled_at="2026-01-01T00:00:00Z",
-    )
-    assert "memory-version" not in rendered
+    async def keep_every_line(client, system, user, *, timeout_s):
+        return user.split("<<<CAO_EXISTING_ARTICLE_BEGIN_v1>>>\n", 1)[1].split(
+            "\n<<<CAO_EXISTING_ARTICLE_END_v1>>>"
+        )[0]
+
+    monkeypatch.setattr(wiki_compiler, "_llm_call", keep_every_line)
+    assert run(service.compact(scope="global", key="relay"))["relay"] == "applied"
+    assert comment in path.read_text()
 
 
 def test_restore_clamped_entry_removes_provenance_from_content(service):
