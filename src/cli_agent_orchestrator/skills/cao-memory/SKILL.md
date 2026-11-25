@@ -13,7 +13,8 @@ available to a brand-new agent in a later session — even on a different provid
 the user never has to repeat themselves.
 
 These are CAO's cross-provider memory tools (`memory_store`, `memory_recall`,
-`memory_related`, `memory_restore`, `memory_forget`), exposed by the CAO MCP server.
+`memory_related`, `memory_forget`), exposed by the CAO MCP server.
+`memory_restore` is exposed only when `memory.supersede.auto` is on at server startup.
 They are **distinct from any provider-native memory** the CLI tool may have.
 
 ## Scopes and types

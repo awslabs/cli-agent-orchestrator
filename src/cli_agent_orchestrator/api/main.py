@@ -11373,18 +11373,21 @@ def _get_memory_service():
 
 def _memory_partial_write_response(error: Any) -> JSONResponse:
     """Preserve the typed partial-write contract across the HTTP boundary."""
+    partial_write = {
+        "key": error.key,
+        "scope": error.scope,
+        "scope_id": error.scope_id,
+        "file_path": error.file_path,
+        "completed_phases": error.completed_phases,
+        "repair_command": error.repair_command,
+    }
+    if error.superseded:
+        partial_write["superseded"] = [item.model_dump(mode="json") for item in error.superseded]
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
             "error_kind": error.error_kind,
-            "partial_write": {
-                "key": error.key,
-                "scope": error.scope,
-                "scope_id": error.scope_id,
-                "file_path": error.file_path,
-                "completed_phases": error.completed_phases,
-                "repair_command": error.repair_command,
-            },
+            "partial_write": partial_write,
         },
     )
 
@@ -12114,10 +12117,7 @@ async def clear_memories_endpoint(
     svc = _get_memory_service()
     try:
         memories = await svc.recall(
-            scope=scope.value,
-            limit=1000,
-            scan_all=True,
-            search_mode="metadata",
+            scope=scope.value, limit=1000, scan_all=True, search_mode="metadata"
         )
     except Exception as e:
         raise HTTPException(

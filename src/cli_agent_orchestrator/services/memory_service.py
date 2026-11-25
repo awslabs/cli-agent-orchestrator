@@ -83,6 +83,7 @@ _LEGACY_ENTRY_TIMESTAMP_RE = re.compile(r"## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2
 _COMPILED_MARKER_RE = re.compile(
     r"^<!-- cao-compiled: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z entries=\d+ -->$"
 )
+_VERSION_METADATA_RE = re.compile(r"^<!-- memory-version: (\{[^\n]*\}) -->\n?", re.MULTILINE)
 
 # #861: cap hybrid score/usage widening at 200 per source, never below the requested limit.
 HYBRID_CANDIDATE_MIN = 50
@@ -195,6 +196,7 @@ class MemoryPartialWriteError(RuntimeError):
         self.scope = scope
         self.scope_id = scope_id
         self.file_path = file_path
+        self.superseded: list[SupersededMemory] = []
         self.completed_phases = ["wiki", "index"]
         super().__init__(
             "Memory content and index were saved, but SQLite metadata could not be updated. "
@@ -1147,17 +1149,48 @@ class MemoryService:
                 compile_mode_available = True
             except Exception:
                 pass
+            if is_update and not is_memory_auto_supersede_enabled():
+                preamble_end = new_content.find("\n## ")
+                if preamble_end != -1:
+                    new_content = (
+                        _VERSION_METADATA_RE.sub("", new_content[:preamble_end])
+                        + new_content[preamble_end:]
+                    )
             if (
                 is_update
                 and old_header is not None
                 and compile_mode == "append"
                 and is_memory_auto_supersede_enabled()
+                and not any(
+                    _COMPILED_MARKER_RE.fullmatch(line) for line in existing_content.splitlines()
+                )
             ):
                 old_sections = self._topic_sections(existing_content)
                 if old_sections:
-                    old_version = f"{old_sections[-1][0]}#{len(old_sections) - 1}"
+                    old_version = self._section_version(
+                        old_sections, len(old_sections) - 1, memory_id
+                    )
                     import json
 
+                    preamble = existing_content.split("\n## ", 1)[0]
+                    retained = []
+                    if not self._latest_version_replaced(new_content):
+                        prior_index = len(old_sections) - 2
+                        while prior_index >= 0 and (
+                            self._strip_existing_see_also(old_sections[prior_index][1]).strip()
+                            == self._strip_existing_see_also(old_sections[-1][1]).strip()
+                        ):
+                            prior_index -= 1
+                        retained = [
+                            match.group(0).strip()
+                            for match in _VERSION_METADATA_RE.finditer(preamble)
+                            if prior_index >= 0
+                            and self._metadata_for_version(
+                                match.group(1),
+                                self._section_version(old_sections, prior_index, memory_id),
+                            )
+                            is not None
+                        ]
                     metadata = json.dumps(
                         {
                             "version": old_version,
@@ -1166,8 +1199,13 @@ class MemoryService:
                         },
                         ensure_ascii=True,
                     )
-                    marker = f"<!-- memory-version: {metadata} -->\n"
-                    new_content = new_content.replace("\n## ", f"\n{marker}## ", 1)
+                    preamble_end = new_content.find("\n## ")
+                    if preamble_end != -1:
+                        clean_preamble = _VERSION_METADATA_RE.sub("", new_content[:preamble_end])
+                        marker = "\n".join([*retained, f"<!-- memory-version: {metadata} -->"])
+                        new_content = (
+                            clean_preamble.rstrip() + "\n" + marker + new_content[preamble_end:]
+                        )
             entry_body = appended.entry_body
             timestamp = appended.section_at.strftime("%Y-%m-%dT%H:%M:%SZ")
             timestamp_clamped = appended.timestamp_clamped
@@ -1197,7 +1235,9 @@ class MemoryService:
             os.replace(str(tmp_path), str(wiki_path))
             replaced_version = is_update and self._latest_version_replaced(new_content)
             sections = self._topic_sections(new_content) if replaced_version else []
-            replaced_at = f"{sections[-2][0]}#{len(sections) - 2}" if sections else None
+            replaced_at = (
+                self._section_version(sections, len(sections) - 2, memory_id) if sections else None
+            )
             superseded = (
                 await self._auto_supersede(key, scope, scope_id, replaced_at, compile_mode)
                 if auto_supersede
@@ -1271,12 +1311,14 @@ class MemoryService:
                     scope,
                     scope_id,
                 )
-                raise MemoryPartialWriteError(
+                partial_error = MemoryPartialWriteError(
                     key=key,
                     scope=scope,
                     scope_id=scope_id,
                     file_path=str(wiki_path),
-                ) from e
+                )
+                partial_error.superseded = superseded
+                raise partial_error from e
             try:
                 self._sync_content_link_edges(key, scope, scope_id, new_content)
             except Exception:  # noqa: BLE001 — derived edges are repairable
@@ -1321,15 +1363,6 @@ class MemoryService:
     # Automatic supersede with undo (#1335 change 5)
     # -------------------------------------------------------------------------
 
-    def _relationship_service(self) -> Any:
-        """The relationship store on this service's database."""
-        from cli_agent_orchestrator.clients import database
-        from cli_agent_orchestrator.services.memory_relationship_service import (
-            MemoryRelationshipService,
-        )
-
-        return MemoryRelationshipService(self._db_session_factory or database.SessionLocal)
-
     def _topic_sections(self, text: str) -> list[tuple[str, str]]:
         """Raw ``(timestamp, body)`` per entry heading, in file order."""
         from cli_agent_orchestrator.services.settings_service import is_memory_parser_lenient
@@ -1343,6 +1376,28 @@ class MemoryService:
             body = text[match.end() : end].strip()
             sections.append((match.group(1), body))
         return sections
+
+    @staticmethod
+    def _section_version(sections: list[tuple[str, str]], index: int, note_id: str) -> str:
+        stamp, body = sections[index]
+        return f"{stamp}#{index}:{hashlib.sha256(f'{note_id}:{body}'.encode()).hexdigest()[:12]}"
+
+    @staticmethod
+    def _metadata_for_version(raw: str, version: str) -> Optional[dict[str, str]]:
+        import json
+
+        try:
+            candidate = json.loads(raw)
+        except ValueError:
+            return None
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("version") == version
+            and candidate.get("type") in {"user", "feedback", "project", "reference"}
+            and isinstance(candidate.get("tags"), str)
+        ):
+            return candidate
+        return None
 
     def _latest_version_replaced(self, text: str) -> bool:
         """True when the newest entry hides a different previous entry from recall."""
@@ -1440,6 +1495,14 @@ class MemoryService:
                 "error_kind": "disabled",
                 "error": "automatic supersede is off",
             }
+        from cli_agent_orchestrator.services.settings_service import get_compile_mode
+
+        if get_compile_mode() != "append":
+            return {
+                "success": False,
+                "error_kind": "llm_mode",
+                "error": "restore requires append mode",
+            }
         MemoryScope(scope)
         from cli_agent_orchestrator.services.memory_scoring import scope_write_allowed
 
@@ -1480,52 +1543,54 @@ class MemoryService:
 
         text = wiki_path.read_text(encoding="utf-8")
         sections = self._topic_sections(text)
-        if version is not None:
-            stamp, separator, ordinal = version.partition("#")
-            if (
-                not separator
-                or not ordinal.isdecimal()
-                or int(ordinal) >= len(sections)
-                or sections[int(ordinal)][0] != stamp
-            ):
-                return {
-                    "success": False,
-                    "error_kind": "version_not_found",
-                    "error": f"version not found: {version}",
-                }
-            index = int(ordinal)
-            restored_body = re.sub(
-                r"^_Originally recorded: [^\n]+_\n?", "", sections[index][1]
-            ).strip()
-            if index < len(sections) - 1 and sections[-1][1] == restored_body:
-                return {
-                    "success": True,
-                    "key": canonical,
-                    "scope": scope,
-                    "restored": "already_restored",
-                    "restored_from": version,
-                }
-            if index != len(sections) - 2:
-                return {
-                    "success": False,
-                    "error_kind": "stale_version",
-                    "error": f"version is not the immediately previous entry: {version}",
-                }
-        if not self._latest_version_replaced(text):
+        id_match = re.search(r"<!-- id: ([a-f0-9\-]+)", text)
+        ordinal = version.partition("#")[2].partition(":")[0]
+        if (
+            id_match is None
+            or not ordinal.isdecimal()
+            or int(ordinal) >= len(sections)
+            or self._section_version(sections, int(ordinal), id_match.group(1)) != version
+        ):
+            return {
+                "success": False,
+                "error_kind": "version_not_found",
+                "error": f"version not found: {version}",
+            }
+        index = int(ordinal)
+        restored_body = re.sub(r"^_Originally recorded: [^\n]+_\n?", "", sections[index][1]).strip()
+        if index < len(sections) - 1 and sections[-1][1] == restored_body:
+            return {
+                "success": True,
+                "key": canonical,
+                "scope": scope,
+                "restored": "already_restored",
+                "restored_from": version,
+            }
+        if index >= len(sections) - 1 or any(
+            self._strip_existing_see_also(body).strip()
+            != self._strip_existing_see_also(sections[index + 1][1]).strip()
+            for _, body in sections[index + 1 :]
+        ):
+            return {
+                "success": False,
+                "error_kind": "stale_version",
+                "error": f"version is not the immediately previous entry: {version}",
+            }
+        if any(_COMPILED_MARKER_RE.fullmatch(line) for line in text.splitlines()) or (
+            self._strip_existing_see_also(sections[index][1]).strip()
+            == self._strip_existing_see_also(sections[index + 1][1]).strip()
+        ):
             return {
                 "success": False,
                 "error_kind": "nothing_to_restore",
                 "error": f"memory has no superseded version to restore: {canonical}",
             }
-        restored_from, previous = sections[-2]
+        restored_from, previous = sections[index]
         previous = re.sub(r"^_Originally recorded: [^\n]+_\n?", "", previous).strip()
-        import json
-
         metadata = None
-        for metadata_match in re.finditer(r"<!-- memory-version: (\{[^\n]*\}) -->", text):
-            candidate = json.loads(metadata_match.group(1))
-            if isinstance(candidate, dict) and candidate.get("version") == version:
-                metadata = candidate
+        preamble = text.split("\n## ", 1)[0]
+        for metadata_match in _VERSION_METADATA_RE.finditer(preamble):
+            metadata = metadata or self._metadata_for_version(metadata_match.group(1), version)
         header = next(
             (match for line in text.splitlines() if (match := TOPIC_HEADER_RE.fullmatch(line))),
             None,
@@ -1547,7 +1612,7 @@ class MemoryService:
             )
         except MemoryRestoreConflict:
             current = self._topic_sections(wiki_path.read_text(encoding="utf-8"))
-            if version is not None and current and current[-1][1] == previous:
+            if current and current[-1][1] == previous:
                 return {
                     "success": True,
                     "key": canonical,
@@ -1584,8 +1649,11 @@ class MemoryService:
             "scope": scope,
             "restored": "previous_version",
             "restored_from": version or restored_from,
+            "metadata_restored": metadata is not None,
             "reverse_undo": self._undo_hint(
-                canonical, scope, f"{sections[-1][0]}#{len(sections) - 1}"
+                canonical,
+                scope,
+                self._section_version(sections, len(sections) - 1, id_match.group(1)),
             ),
         }
 
@@ -3308,7 +3376,6 @@ class MemoryService:
                 )
             )
         eligibility_kwargs: dict[str, Any] = {"eligibility": check} if check is not None else {}
-        pool_kwargs = eligibility_kwargs
 
         if search_mode == "bm25" and not query:
             return []
@@ -3323,7 +3390,7 @@ class MemoryService:
             search_mode,
             sort_by,
             recall_policy,
-            **pool_kwargs,
+            **eligibility_kwargs,
         )
         superseded_snapshot = None
         target_plan = None
@@ -3367,7 +3434,7 @@ class MemoryService:
                 lifecycle_on=lifecycle_on,
                 superseded_snapshot=superseded_snapshot,
             )
-            results = self._finish_recall(
+            return self._finish_recall(
                 ordered,
                 scope,
                 limit,
@@ -3380,19 +3447,17 @@ class MemoryService:
                 superseded_snapshot=superseded_snapshot,
                 target_plan=target_plan,
             )
-        else:
-            results = self._apply_sort_and_increment(
-                pool.rows,
-                scope,
-                pool.effective_sort,
-                limit,
-                include_related=include_related,
-                query=query,
-                terminal_context=terminal_context,
-                scan_all=scan_all,
-                policy=recall_policy,
-            )
-        return results
+        return self._apply_sort_and_increment(
+            pool.rows,
+            scope,
+            pool.effective_sort,
+            limit,
+            include_related=include_related,
+            query=query,
+            terminal_context=terminal_context,
+            scan_all=scan_all,
+            policy=recall_policy,
+        )
 
     async def related(
         self,

@@ -228,8 +228,7 @@ memory_recall(
   limit=10,                # optional, default 10, max 100
   search_mode=None,        # optional: "hybrid" (default), "bm25", "metadata"
   sort_by=None,            # optional: "recency" (default), "score", "usage", "relevance"
-  include_related=False,   # optional, expand cross-referenced memories
-  include_superseded=False # optional, also list notes CAO superseded automatically
+  include_related=False    # optional, expand cross-referenced memories
 )
 ```
 
@@ -323,17 +322,20 @@ Undo an automatic supersede that a `memory_store` result reported.
 memory_restore(
   key="bridge-schedule",
   scope="project",          # optional, default: "project"
-  version="2026-11-25T08:00:00Z#0"  # exact hint from the store result
+  version="2026-11-25T08:00:00Z#0:<digest>"  # exact hint from the store result
 )
 ```
 
 The requested previous entry is appended under the same key with authored links
-intact. The version hint includes a timestamp and entry ordinal, so same-second
-writes remain distinct. Repeating the request returns `already_restored` without
-another write; a later replacement makes an old hint return `stale_version`.
-Restore also reinstates the previous entry's type and tags, and returns a
+intact. The version hint includes a timestamp, entry ordinal and digest of the
+topic ID and entry content,
+so hints cannot be used for another note. Unchanged repeated writes do not invalidate
+an earlier hint. Repeating the request returns `already_restored` without another
+write; a later different replacement makes an old hint return `stale_version`.
+Restore reinstates previous type and tags when their version metadata is present;
+otherwise it uses the current values and returns `metadata_restored: false`. It returns a
 `reverse_undo` hint for reversing the restoration. Per-version type and tags
-are recorded in topic-file metadata comments while automatic supersede is on.
+are recorded in bounded topic-file metadata comments while automatic supersede is on.
 An absent key returns `not_found`. The caller needs the same write access as
 `memory_store`; vault-mapped keys cannot be restored this way.
 
@@ -356,7 +358,8 @@ content.
 `memory.supersede.auto` defaults to `false`. Set it to `true` to report same-key
 replacements in append mode. Env override: `CAO_MEMORY_SUPERSEDE_AUTO`.
 Off produces no supersede audit lines; `memory_restore` is unavailable as an
-MCP tool and the internal restore route refuses requests while off.
+MCP tool and the internal restore route refuses requests while off. Registration
+is read at MCP server startup; restart the server after enabling the setting.
 The setting doesn't change the opt-in
 `memory.lifecycle.enabled` rules below, which apply to every active `supersedes`
 edge.
@@ -652,7 +655,8 @@ shift. A later memory-v2 phase adds BM25 as the default ranking mode.
 Memories are linked by typed, provenance-tagged edges (`relates_to`,
 `contradiction`, `supersedes`) held in a durable store rather than inferred at
 read time. Each edge records its `origin` — `compiler`, `wiki_lint`, `human`,
-`legacy_related_keys`, `external_import`, `vault`, or `content_link` — and a `status`.
+`legacy_related_keys`, `external_import`, `vault`, or `content_link` — and a
+`status`.
 
 With `memory.relationships.content_links=true` (opt-in), native topic content
 is also a relationship producer. On store and repair, same-scope

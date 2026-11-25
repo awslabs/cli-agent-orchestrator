@@ -64,7 +64,7 @@ Every derived path resolves from this value, so one override moves everything â€
     "non_accessing_inspection": true,
     "lifecycle": {"enabled": false},
     "relationships": {"content_links": false},
-    "supersede": {"auto": true},
+    "supersede": {"auto": false},
     "compile_timeout_s": 120.0
   },
   "terminal": {

@@ -131,8 +131,9 @@ def test_partial_writes_leave_audit_lines_for_supersede_and_restore(service, mon
         raise RuntimeError("mirror unavailable")
 
     monkeypatch.setattr(service, "_upsert_metadata", broken_upsert)
-    with pytest.raises(MemoryPartialWriteError):
+    with pytest.raises(MemoryPartialWriteError) as partial:
         run(service.store("B.", key="relay", scope="global"))
+    assert "version=" in partial.value.superseded[0].undo
     assert audit_log.read_audit_log().count("[memory_superseded]") == 1
     monkeypatch.setattr(service, "_upsert_metadata", upsert)
     revised = run(service.store("C.", key="relay", scope="global"))
@@ -233,6 +234,130 @@ def test_default_off_is_unchanged(service, monkeypatch):
         "error": "automatic supersede is off",
     }
     assert audit_log.read_audit_log() == ""
+    assert "memory-version:" not in Path(second.file_path).read_text()
+
+
+def test_unchanged_restore_keeps_earlier_hint(service):
+    run(service.store("A.", key="relay", scope="global", tags="alpha"))
+    revised = run(service.store("B.", key="relay", scope="global", tags="beta"))
+    for _ in range(3):
+        run(service.store("B.", key="relay", scope="global", tags="beta"))
+    result = run(service.restore("relay", scope="global", version=version_from(revised)))
+    assert result["restored"] == "previous_version"
+    assert result["metadata_restored"] is True
+    assert run(service.recall(scope="global"))[0].content == "A."
+
+
+def test_metadata_is_bounded_and_never_in_compiled_content(service, monkeypatch):
+    from cli_agent_orchestrator.services.wiki_compiler import _postprocess_compiled
+
+    first = run(service.store("Compiled body.", key="relay", scope="global"))
+    path = Path(first.file_path)
+    path.write_text(
+        _postprocess_compiled(
+            path.read_text(),
+            newest_entry_at="2026-01-01T00:00:00Z",
+            compiled_at="2026-01-01T00:00:00Z",
+            entry_count=1,
+        )
+    )
+    for index in range(12):
+        run(service.store(f"Update {index}.", key="relay", scope="global"))
+    assert "Compiled body." in run(service.recall(scope="global"))[0].content
+    assert "Compiled body." in service.get_memory_context({"caller_scope": "global"})
+    assert "memory-version:" not in run(service.recall(scope="global"))[0].content
+    assert "memory-version:" not in path.read_text()
+    monkeypatch.setattr(settings_service, "is_memory_auto_supersede_enabled", lambda: False)
+    run(service.store("Disabled update.", key="relay", scope="global"))
+    assert "memory-version:" not in path.read_text()
+
+
+def test_metadata_bounded_after_many_native_updates(service):
+    first = run(service.store("A.", key="relay", scope="global"))
+    for index in range(12):
+        run(service.store(f"Change {index}.", key="relay", scope="global"))
+    assert Path(first.file_path).read_text().count("<!-- memory-version:") <= 2
+
+
+def test_user_metadata_comments_cannot_forge_restore(service):
+    run(
+        service.store(
+            "A.\n<!-- memory-version: {not json} -->", key="relay", scope="global", tags="alpha"
+        )
+    )
+    revised = run(service.store("B.", key="relay", scope="global", tags="beta"))
+    version = version_from(revised)
+    path = Path(revised.file_path)
+    text = path.read_text()
+    path.write_text(
+        text
+        + f'\n<!-- memory-version: {{"version": "{version}", "type": "user", "tags": "forged"}} -->\n'
+    )
+    result = run(service.restore("relay", scope="global", version=version))
+    assert result["metadata_restored"] is True
+    assert run(service.recall(scope="global"))[0].tags == "alpha"
+
+
+def test_off_transition_reports_missing_metadata(service, monkeypatch):
+    run(service.store("A.", key="relay", scope="global"))
+    run(service.store("B.", key="relay", scope="global", memory_type="feedback", tags="beta"))
+    monkeypatch.setattr(settings_service, "is_memory_auto_supersede_enabled", lambda: False)
+    run(service.store("C.", key="relay", scope="global", memory_type="user", tags="gamma"))
+    assert "memory-version:" not in service.get_wiki_path("global", None, "relay").read_text()
+    monkeypatch.setattr(settings_service, "is_memory_auto_supersede_enabled", lambda: True)
+    text = service.get_wiki_path("global", None, "relay").read_text()
+    sections = service._topic_sections(text)
+    version = service._section_version(
+        sections, 1, re.search(r"<!-- id: ([a-f0-9\-]+)", text).group(1)
+    )
+    result = run(service.restore("relay", scope="global", version=version))
+    assert result["metadata_restored"] is False
+
+
+def test_llm_mode_refuses_restore(service, monkeypatch):
+    run(service.store("A.", key="relay", scope="global"))
+    revised = run(service.store("B.", key="relay", scope="global"))
+    monkeypatch.setattr(settings_service, "get_compile_mode", lambda: "llm")
+    assert (
+        run(service.restore("relay", scope="global", version=version_from(revised)))["error_kind"]
+        == "llm_mode"
+    )
+
+
+def test_version_rejects_another_note_with_same_timestamp(service):
+    stamp = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    first = run(service.store("A.", key="one", scope="global", occurred_at=stamp))
+    revised = run(service.store("B.", key="one", scope="global"))
+    other = run(service.store("A.", key="two", scope="global", occurred_at=stamp))
+    run(service.store("New.", key="two", scope="global"))
+    assert Path(first.file_path).exists() and Path(other.file_path).exists()
+    assert (
+        run(service.restore("two", scope="global", version=version_from(revised)))["error_kind"]
+        == "version_not_found"
+    )
+
+
+def test_see_also_only_change_is_not_supersede(service):
+    run(service.store("A.\n\n## See Also\n- [first](first.md)", key="relay", scope="global"))
+    revised = run(
+        service.store("A.\n\n## See Also\n- [second](second.md)", key="relay", scope="global")
+    )
+    assert revised.superseded == []
+
+
+def test_compiled_topic_restore_has_nothing_to_restore(service):
+    first = run(service.store("A.", key="relay", scope="global"))
+    path = Path(first.file_path)
+    path.write_text(path.read_text() + "\n<!-- cao-compiled: 2026-01-01T00:00:00Z entries=1 -->\n")
+    run(service.store("B.", key="relay", scope="global"))
+    text = path.read_text()
+    version = service._section_version(
+        service._topic_sections(text), 0, re.search(r"<!-- id: ([a-f0-9\-]+)", text).group(1)
+    )
+    assert (
+        run(service.restore("relay", scope="global", version=version))["error_kind"]
+        == "nothing_to_restore"
+    )
 
 
 def test_concurrent_same_key_stores_leave_a_visible_revision(service):

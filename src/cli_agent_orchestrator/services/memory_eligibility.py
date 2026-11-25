@@ -24,7 +24,7 @@ from typing import (
 
 logger = logging.getLogger(__name__)
 _TOKEN = re.compile(r"[a-z][a-z0-9_.-]{0,63}\Z")
-EligibilityPurpose = Literal["injected_context", "curated_recall", "explicit_recall"]
+EligibilityPurpose = Literal["injected_context", "curated_recall"]
 T = TypeVar("T")
 
 

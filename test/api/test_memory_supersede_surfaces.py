@@ -1,7 +1,10 @@
 """MCP and remote restore carry the exact version from the store hint."""
 
 import asyncio
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,6 +24,44 @@ def run(coroutine):
 def tool(name):
     candidate = getattr(server, name)
     return getattr(candidate, "fn", candidate)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_restore_registration_uses_startup_setting(enabled):
+    environment = os.environ.copy()
+    environment["CAO_MEMORY_SUPERSEDE_AUTO"] = "1" if enabled else "0"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import asyncio; from cli_agent_orchestrator.mcp_server import server; print('memory_restore' in {tool.name for tool in asyncio.run(server.mcp._list_tools())})",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    assert result.stdout.strip() == str(enabled)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_restore_registration_uses_startup_setting(enabled):
+    environment = os.environ.copy()
+    environment["CAO_MEMORY_SUPERSEDE_AUTO"] = "1" if enabled else "0"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import asyncio; from cli_agent_orchestrator.mcp_server import server; print('memory_restore' in {tool.name for tool in asyncio.run(server.mcp._list_tools())})",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    assert result.stdout.strip() == str(enabled)
 
 
 @pytest.fixture
@@ -48,6 +89,26 @@ def test_mcp_restore_idempotent(service):
         run(tool("memory_restore")(key="relay", scope="global", version=version))["restored"]
         == "already_restored"
     )
+
+
+def test_partial_store_exposes_restore_hint_on_mcp_and_http(service, client, monkeypatch):
+    run(service.store("A.", key="relay", scope="global"))
+
+    def broken_upsert(**kwargs):
+        raise RuntimeError("mirror unavailable")
+
+    monkeypatch.setattr(MemoryService, "_upsert_metadata", broken_upsert)
+    mcp_result = run(
+        tool("memory_store")(
+            content="B.", key="relay", scope="global", memory_type="project", tags=None
+        )
+    )
+    assert "version=" in mcp_result["partial_write"]["superseded"][0]["undo"]
+    with patch("cli_agent_orchestrator.api.main._get_memory_service", return_value=service):
+        response = client.post(
+            "/internal/memory/store", json={"content": "C.", "key": "relay", "scope": "global"}
+        )
+    assert "version=" in response.json()["partial_write"]["superseded"][0]["undo"]
 
 
 def test_gateway_forwards_version(service, client, monkeypatch):
@@ -118,7 +179,6 @@ def test_default_off_operator_list_has_main_wire_shape(service, client, monkeypa
 def test_off_surface_hides_restore_and_matches_recall_schema(service, monkeypatch):
     monkeypatch.setattr(settings_service, "is_memory_auto_supersede_enabled", lambda: False)
     listed = {item.name: item for item in run(server.mcp._list_tools())}
-    assert "memory_restore" not in listed
     schema = listed["memory_recall"].to_mcp_tool(name="memory_recall").input_schema
     optional_text = {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None}
     assert schema == {
@@ -168,7 +228,14 @@ def test_off_operator_list_with_lifecycle_edge_has_no_added_fields(service, clie
     monkeypatch.setattr(settings_service, "is_memory_lifecycle_enabled", lambda: True)
     run(service.store("Old.", key="old", scope="global"))
     run(service.store("New.", key="new", scope="global"))
-    service._relationship_service().create("global", None, "new", "old", "supersedes", "human")
+    from cli_agent_orchestrator.clients.database import SessionLocal
+    from cli_agent_orchestrator.services.memory_relationship_service import (
+        MemoryRelationshipService,
+    )
+
+    MemoryRelationshipService(service._db_session_factory or SessionLocal).create(
+        "global", None, "new", "old", "supersedes", "human"
+    )
     with patch("cli_agent_orchestrator.api.main._get_memory_service", return_value=service):
         response = client.get("/memory", params={"scope": "global"})
     assert response.status_code == 200

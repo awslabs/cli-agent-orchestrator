@@ -2046,18 +2046,21 @@ async def memory_store(
             result["superseded"] = [item.model_dump(mode="json") for item in memory.superseded]
         return result
     except MemoryPartialWriteError as e:
+        partial_write: Dict[str, Any] = {
+            "key": e.key,
+            "scope": e.scope,
+            "scope_id": e.scope_id,
+            "file_path": e.file_path,
+            "completed_phases": e.completed_phases,
+            "repair_command": e.repair_command,
+        }
+        if e.superseded:
+            partial_write["superseded"] = [item.model_dump(mode="json") for item in e.superseded]
         return {
             "success": False,
             "error_kind": e.error_kind,
             "error": str(e),
-            "partial_write": {
-                "key": e.key,
-                "scope": e.scope,
-                "scope_id": e.scope_id,
-                "file_path": e.file_path,
-                "completed_phases": e.completed_phases,
-                "repair_command": e.repair_command,
-            },
+            "partial_write": partial_write,
         }
     except MemoryDisabledError as e:
         return {"success": False, "disabled": True, "error": str(e)}

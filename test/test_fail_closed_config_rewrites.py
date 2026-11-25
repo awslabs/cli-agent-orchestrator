@@ -35,6 +35,18 @@ PACKAGE = Path(__file__).resolve().parents[1] / "src" / "cli_agent_orchestrator"
 # A write path whose pre-image may be a lenient load, with the reason it is allowed.
 # Keys are "<path relative to src/>::<qualified function name>".
 ALLOWLIST: Dict[str, str] = {
+    "cli_agent_orchestrator/services/memory_service.py::MemoryService.store": (
+        "FALSE POSITIVE: _metadata_for_version parses an optional in-memory metadata "
+        "comment, not a file or JSON pre-image. A malformed comment is ignored; "
+        "store writes the original topic's body and bounded trusted metadata. "
+        "Pinned by test_user_metadata_comments_cannot_forge_restore."
+    ),
+    "cli_agent_orchestrator/services/memory_service.py::MemoryService.restore": (
+        "FALSE POSITIVE: _metadata_for_version parses an optional comment from "
+        "the topic preamble, not a JSON file. When absent or invalid, restore "
+        "uses the current type/tags and explicitly returns metadata_restored: false. "
+        "Pinned by test_off_transition_reports_missing_metadata."
+    ),
     "cli_agent_orchestrator/services/config_service.py::_load_raw": (
         "The legacy config.json migration is a write on a read path. It is "
         "suppressed when the settings.json read actually failed (#737); only an "
