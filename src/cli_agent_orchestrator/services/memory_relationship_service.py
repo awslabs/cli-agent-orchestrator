@@ -1280,12 +1280,7 @@ class MemoryRelationshipService:
             )
         return hit is not None
 
-    def superseded_targets(
-        self,
-        scope: str,
-        scope_id: Optional[str],
-        keys: List[str],
-    ) -> set:
+    def superseded_targets(self, scope: str, scope_id: Optional[str], keys: List[str]) -> set:
         """BATCH form of is_superseded (FR-4.6): given many candidate keys in one
         (scope, scope_id), return the subset that are the TARGET of an ACTIVE
         supersedes edge — in ONE query (avoids the N-query loop in a large recall
@@ -1295,14 +1290,17 @@ class MemoryRelationshipService:
         sentinel = self._to_sentinel(scope_id)
         sanitized = {self._sanitize_key(k): k for k in keys}
         with self._session_factory() as db:
-            q = db.query(MemoryRelationshipModel.target_key).filter(
-                MemoryRelationshipModel.scope == scope,
-                MemoryRelationshipModel.scope_id == sentinel,
-                MemoryRelationshipModel.type == "supersedes",
-                MemoryRelationshipModel.status == "active",
-                MemoryRelationshipModel.target_key.in_(list(sanitized.keys())),
+            rows = (
+                db.query(MemoryRelationshipModel.target_key)
+                .filter(
+                    MemoryRelationshipModel.scope == scope,
+                    MemoryRelationshipModel.scope_id == sentinel,
+                    MemoryRelationshipModel.type == "supersedes",
+                    MemoryRelationshipModel.status == "active",
+                    MemoryRelationshipModel.target_key.in_(list(sanitized.keys())),
+                )
+                .all()
             )
-            rows = q.all()
         # Map sanitized targets back to the caller's original key strings.
         return {sanitized[r[0]] for r in rows if r[0] in sanitized}
 

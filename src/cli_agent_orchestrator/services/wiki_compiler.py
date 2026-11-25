@@ -274,6 +274,8 @@ def _postprocess_compiled(
     for line in compiled.splitlines():
         if _COMPILED_MARKER_RE.fullmatch(line):
             continue
+        if line.startswith("<!-- memory-version: ") and line.endswith(" -->"):
+            continue
         lines.append(_TIMESTAMP_TOKEN_RE.sub(r"### Entry\1", line))
 
     # The header block is the leading H1/id-comment pair (either order), with

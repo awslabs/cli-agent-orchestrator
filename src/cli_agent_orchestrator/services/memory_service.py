@@ -85,6 +85,46 @@ _COMPILED_MARKER_RE = re.compile(
 )
 _VERSION_METADATA_RE = re.compile(r"^<!-- memory-version: (\{[^\n]*\}) -->\n?", re.MULTILINE)
 
+
+def _strip_version_preamble(text: str) -> str:
+    """Remove CAO metadata only from the canonical header, not user-authored introductions."""
+    import json
+
+    preamble, separator, entries = text.partition("\n## ")
+    if not separator:
+        return text
+    lines = preamble.splitlines(keepends=True)
+    header_end = 0
+    for index, line in enumerate(lines):
+        if line.startswith("# ") or line.startswith("<!-- id: ") or not line.strip():
+            header_end = index + 1
+            continue
+        break
+    tail = lines[header_end:]
+    kept = lines[:header_end]
+    in_header = True
+    removed = False
+    for line in tail:
+        match = _VERSION_METADATA_RE.fullmatch(line) if in_header else None
+        if match:
+            try:
+                metadata = json.loads(match.group(1))
+            except ValueError:
+                metadata = None
+            if (
+                isinstance(metadata, dict)
+                and isinstance(metadata.get("version"), str)
+                and metadata.get("type") in {"user", "feedback", "project", "reference"}
+                and isinstance(metadata.get("tags"), str)
+            ):
+                removed = True
+                continue
+        if line.strip():
+            in_header = False
+        kept.append(line)
+    return "".join(kept) + separator + entries if removed else text
+
+
 # #861: cap hybrid score/usage widening at 200 per source, never below the requested limit.
 HYBRID_CANDIDATE_MIN = 50
 HYBRID_CANDIDATE_MULTIPLIER = 3
@@ -1150,12 +1190,7 @@ class MemoryService:
             except Exception:
                 pass
             if is_update and not is_memory_auto_supersede_enabled():
-                preamble_end = new_content.find("\n## ")
-                if preamble_end != -1:
-                    new_content = (
-                        _VERSION_METADATA_RE.sub("", new_content[:preamble_end])
-                        + new_content[preamble_end:]
-                    )
+                new_content = _strip_version_preamble(new_content)
             if (
                 is_update
                 and old_header is not None
@@ -1201,10 +1236,11 @@ class MemoryService:
                     )
                     preamble_end = new_content.find("\n## ")
                     if preamble_end != -1:
-                        clean_preamble = _VERSION_METADATA_RE.sub("", new_content[:preamble_end])
+                        clean_content = _strip_version_preamble(new_content)
+                        clean_preamble, _, clean_entries = clean_content.partition("\n## ")
                         marker = "\n".join([*retained, f"<!-- memory-version: {metadata} -->"])
                         new_content = (
-                            clean_preamble.rstrip() + "\n" + marker + new_content[preamble_end:]
+                            clean_preamble.rstrip() + "\n" + marker + "\n## " + clean_entries
                         )
             entry_body = appended.entry_body
             timestamp = appended.section_at.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1585,7 +1621,7 @@ class MemoryService:
                 "error_kind": "nothing_to_restore",
                 "error": f"memory has no superseded version to restore: {canonical}",
             }
-        restored_from, previous = sections[index]
+        _, previous = sections[index]
         previous = re.sub(r"^_Originally recorded: [^\n]+_\n?", "", previous).strip()
         metadata = None
         preamble = text.split("\n## ", 1)[0]
@@ -1648,7 +1684,7 @@ class MemoryService:
             "key": canonical,
             "scope": scope,
             "restored": "previous_version",
-            "restored_from": version or restored_from,
+            "restored_from": version,
             "metadata_restored": metadata is not None,
             "reverse_undo": self._undo_hint(
                 canonical,
@@ -2097,6 +2133,7 @@ class MemoryService:
             if content_links_enabled
             else pre_append_content
         )
+        model_existing = _strip_version_preamble(model_existing)
         model_entry = (
             self._strip_existing_see_also(new_entry) if content_links_enabled else new_entry
         )

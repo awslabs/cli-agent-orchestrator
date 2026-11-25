@@ -11571,9 +11571,11 @@ async def internal_memory_related(
 async def internal_memory_restore(
     body: InternalMemoryRestoreRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
-) -> Dict[str, Any]:
+) -> Any:
     """Undo an automatic supersede for a remote CAO worker (#1335)."""
     _require_memory_enabled()
+    from cli_agent_orchestrator.services.memory_service import MemoryPartialWriteError
+
     try:
         return cast(
             Dict[str, Any],
@@ -11590,6 +11592,8 @@ async def internal_memory_restore(
         )
     except PermissionError as error:
         raise HTTPException(status_code=403, detail=str(error)) from error
+    except MemoryPartialWriteError as error:
+        return _memory_partial_write_response(error)
 
 
 @app.post("/internal/memory/forget")

@@ -45,25 +45,6 @@ def test_restore_registration_uses_startup_setting(enabled):
     assert result.stdout.strip() == str(enabled)
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_restore_registration_uses_startup_setting(enabled):
-    environment = os.environ.copy()
-    environment["CAO_MEMORY_SUPERSEDE_AUTO"] = "1" if enabled else "0"
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import asyncio; from cli_agent_orchestrator.mcp_server import server; print('memory_restore' in {tool.name for tool in asyncio.run(server.mcp._list_tools())})",
-        ],
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=60,
-    )
-    assert result.stdout.strip() == str(enabled)
-
-
 @pytest.fixture
 def service(tmp_path: Path, isolated_memory_db, monkeypatch):
     monkeypatch.setattr(settings_service, "is_memory_auto_supersede_enabled", lambda: True)
@@ -109,6 +90,41 @@ def test_partial_store_exposes_restore_hint_on_mcp_and_http(service, client, mon
             "/internal/memory/store", json={"content": "C.", "key": "relay", "scope": "global"}
         )
     assert "version=" in response.json()["partial_write"]["superseded"][0]["undo"]
+
+
+def test_partial_restore_is_typed_on_mcp_and_http(service, client, monkeypatch):
+    original_upsert = MemoryService._upsert_metadata
+    store = tool("memory_store")
+    run(store(content="A.", key="relay", scope="global", memory_type="project", tags=None))
+    revised = run(
+        store(content="B.", key="relay", scope="global", memory_type="project", tags=None)
+    )
+    version = re.search(r"version='([^']+)'", revised["superseded"][0]["undo"]).group(1)
+
+    def broken_upsert(**kwargs):
+        raise RuntimeError("mirror unavailable")
+
+    monkeypatch.setattr(MemoryService, "_upsert_metadata", broken_upsert)
+    mcp_result = run(tool("memory_restore")(key="relay", scope="global", version=version))
+    assert mcp_result["error_kind"] == "memory_metadata_partial_write"
+    assert mcp_result["partial_write"]["repair_command"] == "cao memory repair --apply"
+    assert (
+        run(tool("memory_restore")(key="relay", scope="global", version=version))["restored"]
+        == "already_restored"
+    )
+
+    monkeypatch.setattr(MemoryService, "_upsert_metadata", original_upsert)
+    newer = run(service.store("C.", key="relay", scope="global"))
+    monkeypatch.setattr(MemoryService, "_upsert_metadata", broken_upsert)
+    next_version = re.search(r"version='([^']+)'", newer.superseded[0].undo).group(1)
+    with patch("cli_agent_orchestrator.api.main._get_memory_service", return_value=service):
+        response = client.post(
+            "/internal/memory/restore",
+            json={"key": "relay", "scope": "global", "version": next_version},
+        )
+    assert response.status_code == 500
+    assert response.json()["error_kind"] == "memory_metadata_partial_write"
+    assert response.json()["partial_write"]["completed_phases"] == ["wiki", "index"]
 
 
 def test_gateway_forwards_version(service, client, monkeypatch):

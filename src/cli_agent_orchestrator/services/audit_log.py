@@ -70,8 +70,8 @@ SYNC_AUDIT_EVENTS: frozenset = frozenset(
         # mutation already happened — the DB rolls back but the on-disk change
         # persists, so the forensic trail must still record it.
         "heal_partial_mutation",
-        # #1335 change 5: CAO switched recall to a replacing note, or an
-        # agent undid that. AWAITED so the history line is durable before
+        # #1335 change 5: CAO recorded a same-key replacement or its undo.
+        # AWAITED so the history line is durable before
         # the store/restore returns. Content-free: keys, scope, reason.
         "memory_superseded",
         "memory_supersede_undone",

@@ -345,8 +345,10 @@ Automatic reporting is opt-in. In `append` mode, a changed write under an
 existing key in the same scope reports `reason: "same_key"` with a version-pinned
 undo hint. The previous entry remains in the topic file under its own heading.
 In `llm` compile mode, CAO does not report automatic supersede or offer an undo
-hint: compilation can merge away prior entries. Links and similarity across keys
-never cause automatic supersede; content links remain normal relationships.
+hint: compilation can merge away prior entries. `memory_restore` refuses in this
+mode with `error_kind: llm_mode`. Compaction ends undo for that topic. Links
+and similarity across keys never cause automatic supersede; content links
+remain normal relationships.
 Same-key writes already show their latest entry in recall, so no other key is
 hidden or resurrected by this feature.
 

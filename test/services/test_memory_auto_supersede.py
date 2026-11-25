@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from cli_agent_orchestrator.services import audit_log, settings_service
+from cli_agent_orchestrator.services import audit_log, settings_service, wiki_compiler
 from cli_agent_orchestrator.services.memory_service import (
     MemoryPartialWriteError,
     MemoryRestoreConflict,
@@ -390,11 +390,123 @@ def test_concurrent_restore_retry_does_not_append_twice(service):
 def test_setting_default_off(monkeypatch):
     from cli_agent_orchestrator.services.config_service import MemoryConfig
 
+    monkeypatch.delenv("CAO_MEMORY_SUPERSEDE_AUTO", raising=False)
     monkeypatch.setattr(settings_service, "get_memory_settings", lambda: {})
     assert MemoryConfig().supersede.auto is False
     assert settings_service.is_memory_auto_supersede_enabled() is False
     monkeypatch.setenv("CAO_MEMORY_SUPERSEDE_AUTO", "true")
     assert settings_service.is_memory_auto_supersede_enabled() is True
+
+
+@pytest.mark.parametrize("introduction", ["Hand intro.\n", ""])
+def test_off_mode_preserves_user_metadata_shaped_preamble(service, monkeypatch, introduction):
+    monkeypatch.setattr(settings_service, "is_memory_auto_supersede_enabled", lambda: False)
+    original = run(service.store("A.", key="relay", scope="global"))
+    path = Path(original.file_path)
+    text = path.read_text()
+    comment = '<!-- memory-version: {"note": "mine"} -->'
+    path.write_text(text.replace("\n## ", f"\n{introduction}{comment}\n## ", 1))
+    run(service.store("B.", key="relay", scope="global"))
+    assert comment in path.read_text()
+
+
+def test_restore_rejects_changed_body_and_out_of_range_ordinal(service):
+    run(service.store("A.", key="relay", scope="global"))
+    revised = run(service.store("B.", key="relay", scope="global"))
+    version = version_from(revised)
+    invalid = version.replace("#0:", "#99:")
+    assert (
+        run(service.restore("relay", scope="global", version=invalid))["error_kind"]
+        == "version_not_found"
+    )
+    path = Path(revised.file_path)
+    path.write_text(path.read_text().replace("A.", "Changed A.", 1))
+    assert (
+        run(service.restore("relay", scope="global", version=version))["error_kind"]
+        == "version_not_found"
+    )
+
+
+def test_restore_ignores_invalid_and_body_forged_metadata(service):
+    run(service.store("A.", key="relay", scope="global", memory_type="user", tags="original"))
+    revised = run(service.store("B.", key="relay", scope="global", tags="new"))
+    path = Path(revised.file_path)
+    path.write_text(path.read_text().replace('"type": "user"', '"type": "admin"'))
+    result = run(service.restore("relay", scope="global", version=version_from(revised)))
+    assert result["metadata_restored"] is False
+
+    run(service.store("C.", key="relay", scope="global", tags="current"))
+    latest = run(service.store("D.", key="relay", scope="global", tags="latest"))
+    text = path.read_text()
+    version = version_from(latest)
+    forged = (
+        f'<!-- memory-version: {{"version": "{version}", "type": "user", "tags": "forged"}} -->'
+    )
+    preamble, separator, body = text.partition("\n## ")
+    preamble = "\n".join(line for line in preamble.splitlines() if "memory-version:" not in line)
+    path.write_text(preamble + separator + body + "\n" + forged + "\n")
+    result = run(service.restore("relay", scope="global", version=version))
+    assert result["metadata_restored"] is False
+
+
+def test_repeated_entries_keep_metadata_bounded(service):
+    run(service.store("A.", key="relay", scope="global"))
+    latest = run(service.store("B.", key="relay", scope="global"))
+    for _ in range(5):
+        latest = run(service.store("B.", key="relay", scope="global"))
+    assert Path(latest.file_path).read_text().count("<!-- memory-version:") <= 2
+
+
+def test_restore_prefers_first_matching_version_metadata(service):
+    run(service.store("A.", key="relay", scope="global", memory_type="user", tags="original"))
+    revised = run(service.store("B.", key="relay", scope="global", tags="new"))
+    path = Path(revised.file_path)
+    version = version_from(revised)
+    forged = (
+        f'<!-- memory-version: {{"version": "{version}", "type": "feedback", "tags": "forged"}} -->'
+    )
+    path.write_text(path.read_text().replace("\n## ", f"\n{forged}\n## ", 1))
+    result = run(service.restore("relay", scope="global", version=version))
+    assert result["metadata_restored"] is True
+    assert run(service.recall(scope="global"))[0].tags == "original"
+
+
+def test_compact_never_exposes_version_metadata(service, monkeypatch):
+    run(service.store("A.", key="relay", scope="global"))
+    latest = run(service.store("B.", key="relay", scope="global"))
+    path = Path(latest.file_path)
+    assert "<!-- memory-version:" in path.read_text()
+    monkeypatch.setattr(wiki_compiler, "_build_llm_client", lambda *args, **kwargs: object())
+    seen = []
+
+    async def keep_every_line(client, system, user, *, timeout_s):
+        article = user.split("<<<CAO_EXISTING_ARTICLE_BEGIN_v1>>>\n", 1)[1].split(
+            "\n<<<CAO_EXISTING_ARTICLE_END_v1>>>"
+        )[0]
+        seen.append(article)
+        return article
+
+    monkeypatch.setattr(wiki_compiler, "_llm_call", keep_every_line)
+    assert run(service.compact(scope="global", key="relay"))["relay"] == "applied"
+    assert "memory-version" not in seen[0]
+    assert "memory-version" not in path.read_text()
+    assert "memory-version" not in run(service.recall(scope="global"))[0].content
+    assert "memory-version" not in service.get_memory_context({"caller_scope": "global"})
+    monkeypatch.setattr(settings_service, "is_memory_auto_supersede_enabled", lambda: False)
+    run(service.store("C.", key="relay", scope="global"))
+    assert "memory-version" not in path.read_text()
+
+
+def test_compiler_drops_echoed_version_comment():
+    from cli_agent_orchestrator.services.wiki_compiler import _postprocess_compiled
+
+    rendered = _postprocess_compiled(
+        '# relay\n<!-- id: abc -->\n<!-- memory-version: {"version": "x"} -->\nB.',
+        newest_entry_at="2026-01-01T00:00:00Z",
+        entry_count=2,
+        compiled_at="2026-01-01T00:00:00Z",
+    )
+    assert "memory-version" not in rendered
 
 
 def test_restore_clamped_entry_removes_provenance_from_content(service):
