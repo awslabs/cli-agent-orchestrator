@@ -57,6 +57,30 @@ describe('instance label', () => {
     expect(document.title).toBe('CLI Agent Orchestrator')
   })
 
+  it("keeps the Workspace tab's (N) attention prefix when /health answers late", async () => {
+    let release: (v: unknown) => void = () => {}
+    const held = new Promise(r => { release = r })
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/health')) { await held; return okJson({ ...HEALTH, instance_label: 'Cluster Mode' }) }
+      if (url.includes('/memory/status')) return okJson({ enabled: false })
+      return okJson([])
+    }))
+    render(<App />)
+    await act(async () => {})
+    document.title = '(2) CLI Agent Orchestrator' // what WorkspacePanel writes for two flags
+    await act(async () => { release(null) })
+    await waitFor(() => expect(screen.getByTestId('instance-label')).toBeInTheDocument())
+    expect(document.title).toBe('(2) Cluster Mode · CLI Agent Orchestrator')
+  })
+
+  it('lets a long label shrink on a narrow window', async () => {
+    vi.stubGlobal('fetch', fetchWithHealth({ ...HEALTH, instance_label: 'x'.repeat(200) }))
+    render(<App />)
+    const badge = await screen.findByTestId('instance-label')
+    expect(badge.className).toContain('min-w-0')
+    expect(badge.parentElement?.className).toContain('min-w-0')
+  })
+
   it('shows no label when /health cannot be read', async () => {
     vi.stubGlobal('fetch', fetchWithHealth(new Error('network down')))
     render(<App />)

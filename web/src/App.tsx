@@ -122,7 +122,10 @@ export default function App() {
     return () => { cancelled = true }
   }, [])
   useEffect(() => {
-    document.title = instanceLabel ? `${instanceLabel} · ${APP_TITLE}` : APP_TITLE
+    // Keep the Workspace tab's "(N) " attention prefix, which it adds only when its
+    // flag count changes: a /health that answers late must not wipe it.
+    const prefix = document.title.match(/^\(\d+\)\s*/)?.[0] ?? ''
+    document.title = prefix + (instanceLabel ? `${instanceLabel} · ${APP_TITLE}` : APP_TITLE)
   }, [instanceLabel])
 
   useEffect(() => {
@@ -162,12 +165,15 @@ export default function App() {
       {/* Header */}
       <header className="border-b border-gray-800 bg-gray-900/80 backdrop-blur-xs sticky top-0 z-40">
         <div className="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-3">
+          {/* min-w-0 only with a label, so a long one truncates on a narrow window
+              instead of pushing Live/Offline off screen; the logo keeps its size.
+              Without a label, nothing changes. */}
+          <div className={`flex items-center gap-3 ${instanceLabel ? 'min-w-0 [&>svg]:shrink-0' : ''}`}>
             <CaoMark size={32} />
             <h1 className="text-lg font-bold text-white">{APP_TITLE}</h1>
             {instanceLabel && (
               <span
-                className="max-w-xs truncate rounded-md border border-amber-400/70 bg-amber-500/15 px-2.5 text-lg font-bold text-amber-300"
+                className="min-w-0 max-w-xs truncate rounded-md border border-amber-400/70 bg-amber-500/15 px-2.5 text-lg font-bold text-amber-300"
                 title={instanceLabel}
                 data-testid="instance-label"
               >
