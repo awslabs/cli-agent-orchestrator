@@ -57,9 +57,10 @@ REQUIRED_SUITES = (
 )
 
 # Seconds one suite may run. install.test.mjs runs the installer many times in scratch homes: it took
-# 220 s on a loaded machine, so 300 s left it 80 s of headroom. The others finish in seconds.
+# 533 s and 540 s on the CI legs that passed and ran past 600 s on one that did not (two pytest-xdist
+# workers share the runner), so it gets 1500 s. The others finish in seconds.
 DEFAULT_SUITE_TIMEOUT_S = 300
-SUITE_TIMEOUT_S = {"install.test.mjs": 600}
+SUITE_TIMEOUT_S = {"install.test.mjs": 1500}
 
 pytestmark = [
     pytest.mark.must_run("unit"),
@@ -228,7 +229,7 @@ def test_a_failing_suite_fails_the_guard_with_its_output(tmp_path: Path) -> None
 
 
 def test_install_gets_more_time_than_the_other_suites() -> None:
-    assert suite_timeout(EXAMPLE / "install.test.mjs") == 600
+    assert suite_timeout(EXAMPLE / "install.test.mjs") == 1500
     assert suite_timeout(EXAMPLE / "lib" / "logic.test.mjs") == DEFAULT_SUITE_TIMEOUT_S
 
 
