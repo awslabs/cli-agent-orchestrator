@@ -81,8 +81,36 @@ def test_subscribe_events_descriptor() -> None:
 
     desc = app_tools._subscribe_events_impl()
     assert desc["sse_url"] == "/events"
+    assert desc["base_url"] == app_tools.API_BASE_URL
     assert desc["history_tool"] == "cao_fetch_history"
     assert desc["ring_capacity"] == 500
+
+
+@pytest.mark.parametrize(
+    "api_base, expected",
+    [
+        ("http://127.0.0.1:9889", "http://127.0.0.1:9889"),
+        ("http://0.0.0.0:9889", "http://127.0.0.1:9889"),
+        ("http://0.0.0.0:9999", "http://127.0.0.1:9999"),
+        ("http://cao.internal:9889", "http://cao.internal:9889"),
+    ],
+)
+def test_subscribe_events_base_url_maps_the_ipv4_wildcard_to_loopback(
+    monkeypatch, api_base, expected
+) -> None:
+    """A wildcard bind (``CAO_API_HOST=0.0.0.0``) is not a usable client address.
+
+    The view would stream from ``http://0.0.0.0:<port>``, which the view's own CSP
+    does not list, so the descriptor points it at loopback, as ``cao-server`` does
+    for agents (api/main.py, utils/mcp_resolution.py).
+    """
+    from cli_agent_orchestrator.ext_apps.apps import DEFAULT_CSP
+
+    monkeypatch.setattr(app_tools, "API_BASE_URL", api_base)
+    desc = app_tools._subscribe_events_impl()
+    assert desc["base_url"] == expected
+    if expected.endswith(":9889") and "127.0.0.1" in expected:
+        assert desc["base_url"] in DEFAULT_CSP["connectDomains"]
 
 
 def test_submit_command_rejects_unknown_kind() -> None:

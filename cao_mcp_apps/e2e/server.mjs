@@ -18,8 +18,9 @@
 // canned, mutable fleet state, and a submit_command that emits a governance
 // event is relayed to /emit so the live event-stream view updates.
 //
-// The default port is 9889 so the event-stream bundle's default
-// `backplaneBaseUrl` (http://127.0.0.1:9889) resolves to this same origin.
+// The event-stream view has no built-in address: the host peer (host.js) tells
+// it this origin as `base_url` in the `subscribe_events` descriptor, so any port
+// works. 9889 stays the default here only to match playwright.config.ts.
 
 import { createReadStream, existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";

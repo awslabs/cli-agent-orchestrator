@@ -261,15 +261,31 @@ def _cao_fetch_history_impl(limit: int = 500, kinds: Optional[List[str]] = None)
     return {"events": events}
 
 
+def _stream_base_url() -> str:
+    """``API_BASE_URL`` as a client can use it: an IPv4 wildcard bind maps to loopback.
+
+    ``CAO_API_HOST=0.0.0.0`` is a bind address, not a client address, and the view's
+    CSP lists only loopback. ``cao-server`` applies the same mapping for agents
+    (``api/main.py``, ``utils/mcp_resolution.py``). ``::`` is left as is, for the
+    reason given there.
+    """
+    prefix = "http://0.0.0.0:"
+    if API_BASE_URL.startswith(prefix):
+        return "http://127.0.0.1:" + API_BASE_URL[len(prefix) :]
+    return API_BASE_URL
+
+
 def _subscribe_events_impl() -> Dict[str, Any]:
     """Return the SSE endpoint descriptor the iframe connects to for live events.
 
     The live stream is delivered over the FastAPI ``/events`` SSE route (not the
     tool channel); the iframe backfills gaps via ``cao_fetch_history``.
+    ``base_url`` is where that route lives; the view has no address of its own.
     """
 
     return {
         "sse_url": "/events",
+        "base_url": _stream_base_url(),
         "history_tool": "cao_fetch_history",
         "ring_capacity": 500,
     }

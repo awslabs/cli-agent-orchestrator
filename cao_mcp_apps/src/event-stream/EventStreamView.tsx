@@ -16,7 +16,12 @@ const HISTORY_LIMIT = 500;
 export interface EventStreamViewProps {
   app?: McpApp;
   initialEvents?: CaoEvent[];
-  /** Base URL for the Backplane SSE endpoint (loopback by default). */
+  /**
+   * Base URL for the Backplane SSE endpoint. Optional: the host supplies it as
+   * `base_url` in the `subscribe_events` descriptor. There is no built-in
+   * default, so a view that is given no address streams nothing rather than
+   * connecting to whatever listens on a well-known port.
+   */
   backplaneBaseUrl?: string;
   /** Injectable EventSource for tests (defaults to the global). */
   eventSourceFactory?: (url: string) => EventSourceLike;
@@ -31,10 +36,27 @@ export interface EventSourceLike {
   close(): void;
 }
 
+/**
+ * Where the live feed is, as told by the host. `sse_url` may be absolute; a
+ * relative one is resolved against the descriptor's `base_url`, then the
+ * `fallbackBase` prop. Returns undefined when neither gives an address.
+ */
+export function resolveStreamUrl(
+  desc: { sse_url?: string; base_url?: string } | undefined,
+  fallbackBase?: string,
+): string | undefined {
+  const path = desc?.sse_url ?? "/events";
+  try {
+    return new URL(path, desc?.base_url ?? fallbackBase).toString();
+  } catch {
+    return undefined;
+  }
+}
+
 export function EventStreamView({
   app,
   initialEvents,
-  backplaneBaseUrl = "http://127.0.0.1:9889",
+  backplaneBaseUrl,
   eventSourceFactory,
 }: EventStreamViewProps): React.JSX.Element {
   const [events, setEvents] = useState<CaoEvent[]>(initialEvents ?? []);
@@ -62,7 +84,8 @@ export function EventStreamView({
       // 2) Subscribe to the live SSE feed via the descriptor.
       try {
         const desc = await app.callServerTool("subscribe_events");
-        const sseUrl = `${backplaneBaseUrl}${desc?.sse_url ?? "/events"}`;
+        const sseUrl = resolveStreamUrl(desc, backplaneBaseUrl);
+        if (!sseUrl) return; // the host gave no address: history only
         const factory =
           eventSourceFactory ??
           ((url: string) => new EventSource(url) as unknown as EventSourceLike);

@@ -235,7 +235,9 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
-          cache-dependency-path: web/package-lock.json
+          cache-dependency-path: |
+            web/package-lock.json
+            cao_mcp_apps/package-lock.json
 
       - name: Build Web UI
         working-directory: web
@@ -243,6 +245,18 @@ jobs:
           npm ci
           npm run build
           # vite.config.ts writes directly to ../src/cli_agent_orchestrator/web_ui/
+
+      # The MCP App views (ui://cao/*) are gitignored build output that hatchling only picks up
+      # through `artifacts`, and a glob matching nothing is a silent no-op, so a wheel built
+      # without this step ships with no views and every job stays green (#1487). Built in each
+      # leg, like the Web UI, because every wheel is built from this job's own checkout
+      # (cibuildwheel copies it into the manylinux container on Linux).
+      # vite writes to ../src/cli_agent_orchestrator/ext_apps/apps_static/
+      - name: Build MCP App views
+        working-directory: cao_mcp_apps
+        run: |
+          npm ci
+          npm run build:all
 
       # macOS and Windows have no build container, so cibuildwheel's `before-build` runs on
       # the host and needs cargo on PATH. Linux builds inside the manylinux container, where
@@ -300,6 +314,12 @@ jobs:
             python scripts/build_tui.py check --wheel "$w" --max-binary-bytes 10485760
           done
 
+      # The views must be inside every produced wheel (#1487). Asserts the artifact, because the
+      # hatchling glob is a silent no-op when the build step above did not run.
+      - name: Assert the MCP App views are inside each wheel
+        shell: bash
+        run: python scripts/assert_mcp_app_views.py --dist wheelhouse/
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           # Per-platform artifact names, merged by the publish jobs via `pattern:` +
@@ -323,7 +343,9 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
-          cache-dependency-path: web/package-lock.json
+          cache-dependency-path: |
+            web/package-lock.json
+            cao_mcp_apps/package-lock.json
 
       - name: Build Web UI
         working-directory: web
@@ -331,10 +353,29 @@ jobs:
           npm ci
           npm run build
 
+      # The MCP App views (ui://cao/*) are gitignored build output that hatchling only picks up
+      # through `artifacts`, and a glob matching nothing is a silent no-op, so a wheel built
+      # without this step ships with no views and every job stays green (#1487). Built in each
+      # leg, like the Web UI, because every wheel is built from this job's own checkout
+      # (cibuildwheel copies it into the manylinux container on Linux).
+      # vite writes to ../src/cli_agent_orchestrator/ext_apps/apps_static/
+      - name: Build MCP App views
+        working-directory: cao_mcp_apps
+        run: |
+          npm ci
+          npm run build:all
+
       - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d  # v10.4.0
 
       - name: Build sdist
         run: uv build --sdist
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Assert the MCP App views are inside the sdist
+        run: python scripts/assert_mcp_app_views.py --dist dist/
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
@@ -455,6 +496,20 @@ jobs:
           cao-server --help
           cao-mcp-server --help
           python -c "import cao_workflow; assert cao_workflow.run_step"
+
+      # The four ui://cao/* MCP App views, read from the INSTALLED package (#1487). `--help` and
+      # an import pass with the views absent, because hatchling drops an empty artifacts glob.
+      - name: Verify the MCP App views are installed
+        shell: bash
+        run: |
+          python - <<'PY'
+          from importlib.resources import files
+          root = files("cli_agent_orchestrator.ext_apps") / "apps_static"
+          names = ("dashboard.html", "agent.html", "event-stream.html", "graph.html")
+          missing = [n for n in names if not (root / n).is_file() or not (root / n).read_bytes()]
+          assert not missing, f"MCP App views missing from the installed package: {missing}"
+          print("MCP App views present:", ", ".join(names))
+          PY
 
       # SR-1, on the artifact an operator would actually receive. The four checks above are
       # exactly what passed while the wheel shipped a binary that could not run on the host
