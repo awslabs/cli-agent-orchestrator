@@ -99,6 +99,8 @@ def load(name: str) -> RemoteBox:
         data = json.loads(target.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise TypeError("a registration must be a JSON object")
+        if any(not isinstance(value, str) for value in data.values()) or data.get("name") != name:
+            raise ValueError("registration fields must be strings and name must match filename")
         data["aws_profile"] = data.pop("profile")
         return RemoteBox(**data)
     except FileNotFoundError as exc:
@@ -125,3 +127,5 @@ def remove(name: str) -> None:
         path_for(name).unlink()
     except FileNotFoundError as exc:
         raise RemoteConfigError(f"remote box '{name}' is not registered") from exc
+    except OSError as exc:
+        raise RemoteConfigError(f"remote box '{name}' has invalid configuration") from exc
