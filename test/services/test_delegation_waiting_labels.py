@@ -572,8 +572,9 @@ class TestTheSweepKeepsGoingAfterOneStepFails:
             svc.sweep()
 
         assert list_open_edges_into("w1") == []  # the armed worker was still evaluated
-        # its forward refreshed the caller, then the repair ran as a complete pass
-        assert backend.calls == [({"sup": 0}, False), ({}, True)]
+        # the forward's refresh is written by the background thread and the repair by the sweep
+        # itself, so either may land first
+        assert sorted(backend.calls, key=lambda call: call[1]) == [({"sup": 0}, False), ({}, True)]
         assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
             "delegation sweep could not settle reply marks: marks locked"
         ]
@@ -606,7 +607,8 @@ class TestTheSweepKeepsGoingAfterOneStepFails:
             and r.getMessage() == "delegation sweep failed for w1: w1 output unreadable"
             for r in caplog.records
         )
-        assert backend.calls[-1][1] is True  # the repair still ran
+        # the repair still ran as a complete pass, and w1's open edge is in its count
+        assert ({"sup": 1}, True) in backend.calls
 
 
 class TestAStoppedPublisherTakesNoMoreRequests:
