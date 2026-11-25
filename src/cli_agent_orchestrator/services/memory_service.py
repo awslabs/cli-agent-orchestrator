@@ -89,8 +89,6 @@ HYBRID_CANDIDATE_MIN = 50
 HYBRID_CANDIDATE_MULTIPLIER = 3
 HYBRID_CANDIDATE_MAX = 200
 
-AUTO_SUPERSEDE_ORIGIN = memory_eligibility.AUTO_SUPERSEDE_ORIGIN
-
 
 @dataclass
 class RecallPool:
@@ -1092,6 +1090,14 @@ class MemoryService:
                     and existing_content != _restore_expected_content
                 ):
                     raise MemoryRestoreConflict("topic changed before restore")
+                old_header = next(
+                    (
+                        match
+                        for line in existing_content.splitlines()
+                        if (match := TOPIC_HEADER_RE.fullmatch(line))
+                    ),
+                    None,
+                )
                 # Try to extract original id
                 id_match = re.search(r"<!-- id: ([a-f0-9\-]+)", existing_content)
                 if id_match:
@@ -1129,6 +1135,39 @@ class MemoryService:
                 MemoryAppendEntry(content=content, occurred_at=occurred_at, now=now),
             )
             new_content = appended.content
+            from cli_agent_orchestrator.services.settings_service import (
+                get_compile_mode,
+                is_memory_auto_supersede_enabled,
+            )
+
+            compile_mode = "llm"
+            compile_mode_available = False
+            try:
+                compile_mode = get_compile_mode()
+                compile_mode_available = True
+            except Exception:
+                pass
+            if (
+                is_update
+                and old_header is not None
+                and compile_mode == "append"
+                and is_memory_auto_supersede_enabled()
+            ):
+                old_sections = self._topic_sections(existing_content)
+                if old_sections:
+                    old_version = f"{old_sections[-1][0]}#{len(old_sections) - 1}"
+                    import json
+
+                    metadata = json.dumps(
+                        {
+                            "version": old_version,
+                            "type": old_header.group("type").strip(),
+                            "tags": old_header.group("tags"),
+                        },
+                        ensure_ascii=True,
+                    )
+                    marker = f"<!-- memory-version: {metadata} -->\n"
+                    new_content = new_content.replace("\n## ", f"\n{marker}## ", 1)
             entry_body = appended.entry_body
             timestamp = appended.section_at.strftime("%Y-%m-%dT%H:%M:%SZ")
             timestamp_clamped = appended.timestamp_clamped
@@ -1159,6 +1198,11 @@ class MemoryService:
             replaced_version = is_update and self._latest_version_replaced(new_content)
             sections = self._topic_sections(new_content) if replaced_version else []
             replaced_at = f"{sections[-2][0]}#{len(sections) - 2}" if sections else None
+            superseded = (
+                await self._auto_supersede(key, scope, scope_id, replaced_at, compile_mode)
+                if auto_supersede
+                else []
+            )
 
             # LLM wiki compilation, deferred. A coding-agent CLI cold-starts in
             # tens of seconds — far too slow to block store() — so on an "llm"
@@ -1169,12 +1213,8 @@ class MemoryService:
             # topic is never compiled: the LLM has nothing to merge into and
             # would only regurgitate the canonical ``# {key}`` header.
             last_compiled_at: Optional[datetime] = None
-            compile_mode = "llm"
             try:
-                from cli_agent_orchestrator.services.settings_service import get_compile_mode
-
-                compile_mode = get_compile_mode()
-                if is_update and compile_mode == "llm":
+                if is_update and compile_mode_available and compile_mode == "llm":
                     self._schedule_background_compile(
                         scope=scope,
                         scope_id=scope_id,
@@ -1245,11 +1285,6 @@ class MemoryService:
                     scope,
                 )
 
-            superseded = (
-                await self._auto_supersede(key, scope, scope_id, replaced_at, compile_mode)
-                if auto_supersede
-                else []
-            )
             logger.info(f"Memory {action}: key={key} scope={scope} scope_id={scope_id}")
         finally:
             try:
@@ -1299,10 +1334,9 @@ class MemoryService:
         """Raw ``(timestamp, body)`` per entry heading, in file order."""
         from cli_agent_orchestrator.services.settings_service import is_memory_parser_lenient
 
-        pattern = (
-            _LENIENT_ENTRY_HEADING_RE if is_memory_parser_lenient() else _CANONICAL_ENTRY_HEADING_RE
-        )
-        matches = list(pattern.finditer(text))
+        matches = list(_CANONICAL_ENTRY_HEADING_RE.finditer(text))
+        if not matches and is_memory_parser_lenient():
+            matches = list(_LENIENT_ENTRY_HEADING_RE.finditer(text))
         sections: list[tuple[str, str]] = []
         for index, match in enumerate(matches):
             end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
@@ -1396,6 +1430,16 @@ class MemoryService:
         """
         if not _is_memory_enabled():
             raise MemoryDisabledError(MEMORY_DISABLED_MESSAGE)
+        from cli_agent_orchestrator.services.settings_service import (
+            is_memory_auto_supersede_enabled,
+        )
+
+        if not is_memory_auto_supersede_enabled():
+            return {
+                "success": False,
+                "error_kind": "disabled",
+                "error": "automatic supersede is off",
+            }
         MemoryScope(scope)
         from cli_agent_orchestrator.services.memory_scoring import scope_write_allowed
 
@@ -1450,7 +1494,10 @@ class MemoryService:
                     "error": f"version not found: {version}",
                 }
             index = int(ordinal)
-            if index < len(sections) - 1 and sections[-1][1] == sections[index][1]:
+            restored_body = re.sub(
+                r"^_Originally recorded: [^\n]+_\n?", "", sections[index][1]
+            ).strip()
+            if index < len(sections) - 1 and sections[-1][1] == restored_body:
                 return {
                     "success": True,
                     "key": canonical,
@@ -1472,6 +1519,13 @@ class MemoryService:
             }
         restored_from, previous = sections[-2]
         previous = re.sub(r"^_Originally recorded: [^\n]+_\n?", "", previous).strip()
+        import json
+
+        metadata = None
+        for metadata_match in re.finditer(r"<!-- memory-version: (\{[^\n]*\}) -->", text):
+            candidate = json.loads(metadata_match.group(1))
+            if isinstance(candidate, dict) and candidate.get("version") == version:
+                metadata = candidate
         header = next(
             (match for line in text.splitlines() if (match := TOPIC_HEADER_RE.fullmatch(line))),
             None,
@@ -1480,16 +1534,20 @@ class MemoryService:
             await self.store(
                 previous,
                 scope=scope,
-                memory_type=header.group("type").strip() if header else "project",
+                memory_type=(
+                    metadata["type"]
+                    if metadata
+                    else (header.group("type").strip() if header else "project")
+                ),
                 key=canonical,
-                tags=header.group("tags") if header else "",
+                tags=metadata["tags"] if metadata else (header.group("tags") if header else ""),
                 terminal_context=terminal_context,
                 auto_supersede=False,
                 _restore_expected_content=text,
             )
         except MemoryRestoreConflict:
             current = self._topic_sections(wiki_path.read_text(encoding="utf-8"))
-            if version is not None and current and current[-1][1] == sections[-2][1]:
+            if version is not None and current and current[-1][1] == previous:
                 return {
                     "success": True,
                     "key": canonical,
@@ -1502,6 +1560,16 @@ class MemoryService:
                 "error_kind": "stale_version",
                 "error": "topic changed before restore",
             }
+        except MemoryPartialWriteError:
+            await self._record_supersede_history(
+                "memory_supersede_undone",
+                key=canonical,
+                scope=scope,
+                scope_id=scope_id,
+                reason="same_key",
+                superseded_by=canonical,
+            )
+            raise
         await self._record_supersede_history(
             "memory_supersede_undone",
             key=canonical,
@@ -1516,6 +1584,9 @@ class MemoryService:
             "scope": scope,
             "restored": "previous_version",
             "restored_from": version or restored_from,
+            "reverse_undo": self._undo_hint(
+                canonical, scope, f"{sections[-1][0]}#{len(sections) - 1}"
+            ),
         }
 
     def _store_vault_memory(
@@ -3089,7 +3160,6 @@ class MemoryService:
                 )
             )
         results = self._visible_to_caller(results, terminal_context)
-        self._label_auto_superseded(results)
 
         from cli_agent_orchestrator.services.settings_service import is_memory_lifecycle_enabled
 
@@ -3159,7 +3229,6 @@ class MemoryService:
         include_related: bool = False,
         *,
         record_access: bool = True,
-        include_superseded: bool = False,
     ) -> list[Memory]:
         """Recall memories matching query and filters.
 
@@ -3184,10 +3253,6 @@ class MemoryService:
         ``related_keys`` cross-references are loaded (one level, same scope)
         and appended after the primary results, marked ``is_related=True``.
         Default False is byte-identical to the non-expanded path.
-
-        ``include_superseded``: notes CAO superseded automatically (#1335
-        change 5) are hidden from recall by default. True lists them too,
-        labelled ``lifecycle_status="superseded"``.
 
         Returns ``[]`` when ``memory.enabled`` is False (U5 / SC-6).
         """
@@ -3242,22 +3307,8 @@ class MemoryService:
                     "curated_recall", terminal_context
                 )
             )
-            if check is not None and include_superseded:
-                check = memory_eligibility.EligibilityCheck(
-                    check.request,
-                    [source for source in check._sources if source.name != "supersede.auto"],
-                    check.errors,
-                )
         eligibility_kwargs: dict[str, Any] = {"eligibility": check} if check is not None else {}
-        # #1335 change 5: hide auto-superseded notes before any slice. The
-        # curator check above already carries the registered source.
         pool_kwargs = eligibility_kwargs
-        if check is None and not include_superseded:
-            hide_check = memory_eligibility.explicit_recall_check(
-                terminal_context, self._db_session_factory
-            )
-            if hide_check is not None:
-                pool_kwargs = {"eligibility": hide_check}
 
         if search_mode == "bm25" and not query:
             return []
@@ -3341,38 +3392,7 @@ class MemoryService:
                 scan_all=scan_all,
                 policy=recall_policy,
             )
-        if include_superseded:
-            self._label_auto_superseded(results)
         return results
-
-    def _label_auto_superseded(self, memories: list) -> None:
-        """Label native notes that are targets of CAO's active auto supersedes."""
-        from cli_agent_orchestrator.services.settings_service import (
-            is_memory_auto_supersede_enabled,
-        )
-
-        if not memories or not is_memory_auto_supersede_enabled():
-            return
-        groups: dict[tuple[str, Optional[str]], list[Memory]] = {}
-        for memory in memories:
-            if memory.source_kind == "native":
-                groups.setdefault((memory.scope, self._effective_scope_id(memory)), []).append(
-                    memory
-                )
-        try:
-            service = self._relationship_service()
-            for (scope_value, scope_id), members in groups.items():
-                targets = service.superseded_targets(
-                    scope_value,
-                    scope_id,
-                    [memory.key for memory in members],
-                    origin=AUTO_SUPERSEDE_ORIGIN,
-                )
-                for memory in members:
-                    if memory.key in targets:
-                        memory.lifecycle_status = "superseded"
-        except Exception as error:  # noqa: BLE001 - labels are best-effort
-            logger.debug("auto-supersede labels skipped: %s", error)
 
     async def related(
         self,

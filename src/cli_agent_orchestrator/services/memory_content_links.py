@@ -8,25 +8,6 @@ from typing import Callable
 _SEE_ALSO_HEADING = re.compile(r"## See Also")
 _MARKDOWN_LINK = re.compile(r"\[[^\[\]\n]+\]\(([^)\n]+)\)")
 _SECTION_END = re.compile(r"^#{1,2}\s+")
-_WIKILINK = re.compile(r"!?\[\[[^\]\n]*\]\]")
-
-
-def strip_content_links(content: str) -> str:
-    """Return ``content`` without its link markup or ``## See Also`` section.
-
-    A link names its target, so leaving it in would make any short note look
-    like a restatement of every note it cites (#1335 change 5).
-    """
-    kept: list[str] = []
-    lines = content.splitlines()
-    see_also_lines = {
-        index for start, end, _ in see_also_sections(lines) for index in range(start, end)
-    }
-    for index, line in enumerate(lines):
-        if index in see_also_lines:
-            continue
-        kept.append(_MARKDOWN_LINK.sub(" ", _WIKILINK.sub(" ", line)))
-    return "\n".join(kept)
 
 
 def see_also_sections(lines: list[str]) -> list[tuple[int, int, set[int]]]:

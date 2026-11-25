@@ -75,43 +75,102 @@ def test_gateway_forwards_version(service, client, monkeypatch):
     assert result["restored_from"] == version
 
 
-def test_http_clear_removes_hidden_legacy_target(service, client):
+def test_http_clear_removes_all_visible_topics(service, client):
     run(service.store("Original.", key="old", scope="global"))
     run(service.store("New.", key="new", scope="global"))
-    service._relationship_service().create(
-        "global", None, "new", "old", "supersedes", "auto_supersede"
-    )
     with patch("cli_agent_orchestrator.api.main._get_memory_service", return_value=service):
-        listed = client.get("/memory", params={"scope": "global", "include_superseded": True})
+        listed = client.get("/memory", params={"scope": "global"})
         assert listed.status_code == 200, listed.text
-        assert {memory["key"]: memory.get("lifecycle_status") for memory in listed.json()} == {
-            "new": None,
-            "old": "superseded",
-        }
+        assert {memory["key"] for memory in listed.json()} == {"new", "old"}
         result = client.delete("/memory", params={"scope": "global"})
         assert result.status_code == 200, result.text
         assert result.json()["deleted_count"] == 2
-    assert run(service.recall(scope="global", include_superseded=True)) == []
+    assert run(service.recall(scope="global")) == []
 
 
 def test_default_off_operator_list_has_main_wire_shape(service, client, monkeypatch):
     monkeypatch.setattr(settings_service, "is_memory_auto_supersede_enabled", lambda: False)
+    monkeypatch.setattr(settings_service, "is_memory_lifecycle_enabled", lambda: True)
     run(service.store("Original.", key="relay", scope="global"))
     with patch("cli_agent_orchestrator.api.main._get_memory_service", return_value=service):
         response = client.get("/memory", params={"scope": "global"})
     assert response.status_code == 200, response.text
     assert len(response.json()) == 1
-    assert set(response.json()[0]) == {
-        "key",
-        "scope",
-        "scope_id",
-        "memory_type",
-        "tags",
-        "created_at",
-        "updated_at",
-        "source_kind",
-        "source_path",
-        "indexed_at",
-        "index_freshness",
-        "content_truncated",
+    memory = run(service.recall(scope="global"))[0]
+    assert response.json() == [
+        {
+            "key": "relay",
+            "scope": "global",
+            "scope_id": None,
+            "memory_type": "project",
+            "tags": "",
+            "created_at": memory.created_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "updated_at": memory.updated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "source_kind": "native",
+            "source_path": None,
+            "indexed_at": None,
+            "index_freshness": None,
+            "content_truncated": False,
+        }
+    ]
+
+
+def test_off_surface_hides_restore_and_matches_recall_schema(service, monkeypatch):
+    monkeypatch.setattr(settings_service, "is_memory_auto_supersede_enabled", lambda: False)
+    listed = {item.name: item for item in run(server.mcp._list_tools())}
+    assert "memory_restore" not in listed
+    schema = listed["memory_recall"].to_mcp_tool(name="memory_recall").input_schema
+    optional_text = {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None}
+    assert schema == {
+        "additionalProperties": False,
+        "properties": {
+            "query": {
+                **optional_text,
+                "description": "Search query matched against memory content (case-insensitive)",
+            },
+            "scope": {
+                **optional_text,
+                "description": 'Filter by scope: "global", "project", "session", "agent", "federated". Omit to search all.',
+            },
+            "memory_type": {
+                **optional_text,
+                "description": 'Filter by type: "user", "feedback", "project", "reference". Omit for all types.',
+            },
+            "limit": {
+                "default": 10,
+                "description": "Maximum number of results to return",
+                "maximum": 100,
+                "minimum": 1,
+                "type": "integer",
+            },
+            "search_mode": optional_text,
+            "sort_by": {
+                **optional_text,
+                "description": 'Ranking: "recency" (default), "score" (BM25+recency+usage), "usage", or "relevance" (lexical relevance over a widened pool; needs query, else behaves as recency). When both ranking arguments are omitted, memory.ranking.default_sort may select BM25 for query recall.',
+            },
+            "include_related": {
+                "default": False,
+                "description": "When True, expand each result's cross-references and append related articles after the primary results. Default False preserves the non-expanded recall behaviour.",
+                "type": "boolean",
+            },
+        },
+        "type": "object",
     }
+    assert run(tool("memory_restore")(key="relay", scope="global", version="unused")) == {
+        "success": False,
+        "error_kind": "disabled",
+        "error": "automatic supersede is off",
+    }
+
+
+def test_off_operator_list_with_lifecycle_edge_has_no_added_fields(service, client, monkeypatch):
+    monkeypatch.setattr(settings_service, "is_memory_auto_supersede_enabled", lambda: False)
+    monkeypatch.setattr(settings_service, "is_memory_lifecycle_enabled", lambda: True)
+    run(service.store("Old.", key="old", scope="global"))
+    run(service.store("New.", key="new", scope="global"))
+    service._relationship_service().create("global", None, "new", "old", "supersedes", "human")
+    with patch("cli_agent_orchestrator.api.main._get_memory_service", return_value=service):
+        response = client.get("/memory", params={"scope": "global"})
+    assert response.status_code == 200
+    assert {row["key"] for row in response.json()} == {"old", "new"}
+    assert all("lifecycle_status" not in row for row in response.json())

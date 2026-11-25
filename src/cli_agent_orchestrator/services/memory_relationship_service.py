@@ -1310,48 +1310,6 @@ class MemoryRelationshipService:
         # Map sanitized targets back to the caller's original key strings.
         return {sanitized[r[0]] for r in rows if r[0] in sanitized}
 
-    def has_active(self, type: str, origin: str) -> bool:
-        """True iff any ACTIVE edge of ``type`` from producer ``origin`` exists."""
-        with self._session_factory() as db:
-            hit = (
-                db.query(MemoryRelationshipModel.id)
-                .filter(
-                    MemoryRelationshipModel.type == type,
-                    MemoryRelationshipModel.origin == origin,
-                    MemoryRelationshipModel.status == "active",
-                )
-                .first()
-            )
-        return hit is not None
-
-    def edges_touching(
-        self,
-        scope: str,
-        scope_id: Optional[str],
-        key: str,
-        *,
-        type: str,
-    ) -> List[RelationshipDTO]:
-        """Every edge of ``type`` with ``key`` at EITHER end, any status/origin."""
-        sentinel = self._to_sentinel(scope_id)
-        canonical = self._sanitize_key(key)
-        with self._session_factory() as db:
-            rows = (
-                db.query(MemoryRelationshipModel)
-                .filter(
-                    MemoryRelationshipModel.scope == scope,
-                    MemoryRelationshipModel.scope_id == sentinel,
-                    MemoryRelationshipModel.type == type,
-                    or_(
-                        MemoryRelationshipModel.source_key == canonical,
-                        MemoryRelationshipModel.target_key == canonical,
-                    ),
-                )
-                .all()
-            )
-            rows.sort(key=_rank_then_created)
-            return [self._to_dto(cast(MemoryRelationshipModel, row)) for row in rows]
-
     def neighbours(
         self,
         scope: str,

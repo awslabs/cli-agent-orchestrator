@@ -2101,13 +2101,6 @@ async def memory_recall(
             "preserves the non-expanded recall behaviour."
         ),
     ),
-    include_superseded: bool = Field(
-        default=False,
-        description=(
-            "When True, also list notes CAO superseded automatically, labelled "
-            'lifecycle_status="superseded". Default False hides them.'
-        ),
-    ),
 ) -> Dict[str, Any]:
     """Retrieve memories matching a query and optional filters.
 
@@ -2143,8 +2136,6 @@ async def memory_recall(
                 bool(include_related) if isinstance(include_related, bool) else False
             ),
         }
-        if include_superseded is True:
-            kwargs["include_superseded"] = True
         memories = (
             await recall_memory(**kwargs)
             if remote_memory_url()
@@ -2227,7 +2218,13 @@ async def memory_related(
         return {"success": False, "error": str(e)}
 
 
-@mcp.tool()
+def _register_memory_restore(function):
+    from cli_agent_orchestrator.services.settings_service import is_memory_auto_supersede_enabled
+
+    return mcp.tool()(function) if is_memory_auto_supersede_enabled() else function
+
+
+@_register_memory_restore
 async def memory_restore(
     key: str = Field(description="Key of the superseded memory to bring back"),
     scope: str = Field(

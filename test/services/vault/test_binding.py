@@ -128,7 +128,6 @@ def test_unmapped_project_write_warns_and_increments_counter(tmp_path, caplog) -
 def test_valid_origins_are_the_full_closed_vault_vocabulary() -> None:
     assert VALID_ORIGINS == frozenset(
         {
-            "auto_supersede",
             "compiler",
             "content_link",
             "wiki_lint",

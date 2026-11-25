@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 
 from cli_agent_orchestrator.services import audit_log, settings_service
-from cli_agent_orchestrator.services.memory_service import MemoryService
+from cli_agent_orchestrator.services.memory_service import (
+    MemoryPartialWriteError,
+    MemoryRestoreConflict,
+    MemoryService,
+)
 
 
 def run(coroutine):
@@ -45,6 +49,96 @@ def test_exact_restore_retains_authored_links_and_is_idempotent(service):
     text = Path(revised.file_path).read_text()
     assert text.count("Manual relay.") == 2
     assert text.count("## See Also\n- [other](other-note.md)") == 2
+    assert audit_log.read_audit_log().count("[memory_supersede_undone]") == 1
+    assert audit_log.read_audit_log().count("[memory_superseded]") == 1
+
+
+@pytest.mark.parametrize(
+    "original,replacement",
+    [
+        ("A.\n\n### Review 2026-01-01T12:34Z\nDetails.", "B."),
+        ("A.", "B.\n\n### Review 2026-01-01T12:34Z\nDetails."),
+    ],
+)
+def test_subheading_timestamp_does_not_split_entry(service, original, replacement):
+    run(service.store(original, key="relay", scope="global"))
+    revised = run(service.store(replacement, key="relay", scope="global"))
+    assert len(revised.superseded) == 1
+    result = run(service.restore("relay", scope="global", version=version_from(revised)))
+    assert result["restored"] == "previous_version"
+    assert run(service.recall(scope="global"))[0].content == original
+
+
+def test_canonical_heading_takes_precedence_over_lenient_subheadings(service):
+    run(service.store("A.\n\n### Review 2026-01-01T12:34Z\nDetails.", key="relay", scope="global"))
+    revised = run(service.store("B.", key="relay", scope="global"))
+    sections = service._topic_sections(Path(revised.file_path).read_text())
+    assert len(sections) == 2
+    assert "### Review 2026-01-01T12:34Z" in sections[0][1]
+
+
+def test_lenient_heading_is_used_when_no_canonical_heading_exists(service):
+    assert service._topic_sections("### Recorded 2026-01-01T12:34Z\nA.") == [
+        ("2026-01-01T12:34Z", "A.")
+    ]
+
+
+def test_repeating_entry_with_timestamp_subheading_does_not_report_replacement(service):
+    run(service.store("A.", key="relay", scope="global"))
+    body = "B.\n\n### Review 2026-01-01T12:34Z\nDetails."
+    run(service.store(body, key="relay", scope="global"))
+    unchanged = run(service.store(body, key="relay", scope="global"))
+    assert unchanged.superseded == []
+    assert run(service.recall(scope="global"))[0].content == body
+
+
+def test_restore_reinstates_prior_type_and_tags_and_reverse_hint(service):
+    run(service.store("A.", key="relay", scope="global", memory_type="project", tags="alpha"))
+    revised = run(
+        service.store("B.", key="relay", scope="global", memory_type="feedback", tags="beta")
+    )
+    result = run(service.restore("relay", scope="global", version=version_from(revised)))
+    recalled = run(service.recall(scope="global"))[0]
+    assert (recalled.content, recalled.memory_type, recalled.tags) == ("A.", "project", "alpha")
+    reverse = re.search(r"version='([^']+)'", result["reverse_undo"]).group(1)
+    assert (
+        run(service.restore("relay", scope="global", version=reverse))["restored"]
+        == "previous_version"
+    )
+    recalled = run(service.recall(scope="global"))[0]
+    assert (recalled.content, recalled.memory_type, recalled.tags) == ("B.", "feedback", "beta")
+
+
+def test_restore_losing_to_new_store_reports_stale_version(service, monkeypatch):
+    run(service.store("A.", key="relay", scope="global"))
+    revised = run(service.store("B.", key="relay", scope="global"))
+    original_store = service.store
+
+    async def racing_store(content, **kwargs):
+        await original_store("C.", key="relay", scope="global")
+        raise MemoryRestoreConflict("topic changed before restore")
+
+    monkeypatch.setattr(service, "store", racing_store)
+    result = run(service.restore("relay", scope="global", version=version_from(revised)))
+    assert result["error_kind"] == "stale_version"
+
+
+def test_partial_writes_leave_audit_lines_for_supersede_and_restore(service, monkeypatch):
+    run(service.store("A.", key="relay", scope="global"))
+    upsert = service._upsert_metadata
+
+    def broken_upsert(**kwargs):
+        raise RuntimeError("mirror unavailable")
+
+    monkeypatch.setattr(service, "_upsert_metadata", broken_upsert)
+    with pytest.raises(MemoryPartialWriteError):
+        run(service.store("B.", key="relay", scope="global"))
+    assert audit_log.read_audit_log().count("[memory_superseded]") == 1
+    monkeypatch.setattr(service, "_upsert_metadata", upsert)
+    revised = run(service.store("C.", key="relay", scope="global"))
+    monkeypatch.setattr(service, "_upsert_metadata", broken_upsert)
+    with pytest.raises(MemoryPartialWriteError):
+        run(service.restore("relay", scope="global", version=version_from(revised)))
     assert audit_log.read_audit_log().count("[memory_supersede_undone]") == 1
 
 
@@ -110,6 +204,14 @@ def test_llm_mode_does_not_promise_undo(service, monkeypatch):
     assert "[memory_superseded]" not in audit_log.read_audit_log()
 
 
+def test_previously_compiled_topic_does_not_promise_undo(service):
+    first = run(service.store("A.", key="relay", scope="global"))
+    path = Path(first.file_path)
+    path.write_text(path.read_text() + "\n<!-- cao-compiled: 2026-01-01T00:00:00Z entries=1 -->\n")
+    revised = run(service.store("B.", key="relay", scope="global"))
+    assert revised.superseded == []
+
+
 def test_global_audit_omits_literal_none_scope_id(service):
     run(service.store("Original.", key="relay", scope="global"))
     run(service.store("Revised.", key="relay", scope="global"))
@@ -125,6 +227,11 @@ def test_default_off_is_unchanged(service, monkeypatch):
     assert first.superseded == second.superseded == []
     assert "superseded" not in second.model_dump()
     assert "lifecycle_status" not in second.model_dump()
+    assert run(service.restore("relay", scope="global", version="unused")) == {
+        "success": False,
+        "error_kind": "disabled",
+        "error": "automatic supersede is off",
+    }
     assert audit_log.read_audit_log() == ""
 
 
@@ -155,64 +262,6 @@ def test_concurrent_restore_retry_does_not_append_twice(service):
     assert Path(revised.file_path).read_text().count("Original.") == 2
 
 
-def test_legacy_edges_label_exact_reads_and_curator_include(service):
-    run(service.store("Original.", key="old", scope="global"))
-    run(service.store("New.", key="new", scope="global"))
-    service._relationship_service().create(
-        "global", None, "new", "old", "supersedes", "auto_supersede"
-    )
-    assert [memory.key for memory in run(service.recall(scope="global"))] == ["new"]
-    labelled = run(service.read_exact_key("old", scope="global"))
-    assert labelled.lifecycle_status == "superseded"
-    visible = run(service.recall(scope="global", include_superseded=True))
-    assert sorted(memory.key for memory in visible) == ["new", "old"]
-    curated = run(
-        service.recall(
-            scope="global",
-            include_superseded=True,
-            terminal_context={"agent_profile": "memory-manager"},
-        )
-    )
-    assert sorted(memory.key for memory in curated) == ["new", "old"]
-    related = run(service.related("new", scope="global"))
-    assert any(
-        item["key"] == "old" and item["status"] == "superseded" for item in related["neighbours"]
-    )
-
-
-def test_only_native_auto_edges_hide_and_label(service):
-    from cli_agent_orchestrator.services.memory_eligibility import (
-        AutoSupersedeSource,
-        EligibilityRequest,
-        MemoryIdentity,
-    )
-
-    for key in ("source", "auto-old", "human-old"):
-        run(service.store(key, key=key, scope="global"))
-    relationships = service._relationship_service()
-    relationships.create("global", None, "source", "auto-old", "supersedes", "auto_supersede")
-    relationships.create("global", None, "source", "human-old", "supersedes", "human")
-    assert sorted(memory.key for memory in run(service.recall(scope="global"))) == [
-        "human-old",
-        "source",
-    ]
-    listed = run(service.recall(scope="global", include_superseded=True))
-    assert {memory.key: memory.lifecycle_status for memory in listed} == {
-        "auto-old": "superseded",
-        "human-old": None,
-        "source": None,
-    }
-    candidates = [
-        MemoryIdentity("auto-old", "global", None, "native"),
-        MemoryIdentity("auto-old", "global", None, "vault"),
-        MemoryIdentity("human-old", "global", None, "native"),
-    ]
-    verdicts = AutoSupersedeSource(service._db_session_factory).excluded(
-        EligibilityRequest.from_context("curated_recall", None), candidates
-    )
-    assert verdicts == {candidates[0]: "superseded"}
-
-
 def test_setting_default_off(monkeypatch):
     from cli_agent_orchestrator.services.config_service import MemoryConfig
 
@@ -241,8 +290,13 @@ def test_restore_clamped_entry_removes_provenance_from_content(service):
         )
     )
     latest = run(service.store("Newest.", key="relay", scope="global"))
-    run(service.restore("relay", scope="global", version=version_from(latest)))
+    version = version_from(latest)
+    run(service.restore("relay", scope="global", version=version))
     assert run(service.recall(scope="global"))[0].content == "Clamped revision."
+    assert (
+        run(service.restore("relay", scope="global", version=version))["restored"]
+        == "already_restored"
+    )
 
 
 def test_restore_resolves_project_alias_before_native_lookup(service, tmp_path, monkeypatch):

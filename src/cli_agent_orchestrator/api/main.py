@@ -1653,7 +1653,6 @@ class MemorySummary(BaseModel):
     indexed_at: Optional[datetime] = None
     index_freshness: Optional[str] = None
     content_truncated: bool = False
-    lifecycle_status: Optional[str] = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class MemoryDetail(MemorySummary):
@@ -11425,7 +11424,6 @@ class InternalMemoryRecallRequest(BaseModel):
     sort_by: Optional[str] = None
     include_related: bool = False
     record_access: bool = True
-    include_superseded: bool = False
 
 
 class InternalMemoryRestoreRequest(BaseModel):
@@ -11508,7 +11506,6 @@ async def internal_memory_recall(
         sort_by=body.sort_by,
         include_related=body.include_related,
         record_access=body.record_access,
-        include_superseded=body.include_superseded,
     )
     # One serializer for both recall surfaces (this route and the MCP
     # memory_recall tool); see models/memory.py.
@@ -11678,7 +11675,6 @@ def _to_memory_summary(mem, base_dir: Path) -> MemorySummary:
         indexed_at=getattr(mem, "indexed_at", None),
         index_freshness=getattr(mem, "index_freshness", None),
         content_truncated=bool(getattr(mem, "content_truncated", False)),
-        lifecycle_status=getattr(mem, "lifecycle_status", None),
     )
 
 
@@ -11725,7 +11721,6 @@ async def list_memories_endpoint(
     memory_type: Optional[MemoryType] = Query(default=None, alias="type"),
     scope_id: Optional[MemoryScopeId] = None,
     limit: int = Query(default=50, ge=1, le=100),
-    include_superseded: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[MemorySummary]:
     """List stored memories across all projects (mirrors `cao memory list --all`)."""
@@ -11743,7 +11738,6 @@ async def list_memories_endpoint(
             limit=1000,
             scan_all=True,
             search_mode="metadata",
-            **({"include_superseded": True} if include_superseded else {}),
             record_access=not is_non_accessing_inspection_enabled(),
         )
         if scope_id is not None:
@@ -12124,7 +12118,6 @@ async def clear_memories_endpoint(
             limit=1000,
             scan_all=True,
             search_mode="metadata",
-            include_superseded=True,
         )
     except Exception as e:
         raise HTTPException(

@@ -331,6 +331,9 @@ The requested previous entry is appended under the same key with authored links
 intact. The version hint includes a timestamp and entry ordinal, so same-second
 writes remain distinct. Repeating the request returns `already_restored` without
 another write; a later replacement makes an old hint return `stale_version`.
+Restore also reinstates the previous entry's type and tags, and returns a
+`reverse_undo` hint for reversing the restoration. Per-version type and tags
+are recorded in topic-file metadata comments while automatic supersede is on.
 An absent key returns `not_found`. The caller needs the same write access as
 `memory_store`; vault-mapped keys cannot be restored this way.
 
@@ -345,11 +348,6 @@ never cause automatic supersede; content links remain normal relationships.
 Same-key writes already show their latest entry in recall, so no other key is
 hidden or resurrected by this feature.
 
-For existing legacy `auto_supersede` edges, exact reads and `memory_related`
-label superseded notes. `cao memory list --include-superseded`,
-`GET /memory?include_superseded=true`, and `memory_recall(include_superseded=True)`
-expose them. Clear includes hidden notes, avoiding later resurrection.
-
 Every supersede and every undo writes one line to the memory audit log
 (`logs/memory/<date>.md`): `memory_superseded` or `memory_supersede_undone`,
 with the key, scope, reason and superseding key. The line never contains note
@@ -357,7 +355,8 @@ content.
 
 `memory.supersede.auto` defaults to `false`. Set it to `true` to report same-key
 replacements in append mode. Env override: `CAO_MEMORY_SUPERSEDE_AUTO`.
-Off produces no supersede audit lines and does not hide legacy supersede edges.
+Off produces no supersede audit lines; `memory_restore` is unavailable as an
+MCP tool and the internal restore route refuses requests while off.
 The setting doesn't change the opt-in
 `memory.lifecycle.enabled` rules below, which apply to every active `supersedes`
 edge.
@@ -369,8 +368,6 @@ verdicts keyed by `(key, scope, scope_id, source_kind)`. Each enabled source is
 queried once per new candidate batch; identities are memoized only within the
 current injection build or curator recall. There is no cross-call cache or
 automatic discovery of external sources. The built-in `lifecycle.supersedes` source is disabled by default.
-The built-in `supersede.auto` source excludes notes CAO superseded automatically.
-It is enabled only while `memory.supersede.auto` is on and such an edge exists.
 
 Native entries, vault candidates and related targets are checked before their
 caps; vault exclusions happen before body loading. The same check also covers
@@ -424,9 +421,7 @@ memory, so the recorded block remains the one delivered with the step's first
 message. Another terminal creation does not invalidate that snapshot. A fresh
 workflow run resolves current memory.
 
-Explicit recall retains lifecycle-superseded memories; legacy auto-supersede
-edges instead require `include_superseded=True` while auto mode is enabled.
-With lifecycle enabled, recency
+Explicit recall retains lifecycle-superseded memories. With lifecycle enabled, recency
 moves them last without changing membership; usage demotes them before the
 stable scope pass and slice. Score/relevance keep their existing always-on
 demotion; the flag adds annotation only in those modes. A transient
@@ -657,8 +652,7 @@ shift. A later memory-v2 phase adds BM25 as the default ranking mode.
 Memories are linked by typed, provenance-tagged edges (`relates_to`,
 `contradiction`, `supersedes`) held in a durable store rather than inferred at
 read time. Each edge records its `origin` — `compiler`, `wiki_lint`, `human`,
-`legacy_related_keys`, `external_import`, `vault`, `content_link`, or
-`auto_supersede` — and a `status`.
+`legacy_related_keys`, `external_import`, `vault`, or `content_link` — and a `status`.
 
 With `memory.relationships.content_links=true` (opt-in), native topic content
 is also a relationship producer. On store and repair, same-scope

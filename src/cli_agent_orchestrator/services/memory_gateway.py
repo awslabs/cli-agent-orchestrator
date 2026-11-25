@@ -128,7 +128,6 @@ async def recall_memory(
     search_mode: Optional[str],
     sort_by: Optional[str],
     include_related: bool,
-    include_superseded: bool = False,
 ):
     if not remote_memory_url():
         return await MemoryService().recall(
@@ -140,7 +139,6 @@ async def recall_memory(
             search_mode=search_mode,
             sort_by=sort_by,
             include_related=include_related,
-            include_superseded=include_superseded,
         )
     body = {
         key: value
@@ -156,8 +154,6 @@ async def recall_memory(
         }.items()
         if value is not None
     }
-    if include_superseded:
-        body["include_superseded"] = True
     payload = await asyncio.to_thread(
         _post,
         "/internal/memory/recall",
