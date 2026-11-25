@@ -8,7 +8,7 @@ import { div as uiDiv, image as uiImage, svg as uiSvg } from "gpui-kit";
 import { h_flex as uiRow } from "gpui-base";
 import { agents as uiAgents, run as uiRun, openOverlay as uiOpenOverlay, props as uiProps, shared as uiShared, setShared as uiSetShared } from "herdr";
 import { randomUUID as uiUuid } from "crypto";
-import { dialogLive, dialogSpec, leaseFor } from "./shell.js";
+import { DIALOG_BUSY_NOTICE_MS, busyNoticeText, dialogLive, dialogSpec, leaseFor } from "./shell.js";
 
 // agent.focus for a terminal Herdr lists as an agent, pane.focus for one it does not.
 export function focusTerminal(address) {
@@ -61,13 +61,21 @@ export function shapeMark(name, c) {
 const UI_DIALOG_KEY = "caowin.dialog";
 const UI_PANEL_MOD = "cao-window-panel";
 
+// When the notice of a refused open ends, in this mod's own memory: the mod that was clicked is the one that draws it.
+let uiBusyUntil = 0;
+// The one-line notice a mod draws while its last open was refused, or null.
+export const dialogBusyNotice = () => busyNoticeText(uiBusyUntil, Date.now());
+
 // Opens the dialog for `request` ({kind, ...}), unless one is open: the lease `caowin.dialog` is read against this
-// clock and refuses only while it is live. Otherwise it writes the lease for a new name (`dlg-<8 hex>`, passed to
+// clock and refuses only while it is live (and then the click leaves the notice dialogBusyNotice gives). Otherwise it writes the lease for a new name (`dlg-<8 hex>`, passed to
 // the dialog in its request) and opens the overlay in the same tick, with the opener's own layout props merged in,
 // because an overlay copy gets only what it is passed. Returns whether a dialog was opened.
 export function openDialog(request) {
   const now = Date.now();
-  if (dialogLive(uiShared(UI_DIALOG_KEY), now)) return false;
+  if (dialogLive(uiShared(UI_DIALOG_KEY), now)) {
+    uiBusyUntil = now + DIALOG_BUSY_NOTICE_MS;
+    return false;
+  }
   const name = `dlg-${uiUuid().replace(/-/g, "").slice(0, 8)}`;
   uiSetShared(UI_DIALOG_KEY, leaseFor(name, now));
   uiOpenOverlay({ mod: UI_PANEL_MOD, ...dialogSpec({ ...request, name }, uiProps()) });

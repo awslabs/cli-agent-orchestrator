@@ -391,8 +391,20 @@ test("a save answer with no usable name still counts as saved, with the name nul
   for (const json of [undefined, null, {}, { name: 5 }, { name: null }, []]) assert.deepEqual(flows.flowSaveOutcome(ok(json, 201), { mode: "create" }), { type: "saved", name: null, armed: false }, JSON.stringify(json));
 });
 
-test("Duplicate on create: a 409 says a schedule with that name exists, at the name field, and carries nothing else", () => {
-  assert.deepEqual(flows.flowSaveOutcome(err(409, { detail: "x" }, "x"), { mode: "create" }), { type: "conflict", field: "name", text: "a schedule with that name exists" });
+test("Duplicate on create: the server's name-clash 409 says a schedule with that name exists, at the name field, and carries nothing else", () => {
+  const clash = "Flow 'daily' already exists";
+  assert.deepEqual(flows.flowSaveOutcome(err(409, { detail: clash }, clash), { mode: "create" }), { type: "conflict", field: "name", text: "a schedule with that name exists" });
+});
+
+test("a create 409 that is not a name clash shows the server's own detail at the name field, not that a schedule with the name exists", () => {
+  // POST /flows answers 409 too when the name's file is the file another flow was added from (a flow `a` added from flows/b.flow.md).
+  const overwrite = "Flow 'b' would overwrite /srv/cao/flows/b.flow.md, the file flow 'a' is registered from";
+  const o = flows.flowSaveOutcome(err(409, { detail: overwrite }, overwrite), { mode: "create" });
+  assert.deepEqual(o, { type: "conflict", field: "name", text: overwrite });
+  assert.deepEqual(flows.flowSaveEffects(o, { name: "b", authText: AUTH }), { done: false, serverErrors: { name: [overwrite] }, banner: null });
+  for (const empty of [undefined, ""]) {
+    assert.equal(flows.flowSaveOutcome(err(409, undefined, empty), { mode: "create" }).text, "a schedule with that name exists", `no detail (${JSON.stringify(empty)}) keeps the clash text`);
+  }
 });
 
 test("an edit's 409 is not a name clash: it is the server's own message, a failure", () => {
@@ -736,7 +748,7 @@ test("a server that ignored enabled false and armed the flow is said so, and onl
 });
 
 test("Duplicate on create: the form says a schedule with that name exists at the name, and nothing else changes", () => {
-  const r = flows.flowSaveOutcome(err(409, { detail: "exists" }, "exists"), { mode: "create" });
+  const r = flows.flowSaveOutcome(err(409, { detail: "Flow 'daily' already exists" }, "Flow 'daily' already exists"), { mode: "create" });
   assert.deepEqual(flows.flowSaveEffects(r, { name: "daily", authText: AUTH }), { done: false, serverErrors: { name: ["a schedule with that name exists"] }, banner: null });
 });
 

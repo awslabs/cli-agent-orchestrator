@@ -17,7 +17,7 @@ import { v_flex, h_flex } from "gpui-base";
 import { exec, hc, spaces, machines, terminals, focused, layout, run, theme, props, shared, setShared, checking, window } from "herdr";
 import { callCao, seg, AUTH_MESSAGE } from "./cao.js";
 import { createStore } from "./store.js";
-import { shapeMark, pinIcon, programMark, crownIcon, sessionBadge, focusTerminal, openDialog } from "./ui.js";
+import { shapeMark, pinIcon, programMark, crownIcon, sessionBadge, focusTerminal, openDialog, dialogBusyNotice } from "./ui.js";
 import { sessionLine, agentRows, pinMark, focusedRow, sessionSelection, agentsHeader, sessionsHeader, foldSummary, badgeColors, badgeFill, goalLines, CROWN_MARK } from "./agents.js";
 import { rsideStep } from "./shell.js";
 import {
@@ -338,9 +338,9 @@ export default class CaoSide extends View {
   // The lines under the header: what is wrong, in the words of lib/logic.js and lib/cao.js.
   noticeLines(t, m) {
     const cao = this.store.get(KEYS.cao);
-    if (this.section === "agents") return [this.store.notice()].filter(Boolean).map((line) => div().flex_none().px(12).pb(4).text_size(11).text_color(t.blocked).child(line));
+    if (this.section === "agents") return [this.store.notice(), dialogBusyNotice()].filter(Boolean).map((line) => div().flex_none().px(12).pb(4).text_size(11).text_color(t.blocked).child(line));
     const note = headerNote({ connected: m.connected, unreachable: cao?.unreachable === true });
-    return [cao?.auth === true ? AUTH_MESSAGE : null, note, this.store.notice()].filter(Boolean)
+    return [cao?.auth === true ? AUTH_MESSAGE : null, note, this.store.notice(), dialogBusyNotice()].filter(Boolean)
       .map((line) => div().flex_none().px(12).pb(4).text_size(11).text_color(t.blocked).child(line));
   }
 

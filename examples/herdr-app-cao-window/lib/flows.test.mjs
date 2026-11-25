@@ -98,6 +98,25 @@ test("Numeric day of week: the warning says the server counts from Monday as 0, 
   assert.match(w, /mon-fri/);
 });
 
+// The scheduler runs a schedule on the days that match the day of the month AND the day of the week; standard cron runs it on either.
+const DAY_AND_WEEKDAY = "Both the day of the month and the day of the week are set. This server runs the schedule only on days that match both; standard cron runs it on days that match either. The next runs below show what it will do.";
+test("Day of month and day of week both set: the warning says the server needs both to match, and the standard reading is either", () => {
+  for (const cron of ["0 9 1 * mon", "0 9 1,15 * mon-fri", "30 8 15 6 fri", "0 9 1-7 * mon", "  0   9\t1 *  mon  ", "0 9 1 * 1", "0 9 31 * sun"]) {
+    assert.equal(flows.dayAndWeekdayWarning(cron), DAY_AND_WEEKDAY, JSON.stringify(cron));
+  }
+});
+
+test("no day-and-weekday warning when either field is a star (or a star with a step, or ?), or for text that is not a cron", () => {
+  for (const cron of ["0 9 * * mon-fri", "0 9 1 * *", "0 9 * * *", "*/5 * * * *", "0 9 */2 * mon", "0 9 1 * */2", "0 9 ? * mon", "0 9 1 * ?", "nonsense", "", "1 2 3 4", "1 2 3 4 5 6"]) {
+    assert.equal(flows.dayAndWeekdayWarning(cron), null, JSON.stringify(cron));
+  }
+  for (const bad of [null, undefined, 5, {}]) assert.equal(flows.dayAndWeekdayWarning(bad), null, String(bad));
+});
+
+test("the presets never trigger the day-and-weekday warning", () => {
+  for (const p of flows.FLOW_PRESETS) assert.equal(flows.dayAndWeekdayWarning(p.cron), null, p.cron);
+});
+
 test("the warning fires for any digit in the day-of-week field, in any form", () => {
   for (const cron of ["0 9 * * 0", "0 9 * * 1-5", "0 9 * * 1,3", "0 9 * * */2", "0 9 * * mon-5", "0 9 * * 6", "0 9 * * 7", "  0   9 *\t* 1-5  "]) {
     assert.equal(typeof flows.numericWeekdayWarning(cron), "string", JSON.stringify(cron));

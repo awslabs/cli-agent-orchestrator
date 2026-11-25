@@ -66,6 +66,17 @@ export function numericWeekdayWarning(cron) {
   return "This server counts days of the week from Monday as 0, so 1-5 is Tuesday to Saturday. Use names such as mon-fri; the next runs below show what it will do.";
 }
 
+// The server's scheduler runs a schedule only on days that match the day of the month AND the day of the week; standard cron, which
+// people have in mind, runs it on either. A field that starts with a star (or is ?) leaves the other one alone in both readings, so
+// only two restricting fields differ. The next runs the server returns are authoritative.
+export function dayAndWeekdayWarning(cron) {
+  const f = fieldsOf(cron);
+  if (f.length !== 5) return null;
+  const restricts = (x) => !x.startsWith("*") && x !== "?";
+  if (!restricts(f[2]) || !restricts(f[4])) return null;
+  return "Both the day of the month and the day of the week are set. This server runs the schedule only on days that match both; standard cron runs it on days that match either. The next runs below show what it will do.";
+}
+
 // A disabled flow's stored next_run is stale when it is in the past. The stored time has no zone;
 // offsetMinutes is the server's offset east of UTC (UTC-8 is -480), read from a validate answer's next run.
 // Without it the time counts as past only when it is past in every zone: even at UTC-12.
@@ -429,7 +440,13 @@ export function flowSaveOutcome(outcome, { mode, enable = false } = {}) {
       ? "CAO did not answer. The edit may have been applied: look at the schedule's details before sending it again."
       : "CAO did not answer. The schedule may exist: look in the Schedules list before creating it again." };
   }
-  if (kind === "error" && outcome.status === 409 && mode !== "edit") return { type: "conflict", field: "name", text: "a schedule with that name exists" };
+  if (kind === "error" && outcome.status === 409 && mode !== "edit") {
+    // POST /flows answers 409 for a name that is taken ("Flow 'x' already exists") and also when the name's file is the file another
+    // flow was added from. Only the first is a name clash; the second gets the server's own words.
+    const detail = typeof outcome.detail === "string" ? outcome.detail.trim() : "";
+    const clash = detail === "" || /^Flow '[^']*' already exists$/.test(detail);
+    return { type: "conflict", field: "name", text: clash ? "a schedule with that name exists" : detail };
+  }
   if (kind === "error" && outcome.status === 422) {
     const e = fieldErrorsFrom422(outcome.json);
     return { type: "fields", errors: formErrorsOf(e.byField), general: e.general };

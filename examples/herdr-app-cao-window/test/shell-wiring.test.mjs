@@ -178,7 +178,7 @@ test("Closed by Herdr: the status bar writes no lease and clears nothing at star
   assert.ok(init !== null && !/\.set\(|setShared\(/.test(init.replace(/this\.store = createStore\([^)]*\)/, "")), "init writes nothing");
 });
 
-test("Delete fails twice after the dialog closed: a delete goes only through draftCall, and its answer through afterDelete", () => {
+test("Delete fails after the dialog closed: a delete goes only through draftCall, and its answer through afterDelete", () => {
   const src = status();
   assert.equal(lineCount(src, /draftCall\(/), 1);
   assert.equal(lineCount(src, /afterDelete\(/), 1);
@@ -366,6 +366,19 @@ test("Opened from either New session control: openDialog reads the lease, then w
   assert.match(body, /dialogSpec\([^)]*,\s*uiProps\(\)\)/, "the overlay props carry the opener's layout props");
   assert.equal(count(body, /\bawait\b|\.then\(/g), 0, "the check and the write are one tick");
   assert.match(src.keep, /openOverlay as uiOpenOverlay/);
+});
+
+test("A refused open leaves a notice: openDialog notes when it refused, and the three hosts of the open buttons draw it", () => {
+  const body = bodyOf(ui(), "openDialog");
+  assert.ok(body !== null);
+  assert.ok(body.search(/dialogLive\(/) < body.search(/uiBusyUntil = /), "the notice is noted on the refusal");
+  assert.ok(body.search(/uiBusyUntil = /) < body.search(/return false/), "and before the open returns false");
+  assert.equal(count(body, /uiBusyUntil = /g), 1);
+  assert.match(ui().keep, /export (function|const) dialogBusyNotice/);
+  for (const [what, src] of [["the side mod", read("mods", "cao-window-side", "main.js")], ["the sidebar", read("mods", "cao-window-panel", "sidebar.js")], ["the status mod", read("mods", "cao-window-status", "main.js")]]) {
+    assert.ok(count(src.keep, /dialogBusyNotice\(\)/g) >= 1, `${what} draws the notice`);
+    assert.match(src.keep, /import \{[^}]*\bdialogBusyNotice\b[^}]*\} from "\.\/ui\.js"/, `${what} imports it from ui.js`);
+  }
 });
 
 // ---- the left sidebar (20.1, 20.2) -------------------------------------------------------------------
@@ -806,7 +819,7 @@ test("Result card: a 201 selects the session behind the card, remembers the dire
 });
 
 const FLOW_RULES = ["flowFormGate", "flowSaveAttempt", "flowSaveEffects", "flowSaveOutcome", "flowCreateBody", "flowUpdateBody", "flowFields", "flowFormOf", "emptyFlowForm",
-  "validateBody", "validateResult", "flowCheckKey", "flowRoute", "routesState", "shownErrors", "firstErrorField", "formErrorsOf", "numericWeekdayWarning", "scheduleWarning",
+  "validateBody", "validateResult", "flowCheckKey", "flowRoute", "routesState", "shownErrors", "firstErrorField", "formErrorsOf", "numericWeekdayWarning", "dayAndWeekdayWarning", "scheduleWarning",
   "workflowChoices", "flowFormDirty", "flowDialogSpec", "validateNote", "runWords"];
 
 
@@ -1043,7 +1056,7 @@ test("Dialog closed during drafting: close does nothing to the record, and a del
   assert.ok(count(src.keep, /(?<![\w$.])draftCall\(/g) >= 1);
 });
 
-test("Delete fails twice: a delete answer goes through afterDelete, and a 404 counts as deleted", () => {
+test("Delete fails: a delete answer goes through afterDelete, and a 404 counts as deleted", () => {
   const src = dialog();
   const effect = bodyOf(src, "dlRunDraftEffect");
   assert.ok(effect !== null, "dlRunDraftEffect exists");

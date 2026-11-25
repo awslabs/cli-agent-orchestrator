@@ -734,6 +734,19 @@ const NAME = "cao-draft-flow-0a1b2c3d";
 const author = (over = {}) => ({ name: NAME, owner: "dlg-a", at: 100 * SEC, tries: 0, id: "t1", ...over });
 const lease = (name, until) => ({ name, until });
 
+test("A click on a form button while a closed dialog's lease is live gets a one-line notice for four seconds, and not for longer", () => {
+  assert.equal(S.DIALOG_BUSY_NOTICE, "A form is still closing, try again in a moment");
+  assert.equal(S.DIALOG_BUSY_NOTICE_MS, 4000);
+  const until = 10_000 + S.DIALOG_BUSY_NOTICE_MS;
+  assert.equal(S.busyNoticeText(until, 10_000), S.DIALOG_BUSY_NOTICE);
+  assert.equal(S.busyNoticeText(until, until - 1), S.DIALOG_BUSY_NOTICE);
+  assert.equal(S.busyNoticeText(until, until), null, "the deadline itself is past");
+  assert.equal(S.busyNoticeText(0, 10_000), null, "no refused click yet");
+  for (const bad of [undefined, null, NaN, "x", Infinity]) assert.equal(S.busyNoticeText(bad, 10_000), null, String(bad));
+  assert.equal(S.busyNoticeText(until, NaN), null);
+  assert.equal(S.busyNoticeText(10_000 + 1e9, 10_000), null, "a clock set back leaves a deadline far ahead, which is dead");
+});
+
 test("Closed by Herdr: a record past its deadline does not refuse an open", () => {
   assert.deepEqual(S.leaseFor("dlg-a", 5000), { name: "dlg-a", until: 15_000 });
   const rec = freeze(S.leaseFor("dlg-a", 0));
@@ -869,22 +882,48 @@ test("Author names that are not the window's own are never recorded: recordAutho
   assert.deepEqual(S.recordAuthor(undefined, "cao-real", "dlg-a", 1), []);
 });
 
-test("A stored try count that is not a count reads as none: a negative or odd value cannot grant more than two deletes", () => {
-  // how many deletes the cleanup sends for an entry whose stored `tries` is this, every one of them failing
-  const attempts = (tries) => {
-    let authors = freeze([author({ tries })]);
-    let n = 0;
-    while (S.authorDeletes(authors, null, 500 * SEC, []).length > 0 && n < 10) {
-      authors = freeze(S.afterDelete(authors, [], NAME, false).authors);
-      n += 1;
-    }
-    return n;
-  };
-  for (const tries of [0, -1, -5, -1e9, -Infinity, NaN, "0", "-5", [0], null, undefined, { valueOf: () => -5 }]) assert.equal(attempts(tries), 2, `tries ${String(tries)}`);
-  assert.equal(attempts(1), 1);
-  for (const tries of [2, 3, 1e300]) assert.equal(attempts(tries), 0, `tries ${tries}`);
+// Every delete answers 5xx or never reaches CAO: the cleanup is driven once a second (the status mod's timer), and each try is
+// recorded with its time. Returns the seconds, from the first try, at which a DELETE was sent.
+const failingRun = (entry, { until = 3600 } = {}) => {
+  let authors = freeze([entry]);
+  const sent = [];
+  for (let t = 0; t <= until; t += 1) {
+    if (S.authorDeletes(authors, null, t * SEC, []).length === 0) continue;
+    sent.push(t);
+    authors = freeze(S.afterDelete(authors, [], NAME, false, t * SEC).authors);
+  }
+  return sent;
+};
+
+test("A failed delete is tried again with a growing delay, ten tries in all, the last about eight and a half minutes after the first", () => {
+  const sent = failingRun(author({ at: 0 }));
+  assert.deepEqual(sent, [0, 1, 3, 7, 15, 31, 63, 127, 255, 511], "each wait is twice the one before");
+  assert.ok(sent.at(-1) * SEC <= 10 * 60 * SEC, "a short outage is covered for ten minutes at most");
+  assert.ok(sent.at(-1) * SEC >= 8 * 60 * SEC, "and for several minutes at least");
+});
+
+test("The delay counts from the last failed try: no DELETE is returned before it has passed, and a try made at another time moves it", () => {
+  const first = freeze(S.afterDelete(freeze([author()]), [], NAME, false, 500 * SEC).authors);
+  assert.equal(first[0].tries, 1);
+  assert.deepEqual(S.authorDeletes(first, null, 500 * SEC + 999, []), []);
+  assert.deepEqual(S.authorDeletes(first, null, 500 * SEC + 1000, []), [NAME]);
+  const second = freeze(S.afterDelete(first, [], NAME, false, 900 * SEC).authors);
+  assert.equal(second[0].tries, 2);
+  assert.deepEqual(S.authorDeletes(second, null, 900 * SEC + 1999, []), []);
+  assert.deepEqual(S.authorDeletes(second, null, 900 * SEC + 2000, []), [NAME]);
+  // a record of a try that is dated in the future (a clock set back) is no record of when: the next try may go at once
+  const skewed = freeze([author({ tries: 1, lastTry: 9_000_000 * SEC })]);
+  assert.deepEqual(S.authorDeletes(skewed, null, 500 * SEC, []), [NAME]);
+});
+
+test("A stored try count that is not a count reads as none: a negative or odd value cannot grant more than ten deletes", () => {
+  for (const tries of [0, -1, -5, -1e9, -Infinity, NaN, "0", "-5", [0], null, undefined, { valueOf: () => -5 }]) assert.equal(failingRun(author({ tries, at: 0 })).length, 10, `tries ${String(tries)}`);
+  assert.equal(failingRun(author({ tries: 1, lastTry: 0 })).length, 9);
+  for (const tries of [10, 11, 1e300]) assert.equal(failingRun(author({ tries })).length, 0, `tries ${tries}`);
   // a failed answer counts from the clamped value, so a stored -5 is one try, not -4
-  assert.equal(S.afterDelete(freeze([author({ tries: -5 })]), [], NAME, false).authors[0].tries, 1);
+  assert.equal(S.afterDelete(freeze([author({ tries: -5 })]), [], NAME, false, 1000).authors[0].tries, 1);
+  // a try time that is not a time reads as none: the delete may go at once, still within the ten
+  for (const lastTry of ["x", NaN, null, -5]) assert.deepEqual(S.authorDeletes(freeze([author({ tries: 3, lastTry })]), null, 500 * SEC, []), [NAME], `lastTry ${String(lastTry)}`);
 });
 
 test("Slow delete is not sent twice: a name in the in-flight list is not returned, on any number of calls", () => {
@@ -928,17 +967,19 @@ test("Launch with no answer keeps the record: status 0 keeps it and the cleanup 
   assert.deepEqual(S.authorDeletes(freeze(kept), null, at + 25 * SEC, []), [NAME, "cao-draft-flow-bbbbbbbb"], "deleted by name 25 s after it was written");
 });
 
-test("Delete fails twice after the dialog closed: two failed answers are two tries, then the name is not returned again", () => {
+test("Delete keeps failing after the dialog closed: each failed answer is a try, and after ten the name is not returned again, however long after", () => {
   let authors = freeze([author()]);
   let drafts = ["t1", "t9"];
-  assert.deepEqual(S.authorDeletes(authors, null, 300 * SEC, []), [NAME]);
-  for (const tries of [1, 2]) {
-    const r = S.afterDelete(authors, drafts, NAME, false);
+  let now = 300 * SEC;
+  assert.deepEqual(S.authorDeletes(authors, null, now, []), [NAME]);
+  for (let tries = 1; tries <= 10; tries += 1) {
+    const r = S.afterDelete(authors, drafts, NAME, false, now);
     authors = freeze(r.authors);
     drafts = r.drafts;
     assert.equal(authors[0].tries, tries);
+    now += 3600 * SEC;
   }
-  assert.deepEqual(S.authorDeletes(authors, null, 300 * SEC, []), []);
+  assert.deepEqual(S.authorDeletes(authors, null, now, []), []);
   assert.equal(authors.length, 1, "the record stays, so Sessions keeps the session with its tag");
   assert.deepEqual(drafts, ["t1", "t9"], "the id stays too");
   assert.equal(authors[0].name, NAME);

@@ -238,15 +238,28 @@ export function dialogLive(record, now, name) {
   return name === undefined || record.name === name;
 }
 
-// `caowin.authors` is a list of {name, owner, at, tries, id}: a Draft with AI author session by the name chosen
-// for it, the dialog that owns it, when it was recorded, how many deletes failed and its terminal id (null until
-// the launch answered 201). `caowin.drafts` stays a list of ids.
+// A button that opens a form does nothing while a closed dialog's lease is still live (up to LEASE_MS: Herdr closes some overlays
+// without running mod code, so the lease runs out by itself). The click gets this one line for a few seconds instead of silence.
+export const DIALOG_BUSY_NOTICE = "A form is still closing, try again in a moment";
+export const DIALOG_BUSY_NOTICE_MS = 4000;
+// The notice while `until` (the refused click's time plus DIALOG_BUSY_NOTICE_MS) is ahead of `now`, else null. A deadline further
+// ahead than that is a clock set back, and is dead.
+export const busyNoticeText = (until, now) => (Number.isFinite(until) && Number.isFinite(now) && now < until && until <= now + DIALOG_BUSY_NOTICE_MS ? DIALOG_BUSY_NOTICE : null);
+
+// `caowin.authors` is a list of {name, owner, at, tries, lastTry, id}: a Draft with AI author session by the name chosen
+// for it, the dialog that owns it, when it was recorded, how many deletes failed, when the last of them was (absent until
+// one has) and its terminal id (null until the launch answered 201). `caowin.drafts` stays a list of ids.
 const AUTHOR_LAUNCH_MS = 25_000;   // the launch's --max-time plus 5 s
-const AUTHOR_TRIES = 2;
+// A DELETE that fails (CAO restarting, an ssh hiccup) is tried again, each wait twice the one before: 1 s, 2 s, 4 s ... 256 s,
+// ten tries in all over about eight and a half minutes, so a short outage does not leave the author agent running.
+const AUTHOR_TRIES = 10;
+const authorRetryDelayMs = (tries) => 1000 * 2 ** (tries - 1);
 const shHasId = (a) => typeof a?.id === "string" && a.id !== "";
 // A try count is a whole number from 0 up; whatever else is stored (a negative, a fraction, text) counts as 0, so
-// a forged value cannot grant more than AUTHOR_TRIES deletes.
+// a forged value cannot grant more than AUTHOR_TRIES deletes. The time of the last try is a time from 0 up and not later than
+// `now`; anything else (a clock set back leaves a later one) reads as 0, so the next try may go at once.
 const shTries = (a) => (Number.isInteger(a?.tries) && a.tries >= 0 ? a.tries : 0);
+const shLastTry = (a, now) => (Number.isFinite(a?.lastTry) && a.lastTry >= 0 && a.lastTry <= now ? a.lastTry : 0);
 
 // Records an author before its launch is sent (no id), or sets the id on the entry of that name, keeping its `at`
 // and `tries`. A call with no id does not wipe the one recorded. A name that is not one of the window's own
@@ -259,7 +272,8 @@ export function recordAuthor(authors, name, owner, now, id) {
   return [...list, { name, owner, at: now, tries: 0, id: newId }];
 }
 
-// The names to send DELETE /sessions/<name> for now: fewer than AUTHOR_TRIES failed tries, no DELETE out
+// The names to send DELETE /sessions/<name> for now: fewer than AUTHOR_TRIES failed tries, the wait after the last failed
+// one over (authorRetryDelayMs, counted from its time), no DELETE out
 // (`inFlight`, the names the always-drawn mod keeps in its own memory), an owner that is not live, and, while no
 // id is recorded, only once the launch's time limit has passed since `at`, so a launch still out is not deleted
 // before it creates its session. The name is the key, and only the window's own author-session names count
@@ -269,19 +283,21 @@ export function authorDeletes(authors, record, now, inFlight) {
   const out = shList(inFlight);
   return shList(authors).filter((a) => isAuthorSession(a?.name)
     && shTries(a) < AUTHOR_TRIES
+    && (shTries(a) === 0 || now >= shLastTry(a, now) + authorRetryDelayMs(shTries(a)))
     && !out.includes(a.name)
     && !(typeof a.owner === "string" && a.owner !== "" && dialogLive(record, now, a.owner))
     && (shHasId(a) || now >= a.at + AUTHOR_LAUNCH_MS)).map((a) => a.name);
 }
 
 // After a DELETE answered: ok (a 2xx or a 404) removes the entry and its id from drafts; else the entry counts a
-// try and stays. -> {authors, drafts}, new lists.
-export function afterDelete(authors, drafts, name, ok) {
+// try, notes when it was (`now`) and stays. -> {authors, drafts}, new lists.
+export function afterDelete(authors, drafts, name, ok, now) {
   const list = shList(authors);
   const entry = list.find((a) => a?.name === name);
   if (!entry) return { authors: list, drafts: shList(drafts) };
   if (ok === true) return { authors: list.filter((a) => a !== entry), drafts: forgetDraft(drafts, entry.id) };
-  return { authors: list.map((a) => (a === entry ? { ...a, tries: shTries(a) + 1 } : a)), drafts: shList(drafts) };
+  const lastTry = Number.isFinite(now) && now >= 0 ? now : 0;
+  return { authors: list.map((a) => (a === entry ? { ...a, tries: shTries(a) + 1, lastTry } : a)), drafts: shList(drafts) };
 }
 
 // After the author launch answered with `status`: an HTTP error status (400 to 599) means no session exists, so

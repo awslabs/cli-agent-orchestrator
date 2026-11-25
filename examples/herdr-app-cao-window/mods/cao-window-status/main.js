@@ -14,7 +14,7 @@ import { h_flex } from "gpui-base";
 import { exec, machines, spaces, terminals, theme, props, shared, setShared, setBadge, setWindowTitle, checking } from "herdr";
 import { callCao } from "./cao.js";
 import { createStore } from "./store.js";
-import { openDialog } from "./ui.js";
+import { openDialog, dialogBusyNotice } from "./ui.js";
 import { draftCall } from "./draft-view.js";
 import { buildModel, holdModel, statusCounts, seenState, nextFilter } from "./logic.js";
 import { statusParts, authorDeletes, afterDelete, deleteStarted, deleteEnded, WINDOW_TITLE } from "./shell.js";
@@ -82,7 +82,7 @@ export default class CaoStatus extends View {
       ok = false;
     }
     this.inFlight = deleteEnded(this.inFlight, name);
-    const next = afterDelete(listOf(this.store.get(KEYS.authors)), listOf(this.store.get(KEYS.drafts)), name, ok);
+    const next = afterDelete(listOf(this.store.get(KEYS.authors)), listOf(this.store.get(KEYS.drafts)), name, ok, Date.now());
     this.store.set(KEYS.authors, next.authors);
     this.store.set(KEYS.drafts, next.drafts);
   }
@@ -105,10 +105,11 @@ export default class CaoStatus extends View {
     const parts = statusParts(this.counts(), this.store.get(KEYS.filter) ?? null, { unreachable: this.store.get(KEYS.cao)?.unreachable === true });
     return h_flex().id("cao-status").size_full().px(8).gap(2).items_center().bg(t.chrome).border_t(1).border_color(t.border)
       .text_size(12).children(parts.map((part) => this.partView(t, part)))
+      .when(dialogBusyNotice() !== null, (e) => e.child(h_flex().id("cao-bar-busy").h(20).px(6).items_center().text_color(t.blocked).child(dialogBusyNotice())))   // fixed: one line of a 28 px status bar
       .child(div().flex_1())
       .child(h_flex().id("cao-bar-help").w(20).h(20).flex_none().items_center().justify_center().rounded(4).bg(t.surface)   // fixed: a control with one character
         .text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover))
-        .on_click(() => openDialog({ kind: "bar-help" }))
+        .on_click((_e, cx) => { openDialog({ kind: "bar-help" }); cx.notify(); })
         .child("?"));
   }
 }

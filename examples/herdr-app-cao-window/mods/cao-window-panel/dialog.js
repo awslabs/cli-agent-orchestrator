@@ -40,7 +40,7 @@ import {
 } from "./launch.js";
 import {
   flowRoute, validateBody, validateResult, FLOW_PRESETS, emptyFlowForm, flowFormOf, flowFields, flowCheckKey, formErrorsOf, shownErrors, firstErrorField, flowFormGate, flowSaveOutcome,
-  flowCreateBody, flowUpdateBody, routesState, flowDialogSpec, FLOW_CLI, validateNote, flowSaveAttempt, flowSaveEffects, numericWeekdayWarning, scheduleWarning, workflowChoices,
+  flowCreateBody, flowUpdateBody, routesState, flowDialogSpec, FLOW_CLI, validateNote, flowSaveAttempt, flowSaveEffects, numericWeekdayWarning, dayAndWeekdayWarning, scheduleWarning, workflowChoices,
   flowFormDirty, runWords,
 } from "./flows.js";
 import {
@@ -69,7 +69,7 @@ const DL_COPIED_MS = 2000;
 const DL_FLOWS_STAMP_KEY = "caowin.flowsStamp";   // the top bar reads GET /flows again when a write moves it
 const DL_FLOW_SAVE_SECONDS = 15;     // the curl limit of POST /flows and PUT /flows/{name}
 const DL_WORKFLOWS_STAMP_KEY = "caowin.workflowsStamp";   // the top bar reads GET /workflows again when a write moves it
-const DL_AUTHORS_KEY = "caowin.authors";   // the Draft with AI author sessions: {name, owner, at, tries, id}, written only by the pure record functions
+const DL_AUTHORS_KEY = "caowin.authors";   // the Draft with AI author sessions: {name, owner, at, tries, lastTry, id}, written only by the pure record functions
 const DL_DRAFTS_KEY = "caowin.drafts";     // the terminal ids of those author sessions: what marks a session "draft" in Sessions
 const DL_APPROVALS_KEY = "caowin.approvals";   // the "not submitted" rows: {workflow, planId, at}, written only through recordApproval and clearApproval
 const DL_WORKFLOW_SAVE_SECONDS = 20;   // the curl limit of POST /workflows and PUT /workflows/{name}
@@ -959,6 +959,7 @@ function dlFlowBody(panel, t, m) {
   const providers = providerChoices(panel.views.providers?.data, profile);
   const workflows = workflowChoices(panel.views.workflows?.data);
   const weekday = numericWeekdayWarning(form.schedule);
+  const dayAndWeekday = dayAndWeekdayWarning(form.schedule);
   const runs = (nf.checks?.nextRuns ?? []).map((r) => runWords(r));
   return dlCol().id("cao-flow-form").gap(12)
     .when(!editing, (e) => e.child(dlDiv().flex_none().text_size(10.5).text_color(t.dim).child("Global: not tied to the open session")))
@@ -979,6 +980,7 @@ function dlFlowBody(panel, t, m) {
       })))),
       { error: at("schedule") }))
     .when(Boolean(weekday), (e) => e.child(dlDiv().id("cao-nf-weekday").text_size(11.5).text_color(t.blocked).child(weekday)))
+    .when(Boolean(dayAndWeekday), (e) => e.child(dlDiv().id("cao-nf-dayweek").text_size(11.5).text_color(t.blocked).child(dayAndWeekday)))
     .child(dlCol().id("cao-nf-runs").gap(2)
       .child(heading(t, "Next 3 runs", "from the server's scheduler"))
       .children(runs.map((r) => dlDiv().text_size(12).child(r)))

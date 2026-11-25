@@ -19,7 +19,7 @@ import { div as sbDiv } from "gpui-kit";
 import { v_flex as sbCol, h_flex as sbRow } from "gpui-base";
 import { exec as sbExec, layout as sbLayout, theme as sbTheme, checking as sbChecking } from "herdr";
 import { callCao, AUTH_MESSAGE } from "./cao.js";
-import { shapeMark, openDialog } from "./ui.js";
+import { shapeMark, openDialog, dialogBusyNotice } from "./ui.js";
 import { shownBlock, applyOutcome, repaintDue, ageWords, dialogKey, statusShape, displayState, sectionSummary } from "./logic.js";
 import {
   flowRoute, flowsPollDue, fieldsOfFlow, validateBody, validateResult, flowDetailsView, flowDialogSpec, confirmSpec, writeOutcome, flowRowState, flowSessionWorking, flowsSummary,
@@ -506,5 +506,6 @@ export function renderSidebarHost(panel) {
   return sbCol().id("cao-panel").size_full().min_h(0).bg(t.chrome).text_color(t.foreground).text_size(13)
     .track_focus(panel.keys).on_key_down((e, cx) => sbOnKey(panel, e, cx))
     .when(panel.store.notice() !== null, (e) => e.child(sbDiv().flex_none().px(12).pt(8).text_size(11).text_color(t.blocked).child(panel.store.notice())))
+    .when(dialogBusyNotice() !== null, (e) => e.child(sbDiv().flex_none().px(12).pt(8).text_size(11).text_color(t.blocked).child(dialogBusyNotice())))
     .child(sbCol().id("cao-panel-body").flex_1().min_h(0).overflow_y_scrollbar().p(12).gap(10).child(body));
 }
