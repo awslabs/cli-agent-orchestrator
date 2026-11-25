@@ -44,12 +44,19 @@ LAYOUT_DOC = "herdr-app"
 DOC_WRITE_ATTEMPTS = 5
 DOC_RETRY_DELAY_S = 0.1
 MANAGED = {"cao.managed": "1"}
+# How many workers a terminal waits on (open delegation edges); absent when none.
+WAITING_LABEL = "cao.waiting"
 # Keys a caller of create_session/create_window may not set through extra_labels:
-# placement (herdr.*) and CAO's own identity labels.
+# placement (herdr.*), CAO's own identity labels, and the label CAO keeps current.
 RESERVED_LABEL_KEYS = frozenset(
-    {"cao.managed", "cao.home", "cao.terminal_id", "cao.session", "cao.window"}
+    {"cao.managed", "cao.home", "cao.terminal_id", "cao.session", "cao.window", WAITING_LABEL}
 )
 RPC_TIMEOUT_S = 10.0
+# A label write is best-effort and the sweep repairs a missed one, so its RPCs
+# give up well before RPC_TIMEOUT_S.
+WAITING_RPC_TIMEOUT_S = 2.0
+# The most a terminal's cao.waiting shows: the window reads 1 to 999 only.
+WAITING_MAX = 999
 # herdr-core error kinds that answer terminal.send before typing anything: a
 # send waiting on a fresh terminal's output gives `unavailable` (see the
 # comment above INPUT_TIMEOUT_S), and bad parameters are rejected before
@@ -150,6 +157,7 @@ class HerdrAppBackend(TerminalBackend):
         self._input_lock = threading.Lock()
         self._home = cao_home_label()
         self._managed = {**MANAGED, "cao.home": self._home}
+        self._waiting_failing = False  # inside a run of failed cao.waiting writes
         self._connect()
 
     def _connect(self) -> None:
@@ -496,6 +504,70 @@ class HerdrAppBackend(TerminalBackend):
         if not include_finished:
             return self._list()
         return list(self._call("terminal.list", labels=dict(self._managed), all=True)["terminals"])
+
+    def set_waiting_counts(self, counts: Mapping[str, int], *, complete: bool = False) -> None:
+        """Set ``cao.waiting`` on this server's terminals to their wait counts.
+
+        A count above 0 is written as a decimal string, at most 999; 0 removes
+        the label, so a terminal that waits on nothing carries none. A label that
+        already holds the wanted value is not written. An id with no live terminal
+        is skipped. With ``complete``, a terminal missing from ``counts`` waits on
+        nothing, so a stale label is removed: this is the sweep that repairs a
+        missed update. Only terminals of this server's ``cao.home`` are read or
+        changed.
+
+        Best-effort: a failed listing or write is logged and the rest go on. Each
+        RPC gives up after ``WAITING_RPC_TIMEOUT_S``. The first failure of a run
+        of failures is a warning, the later ones are debug, and a pass without a
+        failure ends the run.
+
+        Thread Safety:
+            Safe to call from several threads, but two overlapping calls can
+            leave the older count last; ``delegation_callback_service`` calls
+            it from one place at a time and reads each count just before the call.
+        """
+        if not counts and not complete:
+            return
+        failed = False
+        try:
+            live = list(
+                self._call("terminal.list", WAITING_RPC_TIMEOUT_S, labels=dict(self._managed))[
+                    "terminals"
+                ]
+            )
+        except TerminalBackendError as exc:
+            self._waiting_failed(f"could not list terminals to set {WAITING_LABEL}: {exc}")
+            return
+        for terminal in live:
+            labels = terminal.get("labels") or {}
+            terminal_id = str(labels.get("cao.terminal_id", ""))
+            if terminal_id in counts:
+                wanted = min(counts[terminal_id], WAITING_MAX)
+            elif complete:
+                wanted = 0
+            else:
+                continue
+            value = str(wanted) if wanted > 0 else ""
+            if labels.get(WAITING_LABEL, "") == value:
+                continue
+            try:
+                self._call(
+                    "terminal.label",
+                    WAITING_RPC_TIMEOUT_S,
+                    terminal=terminal["address"],
+                    labels={WAITING_LABEL: value},
+                )
+            except TerminalBackendError as exc:
+                self._waiting_failed(f"could not set {WAITING_LABEL} on {terminal_id}: {exc}")
+                failed = True
+        if not failed:
+            self._waiting_failing = False
+
+    def _waiting_failed(self, message: str) -> None:
+        """Log a failed label RPC: a warning to start a run of failures, debug after."""
+        log = logger.debug if self._waiting_failing else logger.warning
+        log("herdr-app: %s", message)
+        self._waiting_failing = True
 
     # --- Sessions and windows ---
 

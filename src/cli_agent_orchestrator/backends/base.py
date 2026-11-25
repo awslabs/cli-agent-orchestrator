@@ -582,3 +582,15 @@ class TerminalBackend(ABC):
         Returns None if unsupported — caller falls back to pane content parsing.
         """
         return None
+
+    def set_waiting_counts(self, counts: Mapping[str, int], *, complete: bool = False) -> None:
+        """Publish how many workers each terminal waits on, where the backend can show it.
+
+        ``counts`` maps a CAO terminal id to the number of its open delegation
+        edges; 0 means it waits on nothing. With ``complete`` the mapping lists
+        every terminal that waits, so a terminal missing from it waits on
+        nothing. Best-effort: it logs what it cannot write and never raises.
+
+        Default: does nothing, for backends that have nowhere to show it.
+        """
+        return None

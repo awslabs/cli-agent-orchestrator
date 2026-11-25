@@ -4764,6 +4764,21 @@ def list_open_edges_out_of(caller_id: str) -> List[DelegationEdge]:
         return [_edge_from_row(r) for r in rows]
 
 
+def count_open_edges_by_caller() -> Dict[str, int]:
+    """Open outbound edges per caller: how many terminals each caller waits on.
+
+    A caller with no open edge is absent. This is what ``cao.waiting`` holds.
+    """
+    with SessionLocal() as db:
+        rows = (
+            db.query(DelegationEdgeModel.caller_id, func.count(DelegationEdgeModel.id))
+            .filter(DelegationEdgeModel.state == EdgeState.OPEN.value)
+            .group_by(DelegationEdgeModel.caller_id)
+            .all()
+        )
+        return {caller_id: int(count) for caller_id, count in rows}
+
+
 def find_any_edge(caller_id: str, worker_id: str) -> Optional[DelegationEdge]:
     """The oldest edge caller -> worker in any state, open or closed."""
     with SessionLocal() as db:

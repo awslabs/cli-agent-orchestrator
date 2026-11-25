@@ -5522,6 +5522,9 @@ async def create_terminal_in_session(
                 await asyncio.to_thread(
                     create_delegation_edge, caller_id, result.id, EdgeSource.ASSIGN
                 )
+                await asyncio.to_thread(
+                    delegation_callback_service.refresh_waiting_labels, [caller_id]
+                )
         _set_launch_note(response, launch_plan)
         return result
     except HTTPException:
