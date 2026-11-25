@@ -559,6 +559,65 @@ class TestTheSweepRepairsWhateverElseFails:
         assert any("step failed" in r.getMessage() for r in caplog.records)
 
 
+class TestTheSweepKeepsGoingAfterOneStepFails:
+    def test_a_failure_settling_reply_marks_is_warned_about_and_the_rest_still_runs(
+        self, db, env, backend, caplog
+    ):
+        _armed("sup", "w1")
+
+        with (
+            patch(f"{MOD}.settle_stale_reply_marks", side_effect=RuntimeError("marks locked")),
+            caplog.at_level(logging.WARNING, logger=MOD),
+        ):
+            svc.sweep()
+
+        assert list_open_edges_into("w1") == []  # the armed worker was still evaluated
+        # its forward refreshed the caller, then the repair ran as a complete pass
+        assert backend.calls == [({"sup": 0}, False), ({}, True)]
+        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
+            "delegation sweep could not settle reply marks: marks locked"
+        ]
+
+    def test_one_workers_failed_evaluation_does_not_stop_the_next_worker(
+        self, db, env, backend, caplog
+    ):
+        _armed("sup", "w1")
+        _armed("sup", "w2")
+        real_evaluate = svc.evaluate_completion
+        seen = []
+
+        def evaluate(worker_id, registry=None):
+            seen.append(worker_id)
+            if worker_id == "w1":
+                raise RuntimeError("w1 output unreadable")
+            real_evaluate(worker_id, registry)
+
+        with (
+            patch(f"{MOD}.evaluate_completion", side_effect=evaluate),
+            caplog.at_level(logging.DEBUG, logger=MOD),
+        ):
+            svc.sweep()
+
+        assert sorted(seen) == ["w1", "w2"]
+        assert [e.worker_id for e in list_open_edges_into("w1")] == ["w1"]  # w1 was left alone
+        assert list_open_edges_into("w2") == []  # w2 was forwarded
+        assert any(
+            r.levelno == logging.DEBUG
+            and r.getMessage() == "delegation sweep failed for w1: w1 output unreadable"
+            for r in caplog.records
+        )
+        assert backend.calls[-1][1] is True  # the repair still ran
+
+
+class TestAStoppedPublisherTakesNoMoreRequests:
+    def test_a_request_after_stop_is_dropped(self, db, backend, publisher):
+        publisher.stop()
+
+        svc.refresh_waiting_labels(["sup"])
+
+        assert backend.calls == []
+
+
 class TestBackendsThatDoNotShowTheLabel:
     """tmux and the herdr TUI keep the no-op default, so no query is made for it (N1)."""
 
