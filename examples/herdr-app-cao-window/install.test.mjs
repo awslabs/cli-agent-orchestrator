@@ -6,7 +6,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync,
+  accessSync, chmodSync, constants, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -2831,13 +2831,26 @@ test("app copy: a Herdr app that is not a bundle, or a folder that would hold th
   nothingWritten(w);
 });
 
+// Whether `tool` is an executable file in one of the folders of a PATH value: what `command -v` answers for a
+// program, without starting a shell.
+function onPath(tool, pathValue) {
+  return pathValue.split(":").some((dir) => {
+    const file = join(dir, tool);
+    try {
+      accessSync(file, constants.X_OK);
+      return statSync(file).isFile();
+    } catch {
+      return false;
+    }
+  });
+}
+
 test("app copy: a missing codesign, xattr or PlistBuddy stops the install before anything is written", () => {
   for (const tool of ["codesign", "xattr", "PlistBuddy"]) {
     const w = world({ copy: true });
     rmSync(join(w.stubs, tool));
     const r = w.install(["--local"], { PATH: `${w.stubs}:${JQ_DIR}:/usr/bin:/bin` });
-    // the path and the tool name reach the shell as arguments, not as text of its command line
-    const real = spawnSync("sh", ["-c", 'PATH="$1" command -v "$2"', "sh", `${w.stubs}:${JQ_DIR}:/usr/bin:/bin`, tool], { encoding: "utf8" }).stdout.trim();
+    const real = onPath(tool, `${w.stubs}:${JQ_DIR}:/usr/bin:/bin`);
     if (real || tool === "PlistBuddy" && existsSync("/usr/libexec/PlistBuddy")) continue;   // the tool exists on this machine: nothing to refuse
     assert.equal(r.status, 3, `${tool}: ${r.text}`);
     assert.match(r.err, new RegExp(tool));
