@@ -181,8 +181,8 @@ def _parse_env_pairs(pairs):
     is_flag=True,
     help=(
         "With --headless and MESSAGE: return once the message is confirmed delivered to "
-        "the agent, without waiting for the task to finish. Exits non-zero with the "
-        "reason if delivery fails."
+        "the agent, without waiting for the task to finish. Exits non-zero if delivery "
+        "fails or is not confirmed in time. Check the terminal before you launch again."
     ),
 )
 @click.option(

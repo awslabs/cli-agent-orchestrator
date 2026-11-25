@@ -1,6 +1,6 @@
 # Headless / CI Example
 
-This example shows how to drive a single CAO agent from a CI runner — non-interactively, with a hard timeout, and with an exit code CI can act on. It launches with `--headless --async --yolo`, wrapped in a polling loop; `--yolo` removes every tool restriction, so read [`--auto-approve` vs `--yolo`](../../docs/tool-restrictions.md#--auto-approve-vs---yolo) before reusing it. With an initial message, `cao launch --async` sends that message and returns once the server confirms it reached the agent, which includes the time the provider takes to start. The agent then continues in the background.
+This example shows how to drive a single CAO agent from a CI runner — non-interactively, with a timeout on the task, and with an exit code CI can act on. It launches with `--headless --async --yolo`, wrapped in a polling loop; `--yolo` removes every tool restriction, so read [`--auto-approve` vs `--yolo`](../../docs/tool-restrictions.md#--auto-approve-vs---yolo) before reusing it. With an initial message, `cao launch --async` sends that message and returns once the server confirms it reached the agent, which includes the time the provider takes to start. The agent then continues in the background.
 
 ## What this demonstrates
 
@@ -29,7 +29,7 @@ sequenceDiagram
 
 ## Files
 
-- [`run.sh`](run.sh) — the runnable script. `set -euo pipefail`, hard timeout via `CAO_CI_TIMEOUT`, (counted from when `cao launch` returns, so the provider startup wait is on top of it), EXIT trap shuts down the session.
+- [`run.sh`](run.sh) — the runnable script. `set -euo pipefail`, hard timeout via `CAO_CI_TIMEOUT` (counted from when `cao launch` returns, so the provider startup wait is on top of it), EXIT trap shuts down the session.
 - [`ci_developer.md`](ci_developer.md) — minimal `role: developer` profile tuned for one-shot non-interactive execution. Always ends with a single-line summary, never asks follow-up questions.
 
 ## Setup
@@ -60,7 +60,7 @@ CAO_CI_TIMEOUT=60 ./examples/headless-ci/run.sh "Quick task"
 | Code | Meaning |
 |------|---------|
 | `0` | Agent reached `IDLE` or `COMPLETED`. |
-| `1` | Agent reached `ERROR`, or stalled at `WAITING_USER_ANSWER` (CI cannot answer). |
+| `1` | Agent reached `ERROR`, or stalled at `WAITING_USER_ANSWER` (CI cannot answer), or `cao launch` failed or could not confirm delivery (`set -e` stops the script). |
 | `124` | Polling exceeded `CAO_CI_TIMEOUT` seconds (default 600), counted from when `cao launch` returns. |
 
 ## Use in GitHub Actions

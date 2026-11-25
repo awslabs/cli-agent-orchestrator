@@ -867,6 +867,60 @@ class TestAKiroInitThatEndsBeforeItsCheckIsUntrusted:
 
 class TestRestartsAroundTheRecord:
     @pytest.mark.asyncio
+    async def test_cao_launch_row_reads_not_confirmed_after_both_startup_sweeps(self, pane):
+        """#882 item 3, on the row ``cao launch --headless "task"`` creates.
+
+        That row has no caller, so it carries the external-owner bit, and the
+        deferred task clears the bit only after it stores ``delivered``. A
+        restart between the send and its confirmation leaves the bit set and
+        ``initial_delivery`` pending, and the external-owner sweep reaches the
+        row first (the order in ``api/main.py``). It used to write "Re-assign
+        the task." and the CLI then said "was not delivered", for a task that
+        may have been typed. Both real sweeps, in startup order, on a real row;
+        then the line ``cao launch`` prints for what they stored.
+        """
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        tid = _row(
+            identity_verified=True, provider="claude_code", initial_delivery={"state": "pending"}
+        )
+
+        assert await terminal_service.recover_interrupted_deferred_init_external_owners()
+        assert await terminal_service.recover_interrupted_initial_deliveries()
+
+        metadata = terminal_service.get_terminal_metadata(tid)
+        delivery = metadata["initial_delivery"]
+        assert delivery["state"] == "failed"
+        for text in (delivery["message"], _failure(tid)["message"]):
+            assert "may already have reached the worker" in text
+            assert "check the terminal before you re-send" in text
+            assert "Re-assign the task" not in text
+
+        response = Mock()
+        response.json.return_value = {"status": "error", "initial_delivery": delivery}
+        with patch("cli_agent_orchestrator.utils.terminal.api_http.get", return_value=response):
+            with pytest.raises(click.ClickException) as excinfo:
+                wait_for_initial_delivery(tid, timeout=5)
+        line = excinfo.value.message
+        assert line.startswith(
+            f"Delivery of the initial message to terminal {tid} was not confirmed"
+        )
+        assert "was not delivered" not in line
+        assert "may already have reached the worker" in line
+
+    @pytest.mark.asyncio
+    async def test_a_restart_before_any_initial_message_still_says_re_assign(self, pane):
+        """No initial message on the row: nothing can have been typed, so the
+        external-owner sweep keeps its old advice."""
+        tid = _row(identity_verified=True, provider="claude_code")
+
+        assert await terminal_service.recover_interrupted_deferred_init_external_owners()
+
+        assert _failure(tid)["message"].endswith("before completion. Re-assign the task.")
+
+    @pytest.mark.asyncio
     async def test_a_restart_during_delivery_after_verification_accepts_the_resend(self, pane):
         """Verified before the restart: the pane is the agent CAO asked for, so the
         interrupted_init row keeps its runtime and accepts the re-send, and "re-send

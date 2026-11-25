@@ -4443,15 +4443,31 @@ async def recover_interrupted_deferred_init_external_owners() -> bool:
         if _has_deferred_init_complete_fallback(terminal_id):
             await _clear_deferred_init_external_owner(terminal_id)
             continue
+        # A row whose initial message is still ``pending`` may have had that
+        # message typed before the restart: the deferred task clears this bit
+        # only after it stores ``delivered``. ``cao launch`` rows are such rows
+        # (no caller, so the bit is set), and this sweep reaches them before
+        # recover_interrupted_initial_deliveries does. Say what that sweep
+        # says, not "Re-assign the task." (#882).
+        delivery = metadata.get("initial_delivery")
+        if isinstance(delivery, dict) and delivery.get("state") == "pending":
+            interrupted_message = (
+                f"Worker {terminal_id} deferred initialization was interrupted by "
+                "cao-server restart before its initial message was confirmed delivered. "
+                "The message may already have reached the worker, so check the terminal "
+                "before you re-send the task or re-launch."
+            )
+        else:
+            interrupted_message = (
+                f"Worker {terminal_id} deferred initialization was interrupted by "
+                "cao-server restart before completion. Re-assign the task."
+            )
         # The reclaim decision is read from the row (#1074): a Kiro row that
         # never recorded its identity check is reclaimed like a refusal.
         await _surface_deferred_init_failure(
             terminal_id,
             kind="interrupted_init",
-            message=(
-                f"Worker {terminal_id} deferred initialization was interrupted by "
-                "cao-server restart before completion. Re-assign the task."
-            ),
+            message=interrupted_message,
             exception_type="ServerRestart",
             registry=None,
             delete_on_failure=False,

@@ -764,30 +764,68 @@ class TestWaitForInitialDelivery:
         assert "waiting_user_answer" in str(excinfo.value)
         assert "parked on a prompt" in str(excinfo.value)
 
-    def test_interrupted_delivery_does_not_claim_the_message_was_not_delivered(self):
-        """After a server restart the message may have reached the agent."""
+    @pytest.mark.parametrize(
+        "kind",
+        [
+            "interrupted",
+            "interrupted_init",
+            "task_not_started",
+            "provider_exited_after_dispatch",
+            "provider_error_after_delivery",
+            "provider_init_error",
+            "waiting_user_answer",
+            "a_kind_added_later",
+        ],
+    )
+    def test_failed_delivery_that_may_have_reached_the_agent_reads_not_confirmed(self, kind):
+        """The task was or may have been typed, so the CLI must not say it was
+        not delivered (#882). A kind the CLI does not know reads the same way."""
         import click
 
         from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
 
-        interrupted = {
+        failed = {
             "status": "idle",
             "initial_delivery": {
                 "state": "failed",
-                "kind": "interrupted",
+                "kind": kind,
                 "message": "The message may already have reached the worker.",
             },
         }
         with patch(
             "cli_agent_orchestrator.utils.terminal.api_http.get",
-            return_value=self._resp(interrupted),
+            return_value=self._resp(failed),
         ):
             with pytest.raises(click.ClickException) as excinfo:
                 wait_for_initial_delivery("t1", timeout=5)
         text = str(excinfo.value)
-        assert "was not confirmed (interrupted)" in text
+        assert f"terminal t1 was not confirmed ({kind})" in text
         assert "was not delivered" not in text
         assert "may already have reached the worker" in text
+
+    def test_failed_delivery_before_anything_was_typed_reads_not_delivered(self):
+        """``provider_exited`` is written only when the first send was refused."""
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        failed = {
+            "status": "error",
+            "initial_delivery": {
+                "state": "failed",
+                "kind": "provider_exited",
+                "message": "nothing was typed into the pane.",
+            },
+        }
+        with patch(
+            "cli_agent_orchestrator.utils.terminal.api_http.get",
+            return_value=self._resp(failed),
+        ):
+            with pytest.raises(click.ClickException) as excinfo:
+                wait_for_initial_delivery("t1", timeout=5)
+        text = str(excinfo.value)
+        assert "Initial message was not delivered to terminal t1 (provider_exited)" in text
+        assert "was not confirmed" not in text
 
     def test_error_status_before_a_verdict_raises_with_the_failure_detail(self):
         import click

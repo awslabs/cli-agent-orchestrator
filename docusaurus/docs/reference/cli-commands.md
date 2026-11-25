@@ -69,7 +69,7 @@ cao launch [MESSAGE] --agents PROFILE [OPTIONS]
 | `--provider TEXT` | Provider to use (default: profile provider or `kiro_cli`) |
 | `--engine [v2\|v3\|kas]` | Kiro engine (`kiro_cli` only; default: the profile's engine, else `v2`; `kas` is an alias of `v3`). v3 is in preview: see [Kiro v3](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/kiro-cli.md#kiro-v3-preview) |
 | `--allowed-tools TEXT` | Override allowedTools (repeatable) |
-| `--async` | With `--headless` and a message: return once the message is confirmed delivered to the agent, without waiting for the task to finish. This wait covers provider startup, so it is not instant. Exits non-zero with the reason if delivery fails |
+| `--async` | With `--headless` and a message: return once the message is confirmed delivered to the agent, without waiting for the task to finish. This wait covers provider startup, so it is not instant. Exits non-zero if delivery fails or is not confirmed in time. Check the terminal before you launch again |
 | `--auto-approve` | Skip confirmation prompt |
 | `--yolo` | **[DANGEROUS]** Unrestricted tool access |
 | `--working-directory TEXT` | Working directory (default: current directory) |

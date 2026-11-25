@@ -343,7 +343,7 @@ cao launch --agents supervisor --headless --yolo \
   --session-name my-task --working-directory '/path/to/project' "Your task here"
 ```
 
-加上 `--async` 可以立即返回，不等待任务完成。
+加上 `--async` 后，命令会在 `cao-server` 确认消息已送达 Agent 后返回，不等待任务完成。这段等待包含 provider 的启动时间。
 
 > Session name 会自动加上 `cao-` 前缀。后续命令中请使用带前缀的形式，例如 `cao-my-task`。
 
