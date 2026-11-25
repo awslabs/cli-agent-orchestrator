@@ -27,6 +27,7 @@ previews, and the "Review your answers" page, which has no footer at all.
 
 from __future__ import annotations
 
+import threading
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Iterator, List, Optional
@@ -49,6 +50,16 @@ from cli_agent_orchestrator.services.inbox_service import InboxService
 
 FIXTURES = Path(__file__).parent.parent / "providers" / "fixtures"
 MESSAGE = "MSG1: refactor module A so the retry policy lives in one place"
+
+
+@pytest.fixture(autouse=True)
+def _no_pane_check_hold_crosses_a_test():
+    """The hold episodes are module state in terminal_service: start and end clean."""
+    with ts._pane_check_holding_lock:
+        ts._pane_check_holding.clear()
+    yield
+    with ts._pane_check_holding_lock:
+        ts._pane_check_holding.clear()
 
 
 def _fixture(name: str) -> str:
@@ -781,3 +792,324 @@ class TestBareEnterRecovery:
         assert self._recover(
             DIALOG_PANES["bash_permission_prompt"], event_inbox=True, orchestration_type=None
         ) == ["Enter"]
+
+
+HELD = "Native-status pane check held input to "
+RELEASED = "Native-status pane check released "
+FAILED_TO_SEND = "Failed to send input to terminal "
+CANNOT_TAKE_INPUT = "cannot take input yet; leaving 1 message(s) pending for retry"
+UNREADABLE = "Could not read the pane of "
+# The three lines one refused inbox delivery writes, with the level each has on
+# the first hold of an episode.
+HOLD_LINES = {HELD: "INFO", FAILED_TO_SEND: "ERROR", CANNOT_TAKE_INPUT: "WARNING"}
+
+
+def _levels(caplog: Any, text: str) -> List[str]:
+    """The level of every captured record whose message contains ``text``, in order."""
+    return [r.levelname for r in caplog.records if text in r.getMessage()]
+
+
+def _refused(terminal_id: str = "term-1") -> TerminalInputBlockedError:
+    """One inbox-type dispatch that must be refused; the exception it raised."""
+    with pytest.raises(TerminalInputBlockedError) as exc:
+        ts.dispatch_input(terminal_id, MESSAGE, orchestration_type=OrchestrationType.SEND_MESSAGE)
+    assert exc.value.reason is TerminalInputBlockedReason.WAITING_USER_ANSWER
+    return exc.value
+
+
+def _make_screen_unreadable(backend: MagicMock, unreadable: Any) -> None:
+    """Fail the pane check's read (the visible screen) and no other pane read."""
+
+    def read(*_args: Any, **kwargs: Any) -> Any:
+        if not kwargs.get("visible_only"):
+            return ""
+        if isinstance(unreadable, BaseException):
+            raise unreadable
+        return unreadable
+
+    backend.get_history.side_effect = read
+
+
+@contextmanager
+def _inbox(backend: MagicMock) -> Iterator[Any]:
+    """An InboxService with one pending message for term-1, on ``backend``.
+
+    Yields ``(service, update)``; ``update`` is the patched message-status write.
+    """
+    with ExitStack() as stack:
+        monitor = stack.enter_context(_terminal(_claude(), backend))
+        module = "cli_agent_orchestrator.services.inbox_service"
+        stack.enter_context(
+            patch(f"{module}.get_pending_messages", return_value=[_inbox_message()])
+        )
+        update = stack.enter_context(patch(f"{module}.update_message_status"))
+        stack.enter_context(patch(f"{module}.status_monitor", monitor))
+        stack.enter_context(patch(f"{module}.get_backend", return_value=backend))
+        yield InboxService(), update
+
+
+class TestHoldEpisodeLogging:
+    """One open dialog is one hold episode, however often delivery is retried.
+
+    The live run retried a held message on every herdr event, up to once every
+    3 seconds, and each refusal wrote an INFO, an ERROR and a WARNING. A dialog
+    can stay open overnight. The start of an episode keeps those levels, the
+    retries inside it log at DEBUG, and the end is one INFO line. Nothing but
+    the levels differs between the first refusal and the ones after it.
+    """
+
+    def test_first_hold_logs_all_three_lines_at_their_levels(self, caplog):
+        backend = _backend(DIALOG_PANES[ASK_USER_QUESTION], native=TerminalStatus.IDLE)
+        with _inbox(backend) as (service, update), caplog.at_level("DEBUG"):
+            service.deliver_pending("term-1")
+        for line, level in HOLD_LINES.items():
+            assert _levels(caplog, line) == [level], line
+        assert _levels(caplog, RELEASED) == []
+        assert update.call_args_list[-1] == call(1, MessageStatus.PENDING)
+
+    def test_repeat_holds_log_at_debug_and_are_still_refused_and_left_pending(self, caplog):
+        backend = _backend(DIALOG_PANES[ASK_USER_QUESTION], native=TerminalStatus.IDLE)
+        with _inbox(backend) as (service, update), caplog.at_level("DEBUG"):
+            service.deliver_pending("term-1")
+            first = list(update.call_args_list)
+            assert first[-1] == call(1, MessageStatus.PENDING)
+            caplog.clear()
+            for _ in range(2):
+                update.reset_mock()
+                service.deliver_pending("term-1")
+                # Refused and requeued exactly as the first time.
+                assert update.call_args_list == first
+        backend.send_keys.assert_not_called()
+        backend.send_special_key.assert_not_called()
+        assert len(_screen_reads(backend)) == 3
+        for line in HOLD_LINES:
+            assert _levels(caplog, line) == ["DEBUG", "DEBUG"], line
+        assert not [
+            r
+            for r in caplog.records
+            if r.levelname != "DEBUG" and any(line in r.getMessage() for line in HOLD_LINES)
+        ]
+
+    def test_repeat_refusal_differs_from_the_first_only_in_its_flag(self):
+        backend = _backend(DIALOG_PANES[ASK_USER_QUESTION], native=TerminalStatus.IDLE)
+        with _terminal(_claude(), backend):
+            first, second, third = _refused(), _refused(), _refused()
+        assert [e.repeat_of_logged_hold for e in (first, second, third)] == [False, True, True]
+        assert str(first) == str(second) == str(third)
+        assert type(first) is type(second) is TerminalInputBlockedError
+        backend.send_keys.assert_not_called()
+
+    def test_flag_defaults_to_false_and_is_keyword_only(self):
+        assert TerminalInputBlockedError("x").repeat_of_logged_hold is False
+        reason = TerminalInputBlockedReason.WAITING_USER_ANSWER
+        assert TerminalInputBlockedError("x", reason).repeat_of_logged_hold is False
+        with pytest.raises(TypeError):
+            TerminalInputBlockedError("x", reason, True)  # type: ignore[misc]
+
+    def test_status_guard_refusal_is_never_a_repeat_and_stays_at_error(self, caplog):
+        """Only the pane check has episodes: the status guard logs as it always did."""
+        backend = _backend(DIALOG_PANES[ASK_USER_QUESTION], native=TerminalStatus.IDLE)
+        with (
+            _terminal(_claude(), backend, status=TerminalStatus.WAITING_USER_ANSWER),
+            caplog.at_level("DEBUG"),
+        ):
+            assert [_refused().repeat_of_logged_hold for _ in range(3)] == [False] * 3
+        assert _levels(caplog, FAILED_TO_SEND) == ["ERROR"] * 3
+        assert ts._pane_check_holding == set()
+
+    def test_other_failures_stay_at_error_inside_an_episode(self, caplog):
+        """Only a flagged refusal is demoted, not whatever fails while a hold is on."""
+        backend = _backend(DIALOG_PANES[ASK_USER_QUESTION], native=TerminalStatus.IDLE)
+        with _terminal(_claude(), backend), caplog.at_level("DEBUG"):
+            _refused()
+            caplog.clear()
+            with patch.object(ts, "get_terminal_metadata", return_value=None):
+                with pytest.raises(Exception, match="term-1"):
+                    ts.dispatch_input(
+                        "term-1", MESSAGE, orchestration_type=OrchestrationType.SEND_MESSAGE
+                    )
+        assert _levels(caplog, FAILED_TO_SEND) == ["ERROR"]
+
+    def test_release_is_logged_once_and_a_new_dialog_is_a_new_episode(self, caplog):
+        backend = _backend(DIALOG_PANES[ASK_USER_QUESTION], native=TerminalStatus.IDLE)
+        with _inbox(backend) as (service, update), caplog.at_level("DEBUG"):
+            service.deliver_pending("term-1")
+            service.deliver_pending("term-1")
+            assert _levels(caplog, RELEASED) == []
+
+            # The human answers; the pane is an ordinary idle prompt again.
+            caplog.clear()
+            update.reset_mock()
+            backend.get_history.return_value = READY_PANES["idle_after_permission"]
+            service.deliver_pending("term-1")
+
+            backend.send_keys.assert_called_once()
+            assert MESSAGE in backend.send_keys.call_args.args[2]
+            assert update.call_args_list == [call(1, MessageStatus.DELIVERED)]
+            released = [r.getMessage() for r in caplog.records if RELEASED in r.getMessage()]
+            assert released == [
+                "Native-status pane check released term-1: no dialog on screen any more"
+            ]
+            assert _levels(caplog, RELEASED) == ["INFO"]
+            for line in HOLD_LINES:
+                assert _levels(caplog, line) == [], line
+
+            # Still ready: the release is not said again.
+            caplog.clear()
+            ts.dispatch_input("term-1", MESSAGE, orchestration_type=OrchestrationType.SEND_MESSAGE)
+            assert _levels(caplog, RELEASED) == []
+
+        # A second dialog later on is a new episode, logged in full. A fresh
+        # provider, as the first one is now mid-turn and the inbox would wait.
+        backend.get_history.return_value = DIALOG_PANES[PLAN_APPROVAL]
+        with _inbox(backend) as (service, update), caplog.at_level("DEBUG"):
+            caplog.clear()
+            service.deliver_pending("term-1")
+            for line, level in HOLD_LINES.items():
+                assert _levels(caplog, line) == [level], line
+            caplog.clear()
+            service.deliver_pending("term-1")
+            for line in HOLD_LINES:
+                assert _levels(caplog, line) == ["DEBUG"], line
+            assert update.call_args_list[-1] == call(1, MessageStatus.PENDING)
+
+    @pytest.mark.parametrize(
+        "unreadable",
+        [RuntimeError("herdr pane read: socket closed"), "", None],
+        ids=["raises", "empty", "not-text"],
+    )
+    def test_failed_pane_read_neither_ends_nor_restarts_an_episode(self, unreadable, caplog):
+        backend = _backend(DIALOG_PANES[ASK_USER_QUESTION], native=TerminalStatus.IDLE)
+        with _terminal(_claude(), backend), caplog.at_level("DEBUG"):
+            assert _refused().repeat_of_logged_hold is False
+            caplog.clear()
+
+            # The read fails: delivery goes ahead on the backend's status, as it
+            # always did, and the episode is left exactly as it was.
+            _make_screen_unreadable(backend, unreadable)
+            ts.dispatch_input("term-1", MESSAGE, orchestration_type=OrchestrationType.SEND_MESSAGE)
+            backend.send_keys.assert_called_once()
+            assert _levels(caplog, UNREADABLE) == ["WARNING"]
+            assert _levels(caplog, RELEASED) == []
+            assert _levels(caplog, HELD) == []
+            assert ts._pane_check_holding == {"term-1"}
+
+            # The dialog is readable again: the same episode, so a repeat.
+            caplog.clear()
+            backend.get_history.side_effect = None
+            backend.get_history.return_value = DIALOG_PANES[ASK_USER_QUESTION]
+            assert _refused().repeat_of_logged_hold is True
+            assert _levels(caplog, HELD) == ["DEBUG"]
+            assert _levels(caplog, FAILED_TO_SEND) == ["DEBUG"]
+
+    def test_failed_pane_read_does_not_start_an_episode(self, caplog):
+        backend = _backend("", native=TerminalStatus.IDLE)
+        _make_screen_unreadable(backend, RuntimeError("socket closed"))
+        with _terminal(_claude(), backend), caplog.at_level("DEBUG"):
+            ts.dispatch_input("term-1", MESSAGE, orchestration_type=OrchestrationType.SEND_MESSAGE)
+            assert ts._pane_check_holding == set()
+            backend.get_history.side_effect = None
+            backend.get_history.return_value = DIALOG_PANES[ASK_USER_QUESTION]
+            assert _refused().repeat_of_logged_hold is False
+        assert _levels(caplog, HELD) == ["INFO"]
+
+    def test_input_the_check_does_not_apply_to_leaves_the_episode_alone(self, caplog):
+        """The operator typing the answer is not a pane read that found no dialog."""
+        backend = _backend(DIALOG_PANES[ASK_USER_QUESTION], native=TerminalStatus.IDLE)
+        with _terminal(_claude(), backend), caplog.at_level("DEBUG"):
+            _refused()
+            ts.dispatch_input("term-1", "1")
+            assert ts._pane_check_holding == {"term-1"}
+            assert _levels(caplog, RELEASED) == []
+            assert _refused().repeat_of_logged_hold is True
+
+    def test_two_terminals_hold_independently(self, caplog):
+        backend = _backend(DIALOG_PANES[ASK_USER_QUESTION], native=TerminalStatus.IDLE)
+        with _terminal(_claude(), backend), caplog.at_level("DEBUG"):
+            assert _refused("term-1").repeat_of_logged_hold is False
+            assert _refused("term-1").repeat_of_logged_hold is True
+            # term-2's first hold is its own episode, whatever term-1 is doing.
+            assert _refused("term-2").repeat_of_logged_hold is False
+            assert _refused("term-2").repeat_of_logged_hold is True
+            assert _levels(caplog, HELD + "term-1") == ["INFO", "DEBUG"]
+            assert _levels(caplog, HELD + "term-2") == ["INFO", "DEBUG"]
+            assert _levels(caplog, FAILED_TO_SEND + "term-1") == ["ERROR", "DEBUG"]
+            assert _levels(caplog, FAILED_TO_SEND + "term-2") == ["ERROR", "DEBUG"]
+
+            # term-1's dialog goes away; term-2 is still held.
+            backend.get_history.return_value = READY_PANES["herdr_idle"]
+            ts.dispatch_input("term-1", MESSAGE, orchestration_type=OrchestrationType.SEND_MESSAGE)
+            assert _levels(caplog, RELEASED + "term-1") == ["INFO"]
+            assert _levels(caplog, RELEASED + "term-2") == []
+            assert ts._pane_check_holding == {"term-2"}
+            backend.get_history.return_value = DIALOG_PANES[ASK_USER_QUESTION]
+            assert _refused("term-2").repeat_of_logged_hold is True
+            assert _refused("term-1").repeat_of_logged_hold is False
+
+    def test_concurrent_checks_of_one_terminal_log_one_hold(self, caplog):
+        """Delivery runs on worker threads: one of them starts the episode."""
+        workers = 8
+        backend = _backend(DIALOG_PANES[ASK_USER_QUESTION], native=TerminalStatus.IDLE)
+        provider = _claude()
+        start = threading.Barrier(workers)
+        results: List[Any] = []
+
+        def check() -> None:
+            start.wait(timeout=10)
+            results.append(
+                ts._check_pane_for_unreported_dialog(
+                    "term-1", provider, OrchestrationType.SEND_MESSAGE
+                )
+            )
+
+        with _terminal(provider, backend), caplog.at_level("DEBUG"):
+            threads = [threading.Thread(target=check) for _ in range(workers)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+        assert len(results) == workers
+        assert all(result.held for result in results)
+        assert sorted(result.repeat for result in results) == [False] + [True] * (workers - 1)
+        assert sorted(_levels(caplog, HELD)) == ["DEBUG"] * (workers - 1) + ["INFO"]
+
+    def test_bare_enter_skip_warning_is_not_demoted_inside_an_episode(self, caplog):
+        """It is written at most once per recovery attempt of a message that was
+        typed, not once per retry of a pending one, so it keeps its level."""
+        provider = _claude()
+        backend = _backend(DIALOG_PANES[REVIEW_PAGE_NAMED], native=TerminalStatus.IDLE)
+        enters: List[str] = []
+        with (
+            _terminal(provider, backend, status=TerminalStatus.IDLE),
+            patch.object(ts, "_capture_current_composer_region", return_value=MESSAGE),
+            patch.object(ts, "send_special_key", side_effect=lambda _tid, key: enters.append(key)),
+            caplog.at_level("DEBUG"),
+        ):
+            _refused()
+            for attempt in (1, 2):
+                ts.redeliver_dropped_message_with_boundary(
+                    "term-1",
+                    MESSAGE,
+                    attempt,
+                    provider,
+                    full_resend_requires_composer_evidence=True,
+                    orchestration_type=OrchestrationType.SEND_MESSAGE,
+                )
+        assert enters == []
+        assert _levels(caplog, "skipping the bare-Enter re-submit") == ["WARNING", "WARNING"]
+        # The check's own line follows the episode: the dispatch above started it.
+        assert _levels(caplog, HELD) == ["INFO", "DEBUG", "DEBUG"]
+
+    def test_teardown_forgets_the_terminal(self, monkeypatch):
+        backend = _backend(DIALOG_PANES[ASK_USER_QUESTION], native=TerminalStatus.IDLE)
+        with _terminal(_claude(), backend):
+            _refused("term-1")
+            _refused("term-2")
+            monkeypatch.setattr(ts, "get_herdr_inbox_service", lambda: None)
+            monkeypatch.setattr(ts.fifo_manager, "stop_reader", lambda terminal_id: True)
+            monkeypatch.setattr(ts.provider_manager, "cleanup_provider", lambda terminal_id: True)
+            monkeypatch.setattr(ts.ephemeral_service, "release", lambda *a, **k: None)
+            ts.dismantle_terminal_runtime(
+                "term-1", {"tmux_session": "cao-session", "tmux_window": "developer-abcd"}
+            )
+        assert ts._pane_check_holding == {"term-2"}

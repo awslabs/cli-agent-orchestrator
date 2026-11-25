@@ -19,8 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they are reported as `waiting_user_answer`: a question page whose footer reads
   `Enter to select · Tab/Arrow keys to navigate · Esc to cancel`, and the final "Review your
   answers" page, which has no footer. A send held by the pane check says so in its error
-  ("its reported status was idle, but a dialog is open on screen") and logs
-  `Native-status pane check held input to <terminal>`.
+  ("its reported status was <status>, but a dialog is open on screen") and logs
+  `Native-status pane check held input to <terminal>`. While a dialog stays open the hold is
+  logged once when it starts and once when it ends, and the retries in between are logged at
+  DEBUG.
 
 - **Workspace split panes fill themselves**. Picking 2 or 4 panes in the Workspace tab now
   shows the session's other agents in the empty panes, in tab order, instead of leaving them
