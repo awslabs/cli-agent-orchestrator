@@ -18,8 +18,7 @@ WHAT A SCHEDULED RUN CHECKS
 0. The run is on ``refs/heads/main``. Releases are cut from the trunk only.
 1. The newest stable ``vMAJOR.MINOR.PATCH`` tag reachable from the release SHA is the
    previous release. No such tag is a refusal. Other tags (``v2.6.0rc1``, benchmark tags)
-   are ignored: ``STABLE_TAG`` only matches a bare ``vMAJOR.MINOR.PATCH``, stricter than
-   ``cliff.toml``'s own ``tag_pattern`` (``v[0-9].*``), which also matches ``v2.6.0rc1``.
+   are ignored: ``STABLE_TAG`` only matches a bare ``vMAJOR.MINOR.PATCH``.
 2. No commits since that tag: skip the week (no empty releases). The bot's repin of the
    agent-plugin packages to that tag does not count (see ``is_previous_repin``):
    ``publish-to-pypi.yml`` pushes it after every PyPI publish, so counting it would make

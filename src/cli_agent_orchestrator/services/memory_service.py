@@ -421,6 +421,25 @@ def resolve_project_id(cwd: Optional[Path]) -> str:
     )
 
 
+class InvalidRelatedArgument(ValueError):
+    """An invalid ``memory_related`` argument; the text is always one fixed literal.
+
+    The message never echoes the caller's value, so the internal route can return it as is.
+    """
+
+    MESSAGES = {
+        "direction": "direction must be one of: in, out, both",
+        "type": "invalid relationship type",
+        "limit": "limit must be between 1 and 100",
+        "key": "key is empty after sanitization",
+        "scope": "invalid memory scope",
+    }
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(self.MESSAGES[code])
+
+
 class MemoryService:
     """Memory service backed by wiki markdown files and SQLite metadata.
 
@@ -680,6 +699,20 @@ class MemoryService:
             return True
         expected_scope_id = private_scope_ids[scope]
         return expected_scope_id is not None and scope_id == expected_scope_id
+
+    @staticmethod
+    def _visible_to_caller(
+        memories: Sequence[Memory], terminal_context: Optional[dict]
+    ) -> list[Memory]:
+        """Apply caller-role scope visibility after native/vault discovery."""
+        if (terminal_context or {}).get("agent_profile") == MEMORY_MANAGER_PROFILE:
+            recallable_scopes = {
+                MemoryScope.SESSION.value,
+                MemoryScope.PROJECT.value,
+                MemoryScope.GLOBAL.value,
+            }
+            return [memory for memory in memories if memory.scope in recallable_scopes]
+        return list(memories)
 
     @staticmethod
     def _sanitize_scope_id(value: str) -> str:
@@ -1172,6 +1205,13 @@ class MemoryService:
                     scope_id=scope_id,
                     file_path=str(wiki_path),
                 ) from e
+            try:
+                self._sync_content_link_edges(key, scope, scope_id, new_content)
+            except Exception:  # noqa: BLE001 — derived edges are repairable
+                logger.warning(
+                    "Memory content-link sync deferred after durable write " "(scope=%s failed=1)",
+                    scope,
+                )
 
             logger.info(f"Memory {action}: key={key} scope={scope} scope_id={scope_id}")
         finally:
@@ -1616,7 +1656,10 @@ class MemoryService:
         "fallback:<reason>") — background callers ignore it; the sweep reports it.
         """
         from cli_agent_orchestrator.services import wiki_compiler
-        from cli_agent_orchestrator.services.settings_service import get_compile_timeout_s
+        from cli_agent_orchestrator.services.settings_service import (
+            get_compile_timeout_s,
+            is_memory_content_links_enabled,
+        )
 
         def _audit(event_type: str, summary: str, **fields: str) -> None:
             try:
@@ -1629,11 +1672,25 @@ class MemoryService:
                 logger.debug(f"compile audit write failed (key={key}): {e}")
 
         wiki_path = self.get_wiki_path(scope, scope_id, key)
+        content_links_enabled = is_memory_content_links_enabled()
+        authored_lines = (
+            self._authored_see_also_lines(pre_append_content, new_entry)
+            if content_links_enabled
+            else []
+        )
+        model_existing = (
+            self._strip_existing_see_also(pre_append_content)
+            if content_links_enabled
+            else pre_append_content
+        )
+        model_entry = (
+            self._strip_existing_see_also(new_entry) if content_links_enabled else new_entry
+        )
 
         try:
             result = await wiki_compiler.compile(
-                pre_append_content,
-                new_entry,
+                model_existing,
+                model_entry,
                 topic_key=key,
                 timeout_s=get_compile_timeout_s(),
                 provider_hint=provider_hint,
@@ -1663,6 +1720,7 @@ class MemoryService:
         # metadata upsert leaves any prior value intact; ``""`` on
         # success-with-empty is written (prevents endless retries).
         related_keys_value: Optional[str] = None
+        see_also_targets: list[str] = []
         try:
             cands = self._candidate_keys_for_topic(scope, scope_id, key)
             related_result = await wiki_compiler.find_related(
@@ -1709,14 +1767,6 @@ class MemoryService:
                         pass
                 except Exception as e:  # noqa: BLE001 — non-blocking; marker already written
                     logger.warning(f"relationship replace_set (compiler) failed, ignoring: {e}")
-                if see_also_targets:
-                    see_also = self._render_see_also(
-                        see_also_targets,
-                        topic_scope=scope,
-                        topic_scope_id=scope_id,
-                    )
-                    stripped = self._strip_existing_see_also(compiled_content)
-                    compiled_content = stripped + "\n" + see_also if see_also else stripped
             else:
                 logger.info("find_related_fallback reason=%s", related_result.fallback_reason)
             _audit(
@@ -1727,6 +1777,36 @@ class MemoryService:
             )
         except Exception as e:  # noqa: BLE001 — non-blocking promise
             logger.warning(f"find_related raised, ignoring: {e}")
+
+        if content_links_enabled:
+            from cli_agent_orchestrator.services.memory_content_links import (
+                extract_content_link_targets,
+            )
+
+            authored_targets = set(
+                extract_content_link_targets(
+                    "## See Also\n" + "\n".join(authored_lines),
+                    self._sanitize_key,
+                    scope,
+                    scope_id=scope_id,
+                )
+            )
+        else:
+            authored_targets = set()
+        if authored_lines or see_also_targets:
+            see_also = self._render_see_also(
+                [target for target in see_also_targets if target not in authored_targets],
+                topic_scope=scope,
+                topic_scope_id=scope_id,
+            )
+            stripped = self._strip_existing_see_also(compiled_content)
+            if authored_lines:
+                rendered = ["## See Also", *authored_lines]
+                if see_also:
+                    rendered.extend(see_also.splitlines()[1:])
+                compiled_content = stripped + "\n" + "\n".join(rendered) + "\n"
+            else:
+                compiled_content = stripped + "\n" + see_also if see_also else stripped
 
         topic_lock_path = wiki_path.parent / f".{wiki_path.stem}.lock"
         try:
@@ -2008,23 +2088,135 @@ class MemoryService:
         ``## See Also`` to the next ``##`` heading or EOF. Trailing
         whitespace is normalised.
         """
-        lines = content.splitlines(keepends=False)
-        out: list = []
-        skip = False
-        for line in lines:
-            stripped = line.rstrip()
-            if stripped == "## See Also":
-                skip = True
-                continue
-            if skip and stripped.startswith("## "):
-                skip = False
-            if skip:
-                continue
-            out.append(line)
+        from cli_agent_orchestrator.services.memory_content_links import see_also_sections
+
+        lines = content.splitlines()
+        excluded = {
+            index for start, end, _ in see_also_sections(lines) for index in range(start, end)
+        }
+        out = [line for index, line in enumerate(lines) if index not in excluded]
         # Drop trailing empty lines created by the strip; reproduce a
         # single trailing newline shape compatible with append-mode bytes.
         rendered = "\n".join(out).rstrip() + "\n"
         return rendered
+
+    @staticmethod
+    def _strip_generated_see_also(content: str) -> str:
+        """Remove canonical CAO-rendered See Also lines, preserving authored lines."""
+        from cli_agent_orchestrator.services.memory_content_links import see_also_sections
+        from cli_agent_orchestrator.services.wiki_compiler import SEE_ALSO_LINK_RE
+
+        lines = content.splitlines(keepends=False)
+        out: list[str] = []
+        sections = {start: (end, body) for start, end, body in see_also_sections(lines)}
+        index = 0
+        while index < len(lines):
+            if index not in sections:
+                out.append(lines[index])
+                index += 1
+                continue
+            end, body = sections[index]
+            authored = [
+                line
+                for line_index, line in enumerate(lines[index + 1 : end], index + 1)
+                if line_index not in body or not SEE_ALSO_LINK_RE.fullmatch(line.strip())
+            ]
+            if any(line.strip() for line in authored):
+                out.append(lines[index])
+                out.extend(authored)
+            index = end
+        return "\n".join(out).rstrip() + "\n"
+
+    @staticmethod
+    def _authored_see_also_lines(*contents: str) -> list[str]:
+        """Collect non-canonical See Also lines without changing their text."""
+        from cli_agent_orchestrator.services.memory_content_links import see_also_sections
+        from cli_agent_orchestrator.services.wiki_compiler import SEE_ALSO_LINK_RE
+
+        lines: list[str] = []
+        seen: set[str] = set()
+        for content in contents:
+            content_lines = content.splitlines()
+            sections = see_also_sections(content_lines)
+            indices = {index for _, _, body in sections for index in body}
+            fenced = {
+                index
+                for start, end, _ in sections
+                for index in range(start + 1, end)
+                if index not in indices
+            }
+            for index, line in enumerate(content_lines):
+                if index in fenced:
+                    lines.append(line)
+                elif index in indices and line.strip():
+                    stripped = line.rstrip()
+                    if not SEE_ALSO_LINK_RE.fullmatch(line.strip()) and stripped not in seen:
+                        seen.add(stripped)
+                        lines.append(line)
+        return lines
+
+    def _sync_content_link_edges(
+        self,
+        key: str,
+        scope: str,
+        scope_id: Optional[str],
+        file_content: str,
+    ) -> None:
+        """Replace this topic's content-link edge set after metadata is durable."""
+        from cli_agent_orchestrator.services.memory_content_links import (
+            extract_content_link_targets,
+        )
+        from cli_agent_orchestrator.services.memory_relationship_service import (
+            MAX_EDGES_PER_MUTATION,
+            EdgeInput,
+            MemoryRelationshipService,
+        )
+        from cli_agent_orchestrator.services.settings_service import (
+            is_memory_content_links_enabled,
+        )
+
+        if not is_memory_content_links_enabled():
+            return
+        targets = extract_content_link_targets(
+            self._strip_generated_see_also(file_content),
+            self._sanitize_key,
+            scope,
+            scope_id=scope_id,
+        )
+        audits: list[Callable[[], None]] = []
+        with self._get_db_session() as db:
+            relationships = MemoryRelationshipService()
+            valid_targets = []
+            dangling = 0
+            for target in targets:
+                try:
+                    relationships._assert_endpoint_exists(db, scope, scope_id, target)
+                except ValueError:
+                    dangling += 1
+                else:
+                    valid_targets.append(target)
+            overflow = max(0, len(valid_targets) - MAX_EDGES_PER_MUTATION)
+            valid_targets = valid_targets[:MAX_EDGES_PER_MUTATION]
+            relationships.replace_set(
+                scope,
+                scope_id,
+                key,
+                "content_link",
+                "relates_to",
+                [EdgeInput(target) for target in valid_targets],
+                db=db,
+                audit_sink=audits,
+            )
+            db.commit()
+        if dangling or overflow:
+            logger.warning(
+                "Content-link targets dropped (dangling=%d overflow=%d kept=%d)",
+                dangling,
+                overflow,
+                len(valid_targets),
+            )
+        for emit_audit in audits:
+            emit_audit()
 
     def _related_keys_lookup(
         self, keys: list, scope: str, scope_id: Optional[str], *, source_kind: str = "native"
@@ -2153,7 +2345,7 @@ class MemoryService:
                 MemoryRelationshipService,
             )
 
-            rel_svc = MemoryRelationshipService()
+            rel_svc = MemoryRelationshipService(self._db_session_factory)
         except Exception:  # pragma: no cover - import guard
             return set()
         groups: dict = {}
@@ -2185,7 +2377,7 @@ class MemoryService:
                 MemoryRelationshipService,
             )
 
-            service = MemoryRelationshipService()
+            service = MemoryRelationshipService(self._db_session_factory)
         except Exception:
             return set(), set(groups)
         snapshot: set = set()
@@ -2621,6 +2813,7 @@ class MemoryService:
                     -memory.updated_at.timestamp(),
                 )
             )
+        results = self._visible_to_caller(results, terminal_context)
 
         from cli_agent_orchestrator.services.settings_service import is_memory_lifecycle_enabled
 
@@ -2851,6 +3044,155 @@ class MemoryService:
             scan_all=scan_all,
             policy=recall_policy,
         )
+
+    async def related(
+        self,
+        key: str,
+        *,
+        scope: Optional[str] = None,
+        depth: int = 1,
+        types: Optional[list[str]] = None,
+        direction: str = "both",
+        limit: int = 20,
+        terminal_context: Optional[dict] = None,
+    ) -> dict[str, Any]:
+        """Return policy-filtered relationship edges and one-line neighbour hooks."""
+        if not _is_memory_enabled():
+            return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
+        if scope is not None:
+            try:
+                MemoryScope(scope)
+            except ValueError:
+                raise InvalidRelatedArgument("scope") from None
+        if limit < 1 or limit > 100:
+            raise InvalidRelatedArgument("limit")
+        if direction not in {"in", "out", "both"}:
+            raise InvalidRelatedArgument("direction")
+        if types is not None:
+            from cli_agent_orchestrator.services.memory_relationship_service import VALID_TYPES
+
+            if any(type_ not in VALID_TYPES for type_ in types):
+                raise InvalidRelatedArgument("type")
+        try:
+            canonical = self._sanitize_key(key)
+        except ValueError:
+            raise InvalidRelatedArgument("key") from None
+        candidate_scopes = (
+            [scope]
+            if scope is not None
+            else [
+                MemoryScope.SESSION.value,
+                MemoryScope.PROJECT.value,
+                MemoryScope.GLOBAL.value,
+                MemoryScope.AGENT.value,
+                MemoryScope.FEDERATED.value,
+            ]
+        )
+        matches = []
+        for candidate_scope in candidate_scopes:
+            memory = await self.read_exact_key(
+                canonical,
+                scope=candidate_scope,
+                terminal_context=terminal_context,
+                record_access=False,
+            )
+            if memory is not None:
+                matches.append(memory)
+        if not matches:
+            return {
+                "success": False,
+                "error_kind": "not_found",
+                "error": f"memory not found: {canonical}",
+            }
+        identities = {(memory.scope, self._effective_scope_id(memory)) for memory in matches}
+        if scope is None and len(identities) > 1:
+            scopes = list(dict.fromkeys(memory.scope for memory in matches))
+            return {
+                "success": False,
+                "error_kind": "ambiguous_scope",
+                "error": f"memory key is present in multiple scopes: {canonical}",
+                "scopes": scopes,
+            }
+
+        source = matches[0]
+        source_scope_id = self._effective_scope_id(source)
+        from cli_agent_orchestrator.services.memory_relationship_service import (
+            MemoryRelationshipService,
+        )
+
+        walked = MemoryRelationshipService(self._db_session_factory).neighbours(
+            source.scope,
+            source_scope_id,
+            [canonical],
+            direction=direction,
+            types=types,
+            depth=depth,
+            limit=min(max(limit * 4, 64), 400),
+        )
+        available_by_key = {}
+        for neighbour_key in dict.fromkeys(edge.neighbour_key for edge in walked):
+            memory = await self.read_exact_key(
+                neighbour_key,
+                scope=source.scope,
+                scope_id=source_scope_id,
+                terminal_context=terminal_context,
+                record_access=False,
+            )
+            if memory is not None:
+                available_by_key[memory.key] = memory
+        reached = {canonical}
+        edges: list[dict[str, Any]] = []
+        neighbours: list[dict[str, Any]] = []
+        emitted_neighbours: set[str] = set()
+        for walked_edge in walked:
+            relationship = walked_edge.relationship
+            current_key = (
+                relationship.source_key
+                if walked_edge.direction == "out"
+                else relationship.target_key
+            )
+            neighbour = available_by_key.get(walked_edge.neighbour_key)
+            if current_key not in reached or neighbour is None:
+                continue
+            if neighbour.key not in emitted_neighbours and len(emitted_neighbours) >= limit:
+                continue
+            reached.add(neighbour.key)
+            edges.append(
+                {
+                    "source_key": relationship.source_key,
+                    "target_key": relationship.target_key,
+                    "type": relationship.type,
+                    "origin": relationship.origin,
+                    "status": relationship.status,
+                    "confidence": relationship.confidence,
+                    "direction": walked_edge.direction,
+                    "depth": walked_edge.depth,
+                }
+            )
+            hook_content = neighbour.content
+            if neighbour.source_kind == "vault":
+                entry = re.split(r"(?m)^##\s+\d{4}-\d{2}-\d{2}T[^\n]+\n", hook_content)
+                hook_content = entry[-1]
+            hook = re.sub(r"\s+", " ", hook_content).strip()
+            if neighbour.key not in emitted_neighbours:
+                neighbours.append(
+                    {
+                        "key": neighbour.key,
+                        "kind": neighbour.memory_type,
+                        "hook": hook[:160],
+                        "status": neighbour.lifecycle_status or "active",
+                    }
+                )
+                emitted_neighbours.add(neighbour.key)
+        return {
+            "success": True,
+            "key": source.key,
+            "scope": source.scope,
+            "scope_id": source_scope_id,
+            "depth": min(max(int(depth), 1), 2),
+            "edges": edges,
+            "neighbours": neighbours,
+        }
 
     async def recall_explain(
         self,
