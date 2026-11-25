@@ -5,6 +5,7 @@
 which reads ``TZ`` once, is what is under test.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.services import flow_service
 
 POSIX_ZONES = ["AEST-10", "UTC0"]
@@ -115,3 +117,43 @@ def test_a_usable_local_zone_is_used_as_it_is(caplog):
 
     assert isinstance(zone, tzinfo)
     assert not caplog.records
+
+
+@pytest.mark.usefixtures("isolated_memory_db")
+@pytest.mark.parametrize(
+    "drift", [timedelta(hours=-1), timedelta(hours=1)], ids=["behind", "ahead"]
+)
+def test_a_fallback_offset_gone_stale_does_not_refire_or_skip_a_flow(drift, tmp_path, monkeypatch):
+    """The fallback has no daylight-saving rules, so it is read at each call and not kept.
+
+    Under a ``TZ`` that tzlocal cannot load but that has such rules, a server that runs across a
+    clock change would hold the offset it had at import. Set the held fallback one hour off the
+    local offset and run a flow that was due 5 minutes ago: it must not be due again at the next
+    poll (offset behind), and its next run must not be an hour late (offset ahead).
+    """
+    monkeypatch.setattr(flow_service, "_SCHEDULER_TZ", timezone(_local_offset() + drift))
+    script = tmp_path / "check.sh"
+    script.write_text('#!/bin/sh\necho \'{"execute": false, "output": {}}\'\n')
+    script.chmod(0o755)
+    flow_file = tmp_path / "poll.flow.md"
+    flow_file.write_text(
+        '---\nname: poll\nschedule: "*/5 * * * *"\nagent_profile: developer\n'
+        f"script: {script}\n---\nPrompt.\n"
+    )
+    database.create_flow(
+        name="poll",
+        file_path=str(flow_file),
+        schedule="*/5 * * * *",
+        agent_profile="developer",
+        provider="kiro_cli",
+        script=str(script),
+        next_run=datetime.now() - timedelta(minutes=5),
+    )
+    assert [f.name for f in database.get_flows_to_run()] == ["poll"]
+
+    before = datetime.now()
+    assert asyncio.run(flow_service.execute_flow("poll")) is False
+
+    stored = database.get_flow("poll").next_run
+    assert database.get_flows_to_run() == [], f"due again at the next poll (next_run {stored})"
+    assert before < stored <= datetime.now() + timedelta(minutes=5), f"next_run {stored}"

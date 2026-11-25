@@ -76,6 +76,10 @@ def _resolve_scheduler_timezone() -> tzinfo:
     zoneinfo name (``AEST-10``, ``UTC0``). A server that cannot resolve its zone must still
     start and must still accept a valid schedule, so the failure is logged and a fixed offset
     (the current one, with no daylight-saving rules) takes its place; UTC is the last resort.
+
+    The fixed offset is a snapshot. ``_scheduler_zone`` replaces it with the offset of the
+    moment of each call, because the ``TZ`` may have daylight-saving rules that the zone cannot
+    carry and the server outlives a clock change.
     """
     try:
         return cast(tzinfo, CronTrigger.from_crontab("* * * * *").timezone)
@@ -90,6 +94,20 @@ def _resolve_scheduler_timezone() -> tzinfo:
 # Resolved once, at import: it reads zone files, and doing it here keeps validate_flow_definition
 # free of file access whichever call comes first.
 _SCHEDULER_TZ = _resolve_scheduler_timezone()
+
+
+def _scheduler_zone() -> tzinfo:
+    """The zone to build a cron trigger in, now.
+
+    A real zone is used as resolved. A fixed offset (``datetime.timezone``) is the fallback for a
+    ``TZ`` that tzlocal could not load: it has no daylight-saving rules, while the libc local time
+    that ``datetime.now()`` and the stored ``next_run`` follow does. So it is read again from the
+    local clock at each call; kept from import, it would be an hour off after a clock change, and
+    a flow would be due again at every poll, or its fire times would be skipped.
+    """
+    if isinstance(_SCHEDULER_TZ, timezone):
+        return datetime.now().astimezone().tzinfo or _SCHEDULER_TZ
+    return _SCHEDULER_TZ
 
 
 def next_fire_times(
@@ -111,7 +129,7 @@ def next_fire_times(
     Raises:
         ValueError: The scheduler refuses the expression.
     """
-    trigger = CronTrigger.from_crontab(cron_expression, timezone=_SCHEDULER_TZ)
+    trigger = CronTrigger.from_crontab(cron_expression, timezone=_scheduler_zone())
     times: List[datetime] = []
     current = _next_fire_within_gap(trigger, None, after if after is not None else datetime.now())
     while current is not None and len(times) < n:
