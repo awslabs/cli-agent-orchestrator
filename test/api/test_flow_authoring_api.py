@@ -6,7 +6,7 @@ CAO home, so a route that writes the wrong file, or writes at all, shows up on d
 
 import os
 import stat
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import frontmatter  # type: ignore
@@ -16,6 +16,10 @@ from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.security import auth
 from cli_agent_orchestrator.services import flow_service
+
+# The scan bound docs/flows.md states (41 years), written out so that raising the constant in
+# flow_service does not raise the limit the tests hold it to.
+DOCUMENTED_SCAN_BOUND = timedelta(days=366 * 41)
 
 GOOD = {
     "name": "daily-report",
@@ -402,7 +406,7 @@ class TestValidateRoute:
         body = validated(client, {**GOOD, "schedule": never})
 
         assert fire_time_scans.spans
-        assert max(fire_time_scans.spans) <= flow_service._LONGEST_FIRE_GAP
+        assert max(fire_time_scans.spans) <= DOCUMENTED_SCAN_BOUND
         assert body["valid"] is False
         assert [e["field"] for e in body["errors"]] == ["schedule"]
         assert body["next_runs"] == []

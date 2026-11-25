@@ -7,7 +7,7 @@ reports its own missing symbol instead of one collection error for the whole fil
 
 import os
 import stat
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import frontmatter  # type: ignore
@@ -18,6 +18,10 @@ from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.services import flow_service
 
 pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+
+# The scan bound docs/flows.md states (41 years), written out so that raising the constant in
+# flow_service does not raise the limit the tests hold it to.
+DOCUMENTED_SCAN_BOUND = timedelta(days=366 * 41)
 
 GOOD = {
     "name": "daily-report",
@@ -217,7 +221,7 @@ def test_a_long_schedule_that_never_fires_is_refused_within_the_scan_bound(fire_
 
     assert set(errors) == {"schedule"}
     assert fire_time_scans.spans
-    assert max(fire_time_scans.spans) <= flow_service._LONGEST_FIRE_GAP
+    assert max(fire_time_scans.spans) <= DOCUMENTED_SCAN_BOUND
 
 
 @pytest.mark.parametrize("field", ["schedule", "agent_profile", "provider"])
@@ -408,7 +412,7 @@ def test_a_long_list_that_never_fires_stops_scanning_at_the_bound(fire_time_scan
 
     assert times == []
     assert fire_time_scans.spans
-    assert max(fire_time_scans.spans) <= flow_service._LONGEST_FIRE_GAP
+    assert max(fire_time_scans.spans) <= DOCUMENTED_SCAN_BOUND
 
 
 @pytest.mark.parametrize(
