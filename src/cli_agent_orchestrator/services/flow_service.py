@@ -9,7 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple, TypedDict, cast
 
@@ -68,9 +68,28 @@ SCHEDULE_INVALID_MESSAGE = (
 # 40 years apart (2072 to 2112 skips the non-leap 2100); no schedule that fires waits longer.
 _LONGEST_FIRE_GAP = timedelta(days=366 * 41)
 
-# The first trigger resolves and caches the local time zone, which reads zone files. Doing it at
-# import keeps validate_flow_definition free of file access, whichever call comes first.
-CronTrigger.from_crontab("* * * * *")
+
+def _resolve_scheduler_timezone() -> tzinfo:
+    """Return the zone every cron trigger of this module runs in, never raising.
+
+    APScheduler asks ``tzlocal`` for the local zone, which raises for a ``TZ`` that is not a
+    zoneinfo name (``AEST-10``, ``UTC0``). A server that cannot resolve its zone must still
+    start and must still accept a valid schedule, so the failure is logged and a fixed offset
+    (the current one, with no daylight-saving rules) takes its place; UTC is the last resort.
+    """
+    try:
+        return cast(tzinfo, CronTrigger.from_crontab("* * * * *").timezone)
+    except Exception as exc:  # tzlocal raises ZoneInfoNotFoundError and friends
+        logger.warning(
+            "Could not resolve the local time zone (%s); flow schedules use a fixed offset", exc
+        )
+    fixed = datetime.now().astimezone().tzinfo
+    return fixed if fixed is not None else timezone.utc
+
+
+# Resolved once, at import: it reads zone files, and doing it here keeps validate_flow_definition
+# free of file access whichever call comes first.
+_SCHEDULER_TZ = _resolve_scheduler_timezone()
 
 
 def next_fire_times(
@@ -92,7 +111,7 @@ def next_fire_times(
     Raises:
         ValueError: The scheduler refuses the expression.
     """
-    trigger = CronTrigger.from_crontab(cron_expression)
+    trigger = CronTrigger.from_crontab(cron_expression, timezone=_SCHEDULER_TZ)
     times: List[datetime] = []
     current = _next_fire_within_gap(trigger, None, after if after is not None else datetime.now())
     while current is not None and len(times) < n:

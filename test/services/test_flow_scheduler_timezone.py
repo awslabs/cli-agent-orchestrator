@@ -1,0 +1,99 @@
+"""The flow scheduler must work, and must not break start-up, under a POSIX ``TZ`` string.
+
+``tzlocal`` (which APScheduler asks for the local zone) refuses a ``TZ`` such as ``AEST-10`` or
+``UTC0`` that is not a zoneinfo name. These tests run in a subprocess so the import itself,
+which reads ``TZ`` once, is what is under test.
+"""
+
+import json
+import logging
+import os
+import subprocess
+import sys
+from datetime import tzinfo
+from pathlib import Path
+
+import pytest
+
+from cli_agent_orchestrator.services import flow_service
+
+POSIX_ZONES = ["AEST-10", "UTC0"]
+
+
+def run_python(code: str, tz: str, home: Path) -> subprocess.CompletedProcess:
+    """Run ``code`` in a fresh interpreter with ``TZ`` set and a private CAO home."""
+    env = {**os.environ, "TZ": tz, "CAO_HOME_DIR": str(home)}
+    return subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=180
+    )
+
+
+@pytest.mark.parametrize("tz", POSIX_ZONES)
+def test_the_server_module_imports_under_a_posix_tz(tz, tmp_path):
+    result = run_python("import cli_agent_orchestrator.api.main", tz, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("tz", POSIX_ZONES)
+def test_schedule_list_runs_under_a_posix_tz(tz, tmp_path):
+    code = (
+        "from click.testing import CliRunner\n"
+        "from cli_agent_orchestrator.cli.main import cli\n"
+        "result = CliRunner().invoke(cli, ['schedule', 'list'])\n"
+        "print(result.exit_code, result.output.strip())\n"
+    )
+
+    result = run_python(code, tz, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    # The fallback warning shares the CliRunner's output; the exit code and the listing matter.
+    assert result.stdout.startswith("0 ")
+    assert result.stdout.strip().endswith("No flows found")
+
+
+@pytest.mark.parametrize("tz", POSIX_ZONES)
+def test_a_weekday_schedule_is_valid_and_fires_under_a_posix_tz(tz, tmp_path):
+    code = (
+        "import json\n"
+        "from datetime import datetime\n"
+        "from cli_agent_orchestrator.services import flow_service\n"
+        "definition = {'name': 'daily', 'schedule': '0 9 * * mon-fri',\n"
+        "              'agent_profile': 'developer', 'provider': 'claude_code'}\n"
+        "errors = flow_service.validate_flow_definition(definition, must_be_new=False)\n"
+        "times = flow_service.next_fire_times(\n"
+        "    '0 9 * * mon-fri', 2, datetime(2026, 11, 20, 8, 0))\n"
+        "print(json.dumps({'errors': errors,\n"
+        "                  'times': [t.replace(tzinfo=None).isoformat() for t in times]}))\n"
+    )
+
+    result = run_python(code, tz, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "errors": [],
+        # Friday 2026-11-20, then Monday 2026-11-23.
+        "times": ["2026-11-20T09:00:00", "2026-11-23T09:00:00"],
+    }
+
+
+def test_an_unusable_local_zone_falls_back_to_a_fixed_zone_and_warns(monkeypatch, caplog):
+    def refuse(*_args, **_kwargs):
+        raise LookupError("tzlocal() does not support non-zoneinfo timezones like AEST-10")
+
+    monkeypatch.setattr(flow_service.CronTrigger, "from_crontab", refuse)
+
+    with caplog.at_level(logging.WARNING, logger=flow_service.logger.name):
+        zone = flow_service._resolve_scheduler_timezone()
+
+    assert isinstance(zone, tzinfo)
+    assert zone.utcoffset(None) is not None  # a fixed offset, not a zone that needs a database
+    assert any("time zone" in record.getMessage() for record in caplog.records)
+
+
+def test_a_usable_local_zone_is_used_as_it_is(caplog):
+    with caplog.at_level(logging.WARNING, logger=flow_service.logger.name):
+        zone = flow_service._resolve_scheduler_timezone()
+
+    assert isinstance(zone, tzinfo)
+    assert not caplog.records
