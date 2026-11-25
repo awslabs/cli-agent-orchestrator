@@ -10,7 +10,8 @@ import logging
 import os
 import subprocess
 import sys
-from datetime import tzinfo
+import time
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,12 @@ def run_python(code: str, tz: str, home: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=180
     )
+
+
+def _local_offset() -> timedelta:
+    offset = datetime.now().astimezone().utcoffset()
+    assert offset is not None
+    return offset
 
 
 @pytest.mark.parametrize("tz", POSIX_ZONES)
@@ -52,8 +59,8 @@ def test_schedule_list_runs_under_a_posix_tz(tz, tmp_path):
     assert result.stdout.strip().endswith("No flows found")
 
 
-@pytest.mark.parametrize("tz", POSIX_ZONES)
-def test_a_weekday_schedule_is_valid_and_fires_under_a_posix_tz(tz, tmp_path):
+@pytest.mark.parametrize(("tz", "offset"), [("AEST-10", "+10:00"), ("UTC0", "+00:00")])
+def test_a_weekday_schedule_is_valid_and_fires_under_a_posix_tz(tz, offset, tmp_path):
     code = (
         "import json\n"
         "from datetime import datetime\n"
@@ -64,7 +71,7 @@ def test_a_weekday_schedule_is_valid_and_fires_under_a_posix_tz(tz, tmp_path):
         "times = flow_service.next_fire_times(\n"
         "    '0 9 * * mon-fri', 2, datetime(2026, 11, 20, 8, 0))\n"
         "print(json.dumps({'errors': errors,\n"
-        "                  'times': [t.replace(tzinfo=None).isoformat() for t in times]}))\n"
+        "                  'times': [t.isoformat() for t in times]}))\n"
     )
 
     result = run_python(code, tz, tmp_path)
@@ -72,12 +79,23 @@ def test_a_weekday_schedule_is_valid_and_fires_under_a_posix_tz(tz, tmp_path):
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {
         "errors": [],
-        # Friday 2026-11-20, then Monday 2026-11-23.
-        "times": ["2026-11-20T09:00:00", "2026-11-23T09:00:00"],
+        # Friday 2026-11-20, then Monday 2026-11-23, at the offset the POSIX string names.
+        "times": [f"2026-11-20T09:00:00{offset}", f"2026-11-23T09:00:00{offset}"],
     }
 
 
-def test_an_unusable_local_zone_falls_back_to_a_fixed_zone_and_warns(monkeypatch, caplog):
+def test_an_unusable_local_zone_falls_back_to_the_local_offset_and_warns(monkeypatch, caplog):
+    # The host's own zone may be UTC (CI), where "the local offset" and "UTC" cannot be told apart.
+    monkeypatch.setenv("TZ", "AEST-10")
+    time.tzset()
+    try:
+        _fall_back_and_check(monkeypatch, caplog)
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
+def _fall_back_and_check(monkeypatch, caplog):
     def refuse(*_args, **_kwargs):
         raise LookupError("tzlocal() does not support non-zoneinfo timezones like AEST-10")
 
@@ -86,8 +104,8 @@ def test_an_unusable_local_zone_falls_back_to_a_fixed_zone_and_warns(monkeypatch
     with caplog.at_level(logging.WARNING, logger=flow_service.logger.name):
         zone = flow_service._resolve_scheduler_timezone()
 
-    assert isinstance(zone, tzinfo)
-    assert zone.utcoffset(None) is not None  # a fixed offset, not a zone that needs a database
+    assert isinstance(zone, timezone)  # a fixed offset, not a zone that needs a database
+    assert zone.utcoffset(None) == timedelta(hours=10), "the fallback is the local offset, not UTC"
     assert any("time zone" in record.getMessage() for record in caplog.records)
 
 
