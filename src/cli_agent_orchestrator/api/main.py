@@ -1713,7 +1713,8 @@ class FlowDefinitionInput(BaseModel):
     schedule: Any = ""
     agent_profile: Any = ""
     provider: Any = "kiro_cli"
-    prompt_template: Any = ""
+    # Left out means "not given", which validate reports as required, as create does.
+    prompt_template: Any = None
 
 
 class UpdateFlowRequest(BaseModel):
@@ -11279,7 +11280,9 @@ async def validate_flow(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Check a flow definition without writing anything (read scope, like workflow validate)."""
-    errors = flow_service.validate_flow_definition(body.model_dump(), must_be_new=True)
+    errors = flow_service.validate_flow_definition(
+        body.model_dump(), must_be_new=True, require_prompt_template=True
+    )
     next_runs: List[str] = []
     if not any(e["field"] == "schedule" for e in errors):
         next_runs = [t.isoformat() for t in flow_service.next_fire_times(body.schedule, 3)]

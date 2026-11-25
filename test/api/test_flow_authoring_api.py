@@ -247,6 +247,35 @@ class TestValidateRoute:
         assert len(body["next_runs"]) == (0 if field == "schedule" else 3)
         assert files_under(flows_home) == []
 
+    @pytest.mark.parametrize(
+        ("body", "message"),
+        [
+            ({k: v for k, v in GOOD.items() if k != "prompt_template"}, "is required"),
+            ({**GOOD, "prompt_template": None}, "is required"),
+            ({**GOOD, "prompt_template": 5}, "must be a string"),
+            ({**GOOD, "prompt_template": ["a"]}, "must be a string"),
+            ({**GOOD, "prompt_template": {"a": 1}}, "must be a string"),
+            ({**GOOD, "prompt_template": True}, "must be a string"),
+        ],
+    )
+    def test_a_prompt_template_that_create_refuses_is_a_field_error_here_too(
+        self, client, flows_home, body, message
+    ):
+        answer = validated(client, body)
+
+        assert answer["valid"] is False
+        assert answer["errors"] == [{"field": "prompt_template", "message": message}]
+        assert len(answer["next_runs"]) == 3
+        # Create refuses the same body while parsing it, so validate must not say "valid".
+        assert client.post("/flows", json=body).status_code == 422
+        assert files_under(flows_home) == []
+
+    def test_an_empty_prompt_template_is_valid_because_create_accepts_it(self, client, flows_home):
+        body = {**GOOD, "prompt_template": ""}
+
+        assert validated(client, body)["valid"] is True
+        assert client.post("/flows", json=body).status_code == 201
+
     def test_a_name_at_the_length_limit_is_valid(self, client, flows_home):
         body = validated(client, {**GOOD, "name": "a" * 64})
 

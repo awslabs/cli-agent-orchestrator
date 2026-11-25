@@ -56,6 +56,38 @@ def register_row(name="daily-report", file_path="/flows/x.flow.md", schedule="0 
 # --------------------------------------------------------------------------- #
 
 
+def test_a_prompt_template_is_checked_only_when_the_caller_asks_for_it():
+    # add_flow and update_flow hold no prompt in their definition; only the authoring routes do.
+    assert flow_service.validate_flow_definition(GOOD, must_be_new=False) == []
+
+    errors = flow_service.validate_flow_definition(
+        GOOD, must_be_new=False, require_prompt_template=True
+    )
+
+    assert errors == [{"field": "prompt_template", "message": "is required"}]
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [(5, "must be a string"), (["a"], "must be a string"), ({"a": 1}, "must be a string")],
+)
+def test_a_prompt_template_that_is_not_a_string_is_refused(value, message):
+    errors = flow_service.validate_flow_definition(
+        {**GOOD, "prompt_template": value}, must_be_new=False, require_prompt_template=True
+    )
+
+    assert errors == [{"field": "prompt_template", "message": message}]
+
+
+@pytest.mark.parametrize("value", ["", "Report.", "line one\nline two", "---\nscript: x\n---"])
+def test_any_string_is_an_acceptable_prompt_template(value):
+    errors = flow_service.validate_flow_definition(
+        {**GOOD, "prompt_template": value}, must_be_new=False, require_prompt_template=True
+    )
+
+    assert errors == []
+
+
 def test_a_valid_definition_has_no_errors():
     assert flow_service.validate_flow_definition(GOOD, must_be_new=False) == []
 

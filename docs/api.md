@@ -680,9 +680,11 @@ See [Memory](memory.md), [Self-Learning](self-learning.md), and
 - `POST /flows/validate` checks a flow definition and writes nothing (`200`); requires
   `cao:read`, `cao:write`, or `cao:admin`. The body is `{name, schedule, agent_profile,
   provider, prompt_template}`, and `provider` defaults to `kiro_cli`. A value that `POST /flows`
-  would refuse while parsing the body, such as a name with `/`, comes back from this route as a
-  field error. A `schedule` longer than 256 characters, or one that does not fire within 41 years
-  (`this schedule never fires`), is a field error too. The result is `{valid, errors, next_runs}`: `errors` lists `{field, message}` entries,
+  would refuse while parsing the body, such as a name with `/` or a `prompt_template` that is
+  missing, `null`, or not a string, comes back from this route as a field error. A `schedule`
+  longer than 256 characters, or one that does not fire within 41 years
+  (`this schedule never fires`), is a field error too. The result is `{valid, errors, next_runs}`:
+  `errors` lists `{field, message}` entries,
   and `next_runs` holds the next three fire times in the server's local time zone (empty when
   the schedule has an error). The route takes no `script` field and checks no path.
 - `POST /flows` creates a flow (`201`); requires `cao:write` or `cao:admin`. The body is

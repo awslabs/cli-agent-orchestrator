@@ -164,18 +164,24 @@ def _has_control_character(value: str) -> bool:
     return any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
 
 
-def validate_flow_definition(fields: Mapping[str, Any], *, must_be_new: bool) -> List[FieldError]:
+def validate_flow_definition(
+    fields: Mapping[str, Any], *, must_be_new: bool, require_prompt_template: bool = False
+) -> List[FieldError]:
     """Check every rule for a flow definition; never touches the file system.
 
     Args:
         fields: ``name``, ``schedule``, ``agent_profile`` and ``provider``; a missing or
-            non-string value is a field error.
+            non-string value is a field error. ``prompt_template`` is read only when
+            ``require_prompt_template`` is set.
         must_be_new: Also refuse a name that belongs to a registered flow. Create and validate
             pass True; an edit passes False so a flow does not collide with itself.
+        require_prompt_template: Also require ``prompt_template`` to be a string (an empty one
+            is fine), as ``POST /flows`` does. A definition read from a flow file or a stored
+            flow has no prompt in it, so only the authoring routes ask for this.
 
     Returns:
-        One error per bad field, in the order name, schedule, agent_profile, provider; empty
-        when the definition is valid.
+        One error per bad field, in the order name, schedule, agent_profile, provider,
+        prompt_template; empty when the definition is valid.
     """
     errors: List[FieldError] = []
 
@@ -209,6 +215,12 @@ def validate_flow_definition(fields: Mapping[str, Any], *, must_be_new: bool) ->
                 add(key, SCHEDULE_INVALID_MESSAGE)
         elif not value.strip():
             add(key, "must not be empty")
+    if require_prompt_template:
+        prompt = fields.get("prompt_template")
+        if prompt is None:
+            add("prompt_template", "is required")
+        elif not isinstance(prompt, str):
+            add("prompt_template", "must be a string")
     return errors
 
 

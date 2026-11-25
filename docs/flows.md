@@ -126,8 +126,10 @@ cao schedule remove daily-standup
 ```bash
 curl -s -X POST http://localhost:9889/flows/validate \
   -H 'Content-Type: application/json' \
-  -d '{"name": "daily-standup", "schedule": "0 9 * * mon-fri", "agent_profile": "developer"}'
+  -d '{"name": "daily-standup", "schedule": "0 9 * * mon-fri", "agent_profile": "developer", "prompt_template": "Summarize yesterday."}'
 ```
+
+`prompt_template` is required and must be a string (an empty string is fine), the same as for `POST /flows`.
 
 The answer is `200` for any JSON object, whatever its values:
 
