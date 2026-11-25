@@ -7,13 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- **A swallowed submit is no longer read as picked up while the receiver is still printing**.
-  When CAO typed a message into a terminal that still looked ready but was emitting output,
-  output that landed in the instant before the keys reached the pane could count as the
-  agent starting on that message. If the Enter was then swallowed, CAO skipped its
-  re-submit and the message sat unsent in the composer. The delivery boundary is now taken
-  at the last moment before the pane write, so only output after the write counts (#709).
-
 - **Workspace split panes fill themselves**. Picking 2 or 4 panes in the Workspace tab now
   shows the session's other agents in the empty panes, in tab order, instead of leaving them
   blank. Panes already showing an agent keep it, and clicking the current layout again refills
