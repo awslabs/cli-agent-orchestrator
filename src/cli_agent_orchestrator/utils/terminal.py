@@ -607,6 +607,13 @@ def wait_for_initial_delivery(
         if state == "failed":
             kind = delivery.get("kind") or "failed"
             detail = delivery.get("message") or "no detail recorded"
+            if kind == "interrupted":
+                # The server restarted before it could confirm the delivery. The
+                # message may have reached the agent, so do not say it did not.
+                raise click.ClickException(
+                    f"Delivery of the initial message to terminal {terminal_id} was not "
+                    f"confirmed ({kind}): {detail}"
+                )
             raise click.ClickException(
                 f"Initial message was not delivered to terminal {terminal_id} ({kind}): {detail}"
             )

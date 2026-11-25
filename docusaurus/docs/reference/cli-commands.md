@@ -95,7 +95,7 @@ cao launch "Refactor the auth module" --agents refactorer --provider claude_code
 cao launch "Build the project" --agents builder --env AWS_REGION=us-west-2 --env STAGE=beta
 
 # Launch asynchronously: returns once the message is delivered, then the task runs in the background
-cao launch "Generate weekly report" --agents reporter --async
+cao launch "Generate weekly report" --agents reporter --headless --auto-approve --async
 
 # Launch with memory manager
 cao launch "Research this codebase" --agents explorer --memory

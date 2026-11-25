@@ -29,7 +29,7 @@ sequenceDiagram
 
 ## Files
 
-- [`run.sh`](run.sh) — the runnable script. `set -euo pipefail`, hard timeout via `CAO_CI_TIMEOUT`, EXIT trap shuts down the session.
+- [`run.sh`](run.sh) — the runnable script. `set -euo pipefail`, hard timeout via `CAO_CI_TIMEOUT`, (counted from when `cao launch` returns, so the provider startup wait is on top of it), EXIT trap shuts down the session.
 - [`ci_developer.md`](ci_developer.md) — minimal `role: developer` profile tuned for one-shot non-interactive execution. Always ends with a single-line summary, never asks follow-up questions.
 
 ## Setup
@@ -61,7 +61,7 @@ CAO_CI_TIMEOUT=60 ./examples/headless-ci/run.sh "Quick task"
 |------|---------|
 | `0` | Agent reached `IDLE` or `COMPLETED`. |
 | `1` | Agent reached `ERROR`, or stalled at `WAITING_USER_ANSWER` (CI cannot answer). |
-| `124` | Polling exceeded `CAO_CI_TIMEOUT` seconds (default 600). |
+| `124` | Polling exceeded `CAO_CI_TIMEOUT` seconds (default 600), counted from when `cao launch` returns. |
 
 ## Use in GitHub Actions
 
