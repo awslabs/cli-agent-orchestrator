@@ -87,9 +87,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Synthetic memory-evaluation arms run with their own CAO settings homes**, so
   future memory phases can measure their setting without changing the legacy baseline (#1329).
 - **Synthetic memory retrieval evaluation fixtures and baseline harness** measure
-  BM25 current-first strictly: a tied current/stale pair counts only when the
-  current note ranks first in both fixed wiki-listing orders, so the measure no
-  longer depends on filesystem listing order. Tokens per recall can still vary
+  current-first strictly in every arm: a current note counts only when it
+  ranks first in both fixed wiki-listing orders. Tokens per recall can still vary
   slightly by filesystem (#1329).
 - **Provider memory file writes now default off** (#1335). CAO delivers each terminal's
   memory without writing it into project files that can be committed. Interactive
