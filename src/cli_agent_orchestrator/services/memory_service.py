@@ -1785,7 +1785,10 @@ class MemoryService:
 
             authored_targets = set(
                 extract_content_link_targets(
-                    "## See Also\n" + "\n".join(authored_lines), self._sanitize_key, scope
+                    "## See Also\n" + "\n".join(authored_lines),
+                    self._sanitize_key,
+                    scope,
+                    scope_id=scope_id,
                 )
             )
         else:
@@ -2134,17 +2137,22 @@ class MemoryService:
         seen: set[str] = set()
         for content in contents:
             content_lines = content.splitlines()
-            indices = {index for _, _, body in see_also_sections(content_lines) for index in body}
+            sections = see_also_sections(content_lines)
+            indices = {index for _, _, body in sections for index in body}
+            fenced = {
+                index
+                for start, end, _ in sections
+                for index in range(start + 1, end)
+                if index not in indices
+            }
             for index, line in enumerate(content_lines):
-                stripped = line.rstrip()
-                if (
-                    index in indices
-                    and line.strip()
-                    and not SEE_ALSO_LINK_RE.fullmatch(line.strip())
-                    and stripped not in seen
-                ):
-                    seen.add(stripped)
+                if index in fenced:
                     lines.append(line)
+                elif index in indices and line.strip():
+                    stripped = line.rstrip()
+                    if not SEE_ALSO_LINK_RE.fullmatch(line.strip()) and stripped not in seen:
+                        seen.add(stripped)
+                        lines.append(line)
         return lines
 
     def _sync_content_link_edges(
@@ -2173,6 +2181,7 @@ class MemoryService:
             self._strip_generated_see_also(file_content),
             self._sanitize_key,
             scope,
+            scope_id=scope_id,
         )
         audits: list[Callable[[], None]] = []
         with self._get_db_session() as db:

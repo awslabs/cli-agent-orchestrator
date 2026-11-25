@@ -906,15 +906,21 @@ def _detect_graph_density(
                 )
 
                 content_targets = (
-                    extract_content_link_targets(r.get("content", ""), MemoryService._sanitize_key)
+                    extract_content_link_targets(
+                        MemoryService._strip_generated_see_also(r.get("content", "")),
+                        MemoryService._sanitize_key,
+                        scope,
+                        scope_id=scope_id,
+                    )
                     if is_memory_content_links_enabled()
                     else []
                 )
                 cross_scope_targets = (
                     extract_content_link_targets(
-                        r.get("content", ""),
+                        MemoryService._strip_generated_see_also(r.get("content", "")),
                         MemoryService._sanitize_key,
                         scope,
+                        scope_id=scope_id,
                         cross_scope_only=True,
                     )
                     if is_memory_content_links_enabled()

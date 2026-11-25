@@ -612,9 +612,14 @@ replaces only that source/type/origin set and preserves human and other
 producer edges. CAO's own canonical generated `## See Also` projection is
 excluded from parsing so it cannot make a deleted edge self-sustaining. Generated
 lines are removed individually from a mixed `## See Also` section, leaving
-hand-authored lines available for parsing. A hand-written bullet in the exact
-generated `- [key](../<scope>/<key>.md)` shape is also treated as generated;
-use `[[key]]` for an authored link.
+hand-authored lines available for parsing. Generated links use
+`- [key](../<scope_id or scope>/<key>.md)`: project, session, and agent notes
+use their scope ID as the folder; global notes use `global`. A hand-written
+bullet in that exact generated shape is also treated as generated; use
+`[[key]]` for an authored link. A `../<folder>/` link is cross-scope when the
+folder is neither the note's scope name nor its scope ID. With the setting on,
+compilation hides the `## See Also` section from the model and writes authored
+lines back afterward, including fenced blocks and their markers.
 
 Existing notes can be indexed after opting in by running `cao memory repair --apply`.
 Set the option to `true` (or set

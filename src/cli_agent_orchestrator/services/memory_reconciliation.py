@@ -1187,6 +1187,7 @@ class MemoryReconciliationService:
                 ),
                 MemoryService._sanitize_key,
                 topic.identity.scope,
+                scope_id=topic.identity.scope_id,
             )
         audits: list[Any] = []
         with self._get_db_session() as db:
@@ -1636,6 +1637,7 @@ class MemoryReconciliationService:
                             ),
                             MemoryService._sanitize_key,
                             topic.identity.scope,
+                            scope_id=topic.identity.scope_id,
                         )
                         source_identity = (identity.scope, identity.scope_id, identity.key)
                         if targets or source_identity in existing_sources:

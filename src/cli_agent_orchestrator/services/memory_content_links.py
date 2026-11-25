@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Callable
 
-_SEE_ALSO_HEADING = re.compile(r"^##\s+See Also\s*$", re.IGNORECASE)
+_SEE_ALSO_HEADING = re.compile(r"## See Also")
 _MARKDOWN_LINK = re.compile(r"\[[^\[\]\n]+\]\(([^)\n]+)\)")
 _SECTION_END = re.compile(r"^#{1,2}\s+")
 
@@ -29,7 +29,7 @@ def see_also_sections(lines: list[str]) -> list[tuple[int, int, set[int]]]:
                 sections.append((start, index, body))
                 start = None
                 body = set()
-            if _SEE_ALSO_HEADING.fullmatch(stripped):
+            if _SEE_ALSO_HEADING.fullmatch(line):
                 start = index
         elif start is not None:
             body.add(index)
@@ -43,6 +43,7 @@ def extract_content_link_targets(
     sanitize_key: Callable[[str], str],
     scope: str | None = None,
     *,
+    scope_id: str | None = None,
     cross_scope_only: bool = False,
 ) -> list[str]:
     """Return canonical targets from ``[[wikilinks]]`` and See Also bullets."""
@@ -80,7 +81,10 @@ def extract_content_link_targets(
             continue
         parts = raw.split("/")
         crosses_scope = (
-            scope is not None and len(parts) >= 3 and parts[0] == ".." and parts[1] != scope
+            scope is not None
+            and len(parts) >= 3
+            and parts[0] == ".."
+            and parts[1] not in {scope, scope_id or scope}
         )
         if crosses_scope != cross_scope_only:
             continue

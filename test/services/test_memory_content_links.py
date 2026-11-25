@@ -100,13 +100,206 @@ def test_keyless_bullet_does_not_hide_following_target(bullet) -> None:
 
 
 def test_see_also_boundaries_and_tilde_fences() -> None:
-    content = "## see also\n- [[first]]\n~~~\n[[hidden]]\n~~~\n# Next\n- [[outside]]\n"
+    content = "## See Also\n- [[first]]\n~~~\n[[hidden]]\n~~~\n# Next\n- [[outside]]\n"
     assert extract_content_link_targets(content, MemoryService._sanitize_key) == [
         "first",
         "outside",
     ]
-    assert MemoryService._authored_see_also_lines(content) == ["- [[first]]"]
-    assert "## see also" not in MemoryService._strip_existing_see_also(content)
+    assert MemoryService._authored_see_also_lines(content) == [
+        "- [[first]]",
+        "~~~",
+        "[[hidden]]",
+        "~~~",
+    ]
+    assert "## See Also" not in MemoryService._strip_existing_see_also(content)
+
+
+def test_sentence_case_see_also_is_not_a_generated_section() -> None:
+    content = "A fact.\n\n## See also\nAn important runbook.\n"
+    assert MemoryService._strip_existing_see_also(content) == content
+    assert MemoryService._authored_see_also_lines(content) == []
+    assert (
+        extract_content_link_targets(content + "- [Other](other.md)", MemoryService._sanitize_key)
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    ("scope", "scope_id", "folder"),
+    [
+        ("project", "project-a", "project-a"),
+        ("project", "project-a", "project"),
+        ("project", "project-a", ""),
+        ("session", "sess-a", "sess-a"),
+        ("agent", "dev", "dev"),
+        ("global", None, "global"),
+    ],
+)
+def test_same_scope_folder_is_a_content_link(scope, scope_id, folder) -> None:
+    destination = f"../{folder}/other.md" if folder else "other.md"
+    content = f"## See Also\n- [Other]({destination})\n"
+    assert extract_content_link_targets(
+        content, MemoryService._sanitize_key, scope, scope_id=scope_id
+    ) == ["other"]
+
+
+def test_different_scope_folder_is_not_a_content_link() -> None:
+    content = "## See Also\n- [Other](../another/other.md)\n"
+    assert (
+        extract_content_link_targets(
+            content, MemoryService._sanitize_key, "project", scope_id="project-a"
+        )
+        == []
+    )
+    assert extract_content_link_targets(
+        content, MemoryService._sanitize_key, "project", scope_id="project-a", cross_scope_only=True
+    ) == ["other"]
+
+
+def test_lint_ignores_generated_lines_and_reports_authored_cross_scope(
+    tmp_path, isolated_memory_db, monkeypatch
+) -> None:
+    _enable_content_links(monkeypatch)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    context = {"cwd": str(tmp_path / "project")}
+    _run(service.store("Other", scope="project", key="other", terminal_context=context))
+    _run(
+        service.store(
+            "## See Also\n- [ghost](../elsewhere/ghost.md)\n" "- [Other notes](../global/other.md)",
+            scope="project",
+            key="source",
+            terminal_context=context,
+        )
+    )
+    issues = _run(
+        run_lint(
+            "fixture",
+            scope="project",
+            max_pairs=0,
+            base_dir=tmp_path,
+            db_engine=isolated_memory_db,
+        )
+    )
+    assert [issue.description for issue in issues if "content link" in issue.description] == [
+        "content link crosses scope: other"
+    ]
+
+
+@pytest.mark.parametrize("scope", ["project", "session", "agent", "global"])
+def test_scope_id_link_store_repair_and_lint(
+    tmp_path, isolated_memory_db, monkeypatch, scope
+) -> None:
+    _enable_content_links(monkeypatch)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    context = {"cwd": str(tmp_path / "project"), "session_name": "sess-a", "agent_profile": "dev"}
+    other = _run(service.store("Other", scope=scope, key="other", terminal_context=context))
+    folder = other.scope_id or scope
+    _run(
+        service.store(
+            f"## See Also\n- [Other notes](../{folder}/other.md)",
+            scope=scope,
+            key="source",
+            terminal_context=context,
+        )
+    )
+    assert ("source", "other", "content_link") in _edges(isolated_memory_db)
+    MemoryReconciliationService(tmp_path, isolated_memory_db).apply()
+    assert ("source", "other", "content_link") in _edges(isolated_memory_db)
+    issues = _run(
+        run_lint(
+            "fixture",
+            scope=scope,
+            max_pairs=0,
+            base_dir=tmp_path,
+            db_engine=isolated_memory_db,
+        )
+    )
+    assert not any("content link crosses scope: other" == issue.description for issue in issues)
+
+
+def test_project_compile_does_not_duplicate_authored_scope_id_link(
+    tmp_path, isolated_memory_db, monkeypatch
+) -> None:
+    _enable_content_links(monkeypatch)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    _identity_compile_stubs(service, monkeypatch, isolated_memory_db, related_keys=("other",))
+    context = {"cwd": str(tmp_path / "project")}
+    other = _run(service.store("Other", scope="project", key="other", terminal_context=context))
+    bullet = f"- [Other notes](../{other.scope_id}/other.md)"
+    stored = _run(
+        service.store(
+            f"## See Also\n{bullet}",
+            scope="project",
+            key="source",
+            terminal_context=context,
+        )
+    )
+    assert (
+        _run(service.compact(key="source", scope="project", terminal_context=context))["source"]
+        == "applied"
+    )
+    section = _see_also_section(stored.file_path)
+    assert section.count("other.md") == 1
+    assert bullet in section
+
+
+@pytest.mark.parametrize("related_keys", [(), ("other",)])
+def test_compile_preserves_fenced_see_also_lines(
+    tmp_path, isolated_memory_db, monkeypatch, related_keys
+) -> None:
+    _enable_content_links(monkeypatch)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    _identity_compile_stubs(service, monkeypatch, isolated_memory_db, related_keys=related_keys)
+    _run(service.store("Other", scope="global", key="other"))
+    content = "## See Also\n- [[other]]\n```text\nkeep backticks\n```\n~~~text\nkeep tildes\n~~~"
+    stored = _run(service.store(content, scope="global", key="source"))
+    assert _run(service.compact(key="source"))["source"] == "applied"
+    section = _see_also_section(stored.file_path)
+    assert "```text\nkeep backticks\n```" in section
+    assert "~~~text\nkeep tildes\n~~~" in section
+
+
+@pytest.mark.parametrize("related_keys", [(), ("other",)])
+def test_compile_preserves_repeated_fence_markers_and_blank_lines(
+    tmp_path, isolated_memory_db, monkeypatch, related_keys
+) -> None:
+    _enable_content_links(monkeypatch)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    _identity_compile_stubs(service, monkeypatch, isolated_memory_db, related_keys=related_keys)
+    _run(service.store("Other", scope="global", key="other"))
+    fenced = "```\nfirst\n\nstill first\n```\n```\nsecond\n\nstill second\n```"
+    content = f"## See Also\n- [[other]]\n{fenced}\n"
+    assert MemoryService._authored_see_also_lines(content) == [
+        "- [[other]]",
+        *fenced.splitlines(),
+    ]
+    stored = _run(service.store(content, scope="global", key="source"))
+    assert _run(service.compact(key="source"))["source"] == "applied"
+    assert fenced in _see_also_section(stored.file_path)
+
+
+def test_sentence_case_heading_survives_compact_with_setting_off(
+    tmp_path, isolated_memory_db, monkeypatch
+) -> None:
+    from cli_agent_orchestrator.services import settings_service
+
+    monkeypatch.setattr(settings_service, "is_memory_content_links_enabled", lambda: False)
+    service = MemoryService(base_dir=tmp_path, db_engine=isolated_memory_db)
+    _identity_compile_stubs(service, monkeypatch, isolated_memory_db, related_keys=("other",))
+    _run(service.store("Other", scope="global", key="other"))
+    stored = _run(
+        service.store("A fact.\n\n## See also\nAn important runbook.", scope="global", key="source")
+    )
+    recalled = _run(service.recall(scope="global", record_access=False))
+    assert any(
+        "## See also\nAn important runbook." in memory.content
+        for memory in recalled
+        if memory.key == "source"
+    )
+    assert _run(service.compact(key="source"))["source"] == "applied"
+    text = Path(stored.file_path).read_text(encoding="utf-8")
+    assert "## See also\nAn important runbook." in text
+    assert "## See Also\n- [other](../global/other.md)" in text
 
 
 def test_unclosed_fence_does_not_erase_earlier_section_links() -> None:
