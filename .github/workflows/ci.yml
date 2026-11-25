@@ -55,9 +55,11 @@ jobs:
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
-    # Bounds a hung test (#1251). The job takes 25-40 min on main (3.11 is the
-    # slower leg), so 60 is 1.5x the slowest recent run. Unbounded, a hang held
-    # the runner for GitHub's default of 360 min.
+    # Bounds a hung test (#1251). Under `-n auto` (#1408) the job takes about
+    # 16-26 min on main (3.11 is the slower leg; a serial run took 25-40 min), so 60
+    # is about 2.3x the slowest xdist run and still above the slowest serial run,
+    # which leaves room for a slow runner or a return to serial. Unbounded, a hang
+    # held the runner for GitHub's default of 360 min.
     timeout-minutes: 60
     strategy:
       matrix:
