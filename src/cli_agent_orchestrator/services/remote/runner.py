@@ -28,15 +28,17 @@ _AMBIENT_AWS_CREDENTIALS = frozenset(
 )
 
 
+def _clean_env() -> dict[str, str]:
+    # Keep PATH, SSH_AUTH_SOCK, proxy and CA settings: the user's tools live outside os.defpath.
+    env = {key: value for key, value in os.environ.items() if key not in _AMBIENT_AWS_CREDENTIALS}
+    env.update(LANG="C", LC_ALL="C")
+    return env
+
+
 class Runner:
     """Run argv-only commands with no stdin and no ambient AWS credentials."""
 
     def run(self, argv: Sequence[str], timeout: float = 15.0) -> RunResult:
-        # Keep PATH, SSH_AUTH_SOCK, proxy and CA settings: the user's tools live outside os.defpath.
-        env = {
-            key: value for key, value in os.environ.items() if key not in _AMBIENT_AWS_CREDENTIALS
-        }
-        env.update(LANG="C", LC_ALL="C")
         try:
             completed = subprocess.run(
                 list(argv),
@@ -45,7 +47,7 @@ class Runner:
                 stderr=subprocess.PIPE,
                 text=True,
                 timeout=timeout,
-                env=env,
+                env=_clean_env(),
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -55,7 +57,7 @@ class Runner:
     def run_interactive(self, argv: Sequence[str]) -> RunResult:
         """Run an explicitly approved command on the caller's terminal."""
         try:
-            completed = subprocess.run(list(argv), check=False)
+            completed = subprocess.run(list(argv), check=False, env=_clean_env())
         except OSError as exc:
             return RunResult(1, stderr=type(exc).__name__)
         return RunResult(completed.returncode)

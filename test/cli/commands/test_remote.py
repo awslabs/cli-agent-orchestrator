@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 from pathlib import Path
 from typing import Sequence
 
@@ -389,6 +390,34 @@ def test_runner_drops_ambient_aws_credentials_but_keeps_required_environment(tmp
     result = Runner().run([tool.name])
     assert result.returncode == 0
     assert result.stdout == "ssh-marker\nproxy-marker\nca-marker\n"
+
+
+def test_interactive_runner_drops_ambient_aws_credentials(monkeypatch):
+    names = (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_PROFILE",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SECURITY_TOKEN",
+        "AWS_SESSION_TOKEN",
+    )
+    for name in names:
+        monkeypatch.setenv(name, "ambient-canary")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "ssh-marker")
+    captured = {}
+
+    def capture(argv, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr("cli_agent_orchestrator.services.remote.runner.subprocess.run", capture)
+    assert Runner().run_interactive(["ssh-keygen", "-V"]) == RunResult(0)
+    assert captured["check"] is False
+    assert "stdin" not in captured and "stdout" not in captured
+    env = captured["env"]
+    assert all(name not in env for name in names)
+    assert env["LANG"] == env["LC_ALL"] == "C"
+    assert env["SSH_AUTH_SOCK"] == "ssh-marker"
 
 
 def test_remote_add_list_remove_and_private_file(tmp_path, monkeypatch):
