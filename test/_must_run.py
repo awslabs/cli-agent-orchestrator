@@ -23,18 +23,26 @@ cargo/trivy/gitleaks installed is not blocked. A bare ``@pytest.mark.must_run``
 with no gate name is a misuse and still fails the session regardless of
 ``CAO_MUST_RUN``, because that is broken code that should never reach main.
 
+Under pytest-xdist (``-n``) collection and execution happen on the workers, so
+each worker runs this same gate against its own items and hands its findings
+back through ``config.workeroutput``; the controller merges them. A controller
+that enforces a gate but hears from no worker fails closed (#1408).
+
 Which jobs set which gates is itself asserted by ``test_must_run_gate.py``;
 without that, a gate that no job enforces would be exactly the dead guard this
 module exists to prevent.
 """
 
 import os
-from typing import Dict, Iterable, List, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
 
 import pytest
 
 MARKER = "must_run"
 ENV_VAR = "CAO_MUST_RUN"
+
+#: Key under ``config.workeroutput`` where an xdist worker reports its findings.
+WORKER_OUTPUT_KEY = "cao_must_run"
 
 #: Registered via ``pytest_configure`` below -- the single source of truth for
 #: the marker's help text (``pytest --markers``).
@@ -72,25 +80,40 @@ class MustRunGate:
         self.misuses: List[str] = []
         self.owned: List[str] = []
         self._gates_by_nodeid: Dict[str, Tuple[str, ...]] = {}
+        self._is_controller = False
+        self._workers_reported = 0
+        self._workers_down = 0
 
     # -- session lifecycle --------------------------------------------------
     def pytest_sessionstart(self, session: pytest.Session) -> None:
-        """Fail closed when this process cannot see collection at all.
+        """Note whether this process is an xdist controller.
 
         Under pytest-xdist (``-n``), collection and ``pytest_itemcollected`` /
         ``pytest_collection_modifyitems`` run on the workers, not on this
         (controller) plugin instance, so ``self._gates_by_nodeid`` and
-        ``self.owned`` never get populated here and every enforcement check
-        below silently never fires. Left unchecked, the controller would print
-        "0 test(s) ... ran as required" and exit 0 -- the exact silent pass
-        this module exists to prevent. Catch it upfront instead.
+        ``self.owned`` are never populated here. Each worker therefore runs its
+        own copy of this gate and reports through ``workeroutput``;
+        ``pytest_testnodedown`` merges those reports. If any worker goes down without
+        reporting (a crashed worker, or none at all), :meth:`pytest_sessionfinish`
+        fails closed, so the controller cannot print
+        "0 test(s) ... ran as required" and exit 0 for a gate nobody checked.
         """
-        if self.gates and session.config.pluginmanager.hasplugin("dsession"):
-            self.violations.append(
-                f"{ENV_VAR} cannot be enforced under pytest-xdist ('-n'); this process "
-                "never sees collection, so the gate would otherwise report success "
-                "without checking anything. Rerun the gated job without '-n'."
-            )
+        self._is_controller = session.config.pluginmanager.hasplugin("dsession")
+
+    # An xdist hook: optional, so a session without pytest-xdist (``-p no:xdist``)
+    # still loads this plugin instead of failing with "unknown hook".
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_testnodedown(self, node: Any, error: Any) -> None:
+        """Merge one xdist worker's findings into the controller's."""
+        del error
+        self._workers_down += 1
+        payload = getattr(node, "workeroutput", {}).get(WORKER_OUTPUT_KEY)
+        if payload is None:
+            return  # counted as down but not reported; sessionfinish fails closed
+        self._workers_reported += 1
+        for attr in ("violations", "misuses", "owned"):
+            mine = getattr(self, attr)
+            mine.extend(line for line in payload[attr] if line not in mine)
 
     # -- collection -------------------------------------------------------
     def pytest_itemcollected(self, item: pytest.Item) -> None:
@@ -178,6 +201,26 @@ class MustRunGate:
 
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         del exitstatus
+        workeroutput = getattr(session.config, "workeroutput", None)
+        if workeroutput is not None:
+            # An xdist worker: report to the controller, which owns the exit status.
+            workeroutput[WORKER_OUTPUT_KEY] = {
+                "violations": self.violations,
+                "misuses": self.misuses,
+                "owned": self.owned,
+            }
+            return
+        if (
+            self.gates
+            and self._is_controller
+            and (self._workers_reported == 0 or self._workers_reported != self._workers_down)
+        ):
+            self.violations.append(
+                f"{ENV_VAR} is set but only {self._workers_reported} of "
+                f"{self._workers_down} pytest-xdist worker(s) reported their must_run "
+                "findings, so part of the suite was not checked by the gate "
+                "(no pytest-xdist worker reported at all if both are 0)."
+            )
         if self.violations or self.misuses:
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
 

@@ -74,6 +74,11 @@ spec:
               value: /home/cao/.cao/state
             - name: CAO_PROJECT_ID
               value: cao-cluster
+            # Shown beside the title of the web UI that talks to this supervisor,
+            # and in its browser tab. The UI is the same build as a laptop's
+            # cao-server UI, so without a label the two look identical.
+            - name: CAO_INSTANCE_LABEL
+              value: "Cluster Mode"
             # Installed by the entrypoint at pod start. The provider MUST be
             # pinned: a delegation resolves the provider from the target node's
             # store, and no built-in profile pins one, so an unpinned profile
