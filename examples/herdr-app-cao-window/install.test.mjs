@@ -18,9 +18,9 @@ const UNINSTALL = join(here, "uninstall.sh");
 // The drawings of our own that the side mod loads by `mods/cao-window-side/<file>` (the crown and the pin): a mod folder's `*.svg` is
 // part of the mod, so the installer copies it and lists it in the manifest.
 const MOD_ASSETS = ["crown.svg", "pin-filled.svg", "pin-tilted.svg"];
-// The tabs mod's own icons of the Flows and Workflows buttons (task 27.22), loaded by `mods/cao-window-tabs/<file>`.
+// The tabs mod's own icons of the Flows and Workflows buttons, loaded by `mods/cao-window-tabs/<file>`.
 const TAB_ASSETS = ["flows.svg", "workflows.svg"];
-// The brand mod's two drawings of the CAO mark (design D42 A): the site's files, drawn by `image()` in full colour.
+// The brand mod's two drawings of the CAO mark: the site's files, drawn by `image()` in full colour.
 const BRAND_ASSETS = ["cao-mark-dark.svg", "cao-mark.svg"];
 const DRAWINGS = { side: MOD_ASSETS, tabs: TAB_ASSETS, brand: BRAND_ASSETS };
 const drawingsOf = (m) => DRAWINGS[m] ?? [];
@@ -235,7 +235,7 @@ const assertTwoBlockLayout = (layout) => {
   assert.deepEqual(all.filter((id, i) => all.indexOf(id) !== i), [], "an id appears twice");
   assert.equal(find(layout, "cao-window-panel").hidden, true);
   assert.equal(find(layout, "cao-window-tabs").min, 34);
-  // owner review (section 27): the left sidebar's edge drags between 200 and 640 px, from 268 px
+  // the left sidebar's edge drags between 200 and 640 px, from 268 px
   const side = find(layout, "sidebar");
   assert.deepEqual([side.size, side.min, side.max], [{ px: 268 }, 200, 640]);
   assert.equal(side.resizable, false, "the blocks inside the sidebar stay locked");
@@ -283,7 +283,7 @@ test("default install: home, layout, mods, shared.json, manifest, machine entry"
   assert.ok(manifest.files.every((f) => /^[0-9a-f]{64}$/.test(f.sha256)));
   assert.ok(w.log().includes("HC_SESSION=caowin hc machine add build-box --session cao --name cao"), w.log().join("\n"));
   assert.equal(w.layout().toast, undefined);   // TOAST_MOD=0 by default
-  assertTwoBlockLayout(w.layout());            // the left sidebar's drag range among them (section 27)
+  assertTwoBlockLayout(w.layout());            // the left sidebar's drag range among them
 });
 
 test("every shared module is copied flat into every mod folder, byte for byte", () => {
@@ -332,8 +332,8 @@ test("uninstall takes the drawings with the rest of the home: none is left where
   for (const f of MOD_ASSETS) assert.ok(existsSync(join(kept, "mods", "cao-window-side", f)), `${f} moved with the home`);
 });
 
-// The brand mod (27.20, D37 S): the window's own draw of the sidebar's top-left row, which says CAO where Herdr's says Herdr. It is
-// a mod folder like the others (mod.json, main.js, and in copy mode the shared modules), with the two drawings of the CAO mark (D42 A);
+// The brand mod: the window's own draw of the sidebar's top-left row, which says CAO where Herdr's says Herdr. It is
+// a mod folder like the others (mod.json, main.js, and in copy mode the shared modules), with the two drawings of the CAO mark;
 // the two buttons use the files Herdr ships in every home.
 const BRAND_MOD = join("mods", "cao-window-brand");
 const blocksUsing = (n, mod) => [n, ...(n.children ?? []).flatMap((c) => blocksUsing(c, mod))].filter((b) => b.content?.mod === mod);
@@ -1020,7 +1020,7 @@ test("a platform with no supported app exits 4, points at the README topologies 
   }
 });
 
-test("Linux exits 4 until spike 1.1 enables it", () => {
+test("Linux exits 4 until Linux support is enabled", () => {
   const enabled = /^LINUX_SUPPORTED=1/m.test(readFileSync(join(here, "bin", "launcher-fill.sh"), "utf8"));
   const w = world({ os: "Linux" });
   const r = w.install(["--local", "--app", "/opt/herdr/herdr-app-gui"]);
@@ -1664,7 +1664,7 @@ test("a folder where a shipped file should be stops the install without deleting
 });
 
 // ---------------------------------------------------------------------------------------------
-// Uninstall (task 5.3)
+// Uninstall
 // ---------------------------------------------------------------------------------------------
 
 test("uninstall: quit, then machine rm, then server stop; launcher removed; home renamed", () => {
@@ -2554,7 +2554,7 @@ test("a folder at the launcher path is left with its contents, and the uninstall
 });
 
 // ---------------------------------------------------------------------------------------------
-// The icon of the app copy (assets/CAO.icns, built from assets/cao-icon.svg; design D40 C)
+// The icon of the app copy (assets/CAO.icns, built from assets/cao-icon.svg)
 // ---------------------------------------------------------------------------------------------
 
 const ICON = join(here, "assets", "CAO.icns");
@@ -2613,7 +2613,7 @@ test("icon: the glyph is the project's own mark, not Herdr's artwork: every coor
 });
 
 // ---------------------------------------------------------------------------------------------
-// The app copy: ~/Applications/CAO.app, a renamed, ad-hoc signed clone of Herdr.app (design D40 B)
+// The app copy: ~/Applications/CAO.app, a renamed, ad-hoc signed clone of Herdr.app
 // ---------------------------------------------------------------------------------------------
 
 const plistOf = (path) => Object.fromEntries(readFileSync(path, "utf8").split("\n").filter(Boolean).map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));

@@ -1,5 +1,5 @@
 // lib/agents.js: the view models of the left sidebar's two blocks, the Sessions line and the Agents
-// tree (specs cao-window-sessions and cao-window-honesty-labels; design D25 and D26; tasks 18.1 to 18.4).
+// tree.
 //
 // The module is imported as a namespace so a function that is not written yet fails its own case with
 // "x is not a function" instead of stopping the whole file at the import line.
@@ -20,7 +20,7 @@ const T = (id, session, over = {}) => ({
 const worker = (id, session, caller = "c1", over = {}) => T(id, session, { profile: "developer", caller, createdMs: 5, ...over });
 const rootWorker = (id, session, over = {}) => T(id, session, { profile: "developer", caller: undefined, createdMs: 5, ...over });
 const never = () => false;
-const nothing = (v) => v === null || v === undefined; // "returns nothing" is null or undefined; the spec does not say which
+const nothing = (v) => v === null || v === undefined; // "returns nothing" is null or undefined; either is fine
 const sess = (name, terms, props = {}, drafts = []) => ({ name, terms, ...classify(terms, props, drafts) });
 
 // Deep freeze, so a function that mutates its argument throws in strict mode (ES modules are strict).
@@ -29,7 +29,7 @@ const freeze = (v) => {
   return v;
 };
 
-// ---- 18.1: sessionLine ----
+// ---- sessionLine ----
 
 test("One line per session: name, an extra mark and the state of the first talkable agent, and no agent rows, no pill", () => {
   const a = freeze(sess("cao-a", [T("c1", "cao-a", { state: "working" }), worker("w1", "cao-a", "c1", { state: "blocked" })]));
@@ -123,7 +123,7 @@ test("Replied mark: a talkable agent that replied draws the done dot in the high
 });
 
 test("Replied mark comes from a talkable agent: a worker that replied gives the session no mark, nor changes its glyph", () => {
-  // spec "Session line": replied when a talkable agent has replied
+  // the line shows replied when a talkable agent has replied
   const s = freeze(sess("cao-a", [T("c1", "cao-a", { state: "idle", turn: 3, seen: 3 }), worker("w1", "cao-a", "c1", { state: "done", turn: 3, seen: 1 })]));
   assert.deepEqual(s.talkable.map((t) => t.id), ["c1"]);
   const line = A.sessionLine(s, { replied: (t) => t.id === "w1" });
@@ -135,7 +135,7 @@ test("Replied mark comes from a talkable agent: a worker that replied gives the 
   assert.deepEqual([second.shape, second.extra, second.tip], ["ring", "dot-hi", "cao-b: idle, replied"], "the glyph is the first talkable agent's, the highlighted dot beside it says another agent replied, and the tooltip says both");
 });
 
-// ---- 18.2: agentRows ----
+// ---- agentRows ----
 
 const ids = (view) => view.rows.map((r) => r.id);
 const depths = (view) => view.rows.map((r) => r.depth);
@@ -152,7 +152,7 @@ test("Indentation shows who started whom: c1 at 0, w1 at 1, w2 at 2, and no row 
   assert.doesNotMatch(text, /\b(c1|w1|w2)\b/, "no terminal id is printed");
 });
 
-test("No fold: a session of 14 agents shows every one, each under its real parent, and a pin changes no row (design D42 C)", () => {
+test("No fold: a session of 14 agents shows every one, each under its real parent, and a pin changes no row", () => {
   const s = freeze(sess("s", [T("c1", "s"), worker("w1", "s", "c1", { createdMs: 2 }), worker("w2", "s", "w1", { createdMs: 3 }), ...fill(11)]));
   const all = ["c1", "w1", "w2", ...fill(11).map((w) => w.id)];
   const view = A.agentRows(s, ["w2"]);
@@ -206,7 +206,7 @@ test("Cycle is cut at the oldest: w1 created first has no parent and w2 sits one
   assert.deepEqual([ids(rg), depths(rg)], [["c1", "b", "c", "a", "d"], [0, 0, 1, 2, 2]], "b is oldest and has no parent: c names b, a names c, d names c");
 });
 
-test("Conductor with workers: every agent is shown, however many, with no line to fold or unfold them (design D42 C)", () => {
+test("Conductor with workers: every agent is shown, however many, with no line to fold or unfold them", () => {
   const s = freeze(sess("s", [T("c1", "s"), worker("w1", "s"), worker("w2", "s"), worker("w3", "s")]));
   const small = A.agentRows(s, []);
   assert.deepEqual(ids(small), ["c1", "w1", "w2", "w3"]);
@@ -253,7 +253,7 @@ test("No talkable agent left: the older of two workers is shown, labelled 'best 
 });
 
 test("No agent is listed for no session or a session that is gone: agentRows takes what agentsHeader takes and returns no rows", () => {
-  // spec "Selected session gone" and "Nothing selected": the header says so and no agent is listed
+  // with the selected session gone or nothing selected, the header says so and no agent is listed
   for (const none of [null, undefined, { kind: "session", name: "cao-a" }, { name: "cao-a" }, {}, [], "cao-a", 5]) {
     const view = A.agentRows(freeze(none), []);
     assert.deepEqual(view, { rows: [] }, JSON.stringify(none));
@@ -344,7 +344,7 @@ test("Row fields: name, glyph, pin flag and tooltip, the terminal for the click,
   }
 });
 
-// ---- the glyph of a state (owner review, changes A and H): Herdr's own marks, one per Herdr status, no word ----
+// ---- the glyph of a state: Herdr's own marks, one per Herdr status, no word ----
 //
 // What Herdr's shipped Agents list draws (mods/agents/main.js `status()`, lines 212-219 of the 0.1.17 mod): working a
 // spinner (spinner.svg, 12 px, t.working), idle a ring (7 px, 1.5 border, t.idle), done a filled dot (7 px, t.done),
@@ -425,12 +425,12 @@ test("The marks are drawn as Herdr's Agents list draws them: the same spinner fi
   // idle: :218, done: :219
   assert.match(body, /size\(7\)\.mx\(3\)\.flex_none\(\)\.rounded\(4\)\.border\(1\.5\)\.border_color\(c\.idle \?\? c\.dim\)/);
   assert.match(body, /size\(7\)\.mx\(3\)\.flex_none\(\)\.rounded\(4\)\.bg\(c\.done \?\? c\.dim\)/);
-  // replied: the done dot's shape (:219) in the highlight token ansi2, the one addition of this window (D39 D)
+  // replied: the done dot's shape (:219) in the highlight token ansi2, the one addition of this window
   assert.match(body, /"dot-hi": \(\) => uiDiv\(\)\.size\(7\)\.mx\(3\)\.flex_none\(\)\.rounded\(4\)\.bg\(c\.ansi2 \?\? c\.done \?\? c\.dim\)/);
   for (const own of ["\\u2713", "check", "dashed", "dotted", "ansi1", "accent", "muted"]) assert.ok(!body.includes(own), `no mark of our own: ${own}`);
 });
 
-// ---- the name of an agent (owner review, change C): the tab name CAO sets, else the profile, else a short id ----
+// ---- the name of an agent: the tab name CAO sets, else the profile, else a short id ----
 
 test("Name of an agent: the Herdr tab name CAO sets (the cao.window label), else the profile, else a short id, and never a raw id while a name exists", () => {
   const n = (over) => A.agentName(T("464f5cb7", "s", over));
@@ -453,7 +453,7 @@ test("Name on the rows and the tabs: the agent row, and the top bar's tab, show 
   for (const r of view.rows) assert.ok(r.tip.startsWith(`${r.name}: `), r.id);
 });
 
-// ---- the age of an agent (change D): compact, 3h, 12m ----
+// ---- the age of an agent: compact, 3h, 12m ----
 
 test("Age: seconds read 'now', minutes '12m', hours '3h', days '2d', and no clock or no time in state is no age", () => {
   assert.equal(A.ageShort(0), "now");
@@ -479,7 +479,7 @@ test("Age on the row: the time in the current state, from the clock the caller g
   assert.equal(A.agentRows(mk({ statusMs: undefined }), [], { now }).rows[0].age, null, "no start");
 });
 
-// ---- the pin marker (change D) ----
+// ---- the pin marker ----
 
 test("Pin marker: a worker row says 'click to pin' or 'pinned'; a talkable row has no pin", () => {
   const s = freeze(sess("s", [T("c1", "s"), worker("w1", "s", "c1"), worker("w2", "s", "c1")]));
@@ -489,7 +489,7 @@ test("Pin marker: a worker row says 'click to pin' or 'pinned'; a talkable row h
   assert.deepEqual([w2.pinTip, w2.pinned], ["click to pin", false]);
 });
 
-// ---- the focused terminal's row (owner review, change G) ----
+// ---- the focused terminal's row ----
 // The row whose terminal Herdr has focused takes the selected highlight, whichever way the focus moved (a click on the row or on a
 // top-bar tab, agent.next, space.select). The Agents block follows clicks for WHICH SESSION it shows, not for this.
 
@@ -521,7 +521,7 @@ test("Focused row: a focused terminal that is not in this session, no focus at a
   assert.deepEqual(A.focusedRow(A.agentRows(null, []), { terminal: "cao/c1" }), null, "no session");
 });
 
-test("Focused row: a worker of a large session has its own row, so the focus on it marks that row and nothing else (design D42 C)", () => {
+test("Focused row: a worker of a large session has its own row, so the focus on it marks that row and nothing else", () => {
   const s = freeze(sess("s", [T("c1", "s"), worker("w1", "s", "c1", { createdMs: 2 }), worker("w2", "s", "c1", { createdMs: 3 }), ...fill(11)]));
   const view = freeze(A.agentRows(s, []));
   assert.equal(view.rows.length, 14);
@@ -531,7 +531,7 @@ test("Focused row: a worker of a large session has its own row, so the focus on 
   assert.equal(typeof A.focusedRow(view, { terminal: "cao/c1" }), "string", "the answer is a row id, not a record with a fold flag");
 });
 
-// ---- 18.3: sessionSelection and agentsHeader ----
+// ---- sessionSelection and agentsHeader ----
 
 test("Stored selection of another kind: a flow, a workflow, a form kind or a malformed value reads as no selection", () => {
   const stale = [
@@ -613,7 +613,7 @@ test("Context percentage off by default: shown, as a heuristic, only when contex
   assert.deepEqual(A.agentsHeader(mkA(), NO_FLOWS, { contextPercentRegex: "ctx (\\d+)%" }, reads).context, { percent: 42, label: "heuristic" });
 });
 
-// Owner review of the live window (27.19, D37 R): "I am not sure showing the directory in the Agents list is helpful".
+// Showing the directory in the Agents list was judged not helpful, so the header has none.
 test("No folder line: the header has no working directory, whatever was read, and keeps its title, note, flow, recap and context", () => {
   const reads = { cwd: "/work/repo", text: `${TAIL} recap: Done.\nctx 40%` };
   const flowSession = freeze(sess("cao-flow-daily-report", [T("c1", "cao-flow-daily-report")]));
@@ -652,7 +652,7 @@ test("Known gap is not in the Agents block: neither the sentence nor its label a
   assert.doesNotMatch(text, /known gap|prose/i);
 });
 
-// ---- 18.4: sessionsHeader and foldSummary ----
+// ---- sessionsHeader and foldSummary ----
 
 // 13 sessions: cao-0 has a blocked worker, cao-1 a working conductor, the rest idle conductors.
 const thirteen = () => {
@@ -714,7 +714,7 @@ test("Folded summaries: Sessions '13' or '13, 1 asking', Agents the selected nam
   assert.equal(A.foldSummary("agents", ""), "none selected");
 });
 
-// ---- the session's letter badge (owner review, task 27.12): the spaces list of Herdr's own window, copied ----
+// ---- the session's letter badge: the spaces list of Herdr's own window, copied ----
 // Herdr's spaces mod (mods/spaces/main.js) draws each space as an 18 px badge with rounded 5, 10.5 px bold white letter, the first
 // letter of the name (:502), filled with a colour that is NOT a hash of the name: a stored assignment per space, the palette colour
 // used least so far (render(), :527-537), shown as the hex of its MARK table (:61), `ansi6` when none is stored (:455). The window
@@ -726,9 +726,9 @@ test("Badge letter: the first character of the name, upper-cased as Herdr does (
   for (const v of ["", undefined, null, 5, {}]) assert.equal(A.badgeLetter(v), "?", `${JSON.stringify(v)} has no letter`);
 });
 
-// ---- refinement 1 (task 29.1): every session name starts with `cao-`, so the badge letter skips that prefix ----
+// ---- every session name starts with `cao-`, so the badge letter skips that prefix ----
 
-test("Badge letter skips a leading `cao-`: the first letter or digit after it, upper-cased (owner review, D39 A)", () => {
+test("Badge letter skips a leading `cao-`: the first letter or digit after it, upper-cased", () => {
   const cases = [
     ["cao-aria-orchestration-lineage-lld", "A"], ["cao-ws-x", "W"], ["cao-sci-x", "S"], ["cao-ml-x", "M"], ["cao-cr-x", "C"],
     ["cao-a", "A"], ["CAO-aria", "A"], ["Cao-Ws", "W"], ["cAo-ml", "M"],
@@ -802,7 +802,7 @@ test("Session line: the badge is the name's letter and the stored colour name (a
   assert.deepEqual(A.sessionLine(draft, { replied: never, colors: { "author-1": "ansi5" } }).badge, { letter: "A", color: "ansi5" }, "a draft session has its badge too");
 });
 
-// ---- the agent's program icon (owner review, task 27.13): the logo of the kind of agent, as Herdr's lists draw it ----
+// ---- the agent's program icon: the logo of the kind of agent, as Herdr's lists draw it ----
 // Herdr's Agents list and tabs mod draw `program.icon` of the terminal's record, a path in the home folder (`icons/claude.svg`), by
 // `p.tint ? svg(p.icon).size(n).text_color(c) : image(p.icon).w(n).h(n)` (mods/agents/main.js:78-81; mods/tabs/main.js:120), and
 // draw nothing when the record has no icon. Herdr's own table maps the agent's reported `app` (`claude-code`, `kiro-cli`, `codex`) to that
@@ -839,7 +839,7 @@ test("Row and tab icons: the model gives each agent the icon of its program, and
   assert.deepEqual(tabs.map((t) => t.icon), rows.map((r) => r.icon), "a tab and its row show the same logo");
 });
 
-// ---- the pin (owner review, tasks 27.10 and 27.14): a pushed-in pin when pinned, a tilted outline when not ----
+// ---- the pin: a pushed-in pin when pinned, a tilted outline when not ----
 // Herdr's own pin (mods/workspace-chrome/pin.svg, drawn by mods/agents/main.js:343) is an outline in both states, and svg() takes a
 // colour, not a fill, so the window ships two small drawings of its own in its side mod's folder and finds them by path as Herdr's tabs
 // mod finds its own win-*.svg (mods/tabs/main.js:153): pinned is a filled upright thumbtack (head up, point down) in the accent;
@@ -905,7 +905,7 @@ test("Pin mark: no diamond or other text glyph is left in the library or the mod
   }
 });
 
-// ---- the top bar's tabs (owner review, task 27.11): every agent by its name, and no tag ----
+// ---- the top bar's tabs: every agent by its name, and no tag ----
 
 test("Tabs: every tab is named by agentName, the conductor like the rest, and a tab carries no worker or talkable tag", () => {
   const s = freeze(sess("s", [
@@ -952,7 +952,7 @@ test("Tabs: one shown agent gives one tab, named like its Agents row and crowned
   assert.deepEqual(A.tabViews(busy, ["w1"]).map((t) => t.tip), A.agentRows(busy, ["w1"]).rows.map((r) => r.tip), "a blocked worker's tab says so in its tooltip");
 });
 
-// ---- no state mark on a tab (owner review, task 27.21): the owner found the top bar's status dot not helpful ----
+// ---- no state mark on a tab: a status dot in the top bar was not helpful ----
 // The state stays drawn on the Agents row and the Sessions line. A tab carries no mark of it; its tooltip is its Agents row's, so the
 // state is still there in words.
 test("Tabs: a tab view carries no state mark, and its tooltip is its Agents row's, the state in words", () => {
@@ -974,7 +974,7 @@ test("Tabs: a tab view carries no state mark, and its tooltip is its Agents row'
   assert.ok(waiting.every((t) => !("shape" in t)), "and draws no mark");
 });
 
-// ---- the top bar's order (owner review, task 27.16): the tabs run in the Agents block's tree order ----
+// ---- the top bar's order: the tabs run in the Agents block's tree order ----
 // The tabs are the shown agents the bar picks (the talkable agents and the pinned workers, tabsFor), in the order the Agents block lists
 // them (agentRows: the conductor first, each agent's children under it in creation order, then by id). CAO sets the order of Herdr's own
 // tabs inside a space and undoes a manual drag, but this bar is a row of the window's own, so its order is the window's to set.
@@ -1018,7 +1018,7 @@ test("Tab order: a worker that is blocked or not pinned is no tab, and the other
   assert.deepEqual(tabIds(s, []), ["c1"], "one shown agent: its one tab");
 });
 
-test("Tab order: the bar follows the block's tree in a session of more than 12 agents too: a pinned worker hangs under its parent (design D42 C)", () => {
+test("Tab order: the bar follows the block's tree in a session of more than 12 agents too: a pinned worker hangs under its parent", () => {
   const s = freeze(sess("s", [
     T("c1", "s", { createdMs: 1 }), worker("h", "s", "c1", { createdMs: 5 }), worker("p", "s", "h", { createdMs: 9 }), worker("q", "s", "c1", { createdMs: 7 }), ...fill(10),
   ]));
@@ -1028,7 +1028,7 @@ test("Tab order: the bar follows the block's tree in a session of more than 12 a
   assert.deepEqual(tabIds(s, ["q", "p"]), ["c1", "p", "q"], "the order of the pins changes nothing");
 });
 
-// ---- the main agent's crown (owner review, task 27.15) ----
+// ---- the main agent's crown ----
 // The main agent of a session is the one the Sessions row speaks for: its first talkable agent (`session.talkable[0]`, which sessionLine
 // reads), the conductor or coordinator the user talks to. Its Agents row and its top-bar tab carry a small crown; no other agent does,
 // a second talkable agent (a coordinator an allow-list made talkable) and every worker included. The Sessions row's letter badge is
@@ -1082,7 +1082,7 @@ test("Main agent: a session with no talkable agent has no crown, and the guessed
   assert.equal(b.main, false);
 });
 
-// ---- 28.5: an agent that waits on its workers (spec cao-window-sessions "An agent that waits on its workers shows as waiting"; design D38) ----
+// ---- an agent that waits on its workers shows as waiting ----
 //
 // The state comes from the `waiting` count termOf reads from the cao.waiting label. The mark is Herdr's working spinner in the muted
 // colour (`spinner-dim`), the words are `waiting on N workers` in the tooltip only, and a waiting agent has not replied.
@@ -1117,7 +1117,7 @@ test("The agent row of a waiting agent carries the waiting mark and its tab none
   assert.doesNotMatch(JSON.stringify(drawn), /waiting/i, "no state word in the drawn fields");
   assert.equal(rows.find((r) => r.id === "w1").shape, "spinner", "the working worker is unchanged");
   const tabs = A.tabViews(s, ["w1"], { replied: repliedOf });
-  assert.deepEqual(tabs.map((t) => [t.id, "shape" in t]), [["c1", false], ["w1", false]], "the top-bar tab draws no mark (task 27.21)");
+  assert.deepEqual(tabs.map((t) => [t.id, "shape" in t]), [["c1", false], ["w1", false]], "the top-bar tab draws no mark");
   assert.match(tabs[0].tip, /^conductor: waiting on 2 workers\b/, "its tooltip says it waits");
 });
 test("The tooltip says how long it has waited as it does for the other states, and 1 worker in the singular", () => {
@@ -1169,10 +1169,10 @@ test("The waiting mark is Herdr's working spinner in the muted token: the same f
   assert.equal(statusShape("waiting"), WAITING_MARK);
 });
 
-// ---- 31.1: the full tree by default (spec cao-window-sessions "Agents block"; design D41 A) ----
-// The Agents block shows every agent of the selected session as an indented tree. Since design D42 C nothing folds: a session of more than
-// 12 agents shows all of them too (D41 A had folded its deepest workers behind an "N workers" line), and the block scrolls.
-// ROOTB is the owner's real tree (conductor-61d0 > supervisor-d6ac > five workers, socrates working), as an old server shows it.
+// ---- the full tree by default ----
+// The Agents block shows every agent of the selected session as an indented tree. Nothing folds: a session of more than
+// 12 agents shows all of them too (an earlier version folded its deepest workers behind an "N workers" line), and the block scrolls.
+// ROOTB is a real tree (conductor-61d0 > supervisor-d6ac > five workers, socrates working), as an old server shows it.
 
 const ROOTB = (over = {}) => freeze(sess("ROOTB", [
   T("c61", "ROOTB", { window: "conductor-61d0", createdMs: 1, state: "done", turn: 3 }),
@@ -1242,7 +1242,7 @@ test("Full tree: a worker of a talkable-less session is still shown, the guessed
   assert.deepEqual(A.agentRows(s, []).rows.map((r) => [r.id, r.worker, r.depth]), [["w1", false, 1], ["w2", true, 1]]);
 });
 
-// ---- 31.2: waiting derived from the tree, drawn (spec cao-window-sessions "An agent that waits on its workers shows as waiting"; design D41 B) ----
+// ---- waiting derived from the tree, drawn ----
 // The model gives each agent that waits on workers below it a `waiting` count, so the rows, the Sessions line, the tabs and the status bar
 // draw it like a cao.waiting label: the muted spinner, "waiting on N workers", and no reply.
 
@@ -1282,7 +1282,7 @@ test("Waiting from the tree: when the last worker finishes the wait ends and the
   assert.deepEqual([A.sessionLine(m.sessions[0], { replied: m.replied }).shape, A.sessionLine(m.sessions[0], { replied: m.replied }).tip], ["dot-hi", "ROOTB: replied"]);
 });
 
-// ---- 31.3: a lost answer does not draw the tree flat (spec cao-window-sessions "Agents block"; design D41 C) ----
+// ---- a lost answer does not draw the tree flat ----
 // A terminal whose profile and caller are still unresolved after the lookups (a lost or failed GET /terminals/{id}) is not a root: it is drawn
 // one step down with the muted words "parent not listed", unless it is the session's main agent, and what hangs on it stays under it.
 
@@ -1305,7 +1305,7 @@ test("Lost answers: a terminal that was answered keeps its place, and one that w
   assert.deepEqual(A.agentRows(answered.sessions[0], []).rows.map((r) => [r.id, r.depth, r.parentNote]), [["c61", 0, null], ["s6d", 1, null], ["she", 2, null], ["soc", 2, null]], "the answer arrives: the tree is whole");
 });
 
-// ---- 31.4: the crown moves to the pin's slot on the Agents row (spec cao-window-sessions "Agents block"; design D41 D) ----
+// ---- the crown moves to the pin's slot on the Agents row ----
 // The right-hand slot of a row (the pin's 18 px) holds the pin of a worker, the crown of the session's main agent, or nothing (another
 // talkable agent), so the status marks stay in one column and the name keeps the room. The top-bar tab keeps its crown after the name.
 
@@ -1326,7 +1326,7 @@ test("Crown slot: one crown at most per session, a tab still says main, and the 
   for (const t of A.tabViews(s, ["w1"])) assert.ok(!("slot" in t), "the bar keeps the crown after the name, as before");
 });
 
-// ---- 32.2: the goal text, the agent's recap, readable: wrapped up to three lines (design D42 B) ----
+// ---- the goal text, the agent's recap, readable: wrapped up to three lines ----
 // The toolkit has no line clamp (no `line_clamp`, `max_lines` or multi-line `text_ellipsis` in gpui-kit.d.ts: `truncate()` is one line), so the
 // clamp is a pure function: a character budget per line from the block's width (`goalChars`), a greedy word wrap into that budget, at most
 // three lines, and an ellipsis at the end of the third when words are left over (`goalLines`). The view draws each line on its own.

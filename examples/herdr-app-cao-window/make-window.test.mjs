@@ -1,6 +1,5 @@
-// make-window.jq derives the CAO window's layout from a base `main` layout (cao-window-install,
-// "Version and layout drift checks", scenarios "Derived layout content", "Shipped main changed shape",
-// "Extra layout prop"). Skips (exit 0) when jq is absent, like add-cao.test.mjs.
+// make-window.jq derives the CAO window's layout from a base `main` layout: the derived content, a shipped `main` that
+// changed shape, and an extra layout prop. Skips (exit 0) when jq is absent.
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -73,10 +72,10 @@ test("Derived layout content: the top bar and the right sidebar carry their fiel
   assert.equal(find(json, "main").content.tab, "active", "the active-tab block must survive");
 });
 
-// Owner review of the live window (section 27, change B): the user can drag the left sidebar's edge. What lets the edge
+// The user can drag the left sidebar's edge. What lets the edge
 // drag is the ROOT row's `resizable` (default true: its children's boundaries drag) and the sidebar's own `min` and `max`
 // (the range of the drag); the sidebar column's `resizable: false` locks only the boundaries between its own children
-// (brand, lists, footer), which are fixed blocks, so it stays false (AGENTS.md "resizable ... applies to that row/column only";
+// (brand, lists, footer), which are fixed blocks, so it stays false (Herdr's layout notes say `resizable` applies to that row or column only;
 // the shipped workspace-chrome mod says "dragging its edge narrows it").
 test("Resizable sidebar: the left sidebar keeps 268 px and may be dragged between 200 and 640 px", () => {
   const { json } = run(BASE);
@@ -106,7 +105,7 @@ test("Resizable sidebar: the script sets the range and leaves the base's own wid
   assert.deepEqual(find(run(dragged).json, "sidebar").size, { px: 410 });
 });
 
-// Owner review of the live window (27.20, D37 S): the top-left of the window shows Herdr's wordmark "Herdr"; it must say "CAO".
+// The top-left of the window shows Herdr's wordmark "Herdr"; it must say "CAO".
 // Herdr draws that row with its shipped workspace-chrome mod in the `brand` block, so the derivation points the `brand`
 // block at the window's own mod, and only that block: the footer of the sidebar is the same mod with the prop `footer`.
 const blocksOf = (node) => [...(node?.content ? [node] : []), ...(node?.children ?? []).flatMap(blocksOf)];
@@ -145,7 +144,7 @@ test("The top-left says CAO: a brand block of another mod, or with no content, a
   assert.equal(blocksOf(none.json).filter((b) => b.content.mod === "cao-window-brand").length, 0);
 });
 
-test("Derived layout content: the root toast key is set only when the toast switch is on (spike 1.13)", () => {
+test("Derived layout content: the root toast key is set only when the toast switch is on", () => {
   assert.equal(run(BASE, PROPS, true).json.toast, "cao-window-toast");
   assert.equal(run(BASE, PROPS, false).json.toast, undefined);
   assert.equal(run(BASE).json.toast, undefined);                       // the default: no toast mod

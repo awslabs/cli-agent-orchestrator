@@ -4,7 +4,7 @@
 # Exit codes: 1 a file or folder could not be written, 2 bad usage or refusal, 3 version too old,
 # 4 platform unsupported, 5 base layout drifted.
 # Every refusal happens before the first file is written: everything is staged in a temp folder and
-# written in the last phase. On macOS the phase starts with the app copy (CAO.app, design D40 B), built next to its
+# written in the last phase. On macOS the phase starts with the app copy (CAO.app), built next to its
 # target and moved into place only when it is signed.
 set -eu
 
@@ -14,14 +14,14 @@ HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 . "$HERE/bin/app-copy.sh"
 
 MIN_HC=0.1.21
-MIN_APP=0.1.16                       # spike 1.9: the version the example was built and checked against
+MIN_APP=0.1.16                       # the version the example was built and checked against
 MODS="cao-window-side cao-window-panel cao-window-tabs cao-window-status cao-window-brand"
-# Formats read from a real install (spike 1.9): the flat string key "frame.welcomed" in shared.json and
+# Formats read from a real install: the flat string key "frame.welcomed" in shared.json and
 # the boolean `telemetry` in settings.json. Each is one constant, so a Herdr that changes them is a one-line fix.
 SHARED_EDIT='.layout = "cao-window" | ."frame.welcomed" = "finished"'
 TELEMETRY_KEY='.telemetry'
 
-# The two switches record a spike's outcome, not a user's choice, so they come from the environment.
+# The two switches record the outcome of a check on a real Herdr, not a user's choice, so they come from the environment.
 # Only the exact values below change anything; the summary line says what is in effect.
 TOAST=0
 case ${TOAST_MOD:-} in
@@ -39,7 +39,7 @@ esac
 
 unset HC_TERMINAL_ID HC_TERMINAL_SOCKET HC_SCOPE HC_SOCKET HC_SESSION
 
-# bundle_mod LIBDIR MODDIR: bundle mode (D8). The shared modules first, then the mod folder's other .js
+# bundle_mod LIBDIR MODDIR: bundle mode (all of a mod's code in one file). The shared modules first, then the mod folder's other .js
 # files, then main.js. Relative imports (also multi-line ones, also `import "x"`) are dropped, the
 # "export " keyword of a declaration is removed and `export { ... };` lists are removed. Imports of the
 # host (herdr, gpui-kit) stay, and an ES import may sit anywhere at the top level. A line that starts
@@ -193,7 +193,7 @@ if [ "$OS" = Darwin ]; then
     APP_RAW=$(defaults read "$APP/Contents/Info" CFBundleShortVersionString 2>/dev/null || true)
     APP_FOUND=$(printf '%s\n' "$APP_RAW" | semver)
 else
-    APP_RAW=$MIN_APP; APP_FOUND=$MIN_APP   # Linux: no version command is known yet (spike 1.1); reached only when LINUX_SUPPORTED=1
+    APP_RAW=$MIN_APP; APP_FOUND=$MIN_APP   # Linux: no version command is known yet; reached only when LINUX_SUPPORTED=1
 fi
 { [ -n "$APP_FOUND" ] && ver_ge "$APP_FOUND" "$MIN_APP"; } || die 3 "Herdr app ${APP_FOUND:-'(version unreadable)'} at $APP is too old: $MIN_APP or later is required"
 
@@ -260,7 +260,7 @@ done
 set +f; IFS=$OLDIFS
 
 # Base layout, first found wins: the main home's, then the copy shipped in this example. The app bundle
-# holds no layout file (spike 1.9), so there is no bundle lookup.
+# holds no layout file, so there is no bundle lookup.
 if [ -f "$MAIN_HOME/layouts/main.json" ]; then
     BASE=$MAIN_HOME/layouts/main.json
 else

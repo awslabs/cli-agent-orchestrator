@@ -1,4 +1,4 @@
-// lib/launch.js: the follow-ups to the launch outcomes that lib/launch.test.mjs leaves open (task 9.3):
+// lib/launch.js: the follow-ups to the launch outcomes that lib/launch.test.mjs leaves open:
 // which field a 400 belongs to, a new key after a failed keyed create, and what a lost response says.
 import { assert, finish, test } from "../test/harness.mjs";
 import * as launch from "./launch.js";

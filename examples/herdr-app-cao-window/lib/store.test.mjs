@@ -1,5 +1,4 @@
-// lib/store.js: shared() and localStorage behind one object that survives storage errors (design D17;
-// cao-window-sessions, "Failure states keep the last good view": Storage throws).
+// lib/store.js: shared() and localStorage behind one object that survives storage errors, so the window keeps its last good view when storage throws.
 import { assert, finish, test } from "../test/harness.mjs";
 import { STORAGE_NOTICE, createStore } from "./store.js";
 

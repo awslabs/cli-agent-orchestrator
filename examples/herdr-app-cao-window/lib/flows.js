@@ -1,6 +1,6 @@
-// The Schedules section's rules (cao-window-flows; what the person reads is "schedule", CAO's own name is "flow", D39 F): rows, schedule words, the confirmations, how server
+// The Schedules section's rules (what the person reads is "schedule"; CAO's own name for it is "flow"): rows, schedule words, the confirmations, how server
 // answers land at form fields, what to say when the flow routes are missing, and the bodies the window
-// sends. Pure. Top-level names are unique across lib/*.js (bundle mode, D8).
+// sends. Pure. Top-level names are unique across lib/*.js (bundle mode puts every shared module in one scope).
 import { AUTH_MESSAGE, seg } from "./cao.js";
 import { HONESTY } from "./honesty.js";
 import { shq } from "./launch.js";
@@ -211,7 +211,7 @@ export function schedulePrompt(workflow, inputs = {}) {
 }
 export const scheduleWarning = () => "An unattended run stops at plan approval unless the plan is approved for these inputs.";
 
-// ---------- write controls in the panel (task 9.2) ----------
+// ---------- write controls in the panel ----------
 
 // Whether a write control works now. `views`: the {auth, unreachable} flags it depends on (one or a list);
 // retry: it is the Retry of a launch whose answer was lost (the way out of "unreachable", so it passes
@@ -224,7 +224,7 @@ export function writeGate(views, { retry = false, connected = true } = {}) {
   return { disabled: false, reason: null, text: null };
 }
 
-// ---------- the Flows section (task 10.2) ----------
+// ---------- the Flows section ----------
 
 // /flows/<name>, or /flows/<name>/<enable|disable|run>. null when the name is not a bare name or the
 // action is not one of those three.
@@ -278,7 +278,7 @@ export function viewNotes(view, now) {
   return lines;
 }
 
-// ---------- flow details (task 10.3) ----------
+// ---------- flow details ----------
 
 const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 // "Mon 2026-11-23 09:00" from a server time (wall clock as the server wrote it); the text itself when it does not read.
@@ -354,7 +354,7 @@ export const fieldsOfFlow = (flow) => ({
 // The body of POST /flows/validate for these fields.
 export const validateBody = (fields) => ({ name: fields.name, schedule: fields.schedule, agent_profile: fields.agent_profile, provider: fields.provider, prompt_template: fields.prompt });
 
-// ---------- New flow and Edit (task 10.5) ----------
+// ---------- New flow and Edit ----------
 
 // ---- New flow and Edit ----
 // The key that says which validate answer belongs to which fields.

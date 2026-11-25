@@ -1,5 +1,4 @@
-# Derives the CAO window's layout from a base `main` layout (task 4.4 of add-herdr-app-cao-window, reworked
-# by D25, D27, D28, D36 and D37).
+# Derives the CAO window's layout from a base `main` layout.
 #   jq --argjson props "$(cat layouts/props.default.json)" [--argjson toast true] -f make-window.jq main.json > cao-window.json
 # The base may be Herdr's own `main` or a layout this script derived earlier (also the earlier three-block
 # one). The script
@@ -11,13 +10,13 @@
 #      Herdr's own block, which the anchor check needs and whose size and place stay;
 #   3. removes only Herdr's own `spaces`, `agents` and `tabs` blocks, sets the root `toast` key only with
 #      `--argjson toast true`, and stamps `props` on every CAO block;
-#   4. lets the user drag the left sidebar's edge (D37): the `sidebar` column keeps its width (the base's 268 px)
+#   4. lets the user drag the left sidebar's edge: the `sidebar` column keeps its width (the base's 268 px)
 #      and gets the range `min` 200 and `max` 640. What lets the edge drag is the ROOT row's `resizable` (default
 #      true: the boundaries between its children drag), so the root is set to true; the sidebar column's own
 #      `resizable: false` stays, because it locks only the boundaries between its own children (brand, lists,
 #      footer), which are fixed blocks.
 #   5. points the sidebar's `brand` block, the top-left row that Herdr draws as its logo and the text "Herdr" with its
-#      `workspace-chrome` mod, at the window's own `cao-window-brand` mod, which draws the same row with "CAO" (D37 S). Only
+#      `workspace-chrome` mod, at the window's own `cao-window-brand` mod, which draws the same row with "CAO". Only
 #      that block, and only when its mod is Herdr's `workspace-chrome` or already ours: the sidebar footer (the same Herdr
 #      mod with `props.footer`) stays Herdr's, a brand block of any other mod or with no content is left as it is, and a
 #      base with no brand block is not given one.

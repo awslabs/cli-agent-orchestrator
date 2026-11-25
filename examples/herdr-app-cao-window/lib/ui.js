@@ -2,7 +2,7 @@
 // shared modules this one imports the host modules, so it cannot run under node and has no node test;
 // the mods are checked with `herdr-app check`.
 //
-// The imports carry ui-prefixed names. Bundle mode (D8) puts every shared module and the mod's own code
+// The imports carry ui-prefixed names. Bundle mode puts every shared module and the mod's own code
 // in one scope, where a second binding of the mod's own `div` or `run` would be a syntax error.
 import { div as uiDiv, image as uiImage, svg as uiSvg } from "gpui-kit";
 import { h_flex as uiRow } from "gpui-base";
@@ -10,7 +10,7 @@ import { agents as uiAgents, run as uiRun, openOverlay as uiOpenOverlay, props a
 import { randomUUID as uiUuid } from "crypto";
 import { dialogLive, dialogSpec, leaseFor } from "./shell.js";
 
-// agent.focus for a terminal Herdr lists as an agent, pane.focus for one it does not (as the cao-tab mod does).
+// agent.focus for a terminal Herdr lists as an agent, pane.focus for one it does not.
 export function focusTerminal(address) {
   if (uiAgents().some((a) => a.address === address)) uiRun("agent.focus", { terminal: address });
   else uiRun("pane.focus", { terminal: address });
@@ -44,7 +44,7 @@ export function crownIcon(mark, c) {
 // One status mark per mark name of statusShape (lib/logic.js), drawn as Herdr's own Agents list draws it (the shipped
 // mods/agents/main.js `status()`, lines 212-219): the same spinner file, sizes, spacing and theme tokens, so a mark here is the
 // mark there. `c` is the theme. The mark sits in a 14 px slot (the widest of them) so that the names after it line up. `spinner-dim` is
-// the working spinner in the muted token, for an agent that waits on its workers (design D38).
+// the working spinner in the muted token, for an agent that waits on its workers.
 export function shapeMark(name, c) {
   const marks = {
     spinner: () => uiSvg("mods/workspace-chrome/spinner.svg").size(12).mx(1).flex_none().text_color(c.working).spin(900),
@@ -57,7 +57,7 @@ export function shapeMark(name, c) {
   return uiRow().w(14).flex_none().items_center().justify_center().child(marks[name]?.() ?? uiDiv().size(7).mx(3).flex_none());
 }
 
-// The dialog's lease key (design D29) and the mod whose overlay hosts every form.
+// The dialog's lease key and the mod whose overlay hosts every form.
 const UI_DIALOG_KEY = "caowin.dialog";
 const UI_PANEL_MOD = "cao-window-panel";
 

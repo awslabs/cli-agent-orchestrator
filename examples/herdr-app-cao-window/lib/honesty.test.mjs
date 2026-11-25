@@ -1,5 +1,5 @@
 // lib/honesty.js: one constants table plus a registry of the function that produces each surface's view
-// model (cao-window-honesty-labels; design D23). Task 12.4 adds the assertion that nothing is pending.
+// model. One test asserts that nothing is pending.
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,7 +9,7 @@ import { HONESTY, HONESTY_PENDING, HONESTY_SOURCES } from "./honesty.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-// The rows of the spec's table, written out so a dropped or renamed row is noticed:
+// The rows of the label table, written out so a dropped or renamed row is noticed:
 // surface -> [label text, module, function].
 const TABLE = {
   bestGuess: ["best guess", "logic", "classify"],
@@ -36,13 +36,13 @@ test("the table has 15 surfaces and the registry has exactly one entry per key",
   assert.deepEqual(Object.keys(HONESTY_SOURCES).sort(), [...EXPECTED].sort());
 });
 
-test("every surface shows the label text the spec gives it", () => {
+test("every surface shows the label text the table gives it", () => {
   for (const [surface, [text]] of Object.entries(TABLE)) {
     assert.equal(HONESTY[HONESTY_SOURCES[surface].label], text, surface);
   }
 });
 
-test("every surface is produced by the function and module the spec names", () => {
+test("every surface is produced by the function and module the table names", () => {
   for (const [surface, [, mod, fn]] of Object.entries(TABLE)) {
     const e = HONESTY_SOURCES[surface];
     assert.equal(e.module, `./${mod}.js`, `${surface} module`);
@@ -51,7 +51,7 @@ test("every surface is produced by the function and module the spec names", () =
   }
 });
 
-test("the table holds the 13 distinct label texts of the spec and is frozen", () => {
+test("the table holds the 13 distinct label texts and is frozen", () => {
   const texts = new Set(Object.values(TABLE).map(([text]) => text));
   assert.equal(texts.size, 13);
   assert.deepEqual([...new Set(Object.values(HONESTY))].sort(), [...texts].sort());
@@ -76,7 +76,7 @@ test("the registry gives each entry a label key, a module, a function name and a
 test("pending surfaces name a real surface and the section that builds it", () => {
   for (const [surface, section] of Object.entries(HONESTY_PENDING)) {
     assert.ok(EXPECTED.includes(surface), `${surface} is pending but is not in the table`);
-    assert.ok(Number.isInteger(section) && section >= 7 && section <= 12, `${surface}: section ${section}`);
+    assert.ok(Number.isInteger(section) && section >= 1, `${surface}: section ${section}`);
   }
 });
 
@@ -106,7 +106,7 @@ test("the audit fails each way a surface can be wrong", async () => {
   assert.match((await run({ sources: { s: { label: "l", module: "m", fn: "boom", args: () => [] } } })).problems[0], /threw/);
   assert.match((await run({ load: async () => { throw new Error("gone"); } })).problems[0], /cannot load/);
   const pendingRun = await run({ pending: { s: 9 }, sources: { s: { label: "l", module: "m", fn: "nope", args: () => [] } } });
-  assert.deepEqual(pendingRun, { problems: [], pending: ["s (section 9)"] });
+  assert.deepEqual(pendingRun, { problems: [], pending: ["s (pending 9)"] });
   assert.match((await run({ pending: { s: 9, ghost: 9 } })).problems[0], /ghost: pending but not in the table/);
 });
 

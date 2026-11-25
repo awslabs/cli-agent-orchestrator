@@ -1,5 +1,4 @@
-// lib/launch.js: the New session form's rules (spec cao-window-session-launcher; honesty labels
-// declaredTools and notEnforced of cao-window-honesty-labels). Tasks 9.1 and 9.3 steps 1-2.
+// lib/launch.js: the New session form's rules (honesty labels declaredTools and notEnforced).
 //
 // Server rules that the window mirrors are read from the repository at test time, so a drift fails here:
 //   src/cli_agent_orchestrator/utils/forwarded_env.py  (env rules)
@@ -90,7 +89,7 @@ test("resolvedProvider: the chosen provider, else the profile's, else kiro_cli",
   assert.equal(launch.resolvedProvider({ provider: "" }, undefined), "kiro_cli");
 });
 
-// D40 A: the owner removed the Kiro engine and the Claude Code resume id from the form. The window launches with the
+// The form has no Kiro engine and no Claude Code resume id. The window launches with the
 // provider's configured default, and the CLI keeps both options for a terminal.
 test("No provider-specific field is left: the form has no engine and no resume id, and nothing offers them", () => {
   const empty = launch.emptyForm("/work/repo");
@@ -100,7 +99,7 @@ test("No provider-specific field is left: the form has no engine and no resume i
   assert.equal(launch.KIRO_ENGINES, undefined, "the engine chips are gone");
 });
 
-test("a field that spike 1.3 found refused is listed in CLI_ONLY_FIELDS; spike 1.3 found none, so the list is empty", () => {
+test("CLI_ONLY_FIELDS lists the fields POST /sessions refuses; it refuses none, so the list is empty", () => {
   assert.deepEqual(launch.CLI_ONLY_FIELDS, []);
 });
 
@@ -110,7 +109,7 @@ test("lib/launch.js does not name the engine or the resume option any more: no f
 });
 
 // ======================================================================================================
-// Env rules (spec "Env fields follow the server's rules"; utils/forwarded_env.py)
+// Env rules: env fields follow the server's rules (utils/forwarded_env.py)
 // ======================================================================================================
 
 test("Provider prefix rejected: a CLAUDE key is blocked at its row with the reserved-prefix message", () => {
@@ -536,7 +535,7 @@ test("No env rows: Launch is enabled; untouched rows do not count as filled", ()
   assert.equal(launch.launchBlocked(form({ env: [{ key: "", value: "" }, { key: "", value: "" }] }), ctxOf()).blocked, false);
 });
 
-test("a field marked CLI only by spike 1.3 blocks Launch when it is filled, with the message 'CLI only'", () => {
+test("a field marked CLI only blocks Launch when it is filled, with the message 'CLI only'", () => {
   const r = launch.launchBlocked(form({ memory: true }), ctxOf({ cliOnly: ["memory"] }));
   assert.equal(r.blocked, true);
   assert.equal(r.problems[0].message, "CLI only");
@@ -755,7 +754,7 @@ test("every typed field counts for the discard guard, including an env row and a
 });
 
 // ======================================================================================================
-// What the server answered (task 9.3 steps 1-2)
+// What the server answered
 // ======================================================================================================
 
 test("Result card: a 201 selects the session and lists the recorded tools and whether a message was sent", () => {
@@ -835,7 +834,7 @@ test("a malformed 201 (not JSON, or without a session name) is not shown as a cr
 });
 
 // ======================================================================================================
-// Review round: every shell-significant word survives the copied command; paths; env note; the CLI's notes
+// Every shell-significant word survives the copied command; paths; env note; the CLI's notes
 // ======================================================================================================
 
 test("a single word with no space that a shell would read as something else round-trips unchanged as a message, a directory, a profile and an env value", () => {
@@ -976,7 +975,7 @@ test("a message with no recognisable prefix is a form-level message even when it
 });
 
 // ======================================================================================================
-// Honesty (cao-window-honesty-labels): the two surfaces this section owns
+// Honesty labels: the two surfaces this file owns
 // ======================================================================================================
 
 test("declaredTools and notEnforced are no longer pending once launch.js exists", () => {
@@ -984,9 +983,9 @@ test("declaredTools and notEnforced are no longer pending once launch.js exists"
 });
 
 // ======================================================================================================
-// The New session form in the panel (tasks 9.2 and 9.3): what lib/launch.js decides for it.
-// No spec names these functions. The contract is the launcher spec's scenarios plus the comment on each
-// function in lib/launch.js; where both are silent, the case says which default it pins.
+// The New session form in the panel: what lib/launch.js decides for it.
+// The contract is the launcher's scenarios plus the comment on each function in lib/launch.js; where both
+// are silent, the case says which default it pins.
 // ======================================================================================================
 
 const frozenDeep = (v) => {
@@ -1024,7 +1023,7 @@ test("launchPlan: a missing profile, a bad name and no directory each block Laun
   assert.deepEqual(p.first, p.problems[0]);
   assert.equal(p.first.field, "profile");
   assert.deepEqual(p.problems, launch.launchBlocked(f, ctxOf()).problems, "the plan shows the problems launchBlocked finds, in its order");
-  // each alone, with the spec's words
+  // each alone, with its own words
   const first = (over) => launch.launchPlan(form(over), ctxOf()).first;
   assert.deepEqual(first({ workdir: "" }), { field: "workdir", message: "a directory on the CAO machine is needed" });
   assert.deepEqual(first({ sessionName: "my session" }), { field: "sessionName", message: "only letters, digits, - and _ are allowed" });
@@ -1696,7 +1695,7 @@ test("Result card: it changes nothing it is given", () => {
   assert.deepEqual(launch.launchResultCard(created, f, term), a);
 });
 
-// ---- follow-ups after the first review: what the Ask-first dialog says about tools, and four hostile inputs ----
+// ---- what the Ask-first dialog says about tools, and four hostile inputs ----
 
 const NONE_DECLARED = "none declared by the profile; the server applies the role's defaults";
 const NOT_KNOWN = "not known: the profile could not be read";
@@ -2000,7 +1999,7 @@ test("typing plays no part outside YOLO: Ask-first and Auto-approve send whateve
   }
 });
 
-test("launchConfirm: every combination of policy, kind, form and typed text, against a table written from the spec", () => {
+test("launchConfirm: every combination of policy, kind, form and typed text, against a table written out by hand", () => {
   const valid = { workdir: "/work/repo", profile: "developer", sessionName: "s1" };
   const invalid = { workdir: "x/y", profile: "developer", sessionName: "s1" };
   for (const policy of ["ask", "auto", "yolo", "other"]) {
@@ -2268,7 +2267,7 @@ test("launchReadResult: with no dialog open, or no word about one, nothing chang
   assert.equal(Object.hasOwn(launch.launchReadResult({ scope: "a", current: "a", sameForm: true }), "dialogOpen"), false);
 });
 
-test("launchReadResult: selection x form x dialog x error, every combination against a table written from the spec", () => {
+test("launchReadResult: selection x form x dialog x error, every combination against a table written out by hand", () => {
   for (const scopeSame of [true, false]) {
     for (const formSame of [true, false]) {
       for (const dialogOpen of [undefined, false, null, true]) {
@@ -2316,7 +2315,7 @@ test("red case, launchReadResult: any truthy dialogOpen is an open dialog, so a 
   }
 });
 
-// ---- an allowed-tools override that holds `*` is YOLO (spec cao-window-session-launcher, the override clause) ------
+// ---- an allowed-tools override that holds `*` is YOLO (the override clause) ------
 // `--allowed-tools '*'` lifts the profile's whole policy, which is what YOLO does, so whatever policy was chosen it
 // needs the typed session name and the YOLO dialog. What counts: `*` as an item of the list, the way the server
 // reads it (is_restricted: "*" in the list). The query joins the items with commas and parseToolList splits on

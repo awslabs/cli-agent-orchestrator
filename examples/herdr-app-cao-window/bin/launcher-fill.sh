@@ -1,7 +1,7 @@
 # shellcheck shell=sh
 # Sourced by install.sh and launcher.test.mjs; defines fill_launcher.
-# Set to 1 only when spike 1.1 showed a released Herdr app that runs on Linux.
-# Spike 1.1 was not run (no Linux machine with a display), so the installer exits 4 on Linux.
+# Set to 1 only once a released Herdr app has been shown to run on Linux.
+# That check has not been done (no Linux machine with a display), so the installer exits 4 on Linux.
 LINUX_SUPPORTED=0
 
 # Print $1 quoted for sh only when it needs quoting. Pure shell (no sed), so a value with a newline

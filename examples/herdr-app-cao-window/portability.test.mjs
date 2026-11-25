@@ -1,7 +1,7 @@
-// Portability: nothing shipped may name one person's setup or an internal system (cao-window-install,
-// "Shipped files are portable"; cao-window-sessions, "CAO data goes through exec on the CAO machine").
+// Portability: nothing shipped may name one person's setup or an internal system, and CAO data goes through
+// exec on the CAO machine.
 // Run: node examples/herdr-app-cao-window/portability.test.mjs
-//   node portability.test.mjs --root <dir>   scans <dir> with the login and the operator's list (tasks 1.12, 16.7).
+//   node portability.test.mjs --root <dir>   scans <dir> with the login and the operator's list.
 // Private names are the operator's list (CAO_PORTABILITY_EXTRA_PATTERNS / _FILE); none are written here.
 // Shapes that the scanner looks for are built from fragments (j) so this file does not trip its own scan.
 import fs from "node:fs";
@@ -368,19 +368,19 @@ test("headings may sit at any level", () => {
 });
 
 test("a README stub defers the heading check", () => {
-  const r = readmeProblems(j("<!-- README-", "STUB: replaced in task 15.1 -->\n# x\n"));
+  const r = readmeProblems(j("<!-- README-", "STUB: replaced by the real README -->\n# x\n"));
   assert.deepEqual(r, { deferred: true, problems: [] });
 });
 
 test("the shipped README passes its heading check (or is the stub)", () => {
   const readme = path.join(HERE, "README.md");
-  assert.ok(fs.existsSync(readme), "README.md is missing: task 4.1 writes the stub");
+  assert.ok(fs.existsSync(readme), "README.md is missing");
   const r = readmeProblems(fs.readFileSync(readme, "utf8"));
-  if (r.deferred) console.log("README is a stub; heading check deferred to 15.1");
+  if (r.deferred) console.log("README is a stub; heading check deferred");
   assert.deepEqual(r.problems, []);
 });
 
-// Task 15.1: the stub marker is gone, so the heading check above is no longer deferred. The marker is
+// The stub marker is gone, so the heading check above is no longer deferred. The marker is
 // built from fragments so this file does not hold it.
 test("no file under the example holds the README stub marker, and the README heading check runs", () => {
   const marker = j("README-", "STUB");
@@ -397,7 +397,7 @@ test("no file under the example holds the README stub marker, and the README hea
   assert.deepEqual(r.problems, []);
 });
 
-// ---- the data path (task 6.2; cao-window-sessions, "CAO data goes through exec on the CAO machine") ----
+// ---- the data path: CAO data goes through exec on the CAO machine ----
 
 function sourceFiles(root) {
   const out = [];

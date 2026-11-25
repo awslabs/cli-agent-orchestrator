@@ -1,5 +1,5 @@
-// lib/flows.js: the Flows section's rules (spec cao-window-flows; honesty labels flowRoutesMissing,
-// flowRuns and createChecksSkipped of cao-window-honesty-labels). Tasks 10.1 and the 10.4 test.
+// lib/flows.js: the Flows section's rules (and the honesty labels flowRoutesMissing, flowRuns and
+// createChecksSkipped).
 //
 // The scheduler claim behind numericWeekdayWarning is the server's, not the window's: APScheduler 3.11.3
 // counts the day of week from Monday as 0, so `1-5` is Tuesday to Saturday. The Python test
@@ -349,7 +349,7 @@ test("the form warns that an unattended run stops at plan approval unless the pl
   assert.match(flows.scheduleWarning(), /stops at plan approval unless the plan is approved for these inputs/);
 });
 
-// ---- review round: hard words in the prompt, and the taken-name message the server sends ---------------
+// ---- more cases: hard words in the prompt, and the taken-name message the server sends ---------------
 
 test("a single word that a shell reads as something else survives the generated command, as an input value and as an input name", () => {
   const cwd = globDir();
@@ -401,8 +401,8 @@ test("flowRoutesMissing, flowRuns and createChecksSkipped are no longer pending 
 });
 
 // ===================================================================================================
-// The Flows section, flow details and write gating: the pure helpers added with tasks 10.2 to 10.4.
-// Cases are derived from specs cao-window-flows, cao-window-sessions (Failure states) and D12-D14.
+// The Flows section, flow details and write gating: the pure helpers behind them.
+// Cases are derived from the intended behaviour of the Schedules section and of the failure states.
 // Inputs are deep-frozen where it matters, so a function that writes to its argument throws.
 // ===================================================================================================
 
@@ -1069,9 +1069,9 @@ test("a validate answer with run times the window cannot read shows them as they
 });
 
 // ===================================================================================================
-// Round 3: the confirm dialogs of the flow writes, and the gate of the panel's write controls.
-// Specs: cao-window-flows "Enable, disable and run now are confirmed" (Enable starts on Cancel, Run now),
-// cao-window-sessions "Failure states" (auth is judged per surface), design D14.
+// The confirm dialogs of the flow writes, and the gate of the panel's write controls.
+// Enable, disable and run now are confirmed (Enable starts on Cancel, and so does Run now), and
+// auth is judged per surface.
 // ===================================================================================================
 
 const WRITES = ["enable", "disable", "run", "createAndEnable"];
@@ -1247,7 +1247,7 @@ test("Auth required reaches the save: the gate of a refused flow save is the gat
   assert.equal(flows.flowFormGate({ fields, checks: { canCreate: true }, checkedKey: flows.flowCheckKey(fields), routes: flows.routesState(200), gate: open, sending: false }).create, true, "a refused save can be tried again");
 });
 
-// ---- 19.6: promptView (the prompt stays collapsed behind "Show prompt") ----
+// ---- promptView (the prompt stays collapsed behind "Show prompt") ----
 
 test("Prompt collapsed: closed gives the control 'Show prompt' and no text, open gives the text and 'Hide prompt', no prompt gives 'not available'", () => {
   const prompt = Array.from({ length: 40 }, (_, i) => `line ${i + 1} of the prompt`).join("\n");
@@ -1273,7 +1273,7 @@ test("Prompt collapsed: closed gives the control 'Show prompt' and no text, open
   assert.deepEqual(flows.flowDetailsView({}).prompt, { control: null, text: null, note: "not available" });
 });
 
-// ---- 29.6: the person reads "schedule"; CAO's own name for it stays "flow" in its routes, sessions and files ----
+// ---- the person reads "schedule"; CAO's own name for it stays "flow" in its routes, sessions and files ----
 
 test("Schedule words: the confirmations, titles and outcomes say schedule, never flow", () => {
   assert.deepEqual(["enable", "run", "createAndEnable", "disable"].map((a) => flows.confirmSpec(a).title), ["Enable this schedule?", "Run this schedule now?", "Create this schedule and enable it?", "Disable this schedule?"]);

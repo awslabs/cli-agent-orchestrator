@@ -3,10 +3,10 @@
 // "agents" is the selected session's header lines and agent tree (agentsHeader, agentRows). Every row is one line:
 // a session's letter badge or an agent's program logo, a name that ends in an ellipsis when it does not fit, and at the
 // right end the state mark (and for an agent its age before it and its pin after it, as in Herdr's own lists); the
-// state's words and the other facts are the row's tooltip, and an honesty label is never cut (design
-// D37; each `truncate()` below says what it cuts). The rules live in
-// lib/agents.js, lib/shell.js and lib/logic.js; this file watches Herdr's push data, fetches the D7 fallback and
-// the health probe, and draws. The Sessions copy runs `tick`; the Agents copy runs `tickAgents` (the recap read
+// state's words and the other facts are the row's tooltip, and an honesty label is never cut (each
+// `truncate()` below says what it cuts). The rules live in
+// lib/agents.js, lib/shell.js and lib/logic.js; this file watches Herdr's push data, fetches the per-terminal fallback for
+// terminals without a cao.profile label, and the health probe, and draws. The Sessions copy runs `tick`; the Agents copy runs `tickAgents` (the recap read
 // and a repaint) and none of the Sessions duties, so herdr.seen is written once per focus and the fallback
 // fetches do not double.
 //
@@ -57,7 +57,7 @@ export default class CaoSide extends View {
     this.section = Object.hasOwn(BLOCKS, props()?.section) ? props().section : "sessions";
     this.store = createStore({ getShared: shared, setShared, local: localStorage });
     const saved = this.store.get(KEYS.cache);
-    this.cache = saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {};   // D7: id -> fallbackResult entry
+    this.cache = saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {};   // terminal id -> fallbackResult entry
     this.obs = initialObs(Date.now());              // quiet-worker observation
     this.seenState = { mode: SEEN_MODE_DEFAULT, pending: null };
     this.view = {};                                 // every callCao outcome, folded by applyOutcome
@@ -90,7 +90,7 @@ export default class CaoSide extends View {
     return { ...held.model, dimmed: held.dimmed };
   }
 
-  // Three things need time: the D7 fallback and health fetches, the pin prune, and the seen check.
+  // Three things need time: the per-terminal fallback and health fetches, the pin prune, and the seen check.
   tick(cx) {
     const m = this.model();
     const now = Date.now();
@@ -266,7 +266,7 @@ export default class CaoSide extends View {
     this.store.set(KEYS.pins, pins.includes(id) ? pins.filter((x) => x !== id) : [...pins, id]);
   }
 
-  // ---------- fold: the block's height lives in the layout, which Herdr saves (as in the cao-tab section) ----------
+  // ---------- fold: the block's height lives in the layout, which Herdr saves ----------
 
   isFolded(section) {
     const px = shownBlock(layout(), BLOCKS[section].id)?.size?.px;
@@ -409,7 +409,7 @@ export default class CaoSide extends View {
     return { name: sel?.name ?? null, found, head };
   }
 
-  // The recap, the one multi-line text of the left sidebar (design D42 B): its honesty label on a line of its own above, never clipped, then
+  // The recap, the one multi-line text of the left sidebar: its honesty label on a line of its own above, never clipped, then
   // the text wrapped to at most three lines at the size of the agent rows, with an ellipsis after the third (goalLines, a pure clamp: the
   // toolkit has no line clamp). The whole text is the tooltip. Every row of the sidebar stays one line.
   recapView(t, recap) {

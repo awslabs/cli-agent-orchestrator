@@ -1,7 +1,7 @@
-// Honesty labels (design D23): every surface whose content is a guess, a heuristic, inferred, the
+// Honesty labels: every surface whose content is a guess, a heuristic, inferred, the
 // agent's own words, proposed or missing in CAO carries one fixed label. HONESTY is the table of label
 // texts; HONESTY_SOURCES names, for each surface, the function whose view model must contain that label
-// and a fixture to call it with; HONESTY_PENDING lists the surfaces whose section is not built yet.
+// and a fixture to call it with; HONESTY_PENDING lists the surfaces whose function is not built yet.
 export const HONESTY = Object.freeze({
   bestGuess: "best guess",
   heuristic: "heuristic",
@@ -21,7 +21,7 @@ export const HONESTY = Object.freeze({
 const HONESTY_PROFILE = { name: "dev", role: "developer", allowedTools: ["fs_read"] };
 
 // surface -> { label: key of HONESTY, module, fn, args(mod) -> arguments for fn }. The signatures the
-// fixtures call are fixed by tasks 7.1 to 12.1; when one changes there, change its row here in the same commit.
+// fixtures call are the functions' own; when one changes, change its row here in the same commit.
 export const HONESTY_SOURCES = {
   bestGuess: { label: "bestGuess", module: "./logic.js", fn: "classify",
     args: () => [[{ id: "w1", profile: "reviewer", caller: "c1", createdMs: 2 }, { id: "w2", profile: "reviewer", caller: "c1", createdMs: 3 }], {}, []] },
@@ -50,6 +50,6 @@ export const HONESTY_SOURCES = {
   inputsUndescribed: { label: "inputsUndescribed", module: "./workflows.js", fn: "inputsForm", args: () => [{}] },
 };
 
-// surface -> the section that builds it. Each section deletes its rows in the task that writes the
-// function; task 12.4 asserts this object is empty.
+// surface -> the section that builds it. A row is deleted when the function that produces the surface
+// is written; lib/honesty.test.mjs asserts this object is empty.
 export const HONESTY_PENDING = {};

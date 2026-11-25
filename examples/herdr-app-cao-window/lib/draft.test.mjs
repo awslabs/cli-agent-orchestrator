@@ -1,10 +1,9 @@
-// lib/draft.js: Draft with AI, proposed (spec cao-window-ai-draft; honesty labels draftBox and draftField of
-// cao-window-honesty-labels). Task 12.1.
+// lib/draft.js: Draft with AI, proposed (honesty labels draftBox and draftField).
 //
-// The author prints ONE fenced JSON object (plan, "Format decisions"): for a flow {name, schedule,
+// The author prints ONE fenced JSON object: for a flow {name, schedule,
 // agent_profile, provider, prompt_template}, for a workflow {name, tier, source}. The window only fills a
 // form from it. Nothing here saves, enables or runs anything, and every path that ends an author session
-// deletes it (spec "Author sessions are always cleaned up").
+// deletes it, so an author session is always cleaned up.
 //
 // Every function is called inside a test case through the namespace, so a function that does not exist
 // yet fails its own case with a TypeError, and the rest of the file still runs.
@@ -630,7 +629,7 @@ test("draftStep changes neither the state nor the event it is given", () => {
   for (const ev of events) draft.draftStep(s, deepFreeze({ ...ev }), 1_000_000);
 });
 
-// ---- review round: a stale validation answer, and a launch whose answer was lost ----------------------
+// ---- a stale validation answer, and a launch whose answer was lost ----------------------
 
 // Attempt 1 ends (deleted); attempt 2 starts, is read, and is cleaning up with its own validation answered.
 function secondAttemptCleaning() {

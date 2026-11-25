@@ -1,6 +1,6 @@
-// lib/workflows.js: the Workflows section's rules (spec cao-window-workflows; honesty label
-// inputsUndescribed of cao-window-honesty-labels). Task 11.1. The two templates of 11.4 are checked
-// against the real validate route by test/examples/test_herdr_app_cao_window_templates.py.
+// lib/workflows.js: the Workflows section's rules (and the inputsUndescribed honesty label). The two
+// New workflow templates are checked against the real validate route by
+// test/examples/test_herdr_app_cao_window_templates.py.
 //
 // Server caps mirrored here: SCRIPT_LINT_MAX_SOURCE_CHARS = 128 * 1024 characters (constants.py:1216)
 // and WORKFLOW_MAX_SPEC_BYTES = 256 * 1024 bytes (constants.py:949). Python counts characters, so an

@@ -1,7 +1,7 @@
 // Draft with AI (proposed): an author agent session writes a definition; the window parses it into the
 // form, validates it, and always deletes the session. Pure: draftStep is a reducer whose effects the mod
-// runs. Nothing here saves, enables or runs anything. Top-level names are unique across lib/*.js (bundle
-// mode, D8).
+// runs. Nothing here saves, enables or runs anything. Top-level names are unique across lib/*.js, because bundle
+// mode puts every shared module in one scope.
 //
 // The mod's side of the contract:
 //   - effects run in order; `launch` carries the attempt number it belongs to;

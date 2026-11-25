@@ -1,5 +1,5 @@
-// The panel mod's dialog host (design D29; specs cao-window-shell "One centered dialog hosts every form" and
-// "Author sessions are cleaned up when the dialog closes"). main.js picks it when props().host is "dialog": the
+// The panel mod's dialog host: one centered dialog hosts every form, and the author
+// sessions it started are cleaned up when it closes. main.js picks it when props().host is "dialog": the
 // overlay lib/ui.js openDialog opens with the request in its props, the opener's layout props merged in
 // (dialogSpec), and the dialog's own name in `request.name` (the item a form works on travels as `request.item`).
 //
@@ -15,7 +15,7 @@
 // dialog, and the form's buttons stay at the bottom, dimmed, so the form behind it cannot change. Esc there is the
 // confirmation's own Cancel and returns to the form; the discard question of the frame is drawn the same way.
 //
-// Open state is a lease (D29). Herdr closes some overlays without running mod code, so a flag only the dialog
+// Open state is a lease. Herdr closes some overlays without running mod code, so a flag only the dialog
 // clears would lock every opener for good. The opener wrote the lease for this dialog's name; the dialog renews it
 // every second from its own timer (leaseFor), and close(cx) stops that timer first and clears the key after.
 // Renewal and clear act only when the stored record carries this dialog's own name or the key is empty, so a
@@ -23,10 +23,10 @@
 //
 // The request is the dialog's own snapshot: it is read once, here, and nothing this file sends or draws reads the
 // selected session or what the right sidebar shows afterwards (the one sidebar write is the `set-rside` effect of
-// a save). No field sets a tab index: the Tab order is the drawn order, which the owner's key test checks (U23).
+// a save). No field sets a tab index: the Tab order is the drawn order, which the manual key test (CHECKLIST.md, U23) checks.
 //
 // The functions take the panel instance (the exported View of main.js). The host imports are aliased with the dl
-// prefix because bundle mode (D8) puts the shared modules and every file of the mod in one scope.
+// prefix because bundle mode puts the shared modules and every file of the mod in one scope.
 import { div as dlDiv } from "gpui-kit";
 import { v_flex as dlCol, h_flex as dlRow, InputState as dlInputState, TextareaState as dlTextareaState } from "gpui-base";
 import { closeOverlay as dlCloseOverlay, notify as dlNotify, props as dlProps, theme as dlTheme, checking as dlChecking, exec as dlExec } from "herdr";
@@ -62,7 +62,7 @@ const DL_LEASE_KEY = "caowin.dialog";
 const DL_RSIDE_KEY = "caowin.rside";
 const DL_SELECTION_KEY = "caowin.selection";   // written once, by a launch that returned 201; the dialog never reads it
 const DL_TICK_MS = 1000;
-const DL_WRITE_EXTRA_MS = 5000;     // a write may be lost once its --max-time plus 5 s have passed (design D29)
+const DL_WRITE_EXTRA_MS = 5000;     // a write may be lost once its --max-time plus 5 s have passed
 const DL_LAUNCH_SECONDS = 20;       // the curl limit of POST /sessions, and the time before a lost answer lets the dialog close
 const DL_BLUR_CLOSE_MS = 200;       // a profile list closes this long after its field loses the keys, so a click on a row still lands
 const DL_COPIED_MS = 2000;
@@ -1268,7 +1268,7 @@ function dlWorkflowButtons(panel, t, m, locked) {
 
 // The Run form's state (`rf`). What the user types here (the inputs, the working directory) and the submission kept for
 // "submit again" live in this object, in the dialog's memory, and nowhere else: no shared key, local-storage entry or
-// file ever holds one (design D29, "Values stay in memory"). The directory a launch used prefills the field; the form never
+// file ever holds one: values stay in memory. The directory a launch used prefills the field; the form never
 // writes it back. The typed fields are made on the first tick after the spec is read, from the tick (never from a draw).
 function dlRunInit(panel) {
   const dl = panel.dl;
@@ -1453,7 +1453,7 @@ function dlRunButtons(panel, t, m, locked) {
 // back as an event stamped with its attempt, so a late answer of an earlier attempt cannot fill the form of the next one.
 // The author is the one thing a dialog starts that outlives it: its record is written before the launch is sent, the 201 adds
 // the terminal id, and the dialog's own successful delete removes both. What closing the dialog leaves is not cleaned up
-// here: the always-drawn status mod finds the record by its name once this dialog's lease is dead (design D29).
+// here: the always-drawn status mod finds the record by its name once this dialog's lease is dead.
 
 // The Draft state of one form: the reducer's state, what is out, why the last press was refused, the form that asked and the
 // retained description field.

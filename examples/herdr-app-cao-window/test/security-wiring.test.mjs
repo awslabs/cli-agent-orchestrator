@@ -1,4 +1,4 @@
-// Static check of how the mods call into lib: the window never sends an env value (spike 1.10, design D20), and
+// Static check of how the mods call into lib: the window never sends an env value (a request body is visible in the process list of the CAO machine while curl runs), and
 // the only thing that could change that is the stdin option. Every call a mod makes to launchPlan, launchConfirm,
 // launchBlocked, buildRequest and editorSizeCheck must pass `stdin: STDIN_SUPPORTED` or no stdin key, the cfg()
 // that feeds callCao must return no stdin, and the word `stdin` must appear nowhere else in a mod. A mod that
@@ -142,7 +142,7 @@ export function wiringOf(src, file = "source") {
 
 // ---- the approvals key ------------------------------------------------------------------------------
 // `caowin.approvals` is saved to disk with the rest of shared storage and holds {workflow, planId, at} rows only
-// (design D28; the Run form's inputs never reach it, F28). The one safe way to write it is to pass the result of
+// (the Run form's inputs never reach it). The one safe way to write it is to pass the result of
 // recordApproval( or clearApproval( as the value, because those two build every row from three values read by
 // name. So every call whose first argument is the key (the literal, `KEYS.approvals`, a constant holding either,
 // or a property of an object literal that holds the literal) and whose function is not a read must have a
@@ -204,7 +204,7 @@ export function approvalsProblems(src, file = "source") {
 
 // Every .js file of each mod folder, not only main.js: a mod may split its code over files (the panel has a sidebar
 // host and a dialog host), and a guarded call in any of them is a call. Sorted, so a failure names the same file each run.
-// ---- the dialog host's lease (design D29, F31) ------------------------------------------------------
+// ---- the dialog host's lease ------------------------------------------------------
 // `caowin.dialog` is {name, until}; the dialog renews it every second from its own timer and clears it when it
 // closes. Rules, read from the source of dialog.js:
 //   - leaseFor( is called from the timer (the callback of timer.every, or a function it calls);
@@ -433,7 +433,7 @@ test("the mods take STDIN_SUPPORTED from cao.js, whose shipped value is false, s
 });
 
 
-// ---- a mod split over several files (tasks 21.1, 21.3, 21.4) ----------------------------------------
+// ---- a mod split over several files ----------------------------------------
 
 // Every problem of every .js file of a mods folder, [{file, what, where}], as the scanner reads them.
 const scanMods = (root) => modFilesIn(root).flatMap((file) => {
@@ -458,7 +458,7 @@ test("a guarded call with stdin in a second file of a mod folder is flagged", ()
 });
 
 
-// ---- the approvals key (design D28 and D29, F28) ------------------------------------------------------
+// ---- the approvals key ------------------------------------------------------
 
 test("a write of the approvals key that is not recordApproval or clearApproval is flagged", () => {
   const scan = (root) => modFilesIn(root).flatMap((file) => approvalsProblems(readFileSync(file, "utf8"), file.slice(root.length + 1)));
@@ -508,7 +508,7 @@ test("the approvals scan leaves reads and the two row builders alone, and flags 
 });
 
 
-// ---- the dialog host (task 21.4) ------------------------------------------------------------------------
+// ---- the dialog host ------------------------------------------------------------------------
 
 const LEASE_OK = [
   'const KEY = "caowin.dialog";',
@@ -562,7 +562,7 @@ test("the lease scan passes a host that follows the rules and flags each rule br
   assert.deepEqual(leaseProblems(`// ${LEASE_OK.replaceAll("\n", "\n// ")}`).map((p) => p.what).length > 0, true, "a source with only comments holds no renewal");
 });
 
-// ---- the forms in the dialog host (tasks 21.5, 21.6) ----------------------------------------------------------
+// ---- the forms in the dialog host ----------------------------------------------------------
 
 test("the guarded calls of the New session form are read in dialog.js, and no env value can reach a request from it", () => {
   const text = readFileSync(join(MODS, "cao-window-panel", "dialog.js"), "utf8");
@@ -579,14 +579,14 @@ test("the guarded calls of the New session form are read in dialog.js, and no en
 });
 
 
-// ---- what the dialog host writes to storage (tasks 21.7, 21.8; design D28, D29 "Values stay in memory", F28) ----
+// ---- what the dialog host writes to storage (values stay in memory) ----
 // Shared storage and local storage are saved to disk. The dialog holds a workflow Run form's input values, its
 // working directory and the server's words in its own memory, and writes only names, ids, counts and times: every
 // write of the host is listed here with the one shape of value it may carry, so a value built from the form (or
 // from an outcome, or from the in-memory approval record) is a problem, whatever key it goes to. A write that
 // matches no line of the table is a problem too, so a new key or a new writer has to be added here on purpose.
 // A write of storage: `<...>store.set(`, any `setLocal(`, `setShared(`, `setItem(` or a file write. A `.set(` on a Map
-// or a text state is not storage and is not read. Three more sinks are read the same way (F2 of the review of 20 and 21):
+// or a text state is not storage and is not read. Three more sinks are read the same way:
 //   - a notification (`notify` of the host, under whatever name a file imports it), which leaves the window as a toast
 //     and a system message, so its one allowed shape is listed too;
 //   - `setShared` of the host, under whatever name a file imports it;
@@ -764,7 +764,7 @@ test("the storage-write scan flags a value that carries an input, a directory, a
   assert.ok(storageWriteProblems("const x = 1;").length > 0, "a source with no write at all is not a pass");
 });
 
-// ---- every file of the panel mod, and the sinks beside store.set (F2 of the review of sections 20 and 21) ----
+// ---- every file of the panel mod, and the sinks beside store.set ----
 
 test("Inputs never reach storage: every file of the panel mod is read, not only dialog.js, and each writes and says only what its rules allow", () => {
   assert.deepEqual(panelStorageProblems(MODS), []);

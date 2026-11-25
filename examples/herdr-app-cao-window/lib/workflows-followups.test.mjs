@@ -1,4 +1,4 @@
-// lib/workflows.js: what lib/workflows.test.mjs leaves open (task 11.1): the details state that
+// lib/workflows.js: what lib/workflows.test.mjs leaves open: the details state that
 // workflows have no scheduler, and the source size line names the CLI that fits the tier.
 import { assert, finish, test } from "../test/harness.mjs";
 import * as wf from "./workflows.js";

@@ -3,7 +3,7 @@
 // the theme `t` and returns an element. They hold no state.
 //
 // Unlike the pure modules this one imports host modules, so it cannot run under node and has no node test; the
-// mods are checked with `herdr-app check`. The imports carry wg-prefixed names: bundle mode (D8) puts every shared
+// mods are checked with `herdr-app check`. The imports carry wg-prefixed names: bundle mode puts every shared
 // module and the mod's own code in one scope, where a second binding of the mod's own `div` would be a syntax error.
 import { div as wgDiv } from "gpui-kit";
 import { v_flex as wgCol, h_flex as wgRow, Input as wgInput, Textarea as wgTextarea } from "gpui-base";
@@ -18,7 +18,7 @@ export const fieldBox = (t, head, flag, body, { hint, error } = {}) => wgCol().g
   .child(heading(t, head, flag)).child(body)
   .when(Boolean(hint), (e) => e.child(hintLine(t, hint)))
   .when(Boolean(error), (e) => e.child(problemLine(t, error)));
-// A text field: the retained InputState inside a bordered box (the cao-tab comment box does the same).
+// A text field: the retained InputState inside a bordered box.
 export const inputBox = (t, id, state, invalid = false) => wgDiv().id(id).h(28).px(8).flex().items_center().rounded(6).border_1()   // fixed: a one-line text field; its value scrolls and it holds no label
   .border_color(invalid ? t.blocked : t.border).bg(t.input).cursor_text()
   .on_mouse_down("left", (_e, cx) => cx.stop_propagation())

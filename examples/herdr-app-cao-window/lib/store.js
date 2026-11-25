@@ -1,4 +1,4 @@
-// Storage with an in-memory fallback (design D17). Pins, selection and filter live in shared(); fold
+// Storage with an in-memory fallback. Pins, selection and filter live in shared(); fold
 // heights live in localStorage. Any storage error is caught: the window keeps working with an
 // in-memory copy and shows the notice for the rest of the run. getShared, setShared and local
 // (getItem/setItem) are injected, so a missing or throwing storage is handled like a full one.

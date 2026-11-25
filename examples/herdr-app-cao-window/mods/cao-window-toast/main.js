@@ -2,7 +2,7 @@
 // copy of it per notification (props: title, body, level, action, overlay, and timeout when given), so a
 // copy lives only while its toast shows, and it draws and dismisses the toast itself.
 //
-// Spike 1.5 was not run, so the shipped behavior is pass-through: every notification is drawn as it
+// The hold-on-hand-off experiment was not run, so the shipped behavior is pass-through: every notification is drawn as it
 // arrives, a click runs its action, and the Dock badge (cao-window-status) carries the asking count.
 // toastStep's pass-through branch is the code path. Holding (the queue, the release on a hand-off, Later)
 // would need a copy that outlives the toast to feed focus events and ticks to toastStep, and is not

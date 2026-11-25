@@ -1,7 +1,7 @@
 # shellcheck shell=sh
 # Sourced by install.sh and uninstall.sh; defines the reading and writing of the app copy's Info.plist.
 #
-# The app copy (CAO.app, design D40 B) is a renamed clone of the Herdr app. The one thing that marks it as ours is
+# The app copy (CAO.app) is a renamed clone of the Herdr app. The one thing that marks it as ours is
 # the plist key below: it holds the Herdr version the copy was made from. install.sh refuses to replace, and
 # uninstall.sh refuses to remove, a CAO.app folder that lacks it.
 COPY_MARK_KEY=CAOWindowSourceVersion

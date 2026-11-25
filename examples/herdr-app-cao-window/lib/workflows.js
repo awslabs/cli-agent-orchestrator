@@ -1,8 +1,8 @@
-// The Workflows section's rules (cao-window-workflows): row state from the newest run, polling, the
+// The Workflows section's rules: row state from the newest run, polling, the
 // details of a workflow and of a run, the plan-approval-needed state, typed inputs, the size checks and
 // the save request. Pure. The window never builds the approve route and never sends a file path: a
 // workflow is named by a bare name and created from source text. Top-level names are unique across
-// lib/*.js (bundle mode, D8).
+// lib/*.js (bundle mode puts every shared module in one scope).
 import { ARG_BODY_MAX, bodyBytes, seg, utf8Length } from "./cao.js";
 import { HONESTY } from "./honesty.js";
 import { shq } from "./launch.js";

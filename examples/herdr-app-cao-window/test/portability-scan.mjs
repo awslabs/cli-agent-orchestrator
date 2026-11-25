@@ -1,5 +1,5 @@
 // Rules and scanner for portability.test.mjs. Generic rules only: this file holds no list of one
-// person's tools, hosts or services, not even as fragments (D18). The operator's private list is read
+// person's tools, hosts or services, not even as fragments. The operator's private list is read
 // from CAO_PORTABILITY_EXTRA_PATTERNS / CAO_PORTABILITY_EXTRA_PATTERNS_FILE at run time. Hits are
 // reported as file, line and rule name, never as the matched text.
 import fs from "node:fs";
@@ -101,7 +101,7 @@ const REQUIRED = [
   ["What this does not do", /what this does not do/i],
 ];
 
-// While the README is the task-4.1 stub the check is deferred; 15.1 removes the marker.
+// While the README is a stub (it starts with the stub marker) the check is deferred; the shipped README has no marker.
 export function readmeProblems(text) {
   if (text.startsWith(STUB)) return { deferred: true, problems: [] };
   const problems = [];

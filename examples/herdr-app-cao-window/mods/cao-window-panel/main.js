@@ -1,5 +1,5 @@
 // The panel mod: the exported View, which picks one of two hosts from props().host and hands its render and
-// close to it (design D29, D32). The block `cao-window-panel` of the layout is the right sidebar (sidebar.js:
+// close to it. The block `cao-window-panel` of the layout is the right sidebar (sidebar.js:
 // the flows and workflows lists, the details of one item, the inline confirms); an overlay opened with
 // host "dialog" is the dialog (dialog.js: the frame, its keys and its lease, every form, and the bar's help).
 // Nothing here reads caowin.selection to decide what to draw. The hosts take this instance and use only its

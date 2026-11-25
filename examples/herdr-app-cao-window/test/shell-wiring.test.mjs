@@ -1,5 +1,5 @@
 // Source scans of the three mods and the helper module of the window's left sidebar, top bar and status bar
-// (tasks 20.1 to 20.4). Mod drawing and Herdr events cannot run under node, so the rules the pure functions of
+// Mod drawing and Herdr events cannot run under node, so the rules the pure functions of
 // lib/shell.js and lib/agents.js cannot reach are pinned here by reading the source: a call order, a timer
 // that must not exist, a press that must be stopped, one writer for a shared key.
 //
@@ -266,14 +266,14 @@ test("The top-left says CAO: the brand mod draws BRAND_TEXT of lib/shell.js besi
   const SAYS_HERDR = /["'`][^"'`\n]*Herdr[^"'`\n]*["'`]/g;
   assert.equal(count(readSource('x.child("Herdr");\n// child("Herdr")\nimage("frame/welcome/herdr.png");\n').keep, SAYS_HERDR), 1, "the scan finds a literal Herdr, not a comment or the logo's file name");
   assert.equal(count(src.keep, SAYS_HERDR), 0, "no string of the mod says Herdr (the logo's file is herdr.png, lower case)");
-  assert.equal(count(src.keep, /\bimage\(brandMark\(t\)\)\.size\(BRAND_MARK_SIZE\)\.rounded\(BRAND_MARK_RADIUS\)/g), 1, "the CAO mark stands beside the text, drawn in full colour at the size and radius Herdr's logo had (design D42 A)");
+  assert.equal(count(src.keep, /\bimage\(brandMark\(t\)\)\.size\(BRAND_MARK_SIZE\)\.rounded\(BRAND_MARK_RADIUS\)/g), 1, "the CAO mark stands beside the text, drawn in full colour at the size and radius Herdr's logo had");
   assert.equal(count(src.keep, /herdr\.png|frame\/welcome/g), 0, "Herdr's logo is no longer drawn (changed on purpose: it was asserted at 20 px)");
   assert.match(src.keep, /import \{[^}]*\bbrandMark\b[^}]*\} from "\.\/shell\.js";/, "the mark and its theme rule are pure code of lib/shell.js");
   assert.ok(src.keep.indexOf("image(") < src.keep.indexOf(".child(BRAND_TEXT)"), "the logo comes before the text");
-  assert.match(src.keep, /div\(\)\.text_color\(t\.foreground\)\.child\(BRAND_TEXT\)/, "the text is drawn in the foreground colour at the weight of the user's font_weight setting, like the rows (task 29.5: no explicit weight)");
+  assert.match(src.keep, /div\(\)\.text_color\(t\.foreground\)\.child\(BRAND_TEXT\)/, "the text is drawn in the foreground colour at the weight of the user's font_weight setting, like the rows (no explicit weight)");
 });
 
-test("The CAO mark's two drawings ship in the brand mod's folder, whole, and are the project's own files (design D42 A)", () => {
+test("The CAO mark's two drawings ship in the brand mod's folder, whole, and are the project's own files", () => {
   const folder = join(ROOT, "mods", "cao-window-brand");
   const site = join(ROOT, "..", "..", "docusaurus", "static", "img");
   for (const f of ["cao-mark.svg", "cao-mark-dark.svg"]) {
@@ -372,7 +372,7 @@ test("Opened from either New session control: openDialog reads the lease, then w
 
 const side = () => read("mods", "cao-window-side", "main.js");
 
-test("Selecting a session: one writer of the selection, and it takes the session's name alone (design D42 C: no unfold key)", () => {
+test("Selecting a session: one writer of the selection, and it takes the session's name alone (no unfold key)", () => {
   const src = side();
   const writes = [...src.keep.matchAll(/store\.set\(KEYS\.selection,\s*\{\s*kind: "session"/g)];
   assert.equal(writes.length, 1);
@@ -446,9 +446,9 @@ test("Clear control: the Sessions header comes from sessionsHeader and its contr
 });
 
 test("Buttons have states: a small control rests as a faint filled background, with no outline, and keeps its hover and pointer", () => {
-  // spec cao-window-sessions "Buttons have states" (D30): the status bar parts and the "?", the header "+" and the header
-  // "clear" control. The tab, the pills and the text fields keep their outlines. The top-bar buttons left this list in task
-  // 27.22: they are drawn as Herdr's own Files and Changes buttons, on the bar's chrome (see "The top-bar buttons look like Herdr's").
+  // The status bar parts and the "?", the header "+" and the header "clear" control. The tab, the pills and the text fields
+  // keep their outlines. The top-bar buttons are not in this list: they are drawn as Herdr's own Files and Changes buttons,
+  // on the bar's chrome (see "The top-bar buttons look like Herdr's").
   const controls = [
     ["status bar partView", bodyOf(status(), "partView")],
     ["status bar render (the ? button)", bodyOf(status(), "render")],
@@ -541,7 +541,7 @@ test("Flow session link: it selects the session and nothing else", () => {
   assert.ok(body !== null);
   assert.match(body, /store\.set\(SB_KEYS\.selection, \{ kind: "session", name \}\)/);
   assert.equal(count(body, /store\.set\(/g), 1, "one write: the selection");
-  assert.equal(count(sidebar().keep, /unfold/gi), 0, "no unfold key (design D42 C)");
+  assert.equal(count(sidebar().keep, /unfold/gi), 0, "no unfold key");
   assert.equal(count(sidebar().keep, /SB_KEYS\.selection/g), 1, "this one write; the sidebar reads no selection");
 });
 test("Approval row survives closing: the sidebar reads the key through approvalRow and writes it nowhere", () => {
@@ -564,7 +564,7 @@ test("The sidebar and the shared widgets import host names only under prefixed a
   }
 });
 
-// ==== the dialog host (task 21.4) ====
+// ==== the dialog host ====
 test("Selection changes under an open dialog: the dialog host reads neither the selection nor the sidebar's state", () => {
   const src = dialog();
   // The reads of a stored key are the lease's (ownsLease) and, since the workflow forms and Draft with AI, the three lists
@@ -694,7 +694,7 @@ test("Hidden at first start: the dialog host sends no layout command and opens n
   assert.equal(count(src.keep, /\brun\(|\bdlRun\b|openOverlay\(/g), 0);
 });
 
-// ==== the dialog's forms (tasks 21.5 and 21.6) ====
+// ==== the dialog's forms ====
 // The New session form and the flow forms moved from the shipped panel into the dialog host. Their rules live in
 // lib/launch.js, lib/flows.js and lib/logic.js (node tests); these scans pin that the dialog applies them and
 // does not re-implement them, and the wiring no node test reaches: what a launch tells the frame, what replaces
@@ -718,7 +718,7 @@ test("Opened from either New session control: the dialog host draws the kinds th
   assert.equal(count(src.keep, /guardLeave|leaveForm|selectionKey|dialogStale|openKey|heldSel|lastDetail|FORM_KINDS|panelFormKey|panelLeaveGuard/g), 0, "nothing keys a form to the selection");
 });
 
-test("The New session form draws no Kiro engine and no resume field, reads neither from the form and sends neither (D40 A)", () => {
+test("The New session form draws no Kiro engine and no resume field, reads neither from the form and sends neither", () => {
   const src = dialog();
   assert.equal(count(src.keep, /cao-en-|cao-f-resume|KIRO_ENGINES|fieldVisibility|resumeId|form\.engine|ins\.resume|"resume"|--engine|--resume-session-id|Kiro engine|Resume a Claude Code/g), 0);
   assert.equal(count(src.keep, /\bvis\b/g), 0, "no field is drawn from a per-provider visibility any more");
@@ -796,7 +796,7 @@ test("Result card: a 201 selects the session behind the card, remembers the dire
   const after = bodyOf(src, "dlAfterLaunch");
   assert.ok(after !== null);
   assert.match(after, /store\.set\(DL_SELECTION_KEY, \{ kind: "session", name: result\.session \}\)/);
-  assert.equal(count(src.keep, /unfold/gi), 0, "the dialog has no unfold key to clear (design D42 C)");
+  assert.equal(count(src.keep, /unfold/gi), 0, "the dialog has no unfold key to clear");
   assert.match(after, /store\.setLocal\("caowin\.lastWorkdir", submission\.workdir\)/);
   assert.match(bodyOf(src, "dlResultCard"), /launchResultCard\(/);
   assert.match(bodyOf(src, "dlSessionInit"), /emptyForm\(panel\.store\.getLocal\("caowin\.lastWorkdir"\)\)/, "Prefill after a launch");
@@ -868,7 +868,7 @@ test("Selection changes under an open dialog (Edit flow): the flow comes from th
 });
 
 
-// ==== the workflow forms in the dialog host (task 21.7) ====
+// ==== the workflow forms in the dialog host ====
 // New workflow, Edit workflow and the Run form moved from the shipped panel into the dialog host. Their rules live in
 // lib/workflows.js and lib/workflows-view.js (node tests) and lib/shell.js (the rows of "not submitted"); these scans pin
 // that the dialog applies them, that a request is a write the frame is told about, and that nothing a user typed in
@@ -1000,7 +1000,7 @@ test("Inputs never reach storage: nothing the Run form holds is named in a write
   assert.equal(count(bodyOf(src, "dlRunInit") ?? "", /store\.setLocal\(/g), 0, "the directory a launch used prefills the form; the form never writes it back");
 });
 
-// ==== the Draft with AI box in the dialog host (task 21.8) ====
+// ==== the Draft with AI box in the dialog host ====
 // The author session is the one thing a dialog starts that outlives it, so its record is written before the launch,
 // completed by the 201, and left for the always-drawn mod when the dialog goes. The reducer (lib/draft.js) decides;
 // these scans pin the order and what the dialog does not do.
@@ -1079,8 +1079,8 @@ test("Dialog closed during drafting: leaving with an author out asks first, and 
 });
 
 
-// ==== owner review of the live window (section 27) ====
-// Changes A to F: the left sidebar's rows are one line each, a name that does not fit is cut with an ellipsis and its words
+// ==== the left sidebar's rows, the labels and the top bar's buttons ====
+// The left sidebar's rows are one line each, a name that does not fit is cut with an ellipsis and its words
 // are in the tooltip, the honesty labels and the pills are never cut, the agent is named as CAO names its tab, and the top bar's
 // buttons carry no counts. The look cannot run under node; the draw code is pinned by reading it.
 
@@ -1145,7 +1145,7 @@ test("Honesty labels are never cut: they are drawn whole, and only the text besi
   assert.match(bodyOf(src, "tagged"), /whole\(label/, "the recap's and the context's label");
 });
 
-// ---- the person reads "schedule", CAO's own word is "flow" (owner review, task 29.6) ----
+// ---- the person reads "schedule", CAO's own word is "flow" ----
 // Every string the person reads that named a flow now says schedule: the top-bar button, the right sidebar's list and its states, the dialog
 // titles, the form's labels and hints, the confirmations, the Agents header link, the toasts and tooltips. What stays: CAO's own names
 // (the /flows routes, the `cao flow` and `cao schedule` commands, the cao-flow-<name> sessions, the file and symbol names, the shared keys,
@@ -1215,8 +1215,8 @@ test("The Agents header link reads Started by schedule X and the times after a d
   assert.doesNotMatch(body, /schedule: /);
 });
 
-// ---- the text weight comes from the user's setting, not from our code (owner review, task 29.5) ----
-// Herdr's rows have no weight call, so the person's `font_weight` setting (500 for the owner) governs them; its block headings are
+// ---- the text weight comes from the user's setting, not from our code ----
+// Herdr's rows have no weight call, so the person's `font_weight` setting (for example 500) governs them; its block headings are
 // `font_medium()` at 11.5 (mods/agents/main.js:439), its Agents rows are 12.5 (mods/agents/main.js:199) and its Spaces rows 13 (the list's
 // root, mods/spaces/main.js:561). Our left sidebar, tabs and brand drew semibold and looked bolder than Herdr's window. What stays bold is
 // what Herdr draws bold itself: the "!" square and the badge letter (:215, :516), a dialog's or a panel's heading and a toast's title.
@@ -1251,7 +1251,7 @@ test("The shared drawing and the right sidebar are not bolder than Herdr's: row 
   assert.ok(dlg.length > 0 && dlg.length <= 8, "the dialog's headings keep their weight, as Herdr's dialogs' titles do (confirm, prompt, machine-add: font_semibold)");
 });
 
-// ---- colour-only marks, no pill text (owner review, task 29.4) ----
+// ---- colour-only marks, no pill text ----
 // The words `Replied` and `Asking`/`needs you` left the rows: needs you is Herdr's compact "!" square (mods/agents/main.js:215), a reply is the
 // done dot in a highlight token, and the words are the row's tooltip (lib/agents.js). Nothing the left sidebar or the shared drawing draws
 // is a word for them any more.
@@ -1273,7 +1273,7 @@ test("The marks have Herdr's shapes: the needs-you square is the compact form of
   assert.notEqual(body.match(/dot: \(\) => [^\n]*/)?.[0], body.match(/"dot-hi": \(\) => [^\n]*/)?.[0], "told apart from the plain done dot");
 });
 
-test("Goal text (design D42 B): the recap's label has its own line above, the text below is the lines of goalLines at the block's width, one truncating line each, the whole text in the tooltip", () => {
+test("Goal text: the recap's label has its own line above, the text below is the lines of goalLines at the block's width, one truncating line each, the whole text in the tooltip", () => {
   const src = side();
   const agents = bodyOf(src, "agentsBody");
   assert.match(agents, /this\.recapView\(t, head\.recap\)/, "the recap goes through its own view, not through tagged (changed on purpose: it was the label-first one-line tagged row)");
@@ -1300,8 +1300,7 @@ test("The one multi-line text of the left sidebar: the recap; the context line, 
   assert.match(bodyOf(src, "agentsBody"), /this\.tagged\(t, `context \$\{head\.context\.percent\}%`, head\.context\.label\)/, "the context line is `context N%` and its label, a short line that is not clipped");
 });
 
-// Change K (task 27.12): the Sessions list is styled like Herdr's spaces list (mods/spaces/main.js of Herdr 0.1.17, a copy kept in the
-// run directory): a lettered badge before the name, and the state mark at the right end of the row.
+// The Sessions list is styled like Herdr's spaces list (mods/spaces/main.js of Herdr 0.1.17): a lettered badge before the name, and the state mark at the right end of the row.
 
 test("A session row reads badge, name, draft tag, hint, extra mark, state mark: the marks at the right end, the extra one before the state, the name giving way", () => {
   const body = bodyOf(side(), "sessionLineView");
@@ -1374,7 +1373,7 @@ test("The Agents rows read the focused terminal: the row of the focused agent ta
   const body = bodyOf(src, "agentsBody");
   assert.match(body, /focusedRow\(tree, focused\(\)\)/, "the rule is the pure function, given Herdr's focus");
   assert.match(body, /agentRowView\(t, r, found, focus\)/, "each row is told which one is focused");
-  assert.equal(count(body, /focus\.fold/g), 0, "no fold line to take the fill (design D42 C)");
+  assert.equal(count(body, /focus\.fold/g), 0, "no fold line to take the fill");
   const row = bodyOf(src, "agentRowView");
   assert.match(row, /focus === r\.id/);
   assert.match(row, /\.bg\(t\.selected\)/, "the fill of the selected session row");
@@ -1396,7 +1395,7 @@ test("The top bar's tab and the Agents row show one name: both come from lib/age
   assert.equal(count(bodyOf(side(), "agentRowView"), /\.profile/g), 0);
 });
 
-test("The bar's order is the block's: the tabs are the view model's list, the bar sorts nothing, and it reads no unfold key (design D42 C)", () => {
+test("The bar's order is the block's: the tabs are the view model's list, the bar sorts nothing, and it reads no unfold key", () => {
   const bar = tabs();
   const shown = bodyOf(bar, "shown");
   assert.ok(shown !== null, "the bar's tabs come from one method");
@@ -1436,7 +1435,7 @@ test("No role tag on a tab: the bar draws no 'worker' or 'talkable' word, and no
   assert.equal(count(body, /text_color\(t\.dim\)|text_size\(11\)/g), 0, "no small muted tag");
 });
 
-test("No state mark on a tab (task 27.21): the tab draws no shapeMark and reads no shape, the bar imports none, and its tooltip says the state", () => {
+test("No state mark on a tab: the tab draws no shapeMark and reads no shape, the bar imports none, and its tooltip says the state", () => {
   const bar = tabs();
   const body = bodyOf(bar, "tabView");
   assert.ok(body !== null && body.length > 100, "fixture: found the tab drawing");
@@ -1472,7 +1471,7 @@ test("The pin is a drawing of our own mod folder: svg() draws the model's file a
   for (const f of ["pin-filled.svg", "pin-tilted.svg"]) assert.ok(existsSync(join(ROOT, "mods", "cao-window-side", f)), `${f} ships in the side mod's folder`);
 });
 
-// ---- the top-bar buttons look like Herdr's Files and Changes buttons (owner review, task 27.22) ----
+// ---- the top-bar buttons look like Herdr's Files and Changes buttons ----
 // Herdr's tabs mod draws them in `panelButton` (mods/tabs/main.js:133-152 of the shipped mod, read only on the Mac): a 26 px row, px 8,
 // gap 5, rounded 6, text 12, a 14 px svg() icon before the label, t.chrome and t.muted at rest, t.selected and t.foreground while its
 // panel is shown, t.hover on hover, and the press stopped. Our icons are drawings of the tabs mod's own folder.
@@ -1504,7 +1503,7 @@ test("The top-bar buttons look like Herdr's: barButton uses panelButton's geomet
   }
 });
 
-// ---- no worker fold (design D42 C) ----
+// ---- no worker fold ----
 // The Agents block lists every worker, always: no "N workers" line, no "hide workers" line, no rule that folds a session of more than 12 agents,
 // no `caowin.unfold` key and no chevron. A pin now decides only which agents get a top-bar tab. The block scrolls when its tree is taller than it.
 
@@ -1536,7 +1535,7 @@ test("The Agents block scrolls vertically when its tree is taller than the block
   assert.equal(count(body, /\.h\(\d|max_h\(|overflow_hidden\(\)/g), 0, "no fixed height cuts the tree");
 });
 
-// ---- the tab strip scrolls like Herdr's, and a divider and the buttons stay fixed at the right (owner review, task 29.2) ----
+// ---- the tab strip scrolls like Herdr's, and a divider and the buttons stay fixed at the right ----
 // Herdr's tabs mod (mods/tabs/main.js:156-160 of the shipped mod, read only on the Mac): a `tab-scroll` h_flex with `flex_1().min_w(0)`,
 // `overflow_x_scrollbar().track_scroll(this.scroll)` and an `on_size_change` that scrolls the active tab into view, an `on_scroll_wheel`
 // on the bar (:155, the handler :39-62), `ScrollHandle.new()` in init (:33) and `scroll_to_item(active)` when the active tab changes
@@ -1624,11 +1623,11 @@ test("Buttons read bare words: the bar asks for the label of a kind and passes n
   assert.match(bodyOf(src, "render"), /cao-bar-flows[^\n]*barButtonLabel\("flows"\)/);
 });
 
-// ==== a label is shown in full (task 21.9, narrowed by section 27) ====
-// cao-window-honesty-labels "A label is shown in full": no honesty label and no pill is cut by a fixed row height, a truncate or
+// ==== a label is shown in full ====
+// No honesty label and no pill is cut by a fixed row height, a truncate or
 // an overflow clip. Every such use in the drawing files either is gone or says on its own line why it holds no label text
 // (`// fixed: <why>`: a control with one short fixed word, an icon, a dot, a rule). The right sidebar's rows, the dialog and the
-// pills still wrap, so they carry no marker at all. Since the owner's review (section 27) the left sidebar's mod alone may also
+// pills still wrap, so they carry no marker at all. The left sidebar's mod alone may also
 // truncate the text of a name, a path or a recap, on a line that says so (`// truncates: <what>`), and never on a line that
 // holds a label, a pill or a hint.
 
@@ -1712,7 +1711,7 @@ test("Names truncate, labels do not: the clip scan lets the left sidebar's mod c
   assert.ok(clipProblems("const r = h_flex().id(`cao-s-${s.name}`).truncate().child(x);   // truncates: a row that holds a pill\n", SIDE).length > 0, "a session line itself may not carry the marker");
 });
 
-// ==== the in-flight guards, the sidebar's run-state check and the typed YOLO name (review of 20 and 21, F3) ====
+// ==== the in-flight guards, the sidebar's run-state check and the typed YOLO name ====
 // A double click must not send twice, a confirm must not send for a run whose state moved, and the YOLO confirmation
 // must be given what the user typed. The order of calls is pinned above; these pin the early returns and the arguments.
 
@@ -1822,7 +1821,7 @@ test("the argument scan reads the arguments of a call and not of its definition 
 
 // ==== end of the dialog host cases ====
 
-// ---- 31.3: the shared cache is merged before it is published, and the Agents copy adopts it (design D41 C) ----
+// ---- the shared cache is merged before it is published, and the Agents copy adopts it ----
 
 test("syncCache reads the shared key first, merges it through sharedCache, and publishes only what changed", () => {
   const src = side();

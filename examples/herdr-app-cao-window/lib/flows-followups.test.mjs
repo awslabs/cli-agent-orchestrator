@@ -1,4 +1,4 @@
-// lib/flows.js: the follow-ups to lib/flows.test.mjs (task 10.1): Edit and the name the route calls
+// lib/flows.js: the follow-ups to lib/flows.test.mjs: Edit and the name the route calls
 // taken, Run now when the answer never comes, and an answer the window cannot read as a run.
 import { assert, finish, test } from "../test/harness.mjs";
 import * as flows from "./flows.js";

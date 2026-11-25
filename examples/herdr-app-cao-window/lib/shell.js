@@ -1,8 +1,7 @@
-// The shell state of the window as pure functions (design D27 to D30 and D37; specs cao-window-shell and the status
-// bar of cao-window-sessions): the labels of the top bar's two buttons, the right sidebar's state, the dialog's
+// The shell state of the window as pure functions: the labels of the top bar's two buttons, the right sidebar's state, the dialog's
 // reducer, lease and author records, the list payloads, the status bar's parts and the help. The mods only
 // draw and send what these return, so `node lib/shell.test.mjs` pins the rules. No function mutates its
-// arguments. Top-level names are unique across lib/*.js (bundle mode, D8). Source stays ASCII: the middle dot
+// arguments. Top-level names are unique across lib/*.js (bundle mode puts every shared module in one scope). Source stays ASCII: the middle dot
 // is written as an escape.
 
 import { forgetDraft, isAuthorSession } from "./draft.js";
@@ -13,10 +12,10 @@ import { workflowRows } from "./workflows-view.js";
 const SH_DOT = "\u00b7";
 const shList = (v) => (Array.isArray(v) ? v : []);
 
-// ---------- the top bar's two buttons (D27) ----------
+// ---------- the top bar's two buttons ----------
 
-// The label of the Schedules or Workflows button (CAO calls a schedule a flow; the person reads "Schedules", D39 F): the bare word, whatever the list holds or whether it was read. The
-// counts moved to the right sidebar's own list headers (design D37): a count in the bar read `Schedules 5 . all off`,
+// The label of the Schedules or Workflows button (CAO calls a schedule a flow; the person reads "Schedules"): the bare word, whatever the list holds or whether it was read. The
+// counts moved to the right sidebar's own list headers: a count in the bar read `Schedules 5 . all off`,
 // which says little and takes room. The arguments a caller may still pass (rows, state) are ignored. To rename the
 // buttons, change the two words here.
 export function barButtonLabel(kind) {
@@ -24,7 +23,7 @@ export function barButtonLabel(kind) {
   return kind === "flows" ? "Schedules" : "Workflows";
 }
 
-// ---------- the top bar's wheel (D39 B) ----------
+// ---------- the top bar's wheel ----------
 
 // A wheel turned over the top bar steps to the neighbouring tab, by the rule of Herdr's own tabs mod (mods/tabs/main.js:39-62 of the
 // shipped mod, which sends `tab.prev` or `tab.next`): one step per notch of a mouse wheel (`delta_lines`); for a touchpad or a smooth
@@ -56,15 +55,15 @@ export function wheelTabStep(swipe, e, now) {
   return { swipe: next, step: dir > 0 ? -1 : 1 };
 }
 
-// ---------- the right sidebar's state (D28) ----------
+// ---------- the right sidebar's state ----------
 
 const SH_LISTS = ["flows", "workflows"];
 const shIsList = (v) => SH_LISTS.includes(v);
 const shIsItem = (v) => typeof v === "string" && v !== "";
 
 // A stored state is {open, list, item, form}: whether the sidebar is shown, which list it shows, the item whose
-// details it shows (a name, or null for the list view) and the request a form holds in it (null unless design
-// D33 applies).
+// details it shows (a name, or null for the list view) and the request a form holds in it (null unless a form
+// is open from the sidebar).
 // Whatever was stored read as a state of this shape: anything else is a closed sidebar at the flows list.
 function shRside(raw) {
   const r = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
@@ -79,7 +78,7 @@ function shRside(raw) {
 // The reducer of the right sidebar. A button opens its list (no item), closes when its list is the open one, or
 // switches to the other list; a row shows an item's details; back returns to the list; a link or a save from the
 // dialog opens the list at an item; close shuts it and drops the item, so the next button always shows the list;
-// form and form-close hold and empty the dialog request of D33. Any other event (a session selection included)
+// form and form-close hold and empty the dialog request. Any other event (a session selection included)
 // leaves the state as it was: what the sidebar shows is stored apart from the selected session.
 export function rsideStep(state, event) {
   const s = shRside(state);
@@ -121,7 +120,7 @@ export function opOf(ops, item) {
   return hits.length > 0 ? hits[hits.length - 1] : null;
 }
 
-// ---------- the right sidebar's record against the block's real state (D28) ----------
+// ---------- the right sidebar's record against the block's real state ----------
 
 // Ticks (calls of rsideLayoutStep) between a show or hide and its single resend.
 export const RSIDE_RESEND_TICKS = 4;
@@ -156,9 +155,9 @@ export function rsideLayoutStep(rside, shown, state) {
   return { rside: adopted, send: null, state: { started: true, wanted: shown, sends: 0, waited: 0 } };
 }
 
-// ---------- the dialog (D29) ----------
+// ---------- the dialog ----------
 
-// The overlay kind of every form: "dialog" (centered, dims). The owner's key test can change it to "window" (D29).
+// The overlay kind of every form: "dialog" (centered, dims). It can be changed to "window".
 export const DIALOG_KIND = "dialog";
 const SH_BUSY_TEXT = "A request is in progress. Wait for the answer.";
 const SH_LOST_NOTE = "The answer may have been lost.";
@@ -218,11 +217,11 @@ export function dialogSpec(request, layoutProps) {
   const req = shObject(request) ? request : {};
   const help = req.kind === "bar-help";
   // host comes last: the request wins every other clash, but not this one, because the overlay copy picks its
-  // surface (dialog or sidebar) from props().host (design D29), so a request cannot send it to the sidebar.
+  // surface (dialog or sidebar) from props().host, so a request cannot send it to the sidebar.
   return { kind: DIALOG_KIND, modal: true, width: help ? 360 : 0.85, height: help ? 220 : 0.85, props: { ...layout, ...req, host: "dialog" } };
 }
 
-// ---------- the dialog lease and the author records (D29) ----------
+// ---------- the dialog lease and the author records ----------
 
 // `caowin.dialog` is {name, until}: the dialog renews it every second with leaseFor, so it is live for 10 s after
 // its last renewal. Herdr closes some overlays without running mod code, so the record is read against the
@@ -297,7 +296,7 @@ export function afterLaunch(authors, name, status) {
 export const deleteStarted = (inFlight, name) => (shList(inFlight).includes(name) ? [...shList(inFlight)] : [...shList(inFlight), name]);
 export const deleteEnded = (inFlight, name) => shList(inFlight).filter((n) => n !== name);
 
-// ---------- the list payloads the bar publishes (D27) ----------
+// ---------- the list payloads the bar publishes ----------
 
 // Shared storage is saved to disk, so a payload holds only what a list row draws, built field by field from an
 // allow-list: no prompt, no script, no workflow source and no run input ever gets in, and none is named here
@@ -327,17 +326,16 @@ export function listView(kind, view, runsView) {
   };
 }
 
-// ---------- the status bar's parts and its help (D30) ----------
+// ---------- the status bar's parts and its help ----------
 
-// The OS title of the window, the text Mission Control, Cmd-` and the window switchers show instead of "Herdr" (design
-// D37). The status mod gives it to setWindowTitle once, when it starts; Herdr does not keep it over a restart.
+// The OS title of the window, the text Mission Control, Cmd-` and the window switchers show instead of "Herdr". The status mod gives it to setWindowTitle once, when it starts; Herdr does not keep it over a restart.
 export const WINDOW_TITLE = "CAO";
 
-// The text of the wordmark at the top-left of the left sidebar, which Herdr draws as "Herdr" (design D37 S). The brand mod
+// The text of the wordmark at the top-left of the left sidebar, which Herdr draws as "Herdr". The brand mod
 // draws it beside Herdr's logo. It is the window's title, so the two cannot name the window differently.
 export const BRAND_TEXT = WINDOW_TITLE;
 
-// The mark beside it (design D42 A): the project's own, in two drawings kept in the brand mod's folder (the site's cao-mark.svg for light
+// The mark beside it: the project's own, in two drawings kept in the brand mod's folder (the site's cao-mark.svg for light
 // surfaces and cao-mark-dark.svg for dark ones). Herdr's logo was drawn at 20 px with a 5 px radius; the mark takes the same room. The
 // drawings have several colours, so the mod draws them with `image()`; `svg()` takes one tint colour and would flatten them.
 export const BRAND_MARK_SIZE = 20;
@@ -403,7 +401,7 @@ export function helpView() {
   return { doneMeans: note.doneMeans, text: note.text, label: note.label };
 }
 
-// ---------- the "not submitted" rows of a workflow Run that needs plan approval (D28, D29) ----------
+// ---------- the "not submitted" rows of a workflow Run that needs plan approval ----------
 
 // `caowin.approvals` is a list of {workflow, planId, at}, saved to disk with the rest of shared storage. What the
 // user typed in the Run form, the directory and the server's own words stay in the dialog's memory; a row is built

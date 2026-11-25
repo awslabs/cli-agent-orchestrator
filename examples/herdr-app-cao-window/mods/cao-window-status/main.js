@@ -8,7 +8,7 @@
 // This mod also deletes the Draft with AI author sessions a closed dialog left behind: the dialog's own copy
 // dies with it, and this mod is always drawn. It reads the records in `caowin.authors` and the dialog's lease,
 // and asks lib/shell.js which names to delete; it writes no lease and clears nothing at start, because a dead
-// lease record is harmless (design D29).
+// lease record is harmless.
 import { View, div } from "gpui-kit";
 import { h_flex } from "gpui-base";
 import { exec, machines, spaces, terminals, theme, props, shared, setShared, setBadge, setWindowTitle, checking } from "herdr";
@@ -60,7 +60,7 @@ export default class CaoStatus extends View {
 
   cfg() { return { machine: this.machine, port: props()?.caoPort }; }
 
-  // ---------- author sessions a closed dialog left behind (design D29) ----------
+  // ---------- author sessions a closed dialog left behind ----------
 
   // Once a second: the recorded author sessions whose dialog is no longer live, not already being deleted.
   cleanAuthors() {

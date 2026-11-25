@@ -2,7 +2,7 @@
 
 This is a test script. You do not need to know how the window is built. Follow the lines in order, copy the commands, compare what you see with the "You should see" text, and write PASS, FAIL, or not run in the results table.
 
-You run it twice: once with CAO on a remote machine (task 16.4), and once with CAO and the app on one machine with `--local` (task 16.5). The results table has one column for each run.
+You run it twice: once with CAO on a remote machine, and once with CAO and the app on one machine with `--local`. The results table has one column for each run.
 
 ## Before you start
 
@@ -560,7 +560,7 @@ With the worker from C08 pinned and its session selected:
 
 ### C12 The hand-off toast
 
-What ships: the window does not hold toasts. The hold-until-hand-off and Later logic exists only as tested code, because the 30-minute spike that decides it has not run. This line checks what does ship.
+What ships: the window does not hold toasts. The hold-until-hand-off and Later logic exists only as tested code, because the 30-minute experiment that decides it has not run. This line checks what does ship.
 
 **Part 1: the default install (no toast mod).**
 
@@ -1431,7 +1431,7 @@ These checks cover Herdr behavior that nothing could run before this checklist: 
 
 ### U19 Two windows write one CAO structure document, and the updater
 
-Two spikes did not run: two windows writing the shared CAO structure document (spike 1.7) and the updater with two processes (spike 1.8). This run holds exactly that two-writer state while your main window still lists the CAO machine. The scratch window of B2 looks at the scratch server, which your main window cannot see, so there is no second writer there. For this line, point the scratch window at your real CAO core for a short time. Run it with no agent working, and write `not run: no second writer` if you will not do it.
+Two experiments did not run: two windows writing the shared CAO structure document and the updater with two processes. This run holds exactly that two-writer state while your main window still lists the CAO machine. The scratch window of B2 looks at the scratch server, which your main window cannot see, so there is no second writer there. For this line, point the scratch window at your real CAO core for a short time. Run it with no agent working, and write `not run: no second writer` if you will not do it.
 
 1. **Point the window at the real CAO.** From here until step 6, do not click or focus any agent in the CAO window: it writes `herdr.seen` on a real terminal when you focus a finished agent. In the Mac terminal (outside Herdr, with the variables of "Scratch names" set), remove the machine entry from the scratch window's own core, and install again against the real port and core:
 
@@ -1469,7 +1469,7 @@ Two spikes did not run: two windows writing the shared CAO structure document (s
 
 ### U21 Esc on a `dialog` overlay (H1)
 
-**Status: not run.** This is the owner's key test: it needs a person at a Mac with the window active, and nobody has run it. Until it is run, the window's Esc behavior in the dialog is a design, not a result.
+**Status: not run.** This is the key test: it needs a person at a Mac with the window active, and nobody has run it. Until it is run, the window's Esc behavior in the dialog is a design, not a result.
 
 - **Do:** open New session with the `+` in the Sessions header. Type one letter in the first input and press Esc once. Repeat with the caret in the message textarea.
 - **You should see:** the dialog stays and shows `Discard this form?`, and a second Esc closes it (or returns to the form: the second Esc is the Keep editing default).
@@ -1495,13 +1495,13 @@ Two spikes did not run: two windows writing the shared CAO structure document (s
 
 - **Do:** on the real layout, click `Schedules` three times (open, switch to `Workflows`, close). Watch the pane while it opens and closes. Open it, quit with Cmd+Q, open the window again.
 - **You should see:** the sidebar block appears and disappears, the pane gives up and takes back its width, and after the restart the sidebar is hidden whatever it was when you quit. Nothing is resized to hide it.
-- **Report back:** a sidebar that does not hide, a pane that does not take its width back, a flicker of the sidebar open at start, or a button that needed two clicks. The spike on Herdr 0.1.17 measured show, hide, the reflow and the saved state; this is the same on the installed layout.
+- **Report back:** a sidebar that does not hide, a pane that does not take its width back, a flicker of the sidebar open at start, or a button that needed two clicks. A measurement on Herdr 0.1.17 covered show, hide, the reflow and the saved state; this is the same on the installed layout.
 
 ### U25 `shared()` across the new blocks
 
 - **Do:** with two sessions listed, click the first in **Sessions**, then the second, then pin a worker in **Agents** and watch the top bar.
 - **You should see:** the **Agents** header and tree follow the click within about a second, the second block's fold state is its own, and a pinned worker shows as a tab in the top bar within about a second.
-- **Report back:** a delay of more than a second, an Agents block that shows the previous session, or a fold that moved both blocks. The spike measured 10 to 30 ms for two blocks of one mod; the new block ids were not measured on a Mac.
+- **Report back:** a delay of more than a second, an Agents block that shows the previous session, or a fold that moved both blocks. A measurement found 10 to 30 ms for two blocks of one mod; the new block ids were not measured on a Mac.
 
 ### U26 A press on a bar control does not drag or maximize the window
 
@@ -1513,7 +1513,7 @@ Two spikes did not run: two windows writing the shared CAO structure document (s
 
 - **Do:** open `chk-flow` in the right sidebar and confirm Run now. At once click `Schedules` to close the sidebar. Wait until the schedule has finished (30 seconds or the time the schedule needs), then click `Schedules`, and open `chk-flow` again.
 - **You should see:** the right sidebar's details show the answer of the run, and the schedule's row in the list no longer reads `running`.
-- **Report back:** a row that still reads `running` after the schedule finished, or details with no answer. The spike showed that a hidden copy keeps its timers; that it receives the answer of an `exec` was not measured.
+- **Report back:** a row that still reads `running` after the schedule finished, or details with no answer. A measurement showed that a hidden copy keeps its timers; that it receives the answer of an `exec` was not measured.
 
 ### U28 The theme key and folder of a copied settings file
 
@@ -1728,7 +1728,7 @@ Lines for later fixes:
 | The dialog's open state is a lease | C63 |
 | A closed Draft with AI dialog leaves no author session | C61 |
 | A workflow Run in the dialog, plan approval and nothing typed stored | C66 |
-| Esc and Tab order in the dialog (owner's key test, not run) | U21, U22, U23 |
+| Esc and Tab order in the dialog (the key test, not run) | U21, U22, U23 |
 | The theme a copied settings file names | U28 |
 | The left sidebar's edge drags between 200 and 640 px | U29 |
 

@@ -1,8 +1,8 @@
-// What the panel decides around the Draft with AI box (cao-window-ai-draft): which requests the reducer's
+// What the panel decides around the Draft with AI box: which requests the reducer's
 // effects become and which events their answers become, when an author session still needs attention, which
 // box action means what, how a parsed draft lands in the two forms, and what counts as a validation error.
 // Pure; lib/draft.js owns the reducer (draftStep) and the rules about the definition. Top-level names are
-// unique across lib/*.js (bundle mode, D8).
+// unique across lib/*.js, because bundle mode puts every shared module in one scope.
 import { seg } from "./cao.js";
 import { applyDraft, draftAllowed, draftBox, isAuthorSession } from "./draft.js";
 import { resolvedProvider } from "./launch.js";

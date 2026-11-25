@@ -1,14 +1,14 @@
-// lib/draft-view.js: the glue between the Draft with AI reducer (lib/draft.js) and the panel (spec
-// cao-window-ai-draft; honesty labels draftBox and draftField; tasks 12.2 and 12.3).
+// lib/draft-view.js: the glue between the Draft with AI reducer (lib/draft.js) and the panel
+// (honesty labels draftBox and draftField).
 //
-// The cases come from the spec's requirements and scenarios (No author profile configured, Provider without
+// The cases come from the Draft with AI requirements and scenarios (No author profile configured, Provider without
 // native enforcement, Install-time provider refused, Draft request, Good draft, Several fenced blocks, Draft
 // with a validation error, Timeout, Missing fence, Launch fails, Delete fails twice, Fix, and the cleanup of a
-// launch whose answer was lost), then from the invariants the design gives: a cleanup effect on every exit
-// path, never a tool set other than fs_read, no field the spec forbids, a form filled only after a click, no
+// launch whose answer was lost), then from its invariants: a cleanup effect on every exit
+// path, never a tool set other than fs_read, no field a draft may not fill, a form filled only after a click, no
 // input mutated, and the same event twice neither deletes nor launches twice.
 //
-// Defaults chosen where the specs are silent are marked "default:" at the case.
+// Defaults chosen where the requirements are silent are marked "default:" at the case.
 import { assert, finish, test } from "../test/harness.mjs";
 import * as draft from "./draft.js";
 import * as view from "./draft-view.js";
@@ -119,7 +119,7 @@ test("draftHolds: no state, a non-object state or an unknown phase holds nothing
 
 const LAUNCH_QUERY_KEYS = ["agent_profile", "allowed_tools", "idempotency_key", "provider", "session_name", "working_directory"];
 
-test("draftCall launch: one POST /sessions with exactly the spec's query, fs_read, and the message in the body only", () => {
+test("draftCall launch: one POST /sessions with exactly the expected query, fs_read, and the message in the body only", () => {
   const req = request();
   const call = view.draftCall(deepFreeze({ type: "launch", request: req, attempt: 1 }));
   assert.deepEqual([call.method, call.path], ["POST", "/sessions"]);
@@ -379,7 +379,7 @@ function reached(where, h) {
   return p.state;
 }
 
-test("draftActionList: each phase offers the buttons the spec allows (Draft, Cancel, Retry, Fix with AI), and none while cleaning", () => {
+test("draftActionList: each phase offers the buttons it allows (Draft, Cancel, Retry, Fix with AI), and none while cleaning", () => {
   const draftOnly = { validate: () => [] };
   const noErrors = (() => { const p = flowPanel(undefined, draftOnly); p.click("Draft", request()); p.settle(); p.push(finished); p.settle(); return p.state; })();
   assert.deepEqual(view.draftActionList(reached("idle")), ["Draft"]);
@@ -602,7 +602,7 @@ test("flowFormFromDraft: a field the draft names replaces what the user typed, a
   assert.equal(r.marks.name, AI);
 });
 
-test("flowFormFromDraft: nothing the spec forbids is filled: enabled, a script, a path, the kind or a form key are not taken from a draft", () => {
+test("flowFormFromDraft: nothing a draft may not fill is filled: enabled, a script, a path, the kind or a form key are not taken from a draft", () => {
   const hostile = { enabled: "true", script: "/bin/sh -c x", engine: "x", path: "/etc/passwd", workflow: "evil", kind: "workflow", id: "9", profile: "evil", prompt: "evil", agent_profile_: "x", marks: "AI", run: "now", save: "yes" };
   const r = view.flowFormFromDraft(deepFreeze({ ...FORM }), deepFreeze(parsedFlow(hostile)));
   assert.deepEqual(r.form, FORM);
@@ -828,7 +828,7 @@ test("draftFormDirty: a blank description with no session to clean up loses noth
   }
 });
 
-// ---- the spec's scenarios, through the glue and the reducer ----------------------------------------
+// ---- the scenarios, through the glue and the reducer ----------------------------------------
 
 const calls = (p, method) => p.calls.filter((c) => (c.method ?? "GET") === method);
 const deletes = (p) => calls(p, "DELETE").map((c) => c.path);
@@ -1449,7 +1449,7 @@ test("Install-time provider refused: draftProviders [kiro_cli] and a profile tha
 
 // ---- the author's tools can only be limited to CAO's own when it has no other MCP server --------------------------
 // A restricted claude_code launch writes every mcpServers entry of the profile into --mcp-config, so a server other
-// than cao-mcp-server stays callable whatever allowed_tools says (spec cao-window-ai-draft, "Author profile with
+// than cao-mcp-server stays callable whatever allowed_tools says (scenario "Author profile with
 // another MCP server"). The cases read the profile the way the panel does, through profileFromOutcome, so they hold
 // whatever name the profile object gives its list of servers.
 
@@ -1513,10 +1513,10 @@ test("Author profile with exactly cao-mcp-server passes, whatever its entry hold
 // ---- the author must declare exactly cao-mcp-server, and must not be a native agent ----------------------------------
 // claude_code adds --mcp-config and --strict-mcp-config only when the profile's mcpServers is not empty. With none
 // declared it starts with the operator's own MCP discovery (user level, project .mcp.json, plugins), so "no other
-// server" is not enough: the profile has to name cao-mcp-server and nothing else (spec cao-window-ai-draft, scenarios
+// server" is not enough: the profile has to name cao-mcp-server and nothing else (scenarios
 // "Author profile with no MCP server declared" and "Author profile that is a native agent"). A native_agent profile
 // keeps its MCP configuration in Claude's own agent file, which the profile read does not show.
-// Chosen where the spec is silent: the list must be exactly ["cao-mcp-server"], so a repeated name is refused too;
+// Chosen where the requirements are silent: the list must be exactly ["cao-mcp-server"], so a repeated name is refused too;
 // native_agent counts as set for any value but absent, null, "" and false (so " " and true are set).
 
 const EXACT_NOTE = /exactly[^.]*cao-mcp-server/i;
@@ -1614,7 +1614,7 @@ test("draftBeginCheck: a readable profile that names no provider resolves to the
   }
 });
 
-test("draftBeginCheck: the provider rules follow the spec's order: install-time, not native, not allowed, not installed, no directory", () => {
+test("draftBeginCheck: the provider rules apply in this order: install-time, not native, not allowed, not installed, no directory", () => {
   const at = (over) => view.draftBeginCheck({ ...BEGIN, ...over }).code;
   assert.equal(at({ detail: { provider: "kiro_cli", mcpServers: ["cao-mcp-server"] }, draftProviders: ["claude_code"], providers: [], workdir: "" }), "install_time");
   assert.equal(at({ detail: { provider: "codex", mcpServers: ["cao-mcp-server"] }, draftProviders: ["claude_code"], providers: [], workdir: "" }), "not_native");
@@ -1843,7 +1843,7 @@ test("draftFillPlan flow: a field the draft does not name keeps its typed text a
   assert.equal(view.draftFillPlan("flow", { form: { ...FORM, profile: undefined } }, undefined).loadProfile, null);
 });
 
-test("draftFillPlan flow: what the spec forbids is not filled, and the plan's form is a new object", () => {
+test("draftFillPlan flow: what a draft may not fill is not filled, and the plan's form is a new object", () => {
   const form = deepFreeze({ ...FORM });
   const hostile = JSON.parse('{"enabled":"true","script":"/bin/sh","path":"/etc","__proto__":{"polluted":"yes"},"constructor":"x","name":"ok"}');
   const plan = view.draftFillPlan("flow", { form, touched: {} }, hostile);

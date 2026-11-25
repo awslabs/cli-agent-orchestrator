@@ -1,7 +1,6 @@
-// lib/flows.js: the New flow and Edit form helpers added with task 10.5 (spec cao-window-flows "New flow
-// and edit", flow-authoring-api for the routes the form calls, design D13 and D14). Cases come from the
-// spec scenarios first: Create disabled, Validation errors, Duplicate on create, Parse-shape 422, Numeric
-// day of week, Schedule a workflow. Inputs are deep-frozen where it matters, so a function that writes to
+// lib/flows.js: the New flow and Edit form helpers (the routes the form calls are the flow-authoring API
+// in docs/flows.md). Cases come from the intended behaviour first: Create disabled, Validation errors,
+// Duplicate on create, Parse-shape 422, Numeric day of week, Schedule a workflow. Inputs are deep-frozen where it matters, so a function that writes to
 // its argument throws.
 import { assert, finish, test } from "../test/harness.mjs";
 import { callCao } from "./cao.js";
@@ -302,7 +301,7 @@ test("Create is off under a gate (auth, unreachable, not connected) and while a 
 });
 
 // An older server has no POST /flows/validate, and its POST /flows arms the flow and overwrites the file of a
-// same-named flow, so the window cannot create there (spec cao-window-flows, "Validate route missing"). The form
+// same-named flow, so the window cannot create there (the validate route is missing). The form
 // says how to create it from a terminal instead.
 const CLI_ADD = "cao schedule add";
 const CLI_DISABLE = "cao schedule disable";
@@ -503,10 +502,9 @@ test("Schedule a workflow: a form opened with a workflow chosen is clean until t
 });
 
 // ===================================================================================================
-// Round 3: what a flow save attempt does, what its answer does to the form, why a check gave no answer,
-// and the CLI named when a flow is too large to send. Spec: cao-window-flows "New flow and edit"
-// (Create disabled, Validation errors, Duplicate on create, Parse-shape 422), cao-window-sessions
-// "CAO data goes through exec" (Body too large for argument mode) and design D14.
+// What a flow save attempt does, what its answer does to the form, why a check gave no answer,
+// and the CLI named when a flow is too large to send (Create disabled, Validation errors, Duplicate on
+// create, Parse-shape 422, and a body too large for argument mode).
 // ===================================================================================================
 
 const CFG = { machine: "cao", port: 9889, stdin: false };
@@ -783,7 +781,7 @@ test("an effect that is not done selects nothing, and flowSaveEffects of nothing
   assert.equal(flows.flowSaveEffects({ type: "saved", name: "a", armed: false }).done, true, "no options at all");
 });
 
-// Validation errors (spec cao-window-flows): "Create is dimmed and sends nothing until a check of the current
+// Validation errors: "Create is dimmed and sends nothing until a check of the current
 // fields says valid, and pressing it checks again and moves focus to the first error". Pressing a dimmed
 // Create whose current fields were already checked must still run a check, since the server's answer may
 // have changed (the name may be taken by now); flowSaveAttempt only checks when the fields are unchecked.

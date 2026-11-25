@@ -1,15 +1,15 @@
-// The view models of the left sidebar's two blocks (design D25, D26 and D37): one line per session in the
+// The view models of the left sidebar's two blocks: one line per session in the
 // Sessions block, and the agent tree and header of the selected session in the Agents block. Pure, so
 // `node lib/agents.test.mjs` runs it; the mods only draw what these return. A session row is a letter badge, a name,
 // the state mark and, when it has one, an extra mark; an agent row is the logo of its program, a name, an age, the state mark and, for a worker, a pin
 // (the lists of Herdr's own window, copied). The state is the mark; its words and the other facts are the row's `tip`, the plain text
-// of its tooltip. No function mutates its arguments. Top-level names are unique across lib/*.js (bundle mode, D8), so every helper here is
+// of its tooltip. No function mutates its arguments. Top-level names are unique across lib/*.js (bundle mode puts every shared module in one scope), so every helper here is
 // prefixed `ag`. Source stays ASCII: the middle dot is written as an escape.
 import { HONESTY } from "./honesty.js";
 import { cronHuman } from "./flows.js";
 import { ageWords, askingKind, contextPercent, displayState, flowOfSession, olderFirst, parseRecap, rowShowsReplied, seenState, sessionTree, statusShape, tabsFor, waitingCount } from "./logic.js";
 
-// ---------- names, words and ages (D37) ----------
+// ---------- names, words and ages ----------
 
 const agText = (v) => (typeof v === "string" && v.trim() !== "" ? v.trim() : undefined);
 
@@ -35,7 +35,7 @@ export function ageShort(ms) {
 }
 
 // The words of a display state, as Herdr says them: a blocked agent "needs you", with the kind of what it asks when Herdr reports one
-// ("needs you: permission"); an agent that waits on its workers (D38) says how many.
+// ("needs you: permission"); an agent that waits on its workers says how many.
 function agWord(state, t) {
   if (state === "blocked") return askingKind(t) === null ? "needs you" : `needs you: ${askingKind(t)}`;
   if (state !== "waiting") return state;
@@ -43,7 +43,7 @@ function agWord(state, t) {
   return `waiting on ${n} worker${n === 1 ? "" : "s"}`;
 }
 
-// ---------- the session's letter badge (D37) ----------
+// ---------- the session's letter badge ----------
 
 // The Sessions block is styled like Herdr's own spaces list (mods/spaces/main.js of Herdr 0.1.17). A space there is an 18 px badge
 // with the first letter of its name (:502), filled with a colour that is a stored assignment per space and not derived from the name:
@@ -56,7 +56,7 @@ const AG_DEFAULT_COLOR = "ansi6";
 const agColorName = (v) => (typeof v === "string" && v !== "" ? v : undefined);
 
 // The letter of a badge. Herdr takes the first code point of the name, upper-cased ([...name][0]?.toUpperCase() ?? "?", :502). Every CAO
-// session name starts with `cao-`, so that rule gave every badge a C (owner review, D39 A): a leading `cao-` (any case) is skipped and the
+// session name starts with `cao-`, so that rule gave every badge a C: a leading `cao-` (any case) is skipped and the
 // first letter or digit after it is taken, upper-cased. A name that is only `cao-`, or has nothing alphanumeric after it, and a name
 // without the prefix use Herdr's rule on the whole name.
 const AG_PREFIX = /^cao-/i;
@@ -98,7 +98,7 @@ export function badgeFill(color, theme) {
   return agColorName(token) ?? AG_MARK[AG_DEFAULT_COLOR];
 }
 
-// ---------- the agent's program icon (D37) ----------
+// ---------- the agent's program icon ----------
 
 // Herdr's Agents list and its tabs mod draw the icon of the terminal's resolved program (`program.icon`, a path in the home folder
 // such as `icons/claude.svg`) by `p.tint ? svg(p.icon) : image(p.icon)` (mods/agents/main.js:78-81, mods/tabs/main.js:120). The app's own
@@ -112,10 +112,10 @@ export function programIcon(program) {
   return icon === undefined ? { ...AG_FALLBACK_ICON } : { path: icon, tint: Boolean(program.tint) };
 }
 
-// ---------- the session line (D26) ----------
+// ---------- the session line ----------
 
 // One session -> what its line in the Sessions block shows, and no agent rows: the name; the status shape of the first talkable
-// agent (no state word: the shape is the state); an `extra` mark beside it (D39 D: no pill, no word, only a shape and a colour): "bang",
+// agent (no state word: the shape is the state); an `extra` mark beside it (no pill and no word, only a shape and a colour): "bang",
 // Herdr's needs-you square, when any terminal of the session is blocked and the agent's own mark is not already that square, else "dot-hi",
 // the done dot in the highlight colour, when a talkable agent has replied and the agent's own mark is not already that dot, else null
 // (a recorded draft author session shows its tag and no extra mark); the "stuck?" hint with its label; and `tip`, the
@@ -146,7 +146,7 @@ export function sessionLine(session, { replied = () => false, quiet = null, colo
   };
 }
 
-// ---------- the agent tree (D26) ----------
+// ---------- the agent tree ----------
 
 // The facts of an agent that its row does not draw, for its tooltip: its state in words and the time in it, its
 // turn, "talkable" or "worker", its seen state when it is talkable, and Herdr's status message while it works.
@@ -164,7 +164,7 @@ function agFacts(t, state, worker, now, local) {
   ].filter(Boolean).join(", ");
 }
 
-// The agents of a session in tree order. Every agent is shown, whatever their number (design D41 A, D42 C): the block is the tree of who
+// The agents of a session in tree order. Every agent is shown, whatever their number: the block is the tree of who
 // started whom, and it scrolls when it is taller than the block. A row's parent is the terminal its caller names; its depth is one more
 // than its parent's. A row whose caller is not among the session's terminals sits at depth 1 with the note "parent not listed" (that missing
 // parent counts as the step above it). Siblings, and the top level, are in creation order, then by id. No session (null, or the stored
@@ -172,8 +172,8 @@ function agFacts(t, state, worker, now, local) {
 // ctx {now, replied, local} (all optional) feeds the age and the tooltip: the clock, the model's replied predicate and the per-window seen map.
 // A row is one line: the program `icon` of the agent ({path, tint}, programIcon), its `name` (agentName) and `main`, its best-guess
 // label when it has one, its compact `age` (null without a clock), its status shape and, in the 18 px slot at the right end, its `slot`:
-// "pin" for a worker (its pin marker, with `pinTip`, "pinned" or "click to pin"), "crown" for the session's main agent (its crown, design D41 D)
-// and "blank" for any other talkable agent, so the status marks stay in one column. It carries no state word and no pill (D39 D): its mark is the state, a needs-you square or a highlighted dot
+// "pin" for a worker (its pin marker, with `pinTip`, "pinned" or "click to pin"), "crown" for the session's main agent (its crown)
+// and "blank" for any other talkable agent, so the status marks stay in one column. It carries no state word and no pill: its mark is the state, a needs-you square or a highlighted dot
 // included, and `tip` holds the name, the state in words ("needs you: <kind>", "replied") and the other facts. A pin decides only the top-bar
 // tab.
 // -> {rows: [{id, name, icon, main, slot, shape, depth, worker, pinned, pinTip, label, parentNote, age, tip, term}]}
@@ -219,7 +219,7 @@ export function agentRows(session, pins = [], { now, replied = () => false, loca
   return { rows };
 }
 
-// ---------- the pin (D37) ----------
+// ---------- the pin ----------
 
 // What a worker row's pin marker draws. Herdr's own pin (`mods/workspace-chrome/pin.svg`, drawn by its Agents list with
 // `svg("mods/workspace-chrome/pin.svg").size(13)`, mods/agents/main.js:343) is an outline in both states and `svg()` takes a colour,
@@ -231,7 +231,7 @@ const AG_PIN_PINNED = "mods/cao-window-side/pin-filled.svg";
 const AG_PIN_LOOSE = "mods/cao-window-side/pin-tilted.svg";
 export const pinMark = (pinned) => (pinned === true ? { icon: AG_PIN_PINNED, tone: "accent" } : { icon: AG_PIN_LOOSE, tone: "dim" });
 
-// ---------- the main agent's crown (D37) ----------
+// ---------- the main agent's crown ----------
 
 // The main agent of a session is the one its Sessions row speaks for, the first talkable agent (`session.talkable[0]`: the conductor or
 // coordinator the user talks to). Its Agents row carries a small crown in the slot at the right end where a worker carries its pin (agentRows'
@@ -240,7 +240,7 @@ export const pinMark = (pinned) => (pinned === true ? { icon: AG_PIN_PINNED, ton
 // `icon` is found by `mods/<mod>/<file>` as the pin drawings are. -> {icon, tone}
 export const CROWN_MARK = Object.freeze({ icon: "mods/cao-window-side/crown.svg", tone: "accent" });
 
-// ---------- the top bar's tabs (D37) ----------
+// ---------- the top bar's tabs ----------
 
 // The tabs of a session: the agents tabsFor picks (the talkable agents and the pinned workers; one is one tab, none shown is none), each as
 // {id, name, icon, main, tip, term}, in the order the Agents block lists them: agentRows' tree order (the conductor first, each agent's
@@ -249,7 +249,7 @@ export const CROWN_MARK = Object.freeze({ icon: "mods/cao-window-side/crown.svg"
 // (it undoes a manual drag), but this bar is a row of the window's own, so its order is the window's to set. The block lists every agent, so
 // a pinned worker hangs under its real parent. The name is agentName, the one an
 // Agents row shows, so the conductor and a worker are named alike and a tab carries no tag of its role. The icon is the row's. A tab
-// carries no state mark (the owner found the top bar's status dot not helpful, D37 T): the state is drawn on the Agents row and the
+// carries no state mark (a status dot in the top bar was not helpful): the state is drawn on the Agents row and the
 // Sessions line, and `tip`, the row's tooltip, says it in words on the tab (a reply marks a talkable agent only). `replied(terminal)`
 // is the model's predicate. No function of this module mutates its
 // arguments.
@@ -261,7 +261,7 @@ export function tabViews(session, pins = [], { replied = () => false } = {}) {
     .map((r) => ({ id: r.id, name: r.name, icon: r.icon, main: r.main, tip: r.tip, term: r.term }));
 }
 
-// ---------- the focused terminal's row (D37) ----------
+// ---------- the focused terminal's row ----------
 
 const agIsAddress = (address, f) => typeof address === "string" && (address === f || address.endsWith(`/${f}`));
 
@@ -276,7 +276,7 @@ export function focusedRow(view, focus) {
   return view.rows.find((r) => agIsAddress(r.term?.address, f))?.id ?? null;
 }
 
-// ---------- selection and the Agents header (D25) ----------
+// ---------- selection and the Agents header ----------
 
 // A stored selection -> {kind: "session", name}, or null. Anything else the shipped window stored there
 // (flow, workflow and new-* kinds) or a malformed value reads as no selection, so an upgrade needs no cleanup.
@@ -290,8 +290,8 @@ export function sessionSelection(raw) {
 // when nothing is selected. `flows` is the trimmed flow list ({name, schedule, enabled}); `props.
 // contextPercentRegex` turns the context percentage on; `reads` is what was read for the session: the screen
 // text of its talkable root once that root's turn ended ({text}). The block carries no "done means" sentence
-// and no known-gap note (the status bar help has both) and no working directory (D37 R: the owner found a path
-// in the Agents list not helpful).
+// and no known-gap note (the status bar help has both) and no working directory (a path
+// in the Agents list was not helpful).
 // -> {title, note, flow: {flow, text, label, schedule} | null, recap: {text, label} | null,
 //     context: {percent, label} | null}
 export function agentsHeader(session, flows, props, reads) {
@@ -312,7 +312,7 @@ export function agentsHeader(session, flows, props, reads) {
   };
 }
 
-// ---------- the goal text, wrapped (D42 B) ----------
+// ---------- the goal text, wrapped ----------
 
 // The recap of the session's main agent (labelled "the agent's own words") is the one text of the left sidebar that is not cut to one
 // line: it wraps up to three lines at the size of the agent rows, and an ellipsis ends the third when words are left (the full text is the
@@ -350,7 +350,7 @@ export function goalLines(text, width) {
   return [...lines.slice(0, GOAL_LINES - 1), `${kept.join("").trimEnd()}\u2026`];
 }
 
-// ---------- the Sessions header and the folded summaries (D25) ----------
+// ---------- the Sessions header and the folded summaries ----------
 
 const AG_FILTERS = ["asking", "replied", "working"];
 const agLive = (sessions) => (Array.isArray(sessions) ? sessions : []).filter((s) => !s.draft);

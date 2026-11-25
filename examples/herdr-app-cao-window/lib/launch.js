@@ -1,4 +1,4 @@
-// The New session form's rules (cao-window-session-launcher). Pure: no Herdr imports.
+// The New session form's rules. Pure: no Herdr imports.
 //
 // Two tables are copied from the server. Each has a test that reads the Python file at test time and
 // fails on any difference, and a header here that names the file:
@@ -6,7 +6,7 @@
 //   the enforcement text <- src/cli_agent_orchestrator/utils/enforcement.py
 // The YOLO notes for the install-time providers are the ones cli/commands/launch.py prints.
 //
-// Top-level names are unique across lib/*.js, because bundle mode (D8) puts every shared module in one
+// Top-level names are unique across lib/*.js, because bundle mode puts every shared module in one
 // scope: this file owns shq (the shell quoting that flows.js and workflows.js reuse) and buildRequest.
 import { utf8Length } from "./cao.js";
 import { HONESTY } from "./honesty.js";
@@ -142,7 +142,7 @@ export const policyDefault = () => "ask";
 export const profilesForForm = (rows) =>
   (Array.isArray(rows) ? rows : []).filter((r) => r && r.loadable === true && typeof r.name === "string" && r.name !== "" && !r.name.startsWith("."));
 export const resolvedProvider = (form, profile) => form?.provider || profile?.provider || "kiro_cli";
-// Fields that spike 1.3 found `POST /sessions` refuses (named as the form names them). None.
+// Fields that `POST /sessions` is known to refuse (named as the form names them). None.
 export const CLI_ONLY_FIELDS = Object.freeze([]);
 
 // ---------- the form ----------
@@ -309,7 +309,7 @@ export function launchOutcome(outcome, form) {
   return { type: "error", message: outcome?.detail ?? outcome?.message ?? "launch failed" };
 }
 
-// ---------- what the New session form in the panel decides (task 9.2 and 9.3) ----------
+// ---------- what the New session form in the panel decides ----------
 
 // What pressing Launch does: show the problems at their fields (the first one takes focus), open the
 // Ask-first or YOLO dialog, or send at once (Auto-approve). ctx as launchBlocked takes it.

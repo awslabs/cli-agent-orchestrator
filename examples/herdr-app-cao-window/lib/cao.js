@@ -1,15 +1,15 @@
 // The CAO data path. Every call the window makes to cao-server is built here and nowhere else:
 // exec("curl", [...], {on: <CAO machine>, timeout}) against the loopback address of that machine
-// (127.0.0.1:<port>). No other host, no port forward (cao-window-sessions). Pure: curlRequest returns
+// (127.0.0.1:<port>). No other host, no port forward. Pure: curlRequest returns
 // the exec call to make, outcomeFrom reads the result, and callCao glues them to an injected exec.
 // Top-level names are unique across lib/*.js (launch.js owns buildRequest and shq, which flows.js and
-// workflows.js import), because bundle mode (D8) puts every shared module in one scope.
+// workflows.js import), because bundle mode puts every shared module and the mod's own code in one scope.
 import { splitStatus } from "./logic.js";
 
 // Linux limits one argument to PAGE_SIZE * 32 bytes including its NUL (131072 with 4 KiB pages); a
 // longer one makes execve of curl fail with E2BIG. 120 KiB of encoded JSON leaves a margin.
 export const ARG_BODY_MAX = 122880;
-// Spike 1.10: exec feeds no stdin (its options are cwd, on and timeout), so bodies travel as a
+// Herdr's exec feeds no stdin (its options are cwd, on and timeout), so bodies travel as a
 // --data-binary argument, the size cap above applies and env_vars is never sent. If a later Herdr
 // feeds stdin, set STDIN_SUPPORTED and check STDIN_OPTION names its option.
 export const STDIN_SUPPORTED = false;

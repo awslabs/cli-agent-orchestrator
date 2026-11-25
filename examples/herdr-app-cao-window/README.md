@@ -118,20 +118,20 @@ If the `settings.json` names a theme and your main home has no `themes/<name>.js
 
 ### The two environment switches
 
-Two switches come from the environment, not from options. Each records the outcome of a spike on the Herdr app, so the installer tests set them. Both are off by default. The summary line prints the value in effect, so a variable left exported in your shell shows.
+Two switches come from the environment, not from options. Each records the outcome of an experiment on the Herdr app, so the installer tests set them. Both are off by default. The summary line prints the value in effect, so a variable left exported in your shell shows.
 
 | Switch | Default | Effect |
 |---|---|---|
 | `TOAST_MOD=1` | `0` (off) | Installs the `cao-window-toast` mod and sets the layout's root `toast` key to it. |
 | `MOD_IMPORTS=bundle` | `copy` | Writes one `main.js` per mod, with the shared modules inlined, instead of copying `lib/*.js` flat into each mod folder. |
 
-**`TOAST_MOD`.** The spike on the toast contract (spike 1.13) found that a mod named by the layout's root `toast` key receives every notification, so `TOAST_MOD=1` works. It is not the default for this reason: the toast mod in this folder only redraws Herdr's own toasts. It does not hold them or release them on a hand-off, because the spike that decides whether holding works needs a person to run it for 30 minutes (spike 1.5) and has not run. With the mod on, every notification, including the alert for a blocked agent, depends on it. With the mod off, Herdr's own toasts show unchanged, and the Dock badge shows the number of asking agents. Set `TOAST_MOD=1` when you want to try the window's own toast. Set it on every installer run: a run without it derives the layout without the `toast` key.
+**`TOAST_MOD`.** An experiment on the toast contract found that a mod named by the layout's root `toast` key receives every notification, so `TOAST_MOD=1` works. It is not the default for this reason: the toast mod in this folder only redraws Herdr's own toasts. It does not hold them or release them on a hand-off, because the experiment that decides whether holding works needs a person to run it for 30 minutes and has not run. With the mod on, every notification, including the alert for a blocked agent, depends on it. With the mod off, Herdr's own toasts show unchanged, and the Dock badge shows the number of asking agents. Set `TOAST_MOD=1` when you want to try the window's own toast. Set it on every installer run: a run without it derives the layout without the `toast` key.
 
 ```sh
 TOAST_MOD=1 sh install.sh --cao-ssh-host build-box
 ```
 
-**`MOD_IMPORTS`.** Every mod imports the shared modules from its own folder (`./logic.js`). Spike 1.2 confirmed that Herdr loads such imports, so the default `copy` stands. Set `MOD_IMPORTS=bundle` only if a later Herdr stops loading them, which shows as an import error when a mod loads. Bundle mode leaves only `mod.json` and `main.js` in each mod folder. In either mode the installer copies only a mod's `mod.json` and `.js` files, so a stray file in the source folder (a sync tool's temp file, a note) is not installed or listed in the manifest.
+**`MOD_IMPORTS`.** Every mod imports the shared modules from its own folder (`./logic.js`). An experiment confirmed that Herdr loads such imports, so the default `copy` stands. Set `MOD_IMPORTS=bundle` only if a later Herdr stops loading them, which shows as an import error when a mod loads. Bundle mode leaves only `mod.json` and `main.js` in each mod folder. In either mode the installer copies only a mod's `mod.json` and `.js` files, so a stray file in the source folder (a sync tool's temp file, a note) is not installed or listed in the manifest.
 
 ## Configure the window
 
@@ -207,7 +207,7 @@ What it costs, and what to know:
 
 ## Remove the CAO machine from your main window
 
-This step is required before you rely on the window. Your main window and the CAO window both show the CAO terminals while the main window's core session lists the CAO machine. Both windows then write the same CAO structure document ("the newest write wins"), and both ring alerts for the same agents. Two spikes did not run: one that tests two windows writing one document (spike 1.7) and one that tests the updater with two processes (spike 1.8). The safe default therefore applies: remove the CAO machine from the main window's core session. CHECKLIST.md (U19) runs exactly that two-writer state once, while the CAO machine is still in your main window: it asks you to rename and reorder a tab and to report any lost or duplicated tab.
+This step is required before you rely on the window. Your main window and the CAO window both show the CAO terminals while the main window's core session lists the CAO machine. Both windows then write the same CAO structure document ("the newest write wins"), and both ring alerts for the same agents. Two experiments did not run: one that tests two windows writing one document and one that tests the updater with two processes. The safe default therefore applies: remove the CAO machine from the main window's core session. CHECKLIST.md (U19) runs exactly that two-writer state once, while the CAO machine is still in your main window: it asks you to rename and reorder a tab and to report any lost or duplicated tab.
 
 The installer never does this. Do it by hand, after the CAO window works (run the checklist first):
 
@@ -284,7 +284,7 @@ A broad named list, for example `fs_*,execute_bash,web_fetch`, does not take the
 
 **The process list.** The window sends request bodies to cao-server as a curl argument, through `exec` on the CAO machine. For as long as that curl runs, anyone who can list processes on the CAO machine can read the body. Bodies are initial messages, schedule prompts, workflow source, workflow run inputs, and Draft descriptions. Do not type a secret into any of them. Env values are never sent.
 
-**Why env values are not sent.** Environment values are where secrets go. `exec` has no way to feed a request body on stdin (spike 1.10), so the window never puts env values in a request. When you fill an env row in New session, Launch is disabled and the form shows the `cao launch ... --env KEY=VALUE` command to run in a terminal on the CAO machine, where the CLI sends the values itself.
+**Why env values are not sent.** Environment values are where secrets go. `exec` has no way to feed a request body on stdin, so the window never puts env values in a request. When you fill an env row in New session, Launch is disabled and the form shows the `cao launch ... --env KEY=VALUE` command to run in a terminal on the CAO machine, where the CLI sends the values itself.
 
 **Body size.** Linux limits one argument to 128 KiB, so the window refuses a request body over 122880 bytes (120 KiB, JSON-encoded). The refusal names the CLI command that does the same write.
 

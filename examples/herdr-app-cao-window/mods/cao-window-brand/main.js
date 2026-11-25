@@ -1,9 +1,9 @@
-// The top-left row of the CAO window's left sidebar (design D37 S): Herdr's own row with the CAO mark and "CAO" where Herdr draws
+// The top-left row of the CAO window's left sidebar: Herdr's own row with the CAO mark and "CAO" where Herdr draws
 // its logo and "Herdr", so the window is clearly the CAO window. Herdr draws this row with its shipped `workspace-chrome` mod in the layout's
 // `brand` block; make-window.jq points that block here, and the sidebar's footer stays on `workspace-chrome`. Each part
 // below names the lines of that mod (mods/workspace-chrome/main.js of Herdr 0.1.17) that it mirrors, so a Herdr that
 // changes the row is found by reading them again. The two icons are files every Herdr home holds; the mark is the
-// project's own, two drawings in this folder (D42 A). It does nothing but draw the row and run the two buttons.
+// project's own, two drawings in this folder. It does nothing but draw the row and run the two buttons.
 import { View, div, image, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
 import { theme, run, window, shared, setShared, layout } from "herdr";
@@ -23,7 +23,7 @@ function brandFind(node, id) {
 const brandNarrow = () => (brandFind(layout(), "sidebar")?.size?.px ?? Infinity) < 160;
 
 // workspace-chrome/main.js:18-24, to the rail (on macOS wide enough for the traffic lights), or back to the width it had.
-// The sidebar's range (min 200) clamps the 76 px: the fold button leaves it at 200 px (design D37).
+// The sidebar's range (min 200) clamps the 76 px: the fold button leaves it at 200 px.
 function brandToggle() {
   const width = brandFind(layout(), "sidebar")?.size?.px;
   const rail = brandNarrow();
@@ -42,7 +42,7 @@ export default class CaoBrand extends View {
 
   // workspace-chrome/main.js:48-53, the row: padding, room for the macOS traffic lights, the mark and the text, the search
   // button and the fold button. On the macOS rail the traffic lights fill the row, and the fold button is not drawn. The text takes the weight of
-  // the person's font_weight setting like the rows of the window; Herdr's own wordmark (:50) says font_semibold (owner review, D39 E).
+  // the person's font_weight setting like the rows of the window; Herdr's own wordmark (:50) says font_semibold.
   // The mark is a full-colour `image()` (`svg()` tints one colour), the light or the dark drawing by the theme's brightness (brandMark).
   render() {
     const t = theme();

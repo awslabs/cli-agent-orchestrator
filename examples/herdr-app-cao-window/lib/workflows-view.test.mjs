@@ -1,9 +1,8 @@
-// lib/workflows-view.js: what the Workflows section and the workflow views of the panel decide (spec
-// cao-window-workflows; cao-window-honesty-labels "inputsUndescribed"; cao-window-sessions "Failure states";
-// design D15 to D17; tasks 11.2 to 11.4). The test list comes from the specs; the code was read afterwards
-// for edge cases.
+// lib/workflows-view.js: what the Workflows section and the workflow views of the panel decide (including
+// the inputsUndescribed honesty label and the failure states that keep the last good view). The test list
+// was written from the intended behaviour; the code was read afterwards for edge cases.
 //
-// Defaults chosen where the specs are silent (each has a test that says so):
+// Defaults chosen where the intended behaviour is silent (each has a test that says so):
 //  - a tie on the start time of two runs: the one listed first (the server lists newest first) is the newest;
 //  - a write check with no run list at all sends (nothing contradicts the snapshot); with a list it must agree;
 //  - an unroutable name or run id is left out of rows and gives no route;

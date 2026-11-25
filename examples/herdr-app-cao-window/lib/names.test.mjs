@@ -1,4 +1,4 @@
-// Bundle mode (design D8) puts every shared module in one scope, so a top-level name used by two
+// Bundle mode puts every shared module in one scope, so a top-level name used by two
 // lib/*.js files would clash there while it works under the flat copy. This lists the top-level
 // declarations of each module and fails on a name two modules declare.
 import { readdirSync, readFileSync } from "node:fs";

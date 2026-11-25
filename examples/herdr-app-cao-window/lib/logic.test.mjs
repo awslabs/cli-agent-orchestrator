@@ -1,6 +1,5 @@
 // lib/logic.js: the window's pure rules for sessions, pins, seen state, status counts, failure states and
-// the hand-off toast (specs cao-window-sessions and cao-window-honesty-labels; tasks 7.1, 7.2, 7.3, 7.5
-// step 1, 7.7, 8.1 and 8.3).
+// the hand-off toast.
 //
 // The module is imported as a namespace so a function that is not written yet fails its own case with
 // "x is not a function" instead of stopping the whole file at the import line.
@@ -40,7 +39,7 @@ const freeze = (v) => {
 };
 const sess = (name, terms, over = {}) => ({ name, terms, ...classify(terms, {}, []), ...over });
 
-// ---- the terminal adapter (plan-derived: the spec reads terminals() but not its shape) ----
+// ---- the terminal adapter (the shape of terminals() is assumed here, not documented) ----
 test("termOf reads labels in object form and in array form", () => {
   const a = termOf({ address: "cao/t1", labels: { "cao.terminal_id": "t1", "cao.session": "cao-a", "cao.profile": "conductor", "herdr.seen": "3" }, status: "idle", turn: 4, created_ms: 9, status_ms: 7 });
   assert.deepEqual([a.id, a.session, a.profile, a.caller, a.seen, a.turn, a.createdMs, a.statusMs], ["t1", "cao-a", "conductor", undefined, 3, 4, 9, 7]);
@@ -77,7 +76,7 @@ test("caoTerms keeps only terminals with a CAO session and terminal id", () => {
   assert.deepEqual(caoTerms(raw).map((t) => t.id), ["t1"]);
 });
 
-// ---- classify: talkable agents and workers (Requirement "Talkable agents and workers") ----
+// ---- classify: talkable agents and workers ----
 test("Conductor with workers: the root is talkable, three workers fold into one line", () => {
   const s = classify([T("c1", "s"), worker("w1", "s"), worker("w2", "s"), worker("w3", "s")], {}, []);
   assert.deepEqual(s.talkable.map((t) => t.id), ["c1"]);
@@ -131,7 +130,7 @@ test("a terminal with no profile label is not guessed at: the session shows exac
   assert.deepEqual(s.talkable.map((t) => t.id), ["t1"], "its first terminal");
   assert.equal(s.workers.length, 1);
 });
-test("classification uses the cached D7 values once the fallback resolved a terminal", () => {
+test("classification uses the cached profile values once the fallback resolved a terminal", () => {
   const terms = [T("t1", "s", { profile: undefined }), T("t2", "s", { profile: undefined, createdMs: 2 })];
   const cache = {
     t1: { state: "ok", agent_profile: "conductor", caller_id: null },
@@ -170,7 +169,7 @@ test("sessionsFrom keeps unicode session names apart, and groups equal ones", ()
   const out = sessionsFrom([T("a", composed), T("b", composed), T("c", decomposed), T("d", han)]);
   assert.deepEqual(out.map((s) => s.terms.length), [2, 1, 1], "CAO compares names as given, so the two spellings are two sessions");
 });
-// ---- agent tabs (task 7.5 step 1; Requirement "Agent tabs and the pane") ----
+// ---- agent tabs ----
 test("One shown agent: one tab, the conductor's", () => {
   const s = classify([T("c1", "s"), worker("w1", "s")], {}, []);
   assert.deepEqual(tabsFor(s, []).map((t) => t.id), ["c1"]);
@@ -192,7 +191,7 @@ test("tabsFor: two talkable agents are two tabs; a pin of an unknown or talkable
   assert.deepEqual(tabsFor(classify([T("c1", "s"), worker("w1", "s")], {}, []), ["w1", "w1"]).map((t) => t.id), ["c1", "w1"], "a duplicate pin is one tab");
 });
 
-// ---- pins (Requirement "Pins", design D9) ----
+// ---- pins ----
 test("Pin survives a reconnect: an empty, missing or disconnected snapshot never prunes", () => {
   for (const snap of [[], null, undefined]) assert.deepEqual(prunePins(["w1"], snap), { pins: ["w1"], changed: false });
 });
@@ -217,7 +216,7 @@ test("prunePins does not mutate its arguments and scales to ten thousand pins", 
   assert.ok(Date.now() - t0 < 1000);
 });
 
-// ---- quiet worker hint (Requirement "Quiet worker hint") ----
+// ---- quiet worker hint ----
 const MIN = 60_000;
 const quietSession = (state = "working") => ({ workers: [worker("w1", "s", "c1", { state })] });
 test("Quiet worker: 'stuck?' with the label heuristic once a working worker has been quiet for quietMinutes", () => {
@@ -274,7 +273,7 @@ test("observe does not mutate its arguments", () => {
   assert.doesNotThrow(() => observe(o, freeze([worker("w1", "s")]), 5));
 });
 
-// ---- section summaries (Requirement "Three peer sidebar sections") ----
+// ---- section summaries (three peer sidebar sections) ----
 test("Fold and restore: a folded Flows section shows '5, all off' and 'none yet' when empty", () => {
   assert.equal(sectionSummary("flows", [{ enabled: false }, { enabled: false }, { enabled: false }, { enabled: false }, { enabled: false }]), "5, all off");
   for (const kind of ["flows", "sessions", "workflows"]) assert.equal(sectionSummary(kind, []), "none yet", kind);
@@ -288,7 +287,7 @@ test("sectionSummary counts what is on, asking or running", () => {
   assert.doesNotMatch(sectionSummary("sessions", [{ terms: [T("b", "s")] }]), /asking/);
 });
 
-// ---- "Started by schedule X" (Requirement "Session details"; label via honesty) ----
+// ---- "Started by schedule X" (session details; the label comes from the honesty table) ----
 test("Flow session: cao-flow-<name> for an existing flow reads 'Started by schedule <name>' with its label", () => {
   const r = flowOfSession("cao-flow-daily-report", ["daily-report", "other"]);
   assert.deepEqual([r.flow, r.text, r.label], ["daily-report", "Started by schedule daily-report", HONESTY.flowInferred]);
@@ -309,9 +308,9 @@ test("flowOfSession survives missing input and regex characters in names", () =>
   assert.equal(flowOfSession("cao-flow-日本", ["日本"]).text, "Started by schedule 日本");
 });
 
-// ---- status shapes (Scenario "Every state has its Herdr mark") ----
+// ---- status shapes: every state has its Herdr mark ----
 const EIGHT = ["working", "idle", "done", "replied", "blocked", "quiet", "starting", "error"];
-// Owner review (design D37, change H): the marks are Herdr's own, so the states Herdr has no mark for share the mark of the
+// The marks are Herdr's own, so the states Herdr has no mark for share the mark of the
 // Herdr status they refine (replied is done, error is blocked, quiet is working); lib/agents.test.mjs pins the mapping and the drawing.
 test("Every state has its Herdr mark: working, idle, done and blocked have four different marks, and the other four borrow one", () => {
   const shapes = EIGHT.map(statusShape);
@@ -339,7 +338,7 @@ test("displayState: an error never shows as blocked, and replied never overrides
   assert.ok(EIGHT.includes(displayState(T("a", "s", { state: undefined }), undefined)));
 });
 
-// ---- the D7 fallback (Requirement "Structure falls back to CAO when labels are absent") ----
+// ---- the fallback to CAO's own data when the labels are absent ----
 const unlabelled = (id, over = {}) => T(id, "s", { profile: undefined, ...over });
 test("Older server: each unlabelled terminal is fetched once, labelled ones never", () => {
   const terms = [unlabelled("t1"), unlabelled("t2"), T("t3", "s")];
@@ -388,7 +387,7 @@ test("the fallback functions do not mutate their arguments", () => {
   assert.doesNotThrow(() => { fallbackPlan(cache, terms, 0); markPending(cache, ["t1"], 0); fallbackResult(cache, "t1", { kind: "unreachable" }, 0); withFallback(terms, cache); });
 });
 
-// ---- keyboard (Scenario "Keyboard") ----
+// ---- keyboard ----
 const ITEMS = [
   { kind: "header", section: "sessions" }, { kind: "row", section: "sessions", id: "s1", worker: false },
   { kind: "row", section: "sessions", id: "w1", worker: true }, { kind: "header", section: "flows" },
@@ -431,12 +430,12 @@ test("navStep does not mutate its state", () => {
   assert.doesNotThrow(() => navStep(freeze({ items: ITEMS.map((i) => ({ ...i })), index: 0, folded: {} }), "left"));
 });
 
-// ---- recap, context percentage, known gap (Requirement "Session details"; design D22) ----
+// ---- recap, context percentage, known gap (session details) ----
 test("Recap present: the line is returned as the agent's own words, with its label", () => {
   const r = parseRecap("x\n※ recap: Tests pass; waiting for review.\nmore");
   assert.deepEqual([r.text, r.label], ["Tests pass; waiting for review.", HONESTY.recap]);
 });
-test("Recap present: a later recap line on the screen wins (assumed: the spec shows one line)", () => {
+test("Recap present: a later recap line on the screen wins (assumed: one recap line is shown)", () => {
   assert.equal(parseRecap("※ recap: first\nmore\n※ recap: second\n").text, "second");
 });
 test("No recap: nothing is inferred from text that is not a recap line", () => {
@@ -474,12 +473,12 @@ test("Known gap: the note carries its label and says that done means the turn en
   assert.deepEqual(knownGapNote(), n, "the same note every time");
 });
 
-// ---- seen: who writes herdr.seen, and how "replied" clears (task 7.2; design D10) ----
+// ---- seen: who writes herdr.seen, and how "replied" clears ----
 const REPLIED = T("c1", "s", { state: "done", turn: 10, seen: 9 });
 const FOCUSED = "cao/c1";
 const talk = (t) => ({ ...t, talkable: true });
 
-test("exports: SEEN_VERIFY_MS is 5 s and the default mode is write (spike 1.11)", () => {
+test("exports: SEEN_VERIFY_MS is 5 s and the default mode is write", () => {
   assert.equal(L.SEEN_VERIFY_MS, 5000);
   assert.equal(L.SEEN_MODE_DEFAULT, "write");
 });
@@ -635,7 +634,7 @@ test("Seen state unknown: the session is not counted as replied, and a per-windo
   assert.deepEqual(sortSessions([unknown, working]).map((s) => s.name), ["w", "u"], "by age either way");
 });
 
-// ---- 7.3: the kind of a blocked terminal, the words of its tooltip (Scenario "Needs you in the tooltip with the kind"; no pill, task 29.4) ----
+// ---- the kind of a blocked terminal, the words of its tooltip ("needs you: <kind>"; no pill) ----
 test("Asking kind: the recorded blocked record gives its kind, or none", () => {
   const record = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "test", "fixtures", "blocked-record.json"), "utf8"));
   const t = termOf(record);
@@ -655,7 +654,7 @@ test("Asking kind: the three kinds Herdr names, and a unicode kind, are given as
   for (const kind of ["permission", "question", "auth", "autorisation-é"]) assert.equal(askingKind({ state: "blocked", kind }), kind);
 });
 
-// ---- 7.5 step 1: buildModel, the model the side, tabs and status mods share ----
+// ---- buildModel, the model the side, tabs and status mods share ----
 const raw = (id, session, extra = {}) => ({
   address: `cao/${id}`,
   labels: { "cao.terminal_id": id, "cao.session": session, "cao.profile": extra.profile ?? "conductor", ...(extra.caller ? { "cao.caller": extra.caller } : {}), ...(extra.labels ?? {}) },
@@ -681,7 +680,7 @@ test("buildModel: the replied predicate reads the per-window map and the pins an
   assert.equal(seen.replied(seen.terms[0]), false);
   assert.deepEqual([seen.pins, seen.local], [["w1"], { c1: 5 }]);
 });
-test("buildModel: recorded drafts, the D7 cache, other machines' terminals and junk are handled", () => {
+test("buildModel: recorded drafts, the profile cache, other machines' terminals and junk are handled", () => {
   const m = buildModel(
     [raw("d1", "cao-draft-flow-1", { status: "blocked" }), raw("u1", "old", { labels: { "cao.profile": "" } }), { address: "x", labels: {} }, null],
     [], { machine: "m" }, { ...CTX, drafts: ["d1"] });
@@ -698,7 +697,7 @@ test("buildModel: nothing in, nothing out, and the inputs are not mutated", () =
   assert.doesNotThrow(() => buildModel(freeze([raw("c1", "s"), raw("w1", "s", { profile: "developer", caller: "c1" })]), freeze([]), freeze({ machine: "m" }), freeze({ ...CTX, cache: {}, drafts: [], pins: [], local: {} })));
 });
 
-// ---- 7.7: failure states keep the last good view (Requirement "Failure states keep the last good view") ----
+// ---- failure states keep the last good view ----
 const OK = (json) => ({ kind: "ok", status: 200, json });
 test("Stale data: a failure keeps the last good data and its age is told in minutes", () => {
   const t0 = Date.UTC(2026, 10, 18, 10, 0, 0);
@@ -776,7 +775,7 @@ test("a machine that is not connected is said so in the header, even when CAO al
   assert.match(headerNote({ connected: false, unreachable: true }), /not connected/i);
 });
 
-// ---- 8.1: status bar counts, text and filters (Requirement "Status bar counts and filters") ----
+// ---- status bar counts, text and filters ----
 const BAR = (counts, opts = {}) => barText(counts, opts);
 test("Counts: 13 sessions, one blocked worker, one replied coordinator, five working workers in one session", () => {
   const list = [];
@@ -786,7 +785,7 @@ test("Counts: 13 sessions, one blocked worker, one replied coordinator, five wor
   list.push(sess("busy", [T("cb", "busy"), ...[1, 2, 3, 4, 5].map((i) => worker(`wb${i}`, "busy", "cb", { state: "working" }))]));
   assert.equal(BAR(statusCounts(list, (t) => t.id === "cr")), `cao ${DOT} 13 sessions ${DOT} 1 asking ${DOT} 1 replied ${DOT} 1 working`);
 });
-test("the counts hold the five numbers of the bar under the names the plan gives them", () => {
+test("the counts hold the five numbers of the bar under the names the bar gives them", () => {
   const list = [sess("ask", [T("ca", "ask"), worker("wa", "ask", "ca", { state: "blocked" })]), sess("rest", [T("r", "rest")])];
   assert.deepEqual(statusCounts(list, never), { sessions: 2, asking: 1, replied: 0, repliedUnknown: 0, working: 0 });
 });
@@ -908,7 +907,7 @@ test("filterSessions does not mutate its input", () => {
   assert.doesNotThrow(() => filterSessions(freeze([rest, asking]), "asking", never));
 });
 
-// ---- 8.3: the hand-off toast reducer (Requirement "Hand-off toast"; design D11) ----
+// ---- the hand-off toast reducer ----
 // toastStep(state, event, now) -> [nextState, effects]. The state and event shapes are fixed by the
 // released-toast fixture in lib/honesty.js (queue items with key, kind, session, terminalId, heldAt,
 // releaseAt, later, notification; a focus event with terminal, agentState and busy).
@@ -1079,7 +1078,7 @@ test("a notification that passes through is returned unchanged and in the same s
   const [s] = step(base, notify(note("x", "cao/t9"), info({ cao: false })), 5);
   assert.deepEqual(s, base);
 });
-test("pass-through configured (spike 1.5 default): every notification is shown at once and nothing is held", () => {
+test("pass-through configured (the shipped default): every notification is shown at once and nothing is held", () => {
   const base = initialToast({ passThrough: true });
   const n = note("b", "cao/t9");
   const [s, fx] = step(base, notify(n, info()), 0);
@@ -1152,7 +1151,7 @@ test("unicode and very long titles are carried through the hold unchanged", () =
   assert.equal(shows(fx)[0].notification.title, title);
 });
 
-// ---- review round: cases the first list missed ----
+// ---- more cases the first list missed ----
 test("a worker first seen after the first snapshot is not stuck until quietMinutes after it was first seen", () => {
   let o = initialObs(0);
   o = observe(o, [worker("w1", "s", "c1", { state: "working" })], 0);
@@ -1194,7 +1193,7 @@ test("a pushed value that arrives after the 5 s limit does not verify the write:
   assert.deepEqual(seenVerify(pending, { id: "c1", seen: "10" }, 1000 + 5001), { mode: "local", pending: null });
   assert.deepEqual(seenVerify(pending, { id: "c1", seen: 10 }, 1000 + 4999), { mode: "write", pending: null }, "inside the limit it still verifies");
 });
-test("TOAST_PASS_THROUGH_DEFAULT is true (spike 1.5 was not run)", () => {
+test("TOAST_PASS_THROUGH_DEFAULT is true (holding was never tried against a real Herdr)", () => {
   assert.equal(L.TOAST_PASS_THROUGH_DEFAULT, true);
 });
 test("shippedToastState passes every notification through, as the toast mod ships", () => {
@@ -1262,9 +1261,9 @@ test("Asking kind: a kind with spaces or newlines around it is trimmed", () => {
   assert.equal(askingKind({ state: "blocked", kind: "\tauth\n" }), "auth");
 });
 
-// ---- honesty: the surfaces these tasks own are produced by the registered functions (D23) ----
+// ---- honesty: the surfaces of these rules are produced by the registered functions ----
 const MINE = ["bestGuess", "stuckHint", "contextPercent", "knownGap", "recap", "startedByFlow", "releasedToast"];
-test("sections 7 and 8.3 are built: their seven surfaces are no longer pending", () => {
+test("the session rules and the toast are built: their seven surfaces are no longer pending", () => {
   for (const surface of MINE) assert.ok(!Object.hasOwn(HONESTY_PENDING, surface), `${surface} is still listed as pending`);
 });
 test("the audit calls classify, quietHint, contextPercent, knownGapNote, parseRecap, flowOfSession and toastStep and finds each label", async () => {
@@ -1274,9 +1273,9 @@ test("the audit calls classify, quietHint, contextPercent, knownGapNote, parseRe
 
 // =====================================================================================================
 // Decisions the mods share: holdModel, sharedCache, rowShowsReplied, repaintDue, readOfThisTurn and
-// shownBlock. The cases come from the specs (cao-window-sessions: "Failure states keep the last good
-// view", "Session order and needs-you marking", "Session details", "Structure falls back to CAO when
-// labels are absent") and design D7, D9, D10 and D22, not from the code of these functions.
+// shownBlock. The cases come from the intended behaviour (failure states keep the last good
+// view, the session order and needs-you marking, the session details, the fallback to CAO when
+// labels are absent), not from the code of these functions.
 // =====================================================================================================
 
 // A model as the mods build it: buildModel over raw terminal records, no CAO machine description needed.
@@ -1400,7 +1399,7 @@ test("holdModel: neither input is changed, and the held model is a new object", 
   assert.deepEqual(prev.pins, []);
 });
 
-// ---- sharedCache (D7: caches agent_profile and caller_id only; D9/Pins: an empty snapshot prunes nothing) ----
+// ---- sharedCache (it caches agent_profile and caller_id only; an empty snapshot prunes nothing) ----
 const answered = (profile, caller, extra = {}) => ({ state: "ok", agent_profile: profile, caller_id: caller, description: "free text from the server", ...extra });
 test("sharedCache: an answered entry is published with only state, agent_profile and caller_id", () => {
   const { published } = sharedCache(freeze({ t1: answered("conductor", null), t2: answered("developer", "t1", { at: 7, secret: "x" }) }), ["t1", "t2"]);
@@ -1595,12 +1594,12 @@ test("shownBlock: reads the real cao-window layout: the tab row and the sessions
   assert.equal(shownBlock(layout, "panel"), null, "the files panel starts hidden");
   assert.equal(shownBlock(layout, "files"), null, "and so does everything inside it");
   assert.ok(JSON.stringify(layout).includes('"id":"cao-window-panel"'), "the right sidebar is in the layout");
-  assert.equal(shownBlock(layout, "cao-window-panel"), null, "the right sidebar starts hidden (task 22.1), so it is not a shown block");
+  assert.equal(shownBlock(layout, "cao-window-panel"), null, "the right sidebar starts hidden, so it is not a shown block");
 });
 
 // ---- the keys of a confirm dialog ----
-// No spec names these functions. The contract is the launcher spec ("Discarding a filled form asks first",
-// "YOLO typed confirmation") plus each function's comment in lib/logic.js; a case says which default it pins.
+// The contract is that discarding a filled form asks first and that a YOLO launch needs its typed
+// confirmation, plus each function's comment in lib/logic.js; a case says which default it pins.
 const CONFIRM = freeze({ confirmEnabled: true });
 const CONFIRM_OFF = freeze({ confirmEnabled: false });
 
@@ -1748,7 +1747,7 @@ test("unchosenProfileText: the chosen name shown in the field, or an empty field
   assert.equal(unchosenProfileText("日本", "日本"), false);
 });
 
-// ---- 28.4: an agent that waits on its workers (spec cao-window-sessions "An agent that waits on its workers shows as waiting"; design D38) ----
+// ---- an agent that waits on its workers shows as waiting ----
 //
 // CAO keeps the label `cao.waiting` (a count of open delegation edges) on the caller; the window reads it from the record's labels.
 const waitingRec = (value, over = {}) => ({ address: "cao/t1", labels: { "cao.terminal_id": "t1", "cao.session": "cao-a", "cao.waiting": value }, status: "idle", ...over });
@@ -1874,9 +1873,9 @@ test("source scan: cao.waiting is read once, in termOf, from the labels; nothing
   for (const f of files) assert.doesNotMatch(f.text, /delegation/i, `${f.path} asks for no delegation data`);
 });
 
-// ---- the tree of who started whom (spec cao-window-sessions "Agents block"; design D41 A, D42 C) ----
+// ---- the tree of who started whom (the Agents block) ----
 
-test("No worker fold (design D42 C): lib/logic.js has no fold rule, and the tree has no level to fold by", () => {
+test("No worker fold: lib/logic.js has no fold rule, and the tree has no level to fold by", () => {
   assert.equal(L.foldWorkers, undefined);
   assert.equal(L.FOLD_OVER, undefined);
   const s = sess("s", [T("c1", "s", { createdMs: 1 }), ...Array.from({ length: 30 }, (_, i) => worker(`w${i}`, "s", "c1", { createdMs: 10 + i }))]);
@@ -1892,7 +1891,7 @@ test("sessionTree: a caller that is not listed marks its agent, and a cycle is c
   assert.deepEqual([...t.parent], [["w1", "c1"], ["w2", "w1"], ["w10", "w9"], ["y", "x"]]);
 });
 
-// ---- 31.2: waiting derived from the tree (spec cao-window-sessions "An agent that waits on its workers shows as waiting"; design D41 B) ----
+// ---- waiting derived from the tree ----
 // A worker is finished when it is idle or done and every worker below it is finished. An agent waits when its own state is idle or done and
 // at least one worker below it is unfinished. Unfinished and counted: working, blocked, or idle/done with something unfinished below (or with
 // a cao.waiting label above 0). An agent whose own state is unknown, starting or error is never counted, and so never makes its parent
@@ -2010,7 +2009,7 @@ test("the tree rule adds no poll and no HTTP call: treeWaiting reads the terms i
   assert.match(buildBody, /treeWaiting\(/, "buildModel feeds every mod");
 });
 
-// ---- 31.3: the cache cannot leave a flat tree (spec cao-window-sessions "Structure falls back to CAO when labels are absent"; design D41 C) ----
+// ---- the cache cannot leave a flat tree (the fallback to CAO when labels are absent) ----
 
 test("PENDING_EXPIRE_MS is 15 s, FALLBACK_RETRY_MS stays 30 s, and markPending stamps the pending entry with the time", () => {
   assert.equal(L.PENDING_EXPIRE_MS, 15_000);
@@ -2099,7 +2098,7 @@ test("sessionTree: the children of an unresolved terminal stay under it, a resol
   assert.deepEqual([...t.unlisted].sort(), ["g", "u"]);
 });
 
-// ---- 31.5: a stable session order, oldest first (spec cao-window-sessions "Session order and needs-you marking"; design D41 E) ----
+// ---- a stable session order, oldest first ----
 // A session's age is the creation time of its oldest terminal; the oldest session is first, ties go by session name, and recorded draft
 // sessions are last in the order they were given. A state never moves a row: marks, counts and filters carry the attention.
 

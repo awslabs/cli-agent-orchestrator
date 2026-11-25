@@ -1,5 +1,5 @@
-// The honesty table audit (cao-window-honesty-labels, "Table complete"). Pure, so the test can feed it
-// broken tables and see each failure mode.
+// The honesty table audit: every surface that carries a guess has a label and a view model that shows it. Pure, so
+// the test can feed it broken tables and see each failure mode.
 export async function auditHonesty({ expected, honesty, sources, pending, load }) {
   const problems = [];
   const reported = [];
@@ -8,7 +8,7 @@ export async function auditHonesty({ expected, honesty, sources, pending, load }
     if (!entry) { problems.push(`${surface}: no registry entry`); continue; }
     const label = honesty[entry.label];
     if (typeof label !== "string" || label.trim() === "") { problems.push(`${surface}: empty or missing label "${entry.label}"`); continue; }
-    if (Object.hasOwn(pending, surface)) { reported.push(`${surface} (section ${pending[surface]})`); continue; }
+    if (Object.hasOwn(pending, surface)) { reported.push(`${surface} (pending ${pending[surface]})`); continue; }
     let mod;
     try { mod = await load(entry.module); } catch (e) { problems.push(`${surface}: cannot load ${entry.module}: ${e.message}`); continue; }
     if (typeof mod[entry.fn] !== "function") { problems.push(`${surface}: ${entry.module} has no function ${entry.fn}`); continue; }

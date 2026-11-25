@@ -1,6 +1,6 @@
-// lib/shell.js: the shell state of the window (specs cao-window-shell, cao-window-workflows and the status
-// bar of cao-window-sessions; design D27 to D30; tasks 19.1 to 19.8). A case is named with its scenario's
-// name first, then a colon and the detail.
+// lib/shell.js: the shell state of the window (the top bar's buttons, the right sidebar, the dialog, the workflow
+// Run form's "not submitted" rows and the status bar). A case is named with its scenario's name first, then a colon
+// and the detail.
 //
 // The module is imported as a namespace so a function that is not written yet fails its own case with
 // "x is not a function" instead of stopping the whole file at the import line.
@@ -20,7 +20,7 @@ const freeze = (v) => {
   return v;
 };
 
-// ---- 29.2: the top bar's tab strip scrolls like Herdr's tabs, and a wheel gesture steps one tab ----
+// ---- the top bar's tab strip scrolls like Herdr's tabs, and a wheel gesture steps one tab ----
 // Herdr's tabs mod (mods/tabs/main.js:39-62 of the shipped mod) turns the wheel into `tab.prev` or `tab.next`: one step per notch of a
 // mouse (delta_lines), and for a touchpad or smooth wheel (pixel deltas) a short swipe of 20 px is one step, a longer swipe goes on
 // at 60 px a step, never faster than one step in 100 ms, and a pause of 250 ms or a turn of direction begins a new gesture.
@@ -87,20 +87,20 @@ test("Wheel steps: a malformed event is no step and no change of the count, and 
   for (const bad of [null, undefined, 3, "x", [], { acc: "a" }]) assert.equal(S.wheelTabStep(bad, { delta: { y: 25 } }, 1000).step, -1, `a bad state ${JSON.stringify(bad)} reads as a fresh one`);
 });
 
-// ---- 27.17: the OS title of the window ----
+// ---- the OS title of the window ----
 
 test("The window title is CAO: the constant the status mod hands to setWindowTitle is the three letters", () => {
   assert.equal(S.WINDOW_TITLE, "CAO");
 });
 
-// ---- 27.20: the wordmark at the top-left of the sidebar ----
+// ---- the wordmark at the top-left of the sidebar ----
 
 test("The top-left says CAO: the text the brand mod draws beside the logo is the three letters, and the window's title", () => {
   assert.equal(S.BRAND_TEXT, "CAO");
   assert.equal(S.BRAND_TEXT, S.WINDOW_TITLE, "the wordmark and the OS title name the window the same way");
 });
 
-// ---- 32.1: the CAO mark at the top-left, in the variant that suits the theme (design D42 A) ----
+// ---- the CAO mark at the top-left, in the variant that suits the theme ----
 // `isDarkTheme(theme)` reads the luminance of the row's own fill (`chrome`, else `background`): WCAG relative luminance below 0.179, the
 // point where white and black draw at the same contrast, is dark. `brandMark(theme)` is the mod-relative path of the drawing for it.
 
@@ -145,7 +145,7 @@ test("Brand mark: the dark drawing on a dark theme and the light one otherwise, 
   assert.equal(S.BRAND_MARK_RADIUS, 5);
 });
 
-// ---- 19.1: barButtonLabel (owner review of the live window, change F: no counts on the two buttons) ----
+// ---- barButtonLabel (no counts on the two buttons) ----
 
 const FLOW = (name, enabled, over = {}) => ({ name, schedule: "0 9 * * mon-fri", enabled, next_run: null, ...over });
 const flowList = (flags) => flags.map((on, i) => FLOW(`f${i}`, on));
@@ -185,7 +185,7 @@ test("Button labels: a kind that is not a list is refused", () => {
   assert.throws(() => S.barButtonLabel(undefined));
 });
 
-// ---- 19.2: rsideStep, confirmScope, opOf ----
+// ---- rsideStep, confirmScope, opOf ----
 
 const CLOSED = { open: false, list: "flows", item: null, form: null };
 const step = (state, ...events) => events.reduce((s, e) => S.rsideStep(freeze(s), freeze(e)), state);
@@ -365,7 +365,7 @@ test("Row shows running meanwhile: the asking item's row reads running while its
   for (const bad of [undefined, null, "x", 5, {}]) assert.equal(S.opOf(bad, A), null, JSON.stringify(bad));
 });
 
-// ---- 19.3: rsideLayoutStep ----
+// ---- rsideLayoutStep ----
 
 const OPEN = { open: true, list: "flows", item: null, form: null };
 // One call per tick: the block is `shown` (a function of the tick number, from 1) and the window's record is
@@ -480,7 +480,7 @@ test("Button then show: a click that opens with the block hidden sends show at o
 });
 
 test("Block shown by a Herdr command while the record says closed: hide is sent, sent once more, then the block's state is adopted as open", () => {
-  // spec "Start state": when they still differ it takes the block's real state as the truth, in both directions
+  // at start: when they still differ it takes the block's real state as the truth, in both directions
   const N = S.RSIDE_RESEND_TICKS;
   const expectRun = (run, firstAt, label) => {
     const sent = sends(run);
@@ -520,7 +520,7 @@ test("A second disagreement after an agreement is sent afresh: a repeat of the s
   assert.ok(run.every((r) => r.rside.open === true), "neither run lasts long enough to be adopted");
 });
 
-// ---- 19.4: dialogStep, dialogSpec ----
+// ---- dialogStep, dialogSpec ----
 
 const REQ = { kind: "new-flow", name: "dlg-0a1b2c3d" };
 const BUSY = "A request is in progress. Wait for the answer.";
@@ -721,13 +721,13 @@ test("Dialog request carries the layout props: every prop but section and host, 
 });
 
 test("A request cannot choose the host: a request that names host sidebar still opens the overlay as the dialog", () => {
-  // the one key the request does not win: the overlay copy picks its surface from props().host (design D29)
+  // the one key the request does not win: the overlay copy picks its surface from props().host
   const spec = S.dialogSpec(freeze({ kind: "new-flow", name: "dlg-1", host: "sidebar" }), freeze({ machine: "m", host: "sidebar", section: "sessions" }));
   assert.equal(spec.props.host, "dialog");
   assert.deepEqual(spec.props, { machine: "m", host: "dialog", kind: "new-flow", name: "dlg-1" });
 });
 
-// ---- 19.5: the dialog lease and the author records ----
+// ---- the dialog lease and the author records ----
 
 const SEC = 1000;
 const NAME = "cao-draft-flow-0a1b2c3d";
@@ -983,7 +983,7 @@ test("Author recorded before the launch is answered: an entry with the name and 
   assert.deepEqual(S.authorDeletes(JSON.parse(JSON.stringify(first)), null, 200 * SEC, []), ["cao-draft-flow-bbbbbbbb", NAME]);
 });
 
-// ---- 19.6: listView ----
+// ---- listView ----
 
 // What GET /flows, GET /workflows and GET /workflows/runs carry beyond what a list row draws: the prompt, the
 // script, a workflow's source and input spec, a run's inputs. None of it may reach shared storage.
@@ -1070,7 +1070,7 @@ test("Failure on either read of the workflows list says so: auth or unreachable 
   assert.deepEqual(flags(S.listView("flows", freeze(applyOutcome(null, { kind: "auth" }, 1)))), [true, false]);
 });
 
-// ---- 19.7: statusParts, helpView ----
+// ---- statusParts, helpView ----
 
 const COUNTS = (over = {}) => ({ sessions: 13, asking: 1, replied: 1, repliedUnknown: 0, working: 1, ...over });
 const SEP = ` ${DOT} `;
@@ -1101,7 +1101,7 @@ test("Buttons have states: every count is a button with an active flag for the f
 });
 
 test("One session is still a button: with one session the sessions part reads '1 session' and still clears the filter", () => {
-  // spec cao-window-sessions "Status bar counts and filters": each part is a button and the sessions part clears the filter
+  // each part is a button, and the sessions part clears the filter
   const one = S.statusParts(freeze(COUNTS({ sessions: 1 })), "asking")[1];
   assert.deepEqual(one, { id: "sessions", text: "1 session", button: true, action: "clear", filter: null, active: false, resting: true });
   assert.deepEqual(S.statusParts(COUNTS({ sessions: 0, asking: 0, replied: 0, working: 0 }), "asking")[1], { id: "sessions", text: "0 sessions", button: true, action: "clear", filter: null, active: false, resting: true });
@@ -1131,7 +1131,7 @@ test("Help: both notes and the label: 'done means the turn ended', the known-gap
   assert.deepEqual(Object.keys(help).sort(), ["doneMeans", "label", "text"]);
 });
 
-// ---- 19.8: the "not submitted" rows (security rule: what the user typed in a Run form is never stored) ----
+// ---- the "not submitted" rows (security rule: what the user typed in a Run form is never stored) ----
 
 const APPROVAL = (over = {}) => ({ kind: "approval_required", status: 403, planId: "plan-7", message: "approval is required for this plan", ...over });
 

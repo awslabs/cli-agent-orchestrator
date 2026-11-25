@@ -1,10 +1,7 @@
 // Pure rules for the CAO window. No Herdr imports, so `node lib/logic.test.mjs` runs it. No function
 // mutates its arguments.
 //
-// splitStatus, labelValue, spaceIdFor and caoMachine began as copies of the same helpers in an earlier
-// CAO tab mod; this file is now their only home.
-//
-// Top-level names are unique across lib/*.js, because bundle mode (D8) puts every shared module in one
+// Top-level names are unique across lib/*.js, because bundle mode puts every shared module and the mod's own code in one
 // scope. Helpers below carry names no other module or mod is likely to reuse. Source stays ASCII: the
 // middle dot and the recap mark are written as escapes.
 import { HONESTY } from "./honesty.js";
@@ -72,7 +69,7 @@ function finiteNumber(v) {
   return Number(v);
 }
 
-// The count in CAO's `cao.waiting` label: how many workers the terminal waits on (design D38). CAO writes a plain decimal integer
+// The count in CAO's `cao.waiting` label: how many workers the terminal waits on. CAO writes a plain decimal integer
 // and removes the label when it is 0, so only that shape counts: 1 to 999, no sign, space, leading zero, fraction or exponent.
 // Anything else, a missing label included, is 0, so a value this window does not understand never makes an agent look busy.
 const WAITING_COUNT = /^[1-9]\d{0,2}$/;
@@ -119,7 +116,7 @@ export function termOf(raw) {
 // The CAO terminals of a terminals() list: those with a session and a terminal id label.
 export const caoTerms = (list) => (Array.isArray(list) ? list : []).map(termOf).filter((t) => t.session && t.id);
 
-// ---------- talkable agents and workers (design D5) ----------
+// ---------- talkable agents and workers ----------
 
 const oldestOf = (list) => list.reduce((a, b) => (b.createdMs < a.createdMs ? b : a));
 const listOrDefault = (v, fallback) => (Array.isArray(v) ? v : fallback);
@@ -127,8 +124,8 @@ const listOrDefault = (v, fallback) => (Array.isArray(v) ? v : fallback);
 // One session's terminals -> who is talkable, who is a worker, and whether it is a recorded draft
 // author session. `drafts` is the list of terminal ids this window recorded when its own Draft launch
 // returned 201; a name never marks a draft. A terminal with no profile label yet is not guessed at:
-// with no other talkable agent the session shows its first such terminal (`provisional`) until the D7
-// fallback answers.
+// with no other talkable agent the session shows its first such terminal (`provisional`) until the profile
+// fallback (fetching the terminal from CAO) answers.
 export function classify(terms, props = {}, drafts = []) {
   const list = Array.isArray(terms) ? terms : [];
   const hidden = listOrDefault(props?.hiddenRootProfiles, ["memory_manager"]);
@@ -161,7 +158,7 @@ export function sessionsFrom(terms) {
   return [...by].map(([name, ts]) => ({ name, terms: ts }));
 }
 
-// Oldest session first (design D41 E): a session's age is the creation time of its oldest terminal that has one, so the order is the order
+// Oldest session first: a session's age is the creation time of its oldest terminal that has one, so the order is the order
 // the sessions were started in and no state moves a row (the marks, the status bar counts and the filters carry what needs attention). Equal
 // ages go by session name (code unit order); a session none of whose terminals has a creation time comes after the dated ones, by name. A
 // recorded draft session is last, in the order given. The input array is not changed.
@@ -179,7 +176,7 @@ export function sortSessions(sessions) {
   return rows.sort(order).map((x) => x.s);
 }
 
-// ---------- the tree of who started whom (design D26, D41) ----------
+// ---------- the tree of who started whom ----------
 
 // Older first: by creation time, then by id.
 export const olderFirst = (a, b) => a.createdMs - b.createdMs || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -220,14 +217,14 @@ export function sessionTree(session) {
   return { byId, parent, unlisted, terms };
 }
 
-// The agent tabs: the talkable agents plus pinned workers; a pin decides the tab and nothing else: the Agents block lists every worker (design D42 C).
-// One shown agent is one tab (design D37); none shown, none.
+// The agent tabs: the talkable agents plus pinned workers; a pin decides the tab and nothing else: the Agents block lists every worker.
+// One shown agent is one tab; none shown, none.
 export function tabsFor(session, pins = []) {
   const pinned = new Set(listOrDefault(pins, []));
   return [...session.talkable, ...session.workers.filter((w) => pinned.has(w.id))];
 }
 
-// ---------- pins (design D9: the window's own rule, not the cao-tab rule) ----------
+// ---------- pins (the window's own rule) ----------
 
 // A pin goes only when a snapshot that lists at least one CAO terminal no longer lists its id. An
 // empty, missing or disconnected snapshot never prunes.
@@ -271,12 +268,12 @@ export function quietHint(session, obs, quietMinutes, now) {
 
 // ---------- status shapes ----------
 
-// The mark of a display state: Herdr's own marks (design D37), drawn by shapeMark in lib/ui.js the way the shipped Agents
+// The mark of a display state: Herdr's own marks, drawn by shapeMark in lib/ui.js the way the shipped Agents
 // list draws them. Herdr has four: a spinner for working, a ring for idle, a dot for done, and a "!" square for blocked.
 // The states only this window knows borrow the mark of the Herdr status they refine: replied is a finished turn (the done dot, in a
-// highlight token of its own, `dot-hi`, because no word tells it apart any more; D39 D), error counts as blocked in Herdr's own list (mods/agents/main.js:60), a quiet worker is
+// highlight token of its own, `dot-hi`, because no word tells it apart any more), error counts as blocked in Herdr's own list (mods/agents/main.js:60), a quiet worker is
 // still working as far as Herdr knows (the "stuck?" hint says otherwise), and a state nobody knows draws nothing, as in Herdr.
-// An agent that waits on its workers (D38) is idle to Herdr but busy to the user: Herdr's working spinner, in the muted colour.
+// An agent that waits on its workers is idle to Herdr but busy to the user: Herdr's working spinner, in the muted colour.
 const STATUS_SHAPES = { working: "spinner", idle: "ring", done: "dot", replied: "dot-hi", blocked: "bang", quiet: "spinner", starting: "none", error: "bang", waiting: "spinner-dim" };
 export const statusShape = (state) => (Object.hasOwn(STATUS_SHAPES, state) ? STATUS_SHAPES[state] : STATUS_SHAPES.starting);
 
@@ -292,7 +289,7 @@ export function displayState(t, { replied = false, quiet = false } = {}) {
 
 // ---------- section summaries and flow links ----------
 
-// Draft author sessions are listed but never count as needing the user (design D5).
+// Draft author sessions are listed but never count as needing the user.
 export function sectionSummary(kind, items) {
   const list = Array.isArray(items) ? items : [];
   if (!list.length) return "none yet";
@@ -312,7 +309,7 @@ export function sectionSummary(kind, items) {
 const FLOW_SESSION_PREFIX = "cao-flow-";
 
 // "Started by schedule X" for a session named cao-flow-<X> when CAO's flow X exists (a guess from the name). The person reads "schedule"; the
-// session name and the route are CAO's own (D39 F).
+// session name and the route are CAO's own.
 export function flowOfSession(sessionName, flowNames) {
   if (typeof sessionName !== "string" || !sessionName.startsWith(FLOW_SESSION_PREFIX)) return null;
   const flow = sessionName.slice(FLOW_SESSION_PREFIX.length);
@@ -320,11 +317,11 @@ export function flowOfSession(sessionName, flowNames) {
   return { flow, text: `Started by schedule ${flow}`, label: HONESTY.flowInferred };
 }
 
-// ---------- the D7 fallback for terminals without a cao.profile label ----------
+// ---------- the fallback for terminals without a cao.profile label ----------
 
 export const FALLBACK_RETRY_MS = 30_000;
 // A fetch that has not answered after this long is taken as lost (a callback that never completes would leave the entry pending for good, and the
-// terminal unresolved, so its place in the tree unknown) and the id is fetched again like a failure (design D41 C).
+// terminal unresolved, so its place in the tree unknown) and the id is fetched again like a failure.
 export const PENDING_EXPIRE_MS = 15_000;
 
 // Ids to fetch now: unlabelled, not already fetched or in flight, a failure waits 30 s, and a fetch in flight is given 15 s (a pending entry
@@ -430,10 +427,10 @@ export function knownGapNote() {
   };
 }
 
-// ---------- seen: "replied" and the herdr.seen label (design D10) ----------
+// ---------- seen: "replied" and the herdr.seen label ----------
 
 export const SEEN_VERIFY_MS = 5000;
-// "write" (default, spike 1.11): write herdr.seen on focus and verify it. "off": stock Herdr writes it.
+// "write" (default): write herdr.seen on focus and verify it. "off": stock Herdr writes it.
 // "local": the write did not land; only the per-window map clears "replied".
 export const SEEN_MODE_DEFAULT = "write";
 
@@ -444,10 +441,10 @@ const turnEnded = (t) => t.state === "done" || t.state === "idle";
 export const waitingCount = (t) => (turnEnded(t) && Number.isInteger(t.waiting) && t.waiting > 0 ? t.waiting : 0);
 
 // Whether a terminal counts as working for the session order, the working count and the working filter: it works, or it is idle
-// only because it waits on its workers (design D38: counted as working, no count of its own).
+// only because it waits on its workers (counted as working, with no count of its own).
 const isWorking = (t) => t.state === "working" || waitingCount(t) > 0;
 
-// The agents of one session that wait on the workers below them, from who started whom alone (design D41 B), so a server that writes no
+// The agents of one session that wait on the workers below them, from who started whom alone, so a server that writes no
 // `cao.waiting` label shows the wait too. A worker is finished when it is idle or done and every worker below it (whose caller chain reaches it)
 // is finished. An agent waits when its own state is idle or done and at least one worker below it is not finished. Not finished, and so counted:
 // a worker that works or is blocked, and an idle or done worker that waits itself, by the tree or by a `cao.waiting` label above 0 (the label
@@ -543,8 +540,8 @@ const MIDDLE_DOT = "\u00b7";
 
 // ---------- the kind of a blocked terminal ----------
 
-// The kind of what a blocked terminal asks, when Herdr reports one (spike 1.4): the words "needs you: <kind>" of its row's tooltip. There is
-// no pill any more (D39 D). A kind that is empty, blank or not text is no kind: null.
+// The kind of what a blocked terminal asks, when Herdr reports one: the words "needs you: <kind>" of its row's tooltip. There is
+// no pill any more. A kind that is empty, blank or not text is no kind: null.
 export function askingKind(t) {
   return typeof t?.kind === "string" && t.kind.trim() !== "" ? t.kind.trim() : null;
 }
@@ -552,7 +549,7 @@ export function askingKind(t) {
 // ---------- the model every mod draws from ----------
 
 // Everything a mod draws from, recomputed from push data on every render and tick (no HTTP):
-// normalized terminals with the D7 cache applied, sessions classified and sorted, the machine, and the
+// normalized terminals with the profile cache applied, sessions classified and sorted, the machine, and the
 // predicate for "replied". ctx: {cache, drafts, pins, local, sha256hex}; every part may be missing.
 // Sets `talkable: true` on each talkable terminal because seenWrite reads it. The terminals are built
 // here from the raw records, so no argument is mutated.
@@ -678,7 +675,7 @@ export function readOfThisTurn(t, read) {
   return turnEnded(t) && read?.turn === t.turn ? read : null;
 }
 
-// ---------- status bar (design D10) ----------
+// ---------- status bar ----------
 
 // S sessions, A asking terminals, R replied talkable agents, W working sessions (one with a waiting terminal counts); recorded draft
 // author sessions are in none of them, and an `error` terminal is not asking.
@@ -724,12 +721,13 @@ export function filterSessions(sessions, filter, replied) {
 // Clicking the active count clears the filter; clicking another switches to it.
 export const nextFilter = (current, clicked) => (current === clicked ? null : clicked);
 
-// ---------- hand-off toast (design D11) ----------
+// ---------- hand-off toast ----------
 
 export const HAND_OFF_FOCUS_MS = 5000;
-// Spike 1.5 was not run, so the shipped toast mod passes every notification through (cfg.passThrough)
+// Holding a notification needs a copy of the toast mod that outlives the toast, and that has not been built
+// or tried against a real Herdr, so the shipped toast mod passes every notification through (cfg.passThrough)
 // unless configured otherwise. initialToast itself defaults to holding, which is what the reducer's
-// own cases exercise; the toast mod (task 8.4) starts from shippedToastState.
+// own cases exercise; the toast mod starts from shippedToastState.
 export const TOAST_PASS_THROUGH_DEFAULT = true;
 
 const TOAST_HOLD_SECONDS = 120;
@@ -738,7 +736,7 @@ const TOAST_KIND_RANK = { asking: 0, replied: 1 };
 
 // The state the shipped toast mod starts from: pass-through unless the configuration says otherwise
 // (an explicit false turns holding on; a missing or null value keeps the default).
-// Task 8.4's mod calls this, not initialToast.
+// The toast mod calls this, not initialToast.
 export const shippedToastState = (cfg) => initialToast({
   passThrough: cfg?.passThrough ?? TOAST_PASS_THROUGH_DEFAULT,
   holdMaxSeconds: cfg?.holdMaxSeconds ?? TOAST_HOLD_SECONDS,

@@ -110,7 +110,7 @@ test("Linux (when enabled): a caller's core variables do not reach the app", () 
   assert.equal(readFileSync(out, "utf8").trim(), "unset|unset|unset|unset|/tmp/h|caowin");
 });
 
-test("Linux as shipped: exit 4 unless spike 1.1 enabled it", () => {
+test("Linux as shipped: exit 4 unless Linux support was enabled", () => {
   const shipped = /^LINUX_SUPPORTED=1/m.test(readFileSync(FILL, "utf8"));
   const r = fill("Linux", "/opt/herdr/herdr-app-gui", "/tmp/h", "caowin");
   if (shipped) assert.equal(r.status, 0);
@@ -155,7 +155,7 @@ test("filling the same inputs twice gives the same bytes", () => {
   assert.equal(a.text, b.text);
 });
 
-// ---- the app copy (design D40 B): fill_launcher takes the copy's path as a seventh argument ----
+// ---- the app copy: fill_launcher takes the copy's path as a seventh argument ----
 
 function fillWithCopy(os, app, home, core, copy, script = FILL) {
   const out = join(tmp(), "herdr-cao");

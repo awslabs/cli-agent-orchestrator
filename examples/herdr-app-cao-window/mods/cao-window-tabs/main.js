@@ -1,8 +1,8 @@
-// The top bar (design D27): one 34 px block above the pane, always drawn, and the window's drag strip. Left: the
+// The top bar: one 34 px block above the pane, always drawn, and the window's drag strip. Left: the
 // agent tabs of the focused session (its talkable agents plus pinned workers, tabViews), one tab for one shown agent
 // and none when no agent is shown, each named as CAO names the agent's tab (agentName), the conductor like the rest and with no tag of
 // its role; a tab runs agent.focus. The strip scrolls sideways when the tabs are more than fit, as Herdr's own tabs do, and keeps the
-// focused tab in view (D39 B; the mechanism is copied from mods/tabs/main.js of Herdr, lines cited at each part below). Right, outside
+// focused tab in view (the mechanism is copied from mods/tabs/main.js of Herdr, lines cited at each part below). Right, outside
 // the scrolling strip so they never move: a thin divider, then the Flows and Workflows buttons, bare words with no count (barButtonLabel;
 // the lists' own headers carry the counts).
 // A press opens, switches or closes the right sidebar through the pure reducer rsideStep, and the tick keeps the
@@ -167,7 +167,7 @@ export default class CaoTabs extends View {
   // ---------- drawing ----------
 
   // One agent tab: the logo of its program (as Herdr's own tabs draw it, 14 px muted), its name and, for the session's main agent, a crown, from tabViews (the name an Agents row shows, the conductor's like a worker's, no tag of
-  // the role). No state mark (D37 T): the Agents row and the Sessions line draw the state, and the tab's tooltip, its row's, says it in words.
+  // the role). No state mark: the Agents row and the Sessions line draw the state, and the tab's tooltip, its row's, says it in words.
   // The press is stopped, so it does not start a window drag and a double-click does not maximize.
   // A tab at or before the focused one scrolls it back into view when its own size changes (mods/tabs/main.js:110: a rename or a mark on
   // an earlier tab can push the focused one out).

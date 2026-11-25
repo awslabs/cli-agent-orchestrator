@@ -1,8 +1,8 @@
-// What the Workflows section and the workflow views of the panel decide (cao-window-workflows): the rows
+// What the Workflows section and the workflow views of the panel decide: the rows
 // of the section, when its polls run, what its notices say, the details of one workflow with its runs, and
 // the confirmed writes on a run (Cancel, Resume). Pure; the mods only draw and send. The rules about
 // workflows themselves (row state, approval, inputs, size checks, the save request) are lib/workflows.js,
-// and the flow rules are lib/flows.js. Top-level names are unique across lib/*.js (bundle mode, D8).
+// and the flow rules are lib/flows.js. Top-level names are unique across lib/*.js (bundle mode puts every shared module in one scope).
 import { AUTH_MESSAGE, seg } from "./cao.js";
 import { FLOWS_POLL_MS, cronHuman, viewNotes } from "./flows.js";
 import { ageWords } from "./logic.js";

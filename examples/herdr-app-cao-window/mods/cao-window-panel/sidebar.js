@@ -1,5 +1,4 @@
-// The panel mod's right-sidebar host (design D28; specs cao-window-shell "Right sidebar with lists and details",
-// cao-window-flows, cao-window-workflows). main.js picks it when props().host is not "dialog": the block
+// The panel mod's right-sidebar host. main.js picks it when props().host is not "dialog": the block
 // `cao-window-panel`, hidden at first, shown and hidden only by the top bar (this file sends no layout command
 // at all). What it shows is the pure state `caowin.rside`, changed only through rsideStep: the list of flows or
 // workflows, or the details of one item under a back arrow.
@@ -15,7 +14,7 @@
 // when that item's details are shown, whatever is shown by then.
 //
 // The functions take the panel instance (the exported View of main.js). The host imports are aliased with the
-// sb prefix because bundle mode (D8) puts the shared modules and every file of the mod in one scope.
+// sb prefix because bundle mode puts the shared modules and every file of the mod in one scope.
 import { div as sbDiv } from "gpui-kit";
 import { v_flex as sbCol, h_flex as sbRow } from "gpui-base";
 import { exec as sbExec, layout as sbLayout, theme as sbTheme, checking as sbChecking } from "herdr";

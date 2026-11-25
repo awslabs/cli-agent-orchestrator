@@ -1,6 +1,6 @@
-// lib/cao.js: the one place that builds a curl argument list (cao-window-sessions, "CAO data goes
-// through exec on the CAO machine": Request shape, Body too large for argument mode, Body at the limit,
-// Approval refusal is not auth, Unreachable server; "Failure states keep the last good view": Auth required).
+// lib/cao.js: the one place that builds a curl argument list (the request shape, a body too large for
+// argument mode, a body at the limit, an approval refusal that is not an auth failure, an unreachable
+// server, and a required auth that keeps the last good view).
 import { spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -166,7 +166,7 @@ test("stdin mode: even a small body travels on stdin, never in the argument list
   assert.equal(r.exec.opts[STDIN_OPTION], '{"name":"secret-looking-name"}');
 });
 
-test("the mode defaults to what spike 1.10 recorded", () => {
+test("the mode defaults to no stdin, because Herdr's exec feeds none", () => {
   assert.equal(typeof STDIN_SUPPORTED, "boolean");
   const body = bodyOfBytes(130000);
   const r = curlRequest({ machine: "cao", port: 9889 }, { method: "POST", path: "/workflows", body });

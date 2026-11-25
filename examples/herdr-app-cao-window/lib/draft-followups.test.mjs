@@ -1,4 +1,4 @@
-// lib/draft.js: the follow-ups to lib/draft.test.mjs (task 12.1): an answer for an earlier attempt is
+// lib/draft.js: the follow-ups to lib/draft.test.mjs: an answer for an earlier attempt is
 // ignored, validation may answer while the session is being deleted, a lost launch response names the
 // session that may exist, and a failed Fix keeps the errors so it can be asked again.
 import { assert, finish, test } from "../test/harness.mjs";
