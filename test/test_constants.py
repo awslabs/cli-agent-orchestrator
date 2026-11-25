@@ -654,11 +654,13 @@ class TestCaoHomeDirEnvOverride:
     def _reload_constants(self, env_overrides):
         import importlib
         import os
+        import sys
 
         env_copy = os.environ.copy()
         env_copy.pop("CAO_HOME_DIR", None)
         env_copy.update(env_overrides)
         with patch.dict("os.environ", env_copy, clear=True):
+            sys.modules.pop("cli_agent_orchestrator.constants", None)
             import cli_agent_orchestrator.constants as constants_module
 
             importlib.reload(constants_module)
@@ -673,12 +675,15 @@ class TestCaoHomeDirEnvOverride:
         """
         import importlib
         import os
+        import sys
 
         env_copy = os.environ.copy()
         env_copy.pop("CAO_HOME_DIR", None)
         if override is not None:
             env_copy["CAO_HOME_DIR"] = str(override)
         with patch.dict("os.environ", env_copy, clear=True):
+            sys.modules.pop("cli_agent_orchestrator.services.settings_service", None)
+            sys.modules.pop("cli_agent_orchestrator.constants", None)
             import cli_agent_orchestrator.constants as constants_module
             import cli_agent_orchestrator.services.settings_service as settings_module
 
@@ -688,14 +693,25 @@ class TestCaoHomeDirEnvOverride:
 
     @pytest.fixture(autouse=True)
     def _restore_default_constants(self):
-        # Reloading under an override mutates the shared modules in place; reload
-        # them back to their original-env state after each test so the override
-        # cannot leak into tests (here or in other files) that import directly.
-        import os
+        import sys
 
-        original_value = os.environ.get("CAO_HOME_DIR")
+        names = (
+            "cli_agent_orchestrator.constants",
+            "cli_agent_orchestrator.services.settings_service",
+        )
+        saved = {name: sys.modules.get(name) for name in names}
+        package = sys.modules["cli_agent_orchestrator"]
+        services_package = sys.modules["cli_agent_orchestrator.services"]
+        saved_constants_attr = package.__dict__.get("constants")
+        saved_settings_attr = services_package.__dict__.get("settings_service")
         yield
-        self._reload_constants_and_settings(original_value)
+        for name in names:
+            sys.modules.pop(name, None)
+        sys.modules.update({name: module for name, module in saved.items() if module is not None})
+        if saved_constants_attr is not None:
+            package.constants = saved_constants_attr
+        if saved_settings_attr is not None:
+            services_package.settings_service = saved_settings_attr
 
     def test_override_relocates_home_dir(self, tmp_path):
         override = tmp_path / "cao-home"

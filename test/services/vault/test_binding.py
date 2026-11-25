@@ -129,6 +129,7 @@ def test_valid_origins_are_the_full_closed_vault_vocabulary() -> None:
     assert VALID_ORIGINS == frozenset(
         {
             "compiler",
+            "content_link",
             "wiki_lint",
             "human",
             "legacy_related_keys",

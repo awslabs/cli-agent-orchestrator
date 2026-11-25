@@ -141,10 +141,11 @@ daylight saving):
    - `release.yml` bumps `pyproject.toml`, `uv.lock` and the devcontainer feature, runs
      the same version check `verify-release-version` will, then commits, tags
      `v<version>`, pushes both in one atomic push, and creates a GitHub Release.
-   - The changelog is not generated from commit subjects. The bump renames the single
-     hand-written `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD` and inserts a
-     fresh empty `## [Unreleased]` above it, preserving all notes and older sections
-     byte-for-byte. A missing or duplicate heading refuses the release. An empty
+   - The changelog is not generated from commit subjects. The bump promotes the single
+     `## [Unreleased]` section to `## [X.Y.Z] - YYYY-MM-DD`, inserts a fresh empty
+     `## [Unreleased]` above it, and merges validated `changelog.d/<PR>.<type>.md`
+     fragments into the promoted section. The release commit includes the deletion of
+     collected fragments. A missing or duplicate heading refuses the release. An empty
      Unreleased section is allowed because the release policy derives whether to release
      from commits, and changelog entries are not a preflight requirement.
    - If `uv lock` would change anything in `uv.lock` beyond this project's own version

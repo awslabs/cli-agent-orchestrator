@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "about": "Shipped defaults for this kit. Put your own values in workplace.local.json beside this file (kept out of git): at least {\"github_login\": \"<you>\", \"repos\": [\"OWNER/REPO\"]}. Read through bin/workplace.py; `python3 bin/workplace.py show` prints the result. No secrets here, ever: the keys are an allow-list.",
+  "github_login": null,
+  "repos": ["your-org/your-repo"],
+  "cao_api": "http://localhost:9889",
+  "dashboard_port": 8765,
+  "cao_source_checkout": "~/cli-agent-orchestrator",
+  "profiles": {
+    "cao_conductor": {"provider": "claude_code", "model": "opus"},
+    "pr_shepherd": {"provider": "claude_code", "model": "sonnet"}
+  },
+  "conductor_session": "cao-conductor",
+  "relay": {
+    "enabled": false,
+    "checkout": "~/herdr-remote",
+    "secrets_file": "~/.config/herdr-remote/secrets.env",
+    "state_dir": "~/.local/state/herdr-remote",
+    "herdr_session": null,
+    "relay_port": 8375,
+    "tunnel_mode": "none"
+  }
+}
