@@ -99,13 +99,38 @@ def classify_reason(provider: str, raw_prompt: str) -> str:
         return f"{namespace}:unknown_prompt"
 
 
+# Cursor-forward (CUF, ``ESC[nC``) and cursor-to-column (CHA, ``ESC[nG``). Claude
+# Code's Ink renderer draws the gap between words with these instead of spaces,
+# so the raw byte stream holds "Tab\x1b[22Gto amend" where the screen shows
+# "Tab to amend".
+_CURSOR_GAP_RE = re.compile(r"\x1b\[[0-9]*[CG]")
+_MULTI_SPACE_RE = re.compile(r" {2,}")
+
+
+def _plain_text(raw: str) -> str:
+    """Reduce raw terminal output to the text a screen would show on each line.
+
+    ``ApprovalBridge`` passes the tail of the raw pipe-pane buffer, not a
+    rendered screen. Cursor moves that stand in for a gap become one space;
+    every other escape sequence is dropped. Runs of spaces then collapse to
+    one, so a real space next to a cursor move ("Tab \x1b[1Cto") still reads
+    as a single gap.
+
+    Limits (not a renderer): it misses a cursor move that skips unchanged
+    cells, an absolute cursor move within the row, and a footer outside the
+    last 1024 bytes; classifying from the pyte screen would cover all three.
+    """
+    return _MULTI_SPACE_RE.sub(" ", _ANSI_ESCAPE_RE.sub("", _CURSOR_GAP_RE.sub(" ", raw)))
+
+
 def _classify_local(provider: str, raw_prompt: str) -> str:
     """Determine the local_name for a given provider and prompt text."""
     if provider == "claude_code":
+        text = _plain_text(raw_prompt)
         # Trust prompt takes priority (it also matches WAITING pattern sometimes)
-        if re.search(CLAUDE_TRUST_PATTERN, raw_prompt):
+        if re.search(CLAUDE_TRUST_PATTERN, text):
             return "trust_prompt"
-        if re.search(CLAUDE_WAITING_PATTERN, raw_prompt):
+        if re.search(CLAUDE_WAITING_PATTERN, text):
             return "permission_request"
         return "unknown_prompt"
 
