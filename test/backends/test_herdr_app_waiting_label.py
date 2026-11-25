@@ -9,11 +9,17 @@ from test.backends.fake_hc import FakeHc
 
 import pytest
 
-from cli_agent_orchestrator.backends.base import TerminalBackend
+from cli_agent_orchestrator.backends.base import TerminalBackend, TerminalBackendError
 from cli_agent_orchestrator.backends.herdr_app_backend import HerdrAppBackend
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
-from cli_agent_orchestrator.clients.hc_rpc import HcRpcError
+from cli_agent_orchestrator.clients import hc_rpc
+from cli_agent_orchestrator.clients.hc_rpc import (
+    REQUIRED_METHODS,
+    HcNotSentError,
+    HcRpcClient,
+    HcRpcError,
+)
 
 APP_LOGGER = "cli_agent_orchestrator.backends.herdr_app_backend"
 WAITING = "cao.waiting"
@@ -203,6 +209,111 @@ def test_a_failed_write_is_logged_and_the_others_still_go_through(backend, hc, c
     assert WAITING not in first["labels"]
     assert second["labels"][WAITING] == "2"
     assert any("c1c1c1c1" in w and WAITING in w for w in _warnings(caplog)), _warnings(caplog)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TerminalBackendError("herdr-core lost terminal.label: herdr-core sent nothing for 2.0s"),
+        TerminalBackendError("herdr-core lost terminal.label: herdr-core connection closed"),
+        HcNotSentError("herdr-core unreachable for terminal.label"),
+    ],
+    ids=["timeout", "connection-closed", "unreachable"],
+)
+def test_a_core_that_stops_answering_ends_the_pass_after_one_failure(backend, hc, caplog, error):
+    terminals = [_terminal(backend, hc, f"{n}{n}{n}{n}{n}{n}{n}{n}") for n in "abcd"]
+    real_call = hc.call
+    attempts = []
+
+    def hung(method, params=None, timeout=10.0):
+        if method == "terminal.label":
+            attempts.append(params["terminal"])
+            raise error
+        return real_call(method, params, timeout)
+
+    hc.call = hung
+    with caplog.at_level(logging.DEBUG, logger=APP_LOGGER):
+        backend.set_waiting_counts({t["labels"]["cao.terminal_id"]: 1 for t in terminals})
+
+    assert len(attempts) == 1
+    assert len(_warnings(caplog)) == 1, _warnings(caplog)
+    assert "next sweep" in _warnings(caplog)[0]
+
+    hc.call = real_call  # the core answers again: the next pass writes every label
+    backend.set_waiting_counts({t["labels"]["cao.terminal_id"]: 1 for t in terminals})
+
+    assert [t["labels"][WAITING] for t in terminals] == ["1"] * 4
+
+
+def test_a_refusal_for_one_terminal_does_not_end_the_pass(backend, hc):
+    gone = _terminal(backend, hc, "a1a1a1a1")
+    kept = _terminal(backend, hc, "b2b2b2b2")
+    real_call = hc.call
+
+    def refusing(method, params=None, timeout=10.0):
+        if method == "terminal.label" and params["terminal"] == gone["address"]:
+            raise HcRpcError("not_found", "terminal is gone")
+        return real_call(method, params, timeout)
+
+    hc.call = refusing
+    backend.set_waiting_counts({"a1a1a1a1": 1, "b2b2b2b2": 1})
+
+    assert kept["labels"][WAITING] == "1"
+
+
+class _SilentOnLabel:
+    """Stands in for an ``hc connect`` child: answers everything but ``terminal.label``."""
+
+    labels_written = 0  # over every connection: a lost write drops the connection
+
+    def __init__(self, terminals):
+        self.terminals = terminals
+        self._asked = None
+
+    def alive(self):
+        return True
+
+    def write(self, message):
+        self._asked = message
+        if message["method"] == "terminal.label":
+            _SilentOnLabel.labels_written += 1
+
+    def get(self, timeout):
+        method = self._asked["method"]
+        if method == "hello":
+            result = {"generation": 1, "methods": sorted(REQUIRED_METHODS)}
+        elif method == "terminal.list":
+            result = {"terminals": self.terminals}
+        else:
+            raise TimeoutError(f"herdr-core sent nothing for {timeout}s")
+        return {"id": self._asked["id"], "result": result}
+
+    def close(self):
+        pass
+
+
+def test_the_real_client_losing_a_write_to_a_silent_core_ends_the_pass(monkeypatch):
+    """Ties the stop to what ``HcRpcClient`` raises, not to a hand-made error."""
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.utils.mcp_resolution.cao_server_env",
+        lambda: {"CAO_API": "http://x"},
+    )
+    probe = HerdrAppBackend(herdr_app_session="cao", client=FakeHc())
+    terminals = [
+        {
+            "address": f"t{n}",
+            "state": "live",
+            "labels": {**probe._managed, "cao.terminal_id": f"{n}{n}{n}{n}{n}{n}{n}{n}"},
+        }
+        for n in "abcd"
+    ]
+    _SilentOnLabel.labels_written = 0
+    monkeypatch.setattr(hc_rpc, "_Connection", lambda _session: _SilentOnLabel(terminals))
+    backend = HerdrAppBackend(herdr_app_session="cao", client=HcRpcClient("cao"))
+
+    backend.set_waiting_counts({t["labels"]["cao.terminal_id"]: 1 for t in terminals})
+
+    assert _SilentOnLabel.labels_written == 1
 
 
 def test_a_failed_listing_is_logged_and_raises_nothing(backend, hc, caplog):

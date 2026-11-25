@@ -516,10 +516,12 @@ class HerdrAppBackend(TerminalBackend):
         missed update. Only terminals of this server's ``cao.home`` are read or
         changed.
 
-        Best-effort: a failed listing or write is logged and the rest go on. Each
-        RPC gives up after ``WAITING_RPC_TIMEOUT_S``. The first failure of a run
-        of failures is a warning, the later ones are debug, and a pass without a
-        failure ends the run.
+        Best-effort: a failed listing is logged and ends the pass; so does a write
+        that timed out, lost its connection or never left, because the core is not
+        answering and the next sweep writes the rest. A write the core refused
+        (``HcRpcError``) is logged and the rest go on. Each RPC gives up after
+        ``WAITING_RPC_TIMEOUT_S``. The first failure of a run of failures is a
+        warning, the later ones are debug, and a pass without a failure ends the run.
 
         Thread Safety:
             Safe to call from several threads, but two overlapping calls can
@@ -557,9 +559,19 @@ class HerdrAppBackend(TerminalBackend):
                     terminal=terminal["address"],
                     labels={WAITING_LABEL: value},
                 )
-            except TerminalBackendError as exc:
+            except HcRpcError as exc:
+                # The core answered and refused this terminal (it is gone, say); the rest may work.
                 self._waiting_failed(f"could not set {WAITING_LABEL} on {terminal_id}: {exc}")
                 failed = True
+            except TerminalBackendError as exc:
+                # A write that timed out, lost its connection or never left: the core is not
+                # answering, and each further write would cost another timeout and another
+                # reconnect. Leave the rest to the next sweep.
+                self._waiting_failed(
+                    f"could not set {WAITING_LABEL} on {terminal_id}: {exc}; "
+                    "the core is not answering, the rest is left to the next sweep"
+                )
+                return
         if not failed:
             self._waiting_failing = False
 
