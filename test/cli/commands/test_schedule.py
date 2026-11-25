@@ -38,7 +38,7 @@ class TestFlowAddCommand:
 
     @patch("cli_agent_orchestrator.cli.commands.schedule.init_db")
     @patch("cli_agent_orchestrator.cli.commands.schedule.flow_service")
-    def test_add_success(self, mock_service, mock_init_db, runner):
+    def test_add_success(self, mock_service, mock_init_db, runner, tmp_path):
         """Test successful flow addition."""
         mock_flow = MagicMock()
         mock_flow.name = "test-flow"
@@ -47,11 +47,10 @@ class TestFlowAddCommand:
         mock_flow.next_run = datetime(2024, 1, 1, 9, 0)
         mock_service.add_flow.return_value = mock_flow
 
-        with runner.isolated_filesystem():
-            with open("test-flow.md", "w") as f:
-                f.write("---\nname: test-flow\n---\n")
+        flow_file = tmp_path / "test-flow.md"
+        flow_file.write_text("---\nname: test-flow\n---\n")
 
-            result = runner.invoke(schedule, ["add", "test-flow.md"])
+        result = runner.invoke(schedule, ["add", str(flow_file)])
 
         assert result.exit_code == 0
         assert "test-flow" in result.output
@@ -59,15 +58,14 @@ class TestFlowAddCommand:
 
     @patch("cli_agent_orchestrator.cli.commands.schedule.init_db")
     @patch("cli_agent_orchestrator.cli.commands.schedule.flow_service")
-    def test_add_error(self, mock_service, mock_init_db, runner):
+    def test_add_error(self, mock_service, mock_init_db, runner, tmp_path):
         """Test flow addition with error."""
         mock_service.add_flow.side_effect = Exception("Invalid flow format")
 
-        with runner.isolated_filesystem():
-            with open("test-flow.md", "w") as f:
-                f.write("invalid content")
+        flow_file = tmp_path / "test-flow.md"
+        flow_file.write_text("invalid content")
 
-            result = runner.invoke(schedule, ["add", "test-flow.md"])
+        result = runner.invoke(schedule, ["add", str(flow_file)])
 
         assert result.exit_code != 0
         assert "Invalid flow format" in result.output

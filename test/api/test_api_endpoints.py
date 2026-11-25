@@ -76,6 +76,23 @@ class TestHealthCheck:
         assert response.status_code == 200
         assert response.json()["version"] == "unknown"
 
+    def test_health_reports_the_instance_label(self, client, monkeypatch):
+        """CAO_INSTANCE_LABEL is reported, trimmed, for the web UI's header."""
+        monkeypatch.setenv("CAO_INSTANCE_LABEL", "  Cluster Mode  ")
+        assert client.get("/health").json()["instance_label"] == "Cluster Mode"
+
+    @pytest.mark.parametrize("value", [None, "", "   "])
+    def test_health_instance_label_is_null_when_unset_or_blank(self, client, monkeypatch, value):
+        """No label, or a blank one, is null: the UI shows nothing and the
+        response is otherwise unchanged."""
+        if value is None:
+            monkeypatch.delenv("CAO_INSTANCE_LABEL", raising=False)
+        else:
+            monkeypatch.setenv("CAO_INSTANCE_LABEL", value)
+        response = client.get("/health")
+        assert response.status_code == 200
+        assert response.json()["instance_label"] is None
+
     def test_health_reports_terminal_backend_tmux(self, client):
         """GET /health reports terminal_backend matching the active backend (tmux)."""
         with patch("cli_agent_orchestrator.api.main.get_backend") as mock_backend:
