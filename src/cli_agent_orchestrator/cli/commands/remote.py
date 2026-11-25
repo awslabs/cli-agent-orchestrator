@@ -27,7 +27,7 @@ from cli_agent_orchestrator.services.remote.runner import Runner
 
 @click.group()
 def remote() -> None:
-    """Check experimental Remote CAO laptop prerequisites."""
+    """Register and check experimental Remote CAO boxes."""
 
 
 @remote.command("add")

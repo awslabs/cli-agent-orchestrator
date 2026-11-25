@@ -4,21 +4,25 @@
 checks laptop and remote prerequisites. It never creates cloud resources or
 changes a registered box during a check. The SSH stage uses the user's SSH
 configuration, which can open SSM sessions (up to three during a full check).
+`check` always uses the SSH host `cao-<box>`; with the guide's `Host cao-box`
+configuration, register the box as `box`.
 
 ```bash
-cao remote add dev-box \
+cao remote add box \
   --instance-id i-0123456789abcdef \
   --region us-east-1 \
   --profile work
 cao remote list
-cao remote check dev-box
-cao remote check dev-box --json
-cao remote remove dev-box
+cao remote check box
+cao remote check box --json
+cao remote remove box
 ```
 
 `add` records the instance, AWS region and profile in CAO's configuration
 directory with owner-only permissions. `--mode herdr` is the default; use
 `--mode tmux` for a tmux-backed box.
+`--user` optionally records the box's Linux user in the registration and
+displays it in `list`; the current checks do not use it.
 
 `check` returns zero when every applicable check succeeds, one when something
 needs fixing, and two for invalid input or an unavailable/corrupt registration.

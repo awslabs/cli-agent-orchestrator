@@ -377,7 +377,7 @@ def test_runner_drops_ambient_aws_credentials_but_keeps_required_environment(tmp
     tool.write_text(
         "#!/bin/sh\n"
         + "\n".join(f'printenv "{name}" >/dev/null && printf present\\n' for name in names)
-        + '\nprintf "%s\\n" "$SSH_AUTH_SOCK" "$HTTPS_PROXY" "$AWS_CA_BUNDLE"\n',
+        + '\nprintf "%s\\n" "$SSH_AUTH_SOCK" "$HTTPS_PROXY" "$AWS_CA_BUNDLE" "$LANG" "$LC_ALL"\n',
         encoding="utf-8",
     )
     tool.chmod(0o755)
@@ -387,9 +387,11 @@ def test_runner_drops_ambient_aws_credentials_but_keeps_required_environment(tmp
     monkeypatch.setenv("SSH_AUTH_SOCK", "ssh-marker")
     monkeypatch.setenv("HTTPS_PROXY", "proxy-marker")
     monkeypatch.setenv("AWS_CA_BUNDLE", "ca-marker")
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
     result = Runner().run([tool.name])
     assert result.returncode == 0
-    assert result.stdout == "ssh-marker\nproxy-marker\nca-marker\n"
+    assert result.stdout == "ssh-marker\nproxy-marker\nca-marker\nC\nC\n"
 
 
 def test_interactive_runner_drops_ambient_aws_credentials(monkeypatch):
@@ -515,7 +517,11 @@ def test_remote_add_validates_arguments(tmp_path, monkeypatch):
 
 def test_remote_add_rejects_control_characters_in_user_and_profile(tmp_path, monkeypatch, box):
     monkeypatch.setattr(registry, "CAO_HOME_DIR", tmp_path)
-    for user, profile in (("bad\nuser", "work"), ("user", "bad\tprofile")):
+    for user, profile in (
+        ("bad\nuser", "work"),
+        ("user", "bad\tprofile"),
+        ("user", "bad\x1bprofile"),
+    ):
         result = CliRunner().invoke(
             cli,
             [
@@ -564,6 +570,16 @@ def test_malformed_configured_aws_files_are_fix_not_traceback(box, tmp_path, mon
         assert str(configured) in checks["aws-credentials"].detail
 
 
+def test_access_key_in_configured_aws_config_is_fix(box, tmp_path, monkeypatch):
+    home = ready_home(tmp_path, box)
+    configured = tmp_path / "configured-config"
+    configured.write_text("[profile work]\naws_access_key_id = canary\n", encoding="utf-8")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(configured))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "absent-credentials"))
+    checks = checks_by_name(check_box(box, FakeRunner(command_responses(box)), home))
+    assert checks["aws-credentials"].status == "FIX"
+
+
 def test_tmux_version_accepts_3_3_or_newer(box, tmp_path):
     tmux_box = RemoteBox(box.name, box.instance_id, box.region, box.aws_profile, mode="tmux")
     home = ready_home(tmp_path, box)
@@ -586,6 +602,34 @@ def test_tmux_version_accepts_3_3_or_newer(box, tmp_path):
         ] = RunResult(0, version)
         checks = checks_by_name(check_box(tmux_box, FakeRunner(responses), home))
         assert checks["tmux"].status == "OK"
+
+
+def test_tmux_version_below_3_3_is_fix(box, tmp_path):
+    tmux_box = RemoteBox(box.name, box.instance_id, box.region, box.aws_profile, mode="tmux")
+    responses = command_responses(box)
+    responses[
+        ("ssh", "-o", "BatchMode=yes", "-o", "ForwardAgent=no", "cao-box-1", "tmux", "-V")
+    ] = RunResult(0, "tmux 3.2a")
+    checks = checks_by_name(check_box(tmux_box, FakeRunner(responses), ready_home(tmp_path, box)))
+    assert checks["tmux"].status == "FIX"
+
+
+def test_remote_herdr_version_must_match_laptop(box, tmp_path):
+    responses = command_responses(box)
+    responses[("herdr", "--version")] = RunResult(0, "herdr 0.9.5")
+    responses[
+        (
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ForwardAgent=no",
+            "cao-box-1",
+            "bash -lc 'herdr --version'",
+        )
+    ] = RunResult(0, "herdr 0.9.4")
+    checks = checks_by_name(check_box(box, FakeRunner(responses), ready_home(tmp_path, box)))
+    assert checks["herdr-version"].status == "FIX"
 
 
 def test_remote_docs_describe_ssh_sessions_and_no_setup_commands():
@@ -646,6 +690,30 @@ def test_bad_registration_is_usage_error_and_list_keeps_others(tmp_path, monkeyp
         "null",
         '"x"',
         None,
+        json.dumps(
+            {
+                "name": box.name,
+                "instance_id": box.instance_id,
+                "region": box.region,
+                "profile": ["w"],
+            }
+        ),
+        json.dumps(
+            {
+                "name": box.name,
+                "instance_id": box.instance_id,
+                "region": box.region,
+                "profile": {"w": 1},
+            }
+        ),
+        json.dumps(
+            {
+                "name": "other",
+                "instance_id": box.instance_id,
+                "region": box.region,
+                "profile": "work",
+            }
+        ),
     ):
         save(RemoteBox("box-2", box.instance_id, box.region, "work"))
         target = tmp_path / "remote" / f"{box.name}.json"
@@ -664,3 +732,8 @@ def test_bad_registration_is_usage_error_and_list_keeps_others(tmp_path, monkeyp
             target.unlink()
         else:
             target.rmdir()
+    target.mkdir()
+    removed = CliRunner().invoke(cli, ["remote", "remove", box.name])
+    assert removed.exit_code == 2
+    assert "invalid configuration" in removed.output
+    target.rmdir()
