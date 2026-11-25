@@ -4,9 +4,11 @@ A second Herdr app window that shows only CAO. It has its own app home and its o
 
 ## Quick start
 
-On a Mac, from this folder in a clone of the repository (needs the `herdr-app` backend on your cao-server, with no auth token; details under [Prerequisites](#prerequisites)):
+On a Mac (needs the Herdr app, and the `herdr-app` backend on your cao-server with no auth token; details under [Prerequisites](#prerequisites)):
 
 ```sh
+git clone https://github.com/awslabs/cli-agent-orchestrator.git
+cd cli-agent-orchestrator/examples/herdr-app-cao-window
 hc --version; jq --version; which herdr-app                                      # hc 0.1.21 or later
 defaults read /Applications/Herdr.app/Contents/Info CFBundleShortVersionString   # Herdr app 0.1.16 or later
 sh install.sh --local                    # CAO runs on this Mac ...
