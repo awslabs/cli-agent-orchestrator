@@ -34,6 +34,23 @@ Add the CAO core as a machine on the machine where the app runs:
 
 Use your `terminal.herdr_app_session` value in place of `cao` if you changed it.
 
+## A dedicated CAO window
+
+If you add CAO as a machine in your main window, its sessions mix with your own work. [`examples/herdr-app-cao-window/`](../examples/herdr-app-cao-window/) is an example of a second Herdr window with its own app home and its own herdr-core session. That window lists only CAO. Each region of it has one job:
+
+- **Sessions and Agents**, the two blocks of the left sidebar. Sessions lists one line per CAO session (a status glyph, its name and, for a session that needs you or has an unseen reply, a `!` square or a green dot; no word is drawn, the words are the tooltip), and the list keeps a stable order, the oldest session first, so no row jumps when a state changes (the marks, the status bar counts and its filters carry the attention). Agents shows the selected session as a tree of who started whom, one line per agent named like its Herdr tab. The words of a state (done, idle, working) are in the line's tooltip, and a name that does not fit ends in an ellipsis; drag the sidebar's edge to widen it. It lists every agent of the session; only a session of more than 12 agents folds its deepest workers into "N workers", and a pin on a worker puts its tab in the top bar.
+- **The top bar** holds the tabs of the focused session's shown agents, and the **Schedules** and **Workflows** buttons.
+- **The right sidebar** starts hidden. A top-bar button opens it at the list of schedules or of workflows, and a row shows that item's details. You can create (disabled), enable, disable, run, and edit schedules, and run, cancel, resume, create, and edit workflows. Schedules need the routes `POST /flows/validate` and `PUT /flows/{name}`. On a cao-server without `POST /flows/validate`, Create is disabled (that server's create would arm the schedule and overwrite a schedule with the same name), and the form points to `cao schedule add` and `cao schedule disable`. A first workflow run that needs plan approval shows the `cao workflow approve` command to run in a terminal: the window has no approve button.
+- **The dialog** is one centered overlay for every form: a new session, a schedule, a workflow, and a workflow run. Whether Esc and Tab behave as designed in that overlay has not been verified on a Mac.
+- **The status bar** counts sessions, asking agents, replies, and working sessions. Each count filters the Sessions block, and its `?` button explains the counts.
+
+**Draft with AI** (marked "proposed") fills a schedule or workflow form from an author session that the window deletes afterward. You set up the author: `draftProfile` must name a CAO agent profile that declares exactly one MCP server, `cao-mcp-server`, sets no `native_agent`, and runs on a native, non-install-time provider that is installed and listed in `draftProviders`. The window reads CAO through `curl` on the CAO machine. Request bodies (messages, schedule prompts, workflow source, run inputs, and Draft descriptions) are visible in `ps` on the CAO machine while curl runs, and environment values are never sent. It needs a cao-server on the `herdr-app` backend with no auth token. See the example's [README](../examples/herdr-app-cao-window/README.md) for prerequisites, topologies, limits, and troubleshooting, and its [CHECKLIST](../examples/herdr-app-cao-window/CHECKLIST.md) for a step-by-step test.
+
+- Run `install.sh` from that folder on the machine where the app runs. Use `--cao-ssh-host <host>` when CAO runs on another machine, or `--local` when it runs on the same machine as the app. `install.sh --help` lists every option.
+- The installer needs `jq` and `hc` 0.1.21 or later, and it fetches nothing from the network. It writes a launcher, `herdr-cao` in `~/.local/bin` by default.
+- The installer supports macOS. On Linux it exits with code 4.
+- The installer never changes your main window's app home or the core session CAO uses. `uninstall.sh` removes what the installer made and keeps the window's home as `<home>.removed-<epoch>`.
+
 ## How CAO uses the core
 
 - **Labels.** Every terminal carries `cao.managed=1`, `cao.terminal_id`, `cao.session`, `cao.window`, and `cao.home`, plus the app's `herdr.space` and `herdr.tab` placement labels. Every terminal in one CAO session gets the same `herdr.space`, so the session's terminals share one space in the app.
