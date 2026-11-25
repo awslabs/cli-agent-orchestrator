@@ -65,6 +65,7 @@ from cli_agent_orchestrator.utils.orchestration import (
     _target_binding_denial,
     has_discovery_grant,
 )
+from cli_agent_orchestrator.utils.tool_mapping import CAO_CALLBACK_TOOLS
 from cli_agent_orchestrator.utils.workflow_events import parse_sse_frames
 
 logger = logging.getLogger(__name__)
@@ -990,21 +991,38 @@ async def send_message(
     reliable way to send results back to your supervisor.
 
     Any message from a worker to the terminal waiting on it counts as the
-    reply and ends that wait, including a progress note or a question; if
-    the worker then goes idle without a final reply, nothing more is
-    forwarded to the caller.
+    reply, including a progress note or a question, and ends that wait once
+    it is delivered, not when it is sent. If the worker then goes idle
+    without a final reply, nothing more is forwarded to the caller. A reply
+    that is never delivered does not count: the caller keeps waiting on you.
 
     An explicit receiver_id must be one of: a terminal you created via
     assign/handoff, the terminal that created you, or (when your profile
     grants the 'discovery' tool) a sibling that list_siblings returns for
     you. Any other id is refused before anything is sent.
 
+    The call waits for the outcome of the immediate delivery attempt, up to
+    45 seconds, and returns it as ``delivery``:
+    - ``delivered``: the message reached the receiver's terminal.
+    - ``queued``: the receiver was busy, or older messages were ahead; it is
+      delivered later. If that later delivery fails, you get a
+      ``[CAO delivery failed]`` message.
+    - ``in_progress``: the attempt was still running when the wait ended. A
+      later failure reaches you as a ``[CAO delivery failed]`` message.
+    - ``failed`` (``success`` false, ``error`` set): nothing was typed and the
+      server will not retry. Send the message again later.
+    - ``uncertain`` (``success`` false, ``error`` set): the failure came while
+      typing, so some or all of it may have arrived. Check the receiver's
+      terminal before you send it again.
+    If the tool call itself times out, the message may still arrive: check
+    before you send it again.
+
     Args:
         message: Message content to send
         receiver_id: Terminal ID of the receiver (optional, defaults to the recorded caller)
 
     Returns:
-        Dict with success status and message details
+        Dict with ``success``, ``delivery``, ``error`` and the message details
     """
     # Called directly (not through FastMCP), the unset default is the FieldInfo
     # object, which is truthy. Only an explicit True asks for a reply.
@@ -1028,6 +1046,18 @@ async def complete_assignment(
         }
 
     delivered = _send_message_impl(None, message)
+    if delivered.get("delivery") == "uncertain":
+        # The result may already be with the supervisor: releasing would end the
+        # worker on a result nobody saw, and a blind resend could deliver it twice.
+        return {
+            "success": False,
+            "delivered": delivered,
+            "delivery": "uncertain",
+            "error": (
+                "result delivery is uncertain: it may have arrived at the supervisor. "
+                "Check the supervisor before you resend it; the worker was not released"
+            ),
+        }
     if not delivered.get("success"):
         return {
             "success": False,
@@ -1700,14 +1730,11 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
 #: authority over any other identity, and cannot mint one. Keep this set this small:
 #: a tool belongs here only if a worker CANNOT COMPLETE ITS OWN ASSIGNED WORK
 #: without it. "It would be convenient" is what produced #671.
-CALLBACK_EXEMPT_TOOLS = frozenset(
-    {
-        "send_message",
-        "complete_assignment",
-        "workflow_return",
-        "answer_user_prompt",
-    }
-)
+#:
+#: Defined once in ``utils/tool_mapping`` as ``CAO_CALLBACK_TOOLS``, because a Kiro
+#: install must also write these into the agent's ``tools`` list: Kiro hides any
+#: tool that list leaves out, whatever this gate allows.
+CALLBACK_EXEMPT_TOOLS = CAO_CALLBACK_TOOLS
 
 
 def _install_allowlist_middleware(server: Any) -> None:

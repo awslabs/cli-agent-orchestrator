@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # bootstrap.sh: set up one always-on Ubuntu 24.04 arm64 (Graviton) box to run
-# herdr + CAO under systemd. Run it ON THE BOX, as root. Re-running it is safe:
+# herdr (or tmux) + CAO under systemd. Run it ON THE BOX, as root. Re-running it is safe:
 # every step checks before it acts, and anything unexpected stops the run.
 #
 #   sudo bash bootstrap.sh --settings /opt/cao-box-src/box-settings.env --dry-run   # the plan
@@ -11,24 +11,27 @@
 # outside BOX_HOME (for example /opt/cao-box-src/...): root sources and runs
 # files from here, and every agent can write in the box user's home.
 #
-# It never creates AWS resources, never starts a service (it only enables
-# them), and never logs in to anything. See README.md for the full flow.
+# It never creates AWS resources or logs in to anything. See README.md for the
+# full flow.
 #
 # Required settings (in the --settings file, or environment variables):
-#   BOX_USER        the Linux user that owns the agents.
+#   BOX_USER        the Linux user that owns the agents. Default: cao-herdr.
 #   BOX_UID         that user's uid (and gid). Use the SAME value on every
 #                   rebuild so the data volume's files keep their owner.
-#   BOX_HOME        that user's home, for example /Users/<you> (your laptop's
-#                   home path, so absolute paths keep working) or /home/<you>.
+#   BOX_HOME        that user's home. Default: /home/cao-herdr. Set it to
+#                   /Users/<you> if kits or memory hold laptop paths.
 #   HERDR_VERSION   the herdr version your laptop runs, for example v0.9.3.
 #   HERDR_SHA256    sha256 of that release's herdr-linux-aarch64 asset.
 #   CAO_REF         the CAO commit to install (a full sha is best).
 #
 # Optional settings:
+#   ATTACH_MODE     herdr (default) or tmux. tmux uses the standard tmux socket.
 #   DATA_VOLUME_ID  the EBS data volume (vol-...). Found through its NVMe
 #                   serial in /dev/disk/by-id, never by device name.
 #   DATA_DEVICE     only a cross-check: must resolve to the same disk.
-#   DATA_MOUNT      where the volume is mounted. Default: BOX_HOME's parent.
+#   DATA_MOUNT      where the volume is mounted. Default: BOX_HOME itself;
+#                   never /home, which would hide ubuntu's home.
+#   BOX_SSH_PUBLIC_KEY  one OpenSSH public key line for the box user (optional).
 #   INSTALL_DOCKER  yes to install Docker and add BOX_USER to the docker
 #                   group. Default no. The docker group is root-equivalent.
 #   BACKUP_S3_URI, BACKUP_KMS_KEY_ARN   nightly backup target and its key.
@@ -48,6 +51,7 @@
 #                        running this with no group or other write and, as
 #                        root, sit in root-only folders outside BOX_HOME.
 #   --dry-run            print every planned step; change nothing.
+#   --no-start           enable units but do not start them.
 #   --format-new-volume  allow formatting DATA_VOLUME_ID, and only if it is a
 #                        blank, whole, non-root disk. Env form:
 #                        FORMAT_DATA_DEVICE=yes.
@@ -101,6 +105,7 @@ DRY_RUN=0
 ROOT=""
 FORMAT_NEW=0
 FORMAT_FROM_ENV=0
+NO_START=0
 if [ "${FORMAT_DATA_DEVICE:-}" = "yes" ]; then FORMAT_NEW=1; FORMAT_FROM_ENV=1; fi
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"; }
@@ -109,6 +114,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --format-new-volume) FORMAT_NEW=1 ;;
+    --no-start) NO_START=1 ;;
     --settings)
       { [ $# -ge 2 ] && [ -n "$2" ]; } || { echo "--settings needs a file" >&2; exit 2; }
       SETTINGS_FILE="$2"; shift ;;
@@ -172,7 +178,7 @@ fi
 log "OS: ubuntu 24.04 aarch64"
 
 # >>> settings-file
-SETTING_NAMES=" BOX_USER BOX_UID BOX_HOME HERDR_VERSION HERDR_SHA256 CAO_REF DATA_VOLUME_ID DATA_DEVICE \
+SETTING_NAMES=" ATTACH_MODE BOX_USER BOX_UID BOX_HOME HERDR_VERSION HERDR_SHA256 CAO_REF DATA_VOLUME_ID DATA_DEVICE BOX_SSH_PUBLIC_KEY \
 DATA_MOUNT INSTALL_DOCKER BACKUP_S3_URI BACKUP_KMS_KEY_ARN CAO_REPO GH_VERSION AWS_CLI_VERSION \
 AWS_CLI_SHA256 SAM_VERSION SAM_SHA256 YAZI_VERSION YAZI_SHA256 HELIX_VERSION HELIX_SHA256 UV_VERSION UV_SHA256 "
 # read_settings FILE: set the known settings from FILE. FILE is parsed line by
@@ -188,6 +194,11 @@ read_settings() {
   fi
   while IFS= read -r line || [ -n "$line" ]; do
     n=$((n + 1))
+    if [[ "$line" =~ ^BOX_SSH_PUBLIC_KEY=(.*)$ ]]; then
+      key="BOX_SSH_PUBLIC_KEY"
+      value="${BASH_REMATCH[1]%$'\r'}"
+      [[ -n "$value" ]] || die "${file} line ${n}: BOX_SSH_PUBLIC_KEY must be one OpenSSH public key line"
+    else
     line="${line%%#*}"
     line="${line%"${line##*[![:space:]]}"}"
     [ -n "$line" ] || continue
@@ -195,6 +206,7 @@ read_settings() {
       || die "${file} line ${n}: expected KEY=VALUE, with only letters, digits and . _ : / @ + , = - in the value"
     key="${BASH_REMATCH[1]}"
     value="${BASH_REMATCH[2]}"
+    fi
     case "$SETTING_NAMES" in
       *" ${key} "*) ;;
       *) die "${file} line ${n}: ${key} is not a bootstrap setting; refusing" ;;
@@ -210,35 +222,61 @@ SETTINGS_REAL=""
 if [ -n "$SETTINGS_FILE" ]; then read_settings "$SETTINGS_FILE"; fi
 
 PATH_RE='^/[A-Za-z0-9._/-]+$'
-BOX_USER="${BOX_USER:-}"
+ATTACH_MODE="${ATTACH_MODE:-herdr}"
+case "$ATTACH_MODE" in herdr|tmux) ;; *) die "ATTACH_MODE must be herdr or tmux" ;; esac
+if [ "$ATTACH_MODE" = "tmux" ]; then
+  BOX_USER="${BOX_USER:-cao-tmux}"
+  BOX_HOME="${BOX_HOME:-/home/cao-tmux}"
+else
+  BOX_USER="${BOX_USER:-cao-herdr}"
+  BOX_HOME="${BOX_HOME:-/home/cao-herdr}"
+fi
 BOX_UID="${BOX_UID:-}"
-BOX_HOME="${BOX_HOME:-}"
 HERDR_VERSION="${HERDR_VERSION:-}"
 HERDR_SHA256="${HERDR_SHA256:-}"
 CAO_REF="${CAO_REF:-}"
-for var in BOX_USER BOX_UID BOX_HOME HERDR_VERSION HERDR_SHA256 CAO_REF; do
+for var in BOX_USER BOX_UID BOX_HOME CAO_REF; do
   [ -n "${!var}" ] || die "set $var (see the header of this script)"
 done
+if [ "$ATTACH_MODE" = "herdr" ]; then
+  for var in HERDR_VERSION HERDR_SHA256; do
+    [ -n "${!var}" ] || die "set $var (see the header of this script)"
+  done
+fi
 [[ "$BOX_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "BOX_USER must be a plain Linux user name"
 if ! [[ "$BOX_UID" =~ ^[0-9]+$ ]] || [ "$BOX_UID" -lt 1000 ] || [ "$BOX_UID" -ge 60000 ]; then
   die "BOX_UID must be a number from 1000 to 59999"
 fi
 [[ "$BOX_HOME" =~ $PATH_RE ]] || die "BOX_HOME must be an absolute path of letters, digits, . _ - and /"
 case "$BOX_HOME" in */|*/../*|*/..) die "BOX_HOME must not be /, end in /, or contain .." ;; esac
-[[ "$HERDR_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "HERDR_VERSION looks like v0.9.3"
-[[ "$HERDR_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "HERDR_SHA256 must be 64 lowercase hex characters"
+if [ "$ATTACH_MODE" = "herdr" ]; then
+  [[ "$HERDR_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "HERDR_VERSION looks like v0.9.3"
+  [[ "$HERDR_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "HERDR_SHA256 must be 64 lowercase hex characters"
+fi
 [[ "$CAO_REF" =~ ^[0-9A-Za-z._/-]+$ ]] || die "CAO_REF has unexpected characters"
 
 DATA_VOLUME_ID="${DATA_VOLUME_ID:-}"
 DATA_DEVICE="${DATA_DEVICE:-}"
-DATA_MOUNT="${DATA_MOUNT:-$(dirname "$BOX_HOME")}"
+DATA_MOUNT="${DATA_MOUNT:-$BOX_HOME}"
+BOX_SSH_PUBLIC_KEY="${BOX_SSH_PUBLIC_KEY:-}"
 if [ -n "$DATA_VOLUME_ID" ]; then
   [[ "$DATA_VOLUME_ID" =~ ^vol-[0-9a-f]{17}$ ]] || die "DATA_VOLUME_ID looks like vol- and 17 hex characters"
 elif [ -n "$DATA_DEVICE" ]; then
   die "DATA_DEVICE alone is not accepted: set DATA_VOLUME_ID (device names are not stable)"
 fi
-if ! [[ "$DATA_MOUNT" =~ $PATH_RE ]] || [ "$DATA_MOUNT" = "/" ]; then
-  die "DATA_MOUNT must be an absolute path other than /"
+if ! [[ "$DATA_MOUNT" =~ $PATH_RE ]] || [ "$DATA_MOUNT" = "/" ] || [ "$DATA_MOUNT" = "/home" ]; then
+  die "DATA_MOUNT must be an absolute path other than / or /home"
+fi
+if [ -n "$BOX_SSH_PUBLIC_KEY" ]; then
+  [[ "$BOX_SSH_PUBLIC_KEY" != *$'\n'* && "$BOX_SSH_PUBLIC_KEY" != *"PRIVATE KEY"* ]] \
+    || die "BOX_SSH_PUBLIC_KEY must be one public key line, never a private key"
+  read -r ssh_key_type ssh_key_data _ <<< "$BOX_SSH_PUBLIC_KEY"
+  case "$ssh_key_type" in
+    ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-rsa|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) ;;
+    *) die "BOX_SSH_PUBLIC_KEY has an unsupported OpenSSH key type" ;;
+  esac
+  [[ "$ssh_key_data" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] \
+    || die "BOX_SSH_PUBLIC_KEY must contain base64 key data"
 fi
 INSTALL_DOCKER="${INSTALL_DOCKER:-no}"
 case "$INSTALL_DOCKER" in yes|no) ;; *) die "INSTALL_DOCKER is yes or no" ;; esac
@@ -380,6 +418,7 @@ put_home_file() {
 # step changes the box. Steps 2 and 7 check again just before they act.
 home_paths=("$HOME_DIR/.config/herdr/config.toml" "$HOME_DIR/.aws/cli-agent-orchestrator/settings.json" \
             "$HOME_DIR/.claude/settings.json")
+if [ -n "$BOX_SSH_PUBLIC_KEY" ]; then home_paths+=("$HOME_DIR/.ssh" "$HOME_DIR/.ssh/authorized_keys"); fi
 if system_step; then home_paths+=("$BOX_HOME/.local/bin"); fi
 no_links "${home_paths[@]}"
 
@@ -506,6 +545,7 @@ fi
 
 # ---------------------------------------------------------- 3. apt packages
 PKGS=(git sqlite3 curl unzip jq xz-utils ca-certificates)
+[ "$ATTACH_MODE" = "tmux" ] && PKGS+=(tmux)
 [ "$INSTALL_DOCKER" = "yes" ] && PKGS+=(docker.io)
 step "3. packages: ${PKGS[*]}"
 if [ "$INSTALL_DOCKER" = "yes" ]; then
@@ -533,10 +573,16 @@ else
       run usermod -aG docker "$BOX_USER"
     fi
   fi
+  if [ "$ATTACH_MODE" = "tmux" ] && [ "$DRY_RUN" -eq 0 ]; then
+    tmux_version="$(tmux -V | sed -n 's/^tmux //p')"
+    [[ "$tmux_version" =~ ^[0-9]+\.[0-9]+ ]] || die "cannot determine tmux version"
+    [ "$(printf '%s\n%s\n' 3.3 "$tmux_version" | sort -V | head -n 1)" = "3.3" ] \
+      || die "tmux ${tmux_version} is too old; need tmux 3.3 or newer"
+  fi
 fi
 
 # ------------------------------------------------------- 4. pinned tools
-step "4. pinned, checksum-verified tools: herdr, gh, AWS CLI v2, SAM CLI, yazi, hx, uv"
+step "4. pinned, checksum-verified tools: gh, AWS CLI v2, SAM CLI, yazi, hx, uv"
 fetch() { run curl -fsSL --proto '=https' --tlsv1.2 -o "$2" "$1"; }
 
 # verify FILE SHA256 LABEL: stop the run on a missing or wrong checksum.
@@ -587,12 +633,14 @@ herdr_keep() {
 if ! system_step; then
   log "skipped under --root: downloads into ${BOX_HOME}/.local/bin and /usr/local"
 else
-  herdr_bin="$BOX_HOME/.local/bin/herdr"
   need=()
-  if herdr_keep "$herdr_bin"; then
-    log "herdr ${HERDR_VERSION} present (sha256 matches HERDR_SHA256)"
-  else
-    need+=(herdr)
+  if [ "$ATTACH_MODE" = "herdr" ]; then
+    herdr_bin="$BOX_HOME/.local/bin/herdr"
+    if herdr_keep "$herdr_bin"; then
+      log "herdr ${HERDR_VERSION} present (sha256 matches HERDR_SHA256)"
+    else
+      need+=(herdr)
+    fi
   fi
   for pair in gh:gh aws:aws sam:sam yazi:yazi hx:hx; do
     if have "${pair%%:*}"; then log "${pair#*:} present"; else need+=("${pair#*:}"); fi
@@ -694,7 +742,7 @@ else
 fi
 
 # ------------------------------------------------------- 6. session name
-step "6. herdr session name (cao-<instance-id>), kept on the data volume"
+step "6. session name (cao-<instance-id>)"
 etc_env="${ETC_DIR}/box.env"
 vol_env="${STATE_DIR}/box.env"
 STOP_DIR="${ROOT:-/}"
@@ -753,7 +801,11 @@ elif [ -e "$etc_env" ]; then
 elif ! system_step; then
   log "--root: no box.env to copy; the first real run writes it (IMDS is never called under --root)"
 elif [ "$DRY_RUN" -eq 1 ]; then
-  printf '[dry-run] would read the instance id from IMDSv2 and write %s and %s:\n' "$vol_env" "$etc_env"
+  if [ "$use_vol" -eq 1 ]; then
+    printf '[dry-run] would read the instance id from IMDSv2 and write %s and %s:\n' "$vol_env" "$etc_env"
+  else
+    printf '[dry-run] would read the instance id from IMDSv2 and write %s:\n' "$etc_env"
+  fi
   printf '[dry-run]   CAO_BOX_SESSION=cao-<instance-id>\n[dry-run]   CAO_HERDR_SESSION=cao-<instance-id>\n'
 else
   session_now="$("$HERE/bin/box-session-name.sh")"
@@ -780,6 +832,15 @@ else
   log "wrote: $user_env"
 fi
 
+attach_mode_file="${ETC_DIR}/attach-mode"
+if [ "$DRY_RUN" -eq 1 ]; then
+  printf '[dry-run] would write %s (%s)\n' "$attach_mode_file" "$ATTACH_MODE"
+else
+  mkdir -p "$ETC_DIR"
+  printf '%s\n' "$ATTACH_MODE" > "$attach_mode_file"
+  chmod 0644 "$attach_mode_file"
+fi
+
 backup_env="${ETC_DIR}/backup.env"
 backup_text="$(printf 'BACKUP_S3_URI=%s\nBACKUP_KMS_KEY_ARN=%s' "$BACKUP_S3_URI" "$BACKUP_KMS_KEY_ARN")"
 if [ -f "$backup_env" ] && [ -z "$BACKUP_S3_URI" ]; then
@@ -796,61 +857,134 @@ else
 fi
 
 # --------------------------------------------------------------- 7. config
-step "7. box config: herdr [session], CAO settings, Claude Code example"
-herdr_cfg="$HOME_DIR/.config/herdr/config.toml"
-put_home_file herdr "$herdr_cfg" 0644 "" config/herdr-config.toml.snippet \
-  < "$HERE/config/herdr-config.toml.snippet"
+step "7. box config: CAO settings, Claude Code example"
+if [ "$ATTACH_MODE" = "herdr" ]; then
+  herdr_cfg="$HOME_DIR/.config/herdr/config.toml"
+  put_home_file herdr "$herdr_cfg" 0644 "" config/herdr-config.toml.snippet \
+    < "$HERE/config/herdr-config.toml.snippet"
+fi
 
 cao_settings="$HOME_DIR/.aws/cli-agent-orchestrator/settings.json"
-put_home_file cao "$cao_settings" 0644 "$session_now" "config/cao-settings.json.snippet (herdr_session from box.env)" \
-  < <(sed "s/cao-<instance-id>/${session_now:-cao-<instance-id>}/" "$HERE/config/cao-settings.json.snippet")
+if [ "$ATTACH_MODE" = "tmux" ]; then cao_snippet="config/cao-settings.tmux.json.snippet"; else cao_snippet="config/cao-settings.json.snippet"; fi
+put_home_file cao "$cao_settings" 0644 "$session_now" "$cao_snippet" \
+  < <(sed "s/cao-<instance-id>/${session_now:-cao-<instance-id>}/" "$HERE/$cao_snippet")
 
 claude_settings="$HOME_DIR/.claude/settings.json"
 put_home_file claude "$claude_settings" 0600 "" config/claude-settings.box.json.example \
   < "$HERE/config/claude-settings.box.json.example"
 
+if [ -n "$BOX_SSH_PUBLIC_KEY" ]; then
+  step "7a. install the box SSH public key"
+  ssh_dir="$HOME_DIR/.ssh"
+  authorized_keys="$ssh_dir/authorized_keys"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '[dry-run] would, as %s: install .ssh (0700) and authorized_keys (0600) without duplicating BOX_SSH_PUBLIC_KEY\n' "$BOX_USER"
+  elif system_step; then
+    # The inner bash expands $1..$3.
+    # shellcheck disable=SC2016
+    runuser -u "$BOX_USER" -- env HOME="$BOX_HOME" PATH="$USER_PATH" bash -c \
+      'install -d -m 0700 "$2"; touch "$3"; chmod 0600 "$3"; grep -qxF -- "$1" "$3" || printf "%s\n" "$1" >> "$3"' \
+      box-key "$BOX_SSH_PUBLIC_KEY" "$ssh_dir" "$authorized_keys"
+  else
+    install -d -m 0700 "$ssh_dir"
+    touch "$authorized_keys"
+    chmod 0600 "$authorized_keys"
+    grep -qxF -- "$BOX_SSH_PUBLIC_KEY" "$authorized_keys" || printf '%s\n' "$BOX_SSH_PUBLIC_KEY" >> "$authorized_keys"
+  fi
+fi
+
 # ------------------------------------------------------- 8. scripts + units
-step "8. helper scripts and systemd units (enabled, NOT started)"
-for f in backup.sh restore.sh bin/lib-cao-box.sh bin/box-session-name.sh bin/herdr-start.sh bin/herdr-clean-layout.sh \
-         bin/wait-herdr-socket.sh bin/resource-probe-linux.sh bin/box-resume.sh; do
+step "8. helper scripts and systemd units"
+for f in backup.sh restore.sh bin/lib-cao-box.sh bin/box-session-name.sh bin/resource-probe-linux.sh bin/box-resume.sh; do
   install_file "$HERE/$f" "$LIB_DIR/$(basename "$f")" 0755
 done
+if [ "$ATTACH_MODE" = "herdr" ]; then
+  for f in bin/herdr-start.sh bin/herdr-clean-layout.sh bin/wait-herdr-socket.sh; do
+    install_file "$HERE/$f" "$LIB_DIR/$(basename "$f")" 0755
+  done
+fi
 
 render() { sed -e "s|@BOX_USER@|${BOX_USER}|g" -e "s|@BOX_HOME@|${BOX_HOME}|g" "$HERE/systemd/$1"; }
-for unit in herdr-cao.service cao-server.service cao-backup.service cao-backup.timer; do
+units=(cao-server.service cao-backup.service cao-backup.timer)
+if [ "$ATTACH_MODE" = "tmux" ]; then units+=(cao-tmux.service); else units+=(herdr-cao.service); fi
+if [ "$ATTACH_MODE" = "tmux" ]; then server_unit="cao-server.tmux.service"; else server_unit="cao-server.service"; fi
+for unit in "${units[@]}"; do
+  if [ "$unit" = "cao-server.service" ]; then source_unit="$server_unit"; else source_unit="$unit"; fi
   dest="$UNIT_DIR/$unit"
-  if [ -f "$dest" ] && render "$unit" | cmp -s - "$dest"; then
+  if [ -f "$dest" ] && render "$source_unit" | cmp -s - "$dest"; then
     log "unchanged: $dest"
   elif [ "$DRY_RUN" -eq 1 ]; then
-    printf '[dry-run] would install systemd/%s (rendered) -> %s (mode 0644)\n' "$unit" "$dest"
+    printf '[dry-run] would install systemd/%s (rendered) -> %s (mode 0644)\n' "$source_unit" "$dest"
   else
     mkdir -p "$UNIT_DIR"
-    render "$unit" > "$dest.tmp"
+    render "$source_unit" > "$dest.tmp"
     chmod 0644 "$dest.tmp"
     mv -- "$dest.tmp" "$dest"
     log "installed: $dest"
   fi
 done
+if [ "$ATTACH_MODE" = "tmux" ]; then
+  enable_units=(cao-tmux.service cao-server.service cao-backup.timer)
+else
+  enable_units=(herdr-cao.service cao-server.service cao-backup.timer)
+fi
 
 if [ -n "$ROOT" ] && [ "$DRY_RUN" -eq 0 ] && ! command -v systemctl >/dev/null 2>&1; then
   log "no systemctl here: enable the units when the image boots"
 elif [ -n "$ROOT" ]; then
-  run systemctl --root="$ROOT" enable herdr-cao.service cao-server.service cao-backup.timer
+  run systemctl --root="$ROOT" enable "${enable_units[@]}"
 else
   run systemctl daemon-reload
-  run systemctl enable herdr-cao.service cao-server.service cao-backup.timer
+  run systemctl enable "${enable_units[@]}"
+fi
+if [ -n "$ROOT" ]; then
+  log "skipped under --root: start the enabled services after the image boots"
+elif [ "$NO_START" -eq 1 ]; then
+  log "--no-start: enabled services but did not start them"
+else
+  step "9. start services and wait for CAO health"
+  run systemctl start "${enable_units[@]}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '[dry-run] would wait up to 30 seconds for curl -fsS http://127.0.0.1:9889/health\n'
+  else
+    healthy=0
+    for _ in $(seq 1 30); do
+      if curl -fsS --max-time 2 http://127.0.0.1:9889/health >/dev/null; then healthy=1; break; fi
+      sleep 1
+    done
+    [ "$healthy" -eq 1 ] || die "services did not become healthy within 30 seconds; check systemctl status cao-server.service"
+    log "services healthy"
+  fi
 fi
 
 # ------------------------------------------------------------------ done
 step "done"
+if [ "$ATTACH_MODE" = "tmux" ]; then
 cat <<EOF
 Next steps (you run these; see README.md):
   1. Log in to the agent CLIs as ${BOX_USER}: Claude Code (Bedrock via the instance
      role, see config/claude-settings.box.json.example), codex login --device-auth,
      gh auth login.
-  2. Start herdr first, then CAO (cao-server waits for herdr's socket):
-     sudo systemctl start herdr-cao.service && sudo systemctl start cao-server.service
-  3. Check: curl -fsS http://127.0.0.1:9889/health
-  4. On the laptop: herdr machine add <ssh-host> --remote-session <session> --label cao-box
+  2. Check: systemctl is-active cao-tmux.service cao-server.service cao-backup.timer
+     (with --no-start, start cao-tmux then cao-server, and the backup timer).
+  3. Attach: ssh -t <ssh-host> tmux attach
+EOF
+else
+cat <<EOF
+Next steps (you run these; see README.md):
+  1. Log in to the agent CLIs as ${BOX_USER}: Claude Code (Bedrock via the instance
+     role, see config/claude-settings.box.json.example), codex login --device-auth,
+     gh auth login.
+  2. Check: systemctl is-active herdr-cao.service cao-server.service cao-backup.timer
+     (with --no-start, start herdr-cao then cao-server, and the backup timer).
+  3. On the laptop: herdr machine add <ssh-host> --remote-session <session> --label cao-box
      (answer No if it offers to stop the remote server)
 EOF
+fi
+host_key_file="${ROOT}/etc/ssh/ssh_host_ed25519_key.pub"
+if [ -r "$host_key_file" ]; then
+  host_key="$(awk '$1 == "ssh-ed25519" && $2 ~ /^[A-Za-z0-9+/]+={0,2}$/ { print $1 " " $2; exit }' "$host_key_file")"
+  if [ -n "$host_key" ]; then
+    printf 'HOST KEY: %s\n' "$host_key"
+  fi
+fi

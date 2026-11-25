@@ -182,13 +182,6 @@ Kiro CLI workers.
 cao launch --agents analysis_supervisor --provider $PROVIDER
 ```
 
-Provider notes:
-
-- `antigravity_cli`: every `agy` process reads the MCP servers of all CAO
-  terminals from one file, `~/.gemini/config/mcp_config.json`. A worker can
-  therefore call a CAO tool through the server of another terminal
-  ([#532](https://github.com/awslabs/cli-agent-orchestrator/issues/532)).
-
 ## Usage
 
 In the supervisor terminal, try this example task:

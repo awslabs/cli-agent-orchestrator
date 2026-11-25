@@ -194,13 +194,24 @@ class FifoManager:
         terminal_id: str,
         pane_probe: Optional[PaneProbe] = None,
         rearm: Optional[RearmPipe] = None,
-    ) -> None:
+        *,
+        cold_start_check: bool = True,
+    ) -> bool:
         """Create FIFO and start reader thread.
 
         ``pane_probe``/``rearm`` are optional and only supplied by pipe-pane
         (tmux) callers. When both are given, the terminal is enrolled in the
         liveness watchdog (issue #388). Callers that omit them (or backends
         without pipe-pane) get exactly the old behavior — no watchdog.
+
+        When ``cold_start_check=False`` (e.g., re-attaching a surviving pane
+        after a server restart), ``_ever_delivered`` is seeded ``True`` so an
+        idle pane with pre-existing content does not trigger cold-start tail
+        replays or get dropped from the watchdog; the divergence check still
+        protects against real stalls.
+
+        Returns ``True`` if a new reader was created, or ``False`` if a reader
+        already existed for ``terminal_id``.
         """
         fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
@@ -208,7 +219,7 @@ class FifoManager:
 
         with self._lock:
             if terminal_id in self._readers:
-                return
+                return False
 
             _ensure_fifo(fifo_path)
 
@@ -226,7 +237,7 @@ class FifoManager:
             now = time.monotonic()
             self._last_data_at[terminal_id] = now
             self._registered_at[terminal_id] = now
-            self._ever_delivered[terminal_id] = False
+            self._ever_delivered[terminal_id] = not cold_start_check
             if pane_probe is not None and rearm is not None:
                 self._pane_probe[terminal_id] = pane_probe
                 self._rearm[terminal_id] = rearm
@@ -236,6 +247,7 @@ class FifoManager:
             self._ensure_watchdog()
 
         logger.info("Started FIFO reader for terminal %s", terminal_id)
+        return True
 
     def stop_reader(self, terminal_id: str) -> bool:
         """Stop the reader thread (if running) and delete the FIFO file.

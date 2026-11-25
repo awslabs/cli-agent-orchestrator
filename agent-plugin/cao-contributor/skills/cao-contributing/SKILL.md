@@ -72,7 +72,7 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 
 | Job | Runs | Blocking? |
 |-----|------|-----------|
-| **Unit Tests** (3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ examples/remote/ec2/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-branch --cov-fail-under=80 --cov-report=term-missing --cov-report=json` | **Yes** |
+| **Unit Tests** (3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ examples/remote/ec2/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-branch --cov-fail-under=80 --cov-report=term-missing --cov-report=json -n auto --dist loadgroup` | **Yes** |
 | ↳ step: **Validate Markdown links** | `uv run python scripts/validate_markdown_links.py` — every relative link in every tracked `.md`, including `skills/` | **Yes** |
 | ↳ step: **Check links inside each built agent plugin package** | `make check-agent-plugin-links` — builds each `agent-plugin/` package on its own and checks its links, including the generated `README.md` and `CHANGELOG.md` | **Yes** |
 | **Code Quality** | black `--check`, isort `--check-only`, `uv run ruff check src/ test/ examples/`, then `uv run python scripts/mypy_ratchet.py` | **Yes** (all four; the mypy step's `continue-on-error` was removed in issue #1005) |
@@ -91,6 +91,20 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 | **CodeQL** | GitHub Actions, JavaScript/TypeScript, Python, and Rust analysis and upload in the same CI run, including forks after required workflow approval | **Yes** — no project build; the hosted scan/status rules remain as documented in `SECURITY.md` |
 | **Dependency Security** | Full locked npm, Bun, uv, and Cargo inventories, including development dependencies and unfixed advisories, classified against a shipped set measured from the builds; independent clean-install mitigation checks | **Yes** — every HIGH/CRITICAL finding in the shipped set (wheel runtime closure, bundled web/MCP App/docs packages, TUI crates, the decision-model-host CDK app's runtime packages), a malware advisory anywhere, a toolchain HIGH/CRITICAL with a fix that the PR adds or changes, or any scan, completeness or shipped-set error, fails; other toolchain-only findings are listed and do not block; locally, build the bundles first, then `scripts/security-scan.sh dependencies` with Trivy installed |
 | **Dependency Review** | `actions/dependency-review-action` over the PR's dependency delta: `fail-on-severity: high` plus denied licences `GPL-3.0`/`AGPL-3.0` | **Yes** — CI-only; there is nothing to run locally, and it is skipped on forks (`if: github.repository == 'awslabs/cli-agent-orchestrator'`), so a green run on your fork has not exercised it |
+| **Changed paths for filtered jobs** | PRs compare base with tested head and fail closed if the diff cannot be read; pushes to `main` and merge queue entries select every filtered job | **Yes** |
+| **Antigravity provider tests** | provider tests (3.11 / 3.12), path-selected | **Yes** when selected |
+| **Antigravity provider lint** | black and isort block when selected; mypy is advisory (`continue-on-error`) | **Yes** when selected |
+| **Claude provider tests** | provider tests (3.11 / 3.12), path-selected | **Yes** when selected |
+| **Claude provider lint** | black and isort block when selected; mypy is advisory (`continue-on-error`) | **Yes** when selected |
+| **Codex provider tests** | provider tests (3.11 / 3.12), path-selected | **Yes** when selected |
+| **Codex provider lint** | black and isort block when selected; mypy is advisory (`continue-on-error`) | **Yes** when selected |
+| **Kiro provider tests** | provider tests (3.11 / 3.12), path-selected | **Yes** when selected |
+| **Kiro provider lint** | black and isort block when selected; mypy is advisory (`continue-on-error`) | **Yes** when selected |
+| **Transport simulator** | transport example (3.11 / 3.12), path-selected | **Yes** when selected |
+| **Factory simulator** | factory example (3.11 / 3.12), path-selected | **Yes** when selected |
+| **Docs site build** | Docusaurus typecheck and build when docs paths change; production Pages deployment stays separate | **Yes** when selected |
+| **Filtered jobs gate** | validates every selected job: only a no-match PR path result allows a skip | **Yes** |
+| **CI gate (advisory)** | one pass/fail verdict over every other `ci.yml` job; filtered jobs may skip only when changed paths succeeded and did not select them; `Dependency Review` may skip outside upstream PRs | **Yes** — like the jobs above, a failure fails the CI run. No ruleset requires it yet (#1350 step 6). |
 
 CodeQL's four language jobs are part of `ci.yml`, so **Re-run all jobs** includes
 them. The standalone `codeql.yml` is only for weekly and manual scans; both use
@@ -276,6 +290,6 @@ digest together:
 
 - Authoring a *new agent skill* (`SKILL.md`, frontmatter, evals) → no shipped skill covers this
   yet; follow the [Agent Skills specification](https://agentskills.io/specification) directly.
-- Building a provider / plugin / MCP-apps view → **cao-provider** / **cao-plugin** /
+- Building a provider / plugin / MCP-apps view → **cao-provider** / **cao-event-plugin** /
   **cao-mcp-apps**.
 - Launching or steering running agent sessions → **cao-session-management**.

@@ -622,6 +622,12 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::PluginRemove => None,
         CommandId::PluginValidate => None,
 
+        // Experimental Remote CAO is hidden and deliberately has no local API mapping.
+        CommandId::RemoteAdd => None,
+        CommandId::RemoteCheck => None,
+        CommandId::RemoteList => None,
+        CommandId::RemoteRemove => None,
+
         // ── `cao skills *` — HANDOFF, all three (OQ-6) ───────────────────────────────────
         // The entire group is routeless. `GET/POST /settings/skill-dirs` is NOT this: it returns
         // and sets two *directory paths* (`api/main.py:1623-1629`), while `cao skills list`

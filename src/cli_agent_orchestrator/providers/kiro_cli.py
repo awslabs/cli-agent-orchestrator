@@ -300,6 +300,19 @@ TUI_TRUST_ALL_TOOLS_CURSOR = r"❯\s*No, exit"
 # Bottom pane lines scanned for the consent dialog (mirrors codex's window).
 STARTUP_PROMPT_BOTTOM_LINES = 15
 
+# Selection cursor of kiro's blocking list selectors (consent, update, login).
+# The "/" command menu draws the same footer as TUI_TRUST_ALL_TOOLS_FOOTER but
+# no cursor glyph (it highlights the row instead), so Check 2a requires this
+# glyph above the footer. Without it, an open or stale "/" menu read as
+# WAITING_USER_ANSWER.
+TUI_SELECTOR_CURSOR = "❯"
+
+# Bottom lines scanned for an open v2 TUI permission dialog (Checks 2 and 3).
+# Same window as Check 2a. Kiro redraws the dialog on a tmux attach/resize
+# without a new OSC 7501 report, so the blocked report can leave the rolling
+# buffer while the dialog is still open.
+PERMISSION_DIALOG_BOTTOM_LINES = 20
+
 # Reads of the screen for the TUI header after the prompt is ready (see
 # KiroCliProvider._verify_agent_identity). A screen with no header row, only a
 # partial (elided or wrapped) name, or Kiro's plan mode is read again; a screen
@@ -1455,6 +1468,15 @@ class KiroCliProvider(BaseProvider):
             model=model,
         )
 
+    @staticmethod
+    def _permission_dialog_open_after(clean_output: str, position: int) -> bool:
+        """True when a TUI permission dialog sits in the bottom lines, drawn after ``position``."""
+        region = "\n".join(clean_output.split("\n")[-PERMISSION_DIALOG_BOTTOM_LINES:])
+        region_start = len(clean_output) - len(region)
+        return any(
+            region_start + m.start() > position for m in re.finditer(TUI_PERMISSION_PATTERN, region)
+        )
+
     def get_status(self, output: str) -> TerminalStatus:
         """Get Kiro CLI status by analyzing terminal output.
 
@@ -1515,16 +1537,35 @@ class KiroCliProvider(BaseProvider):
             fields = _program_status(match.group(1))
             if "state" in fields:
                 reports.append((match, fields))
+        # True when Kiro's own last report says no permission prompt is open
+        # (working, done, idle), or the prompt was answered after a blocked
+        # report. Dialog text still in the buffer is then stale, so the
+        # screen-text permission checks below are skipped.
+        kiro_reports_unblocked = False
         if reports:
             last, fields = reports[-1]
+            # Approving the prompt (Yes / Trust) leaves no new report: the blocked
+            # report stays last while Kiro redraws its spinner ("Thinking...") or
+            # "Kiro is working" footer. Processing text drawn after the report, with
+            # no dialog text drawn after that, means the prompt has been answered.
+            answered_prompt_resumed = False
+            for working in re.finditer(TUI_PROCESSING_PATTERN, clean_output):
+                if working.start() > last.end():
+                    answered_prompt_resumed = not re.search(
+                        TUI_PERMISSION_PATTERN, clean_output[working.end() :]
+                    )
             if (
                 fields["state"] == "blocked"
                 and fields.get("kind") == "permission"
                 and fields.get("app") == "kiro-cli"
+                and not answered_prompt_resumed
                 and not any(m.start() > last.end() for m in old_idle_matches + new_tui_idle_matches)
                 and not (self._initialized and self.shell_baseline and self._exited_to_shell())
             ):
                 return TerminalStatus.WAITING_USER_ANSWER
+            kiro_reports_unblocked = fields.get("app") == "kiro-cli" and (
+                fields["state"] != "blocked" or answered_prompt_resumed
+            )
 
         # Check 0b: TUI startup — Kiro emits "● Initializing..." or
         # "0 of N mcp servers initialized. ctrl-c to start chatting now"
@@ -1574,6 +1615,18 @@ class KiroCliProvider(BaseProvider):
                 m.start() > last_working_pos for m in new_tui_idle_matches + old_idle_matches
             )
             if not idle_after_working:
+                # An open permission dialog is the newest thing on screen and
+                # wins over working text drawn ABOVE it: the spinner / footer
+                # line that was on screen when the dialog opened, or agent
+                # output that quotes "Thinking..." / "Kiro is working". Only
+                # a dialog drawn after the last working match counts, and only
+                # in the bottom lines; a dialog before it was answered (the
+                # working text redrew over it) and Kiro's own last report
+                # still outranks the text.
+                if not kiro_reports_unblocked and self._permission_dialog_open_after(
+                    clean_output, last_working_pos
+                ):
+                    return TerminalStatus.WAITING_USER_ANSWER
                 return TerminalStatus.PROCESSING
 
         # Check 2a: Trust-all-tools acceptance dialog at startup (no idle prompt case).
@@ -1581,10 +1634,12 @@ class KiroCliProvider(BaseProvider):
         # the dialog has no idle prompt but should classify WAITING_USER_ANSWER.
         # Anchored to bottom 20 lines to avoid false positives when the warning text
         # appears in scrollback with an idle prompt below (same class as issue #405).
+        # A ❯ selection cursor must sit above the footer: the "/" command menu
+        # draws the same footer without one and is not a blocking selector.
         lines = clean_output.split("\n")
         bottom_region = "\n".join(lines[-20:]) if len(lines) > 20 else clean_output
         footer_match = re.search(TUI_TRUST_ALL_TOOLS_FOOTER, bottom_region)
-        if footer_match:
+        if footer_match and TUI_SELECTOR_CURSOR in bottom_region[: footer_match.start()]:
             after_footer = bottom_region[footer_match.end() :]
             has_idle_after = re.search(self._idle_prompt_pattern, after_footer) or re.search(
                 NEW_TUI_IDLE_PATTERN, after_footer
@@ -1602,9 +1657,19 @@ class KiroCliProvider(BaseProvider):
         # idle prompt yet. Without this gate, get_status() returns IDLE
         # immediately after launch, which lets pre-init pastes get absorbed
         # by Kiro's boot screen and silently dropped.
+        #
+        # Kiro does not draw the idle prompt while a permission dialog is open,
+        # so an open dialog whose blocked report has left the buffer (full-screen
+        # redraw on tmux attach/resize, or the rolling-buffer cap) lands here.
+        # Report it as WAITING_USER_ANSWER when the dialog is in the bottom
+        # lines, unless Kiro's last report says the prompt has ended.
         if not has_idle_prompt and not has_new_tui_idle:
             if self._initialized and self.shell_baseline and self._exited_to_shell():
                 return TerminalStatus.IDLE
+            if not kiro_reports_unblocked:
+                dialog_region = "\n".join(lines[-PERMISSION_DIALOG_BOTTOM_LINES:])
+                if re.search(TUI_PERMISSION_PATTERN, dialog_region):
+                    return TerminalStatus.WAITING_USER_ANSWER
             return TerminalStatus.PROCESSING
 
         # Check 2: Look for known error messages in the output
@@ -1615,12 +1680,14 @@ class KiroCliProvider(BaseProvider):
         # Active prompt: 0-1 lines with idle prompt (CLI renders prompt on next line)
         # Stale prompt: 2+ lines with idle prompt (user answered, agent continued)
         # Line-based counting handles \r redraws (same line, no \n) correctly
+        # Skipped when Kiro's last OSC 7501 report says the prompt has ended:
+        # cursor-move redraws leave dialog text with only one idle line after it.
         perm_spans = _legacy_permission_prompt_spans(clean_output)
         tui_perm_spans = [m.span() for m in re.finditer(TUI_PERMISSION_PATTERN, clean_output)]
         all_perm_spans = perm_spans + tui_perm_spans
         # Sort by position so we use the last permission prompt regardless of type
         all_perm_spans.sort(key=lambda span: span[0])
-        if all_perm_spans:
+        if all_perm_spans and not kiro_reports_unblocked:
             after_last_perm = clean_output[all_perm_spans[-1][1] :]
             lines_after = after_last_perm.split("\n")
             idle_lines = sum(

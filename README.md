@@ -155,6 +155,9 @@ provider override while keeping the same sequence.
 - [Kubernetes deployment](examples/cao-clusters/kubernetes/eks/README.md): run a supervisor and worker fleet on
   Amazon EKS, with shared workspace, per-pod state, and credential delivery.
 - [Updating CAO](docs/updating.md): update an installed uv tool.
+- [Remote CLI reference](docs/remote-cli.md): local Remote CAO registration
+  and read-only prerequisite checks.
+- [Remote CAO](docs/remote.md): run CAO on one always-on EC2 box and reach it from your laptop.
 
 ### Configure and integrate
 
