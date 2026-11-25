@@ -2230,6 +2230,26 @@ test("uninstall refuses a --home that is, holds or lies inside the main home or 
   }
 });
 
+test("uninstall refuses a --home that is $HOME, with the main home outside $HOME, and moves nothing", () => {
+  // The main-home clause already refuses $HOME when the main home lies inside it; this one holds the $HOME clause on its own.
+  const w = world();
+  const mainHome = join(w.root, "main-elsewhere");      // outside $HOME
+  mkdirSync(join(mainHome, "layouts"), { recursive: true });
+  const manifest = JSON.stringify({ core: "caowin", caoCore: "cao", machine: "cao", binDir: w.root, launcher: "x", files: [] });
+  writeFileSync(join(w.home, "cao-window-install.json"), manifest);
+  writeFileSync(join(w.home, "keep.txt"), "mine");
+  for (const home of [w.home, `${w.home}/`]) {
+    const mark = w.log().length;
+    const r = w.uninstall(["--home", home, "--main-home", mainHome]);
+    assert.equal(r.status, 2, `${home}: uninstall went ahead\n${r.text}`);
+    assert.match(r.err, /refusing .*home folder/, home);
+    assert.deepEqual(w.log().slice(mark), [], `${home}: a tool was called`);
+    assert.equal(readFileSync(join(w.home, "keep.txt"), "utf8"), "mine", home);
+    assert.ok(existsSync(join(w.home, "cao-window-install.json")), `${home}: the manifest went`);
+    assert.ok(!readdirSync(w.root).some((n) => /\.removed-/.test(n)), `${home}: $HOME was moved aside`);
+  }
+});
+
 test("an empty --bin-dir or --app is refused with a message and nothing is written", () => {
   for (const args of [["--bin-dir", ""], ["--app", ""], ["--bin-dir", "", "--app", ""]]) {
     const w = world();

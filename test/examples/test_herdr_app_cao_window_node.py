@@ -1,7 +1,9 @@
 """Runs every ``*.test.mjs`` of examples/herdr-app-cao-window under pytest, one case per file.
 
-The node suites need ``node`` (18 or later; the example's ``package.json`` has ``"type": "module"``, so that
-Node reads its ``.js`` files with ``import`` as modules and not as CommonJS) and ``jq``. They are marked
+The node suites need ``node`` (18.19 or later, 20.6 or later on Node 20, because install.test.mjs walks folders
+with ``readdirSync(..., { recursive: true })``, which drops entries before those releases; the example's
+``package.json`` has ``"type": "module"``, so that Node reads its ``.js`` files with ``import`` as modules and
+not as CommonJS) and ``jq``. They are marked
 ``must_run("unit")``: on the CI leg that owns the ``unit`` gate (3.12, ``CAO_MUST_RUN=unit``) a missing tool
 fails the session instead of skipping (``test/_must_run.py``). The portability suite is the one that keeps shipped files free of
 one person's setup, so it must actually run in CI.
@@ -354,7 +356,7 @@ def test_the_long_suite_is_started_first_and_only_selected_suites_are_run_togeth
 
 
 def test_install_gets_more_time_than_the_other_suites() -> None:
-    assert suite_timeout(EXAMPLE / "install.test.mjs") == 1500
+    assert suite_timeout(EXAMPLE / "install.test.mjs") > DEFAULT_SUITE_TIMEOUT_S
     assert suite_timeout(EXAMPLE / "lib" / "logic.test.mjs") == DEFAULT_SUITE_TIMEOUT_S
 
 
