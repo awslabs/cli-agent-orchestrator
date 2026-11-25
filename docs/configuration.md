@@ -598,7 +598,7 @@ A number of other `CAO_*` variables (runtime/process-identity vars like `CAO_TER
 | Env var | Default | Type | Purpose |
 |---|---|---|---|
 | `CAO_HOME_DIR` | `~/.aws/cli-agent-orchestrator` | str (path) | Base directory for all CAO state. See [Data directory](#data-directory-cao_home_dir) above. |
-| `CAO_INSTANCE_LABEL` | *(none)* | str | A short name for this server, such as `EKS cluster`. `GET /health` reports it as `instance_label`, and the web UI shows it beside the title and in the browser tab, so two open UIs (a local server and a cluster supervisor) can be told apart. Display only. |
+| `CAO_INSTANCE_LABEL` | *(none)* | str | A short name for this server, such as `EKS cluster`. `GET /health` reports it as `instance_label`, and the web UI shows it beside the title and in the browser tab, so two open UIs (a local server and a cluster supervisor) can be told apart. Display only. `/health` is open in every auth mode, so anyone who can reach the server can read it: do not put anything private in it. |
 
 Rendered-screen status detection adds `CAO_PYTE_STATUS` (default `true`) and `CAO_PYTE_MIDBURST_PROBE_S` (default `1.0`, the minimum interval between mid-burst PROCESSING probes; see [Event-Driven Architecture](event-driven-architecture.md#status-monitor-servicesstatus_monitorpy--publisher--consumer)), both read in `constants.py`. The pipe-pane liveness watchdog (issue #388, `services/fifo_reader.py`) adds six more of these ad-hoc vars, read directly via `_env_int`/`_env_float` in `constants.py` rather than through `ConfigService` — they have no `settings.json` mapping like the rows in the table above:
 

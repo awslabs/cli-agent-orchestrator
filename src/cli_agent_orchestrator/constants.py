@@ -564,7 +564,8 @@ ELASTIC_BROKER_TOKEN_HEADER = "X-CAO-Broker-Token"
 # reports it as ``instance_label`` and the web UI shows it beside the title and in
 # the browser tab. It is how a person with two CAO web UIs open (a local server and
 # a cluster supervisor, which are the same build) tells them apart. Display only:
-# nothing branches on it. Unset or blank means no label.
+# nothing branches on it. Unset or blank means no label. /health is open in
+# every auth mode, so the label is readable without a token: never a secret.
 INSTANCE_LABEL_ENV = "CAO_INSTANCE_LABEL"
 
 
