@@ -292,7 +292,6 @@ async def test_remote_memory_get_preserves_key_in_not_found_error(monkeypatch):
     response.json.return_value = {
         "error_kind": "not_found",
         "error": "memory not found: 'no-such-key'",
-        "key": "no-such-key",
     }
 
     with (

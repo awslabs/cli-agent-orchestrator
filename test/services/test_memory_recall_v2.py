@@ -498,6 +498,80 @@ def test_related_v2_rows_count_hidden_entries(
     assert wire["content_truncated"] is True
 
 
+@pytest.mark.parametrize("sort_by", [None, "score"])
+def test_related_v2_rows_count_hidden_entries_with_recorded_access(
+    service: MemoryService, monkeypatch: pytest.MonkeyPatch, sort_by: str | None
+) -> None:
+    monkeypatch.setattr(settings_service, "is_memory_recall_v2_fields_enabled", lambda: True)
+    _topic(service, "primary-related", "Primary search body.")
+    _topic(
+        service,
+        "related-history",
+        "",
+        timestamps=(
+            ("2026-01-01T01:02:03Z", "Oldest body."),
+            ("2026-01-02T01:02:03Z", "Middle body."),
+            ("2026-01-03T01:02:03Z", "Newest body."),
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "_related_target_plan",
+        lambda primaries: [(primary, ["related-history"]) for primary in primaries],
+    )
+    options = {"sort_by": sort_by} if sort_by is not None else {}
+    rows = asyncio.run(
+        service.recall(
+            query="primary-related",
+            scope="global",
+            search_mode="metadata",
+            include_related=True,
+            record_access=True,
+            **options,
+        )
+    )
+    related = next(row for row in rows if row.key == "related-history")
+    wire = mcp_recall_wire_dict(related, include_v2_fields=True)
+    assert wire["earlier_entries"] == 2
+    assert wire["content_truncated"] is True
+    if sort_by is None:
+        from cli_agent_orchestrator.mcp_server import server
+        from cli_agent_orchestrator.services import memory_gateway, memory_service
+
+        monkeypatch.setattr(memory_gateway, "remote_memory_url", lambda: None)
+        monkeypatch.setattr(memory_service, "MemoryService", lambda: service)
+        monkeypatch.setattr(server, "_get_terminal_context_from_env", lambda: None)
+        tool = getattr(server.memory_recall, "fn", server.memory_recall)
+        response = asyncio.run(
+            tool(
+                query="primary-related",
+                scope="global",
+                memory_type=None,
+                limit=10,
+                search_mode="metadata",
+                sort_by=None,
+                include_related=True,
+                detail="full",
+            )
+        )
+        tool_related = next(row for row in response["memories"] if row["key"] == "related-history")
+        assert tool_related["earlier_entries"] == 2
+        assert tool_related["content_truncated"] is True
+
+
+@pytest.mark.parametrize("search_mode", ["metadata", "bm25"])
+@pytest.mark.parametrize("detail", ["full", "snippet"])
+@pytest.mark.parametrize("query", ["Widgets widgets", "WIDGETS Widgets widgets"])
+def test_recall_match_terms_deduplicate_after_normalizing(
+    service: MemoryService, search_mode: str, detail: str, query: str
+) -> None:
+    _topic(service, "widgets-note", "Widgets", timestamps=(("2026-01-01T01:02:03Z", ""),))
+    rows = asyncio.run(
+        service.recall(query=query, scope="global", search_mode=search_mode, detail=detail)
+    )
+    assert rows[0].match["terms"] == ["widgets"]
+
+
 def _configure_vault_exact_read(
     service: MemoryService, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Path, dict[str, str]]:
@@ -1068,11 +1142,25 @@ def test_default_recall_does_not_count_entry_boundaries(
             ("### 2026-01-01T01:02Z", "### 2026-01-02T01:02Z"),
             ("First entry.", "Second entry."),
         ),
+        *[
+            (
+                tuple(pattern.format(stamp) for stamp in timestamps),
+                ("First entry.", "Second entry.", "Third entry."),
+            )
+            for pattern in ("### {}", "#### {}", "## {} Standup", "## {} ")
+            for timestamps in [
+                ("2026-01-01T01:02:03Z", "2026-01-02T01:02:03Z", "2026-01-03T01:02:03Z")
+            ]
+        ],
     ],
 )
 def test_memory_get_lenient_history_uses_counted_boundaries(
-    service: MemoryService, headings: tuple[str, ...], bodies: tuple[str, ...]
+    service: MemoryService,
+    monkeypatch: pytest.MonkeyPatch,
+    headings: tuple[str, ...],
+    bodies: tuple[str, ...],
 ) -> None:
+    monkeypatch.setattr(settings_service, "is_memory_recall_v2_fields_enabled", lambda: True)
     path = _topic(service, "lenient-history", "Body to replace.")
     text = path.read_text(encoding="utf-8")
     path.write_text(
@@ -1083,6 +1171,16 @@ def test_memory_get_lenient_history_uses_counted_boundaries(
         encoding="utf-8",
     )
 
+    result = asyncio.run(service.get_memory("lenient-history", scope="global"))
+    assert result["earlier_entries"] == len(bodies) - 1
+    assert result["content_truncated"] is True
+    rows = asyncio.run(
+        service.recall(query="lenient-history", scope="global", search_mode="metadata")
+    )
+    wire = mcp_recall_wire_dict(rows[0], include_v2_fields=True)
+    assert wire["earlier_entries"] == len(bodies) - 1
+    assert wire["content_truncated"] is True
+
     result = asyncio.run(
         service.get_memory("lenient-history", scope="global", include_history=True)
     )
@@ -1090,6 +1188,20 @@ def test_memory_get_lenient_history_uses_counted_boundaries(
     assert result["earlier_entries"] == len(bodies) - 1
     assert [item["content"] for item in result["history"]] == list(reversed(bodies))
     assert result["content_truncated"] is False
+
+    if len(bodies) == 3 and headings[0].startswith(("### 2026", "#### 2026", "## 2026")):
+        monkeypatch.setattr(
+            settings_service, "get_memory_settings", lambda: {"parser": {"lenient": False}}
+        )
+        strict = asyncio.run(
+            service.get_memory("lenient-history", scope="global", include_history=True)
+        )
+        strict_rows = asyncio.run(
+            service.recall(query="lenient-history", scope="global", search_mode="metadata")
+        )
+        assert strict["earlier_entries"] == strict_rows[0].earlier_entries == 0
+        assert strict_rows[0].content_truncated is False
+        assert len(strict["history"]) == 1
 
 
 def test_memory_get_does_not_read_unrelated_topic_files(

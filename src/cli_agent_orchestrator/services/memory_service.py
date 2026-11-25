@@ -2968,6 +2968,7 @@ class MemoryService:
                 pool.effective_sort,
                 limit,
                 include_related=include_related,
+                count_entries=is_memory_recall_v2_fields_enabled(),
                 query=query,
                 terminal_context=terminal_context,
                 scan_all=scan_all,
@@ -3020,11 +3021,13 @@ class MemoryService:
             memory.edited_at = memory.edited_at or memory.updated_at
             memory.match = {
                 "mode": search_mode,
-                "terms": [
-                    term.lower() if len(term.lower()) == len(term) else term
-                    for term in terms
-                    if re.search(re.escape(term), memory.content, re.IGNORECASE)
-                ],
+                "terms": list(
+                    dict.fromkeys(
+                        term.lower() if len(term.lower()) == len(term) else term
+                        for term in terms
+                        if re.search(re.escape(term), memory.content, re.IGNORECASE)
+                    )
+                ),
                 "rank_reason": f"{search_mode} match",
             }
             memory.status = memory.lifecycle_status or "active"
@@ -3595,6 +3598,7 @@ class MemoryService:
         terminal_context: Optional[dict] = None,
         scan_all: bool = False,
         *,
+        count_entries: bool = False,
         vault_candidates: Optional[Sequence[VaultCandidate]] = None,
         max_body_chars: int = 4096,
         policy: Optional[VaultInjectionPolicy] = None,
@@ -3616,6 +3620,7 @@ class MemoryService:
             scope,
             limit,
             include_related=include_related,
+            count_entries=count_entries,
             terminal_context=terminal_context,
             policy=policy,
         )
@@ -4882,9 +4887,7 @@ class MemoryService:
                 "timestamp",
             )
         if count_entries and not compiled:
-            entry_count = len(
-                _parseable_entry_boundaries(file_content, lenient=lenient and not use_legacy_split)
-            )
+            entry_count = len(_parseable_entry_boundaries(file_content, lenient=lenient))
 
         if timestamps:
             created_at = timestamps[0]
