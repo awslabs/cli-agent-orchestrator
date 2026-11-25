@@ -1,9 +1,9 @@
 """Runs every ``*.test.mjs`` of examples/herdr-app-cao-window under pytest, one case per file.
 
-The node suites need ``node`` (20.19 or later: they load ``.js`` files with ``import`` and no ``package.json``
-``"type": "module"``, which older Node reads as CommonJS) and ``jq``. They are marked ``must_run("unit")``: on the CI leg that
-owns the ``unit`` gate (3.12, ``CAO_MUST_RUN=unit``) a missing tool fails the session instead of
-skipping (``test/_must_run.py``). The portability suite is the one that keeps shipped files free of
+The node suites need ``node`` (18 or later; the example's ``package.json`` has ``"type": "module"``, so that
+Node reads its ``.js`` files with ``import`` as modules and not as CommonJS) and ``jq``. They are marked
+``must_run("unit")``: on the CI leg that owns the ``unit`` gate (3.12, ``CAO_MUST_RUN=unit``) a missing tool
+fails the session instead of skipping (``test/_must_run.py``). The portability suite is the one that keeps shipped files free of
 one person's setup, so it must actually run in CI.
 
 The gate cases at the bottom run this very file in a child pytest with the tools hidden, because a
