@@ -1155,7 +1155,7 @@ Click `+` in the **Sessions** header, choose a profile and a working directory, 
 ### C50 The filter header and its clear control
 
 - **Do:** click `1 asking` in the status bar (C10 gives you one asking session), then look at the **Sessions** header.
-- **You should see:** `Sessions 1 of N · filter: asking` with a small `clear` control, and only the matching sessions listed. A recorded draft author session, if any, is still listed with its tag and is not counted in `1 of N`. Click `clear`: the header reads `Sessions` and every session is listed again. Click `1 asking` twice instead: the second click also clears it.
+- **You should see:** at the default 268 px width `1 of N · asking` with a small `clear` control (the header drops `filter:`, then `Sessions`, to keep the count and the filter's name readable; its tooltip reads `Sessions 1 of N · filter: asking`, and a sidebar dragged wide enough shows that whole), and only the matching sessions listed. A recorded draft author session, if any, is still listed with its tag and is not counted in `1 of N`. Click `clear`: the header reads `Sessions` and every session is listed again. Click `1 asking` twice instead: the second click also clears it.
 - **Broken means:** a header that does not say a filter is on, no `clear` control, or a count that includes a draft session.
 
 ### C51 "Started by schedule X" opens the right sidebar at that schedule

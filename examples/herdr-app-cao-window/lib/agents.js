@@ -359,10 +359,23 @@ const agLive = (sessions) => (Array.isArray(sessions) ? sessions : []).filter((s
 // author sessions are in neither count (they stay listed with their tag whatever the filter). While a
 // filter is on it reads `Sessions <M> of <S> \u00b7 filter: <name>` and has a clear control, whether or not
 // anything matches; an unknown filter name lists everything, so it is no filter.
-// -> {text, clearable}
-export function sessionsHeader(total, shown, filter) {
-  if (!AG_FILTERS.includes(filter)) return { text: "Sessions", clearable: false };
-  return { text: `Sessions ${agLive(shown).length} of ${agLive(total).length} \u00b7 filter: ${filter}`, clearable: true };
+// The header shares its row with the fold arrow, the clear control and the `+`, so `width` (the block's width in px) decides how much of
+// the text is drawn: `headChars(width)` characters, 7 px a character at the title's 11.5 px size, after the 130 px the padding, the arrow,
+// the gaps, the clear control and the `+` take; a width that is not a finite number is the sidebar's default 268 px (19 characters). The
+// longest of these that fits is `text`, the less useful words going first: the whole text, then without `filter:`, then without
+// `Sessions` (the block's place names it), then the filter's name alone. `full` is the whole text, for the tooltip.
+// -> {text, full, clearable}
+const AG_HEAD_FIXED_PX = 130;
+export function headChars(width) {
+  const w = typeof width === "number" && Number.isFinite(width) ? width : AG_GOAL_DEFAULT_WIDTH;
+  return Math.max(1, Math.floor((w - AG_HEAD_FIXED_PX) / 7));
+}
+export function sessionsHeader(total, shown, filter, width) {
+  if (!AG_FILTERS.includes(filter)) return { text: "Sessions", full: "Sessions", clearable: false };
+  const count = `${agLive(shown).length} of ${agLive(total).length}`;
+  const ladder = [`Sessions ${count} \u00b7 filter: ${filter}`, `Sessions ${count} \u00b7 ${filter}`, `${count} \u00b7 ${filter}`, filter];
+  const room = headChars(width);
+  return { text: ladder.find((s) => [...s].length <= room) ?? filter, full: ladder[0], clearable: true };
 }
 
 // What a folded block shows after its name. Sessions (the sessions list): `N`, or `N, K asking` when K

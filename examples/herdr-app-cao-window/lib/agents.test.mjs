@@ -667,18 +667,20 @@ const thirteen = () => {
 };
 const draftSession = () => freeze(sess("cao-draft-flow-0a1b2c3d", [T("d1", "cao-draft-flow-0a1b2c3d", { state: "blocked" })], {}, ["d1"]));
 
+const WIDE = 640;   // the widest sidebar: the whole header fits
+
 test("Filter: with a filter on the header reads 'Sessions M of S - filter: name' with a clear control", () => {
   const all = thirteen();
   const asking = filterSessions(all, "asking", never);
   assert.equal(asking.length, 1, "fixture: one asking session");
-  const head = A.sessionsHeader(all, asking, "asking");
+  const head = A.sessionsHeader(all, asking, "asking", WIDE);
   assert.equal(head.text, `Sessions 1 of 13 ${DOT} filter: asking`);
   assert.equal(head.clearable, true);
   const working = filterSessions(all, "working", never);
-  assert.equal(A.sessionsHeader(all, working, "working").text, `Sessions 1 of 13 ${DOT} filter: working`);
+  assert.equal(A.sessionsHeader(all, working, "working", WIDE).text, `Sessions 1 of 13 ${DOT} filter: working`);
   const replied = filterSessions(all, "replied", (t) => t.id === "c2");
-  assert.equal(A.sessionsHeader(all, replied, "replied").text, `Sessions 1 of 13 ${DOT} filter: replied`);
-  assert.equal(A.sessionsHeader(all, [], "replied").text, `Sessions 0 of 13 ${DOT} filter: replied`, "a filter that matches nothing still shows its header and control");
+  assert.equal(A.sessionsHeader(all, replied, "replied", WIDE).text, `Sessions 1 of 13 ${DOT} filter: replied`);
+  assert.equal(A.sessionsHeader(all, [], "replied", WIDE).text, `Sessions 0 of 13 ${DOT} filter: replied`, "a filter that matches nothing still shows its header and control");
   assert.equal(A.sessionsHeader(all, [], "replied").clearable, true);
 });
 
@@ -695,9 +697,31 @@ test("Draft sessions are not in the header count: 13 sessions plus a draft, aski
   const all = freeze([...thirteen(), draftSession()]);
   assert.equal(all.length, 14);
   const listed = [...filterSessions(all, "asking", never), draftSession()];
-  assert.equal(A.sessionsHeader(all, listed, "asking").text, `Sessions 1 of 13 ${DOT} filter: asking`, "the draft stays listed and is not counted");
-  assert.equal(A.sessionsHeader(all, filterSessions(all, "asking", never), "asking").text, `Sessions 1 of 13 ${DOT} filter: asking`);
+  assert.equal(A.sessionsHeader(all, listed, "asking", WIDE).text, `Sessions 1 of 13 ${DOT} filter: asking`, "the draft stays listed and is not counted");
+  assert.equal(A.sessionsHeader(all, filterSessions(all, "asking", never), "asking").full, `Sessions 1 of 13 ${DOT} filter: asking`);
   assert.equal(A.sessionsHeader(all, all, null).text, "Sessions");
+});
+
+test("Filter header at the default width: the less useful words go first, so the count and the filter's name stay readable", () => {
+  // At 268 px the header holds 19 characters beside the arrow, the clear control and the +. The whole text was cut to "Sessions 1 of 4 ...".
+  const all = thirteen();
+  const asking = filterSessions(all, "asking", never);
+  assert.equal(A.headChars(268), 19);
+  assert.deepEqual([undefined, null, NaN, "268"].map((w) => A.headChars(w)), [19, 19, 19, 19], "an unknown width is the sidebar's default 268 px");
+  const head = A.sessionsHeader(all, asking, "asking", 268);
+  assert.equal(head.text, `1 of 13 ${DOT} asking`);
+  assert.equal(head.full, `Sessions 1 of 13 ${DOT} filter: asking`, "the tooltip has the whole text");
+  assert.equal(A.sessionsHeader(all, asking, "asking").text, head.text, "no width is the default width");
+  for (const f of ["asking", "replied", "working"]) {
+    for (const w of [200, 268, 300, 340, 400, 640]) {
+      const h = A.sessionsHeader(all, filterSessions(all, f, never), f, w);
+      assert.ok([...h.text].length <= Math.max(A.headChars(w), f.length), `${f} at ${w}: "${h.text}" fits`);
+      assert.ok(h.text.endsWith(f), `${f} at ${w}: the filter's name is drawn`);
+    }
+  }
+  assert.equal(A.sessionsHeader(all, asking, "asking", 340).text, `Sessions 1 of 13 ${DOT} asking`, "\"filter:\" goes first");
+  assert.equal(A.sessionsHeader(all, asking, "asking", 200).text, "asking", "at the narrowest only the name");
+  assert.equal(A.sessionsHeader(all, all, null, 200).text, "Sessions", "no filter: the title, which always fits");
 });
 
 test("Folded summaries: Sessions '13' or '13, 1 asking', Agents the selected name or 'none selected'", () => {

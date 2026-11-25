@@ -458,6 +458,24 @@ test("Clear control: the Sessions header comes from sessionsHeader and its contr
   assert.ok(body !== null && /KEYS\.filter,\s*null/.test(body));
 });
 
+test("Filter header fits its row: the Sessions header is built at the block's width and its tooltip has the whole text", () => {
+  const src = side();
+  const parts = bodyOf(src, "headParts");
+  assert.ok(parts !== null);
+  assert.match(parts, /sessionsHeader\([^;]*, filter, this\.width\)/, "the header is shortened to the width the block was last drawn at");
+  assert.match(parts, /tip: head\.full/, "the tooltip is the whole text");
+  assert.match(bodyOf(src, "headerView"), /\.tooltip\(head\.tip\)\.child\(head\.title\)/, "the title draws the short text and tells the whole one");
+});
+
+test("Flow link keeps its row: the inferred label is on a line of its own above the link, so the link is not cut to 'Start...'", () => {
+  const body = bodyOf(side(), "agentsBody");
+  const [label, link] = [body.indexOf("whole(head.flow.label"), body.indexOf('h_flex().id("cao-d-flow")')];
+  assert.ok(label >= 0 && link >= 0 && label < link, "the label comes first, then the link");
+  const row = body.slice(link, body.indexOf("\n      .when(", link) === -1 ? undefined : body.indexOf("\n      .when(", link));
+  assert.equal(count(row, /whole\(/g), 0, "nothing shares the link's row");
+  assert.match(body, /v_flex\(\)\.id\("cao-tg-flow"\)/, "the label and the link stack");
+});
+
 test("Buttons have states: a small control rests as a faint filled background, with no outline, and keeps its hover and pointer", () => {
   // The status bar parts and the "?", the header "+" and the header "clear" control. The tab, the pills and the text fields
   // keep their outlines. The top-bar buttons are not in this list: they are drawn as Herdr's own Files and Changes buttons,
@@ -1240,7 +1258,7 @@ test("No explicit weight in the left sidebar, the tabs and the brand row: font_s
 
 test("The block titles are Herdr's headings: font_medium at 11.5 in the dim token, and the rows keep the sizes of Herdr's lists", () => {
   const head = bodyOf(side(), "headerView");
-  assert.match(head, /\.min_w\(0\)\.truncate\(\)\.text_size\(11\.5\)\.font_medium\(\)\.text_color\(t\.dim\)\.tooltip\(head\.title\)/, "mods/agents/main.js:439");
+  assert.match(head, /\.min_w\(0\)\.truncate\(\)\.text_size\(11\.5\)\.font_medium\(\)\.text_color\(t\.dim\)\.tooltip\(head\.tip\)/, "mods/agents/main.js:439");
   const row = bodyOf(side(), "agentRowView");
   assert.match(row, /h_flex\(\)\.id\(`cao-r-\$\{r\.id\}`\)\.py\(4\)\.pr\(8\)\.pl\(8 \+ r\.depth \* 14\)\.gap\(6\)\.items_center\(\)\.text_size\(12\.5\)\.rounded\(6\)/, "an Agents row is 12.5 px, as Herdr's (mods/agents/main.js:199)");
   assert.equal(count(bodyOf(side(), "sessionLineView"), /text_size\(/g), 0, "a Sessions row has no size of its own: it takes the block's 13, as a space row does (mods/spaces/main.js:561)");

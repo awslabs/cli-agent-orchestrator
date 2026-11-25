@@ -302,16 +302,18 @@ export default class CaoSide extends View {
 
   // ---------- drawing ----------
 
-  // The title and the folded summary of this block's header, and whether it carries the filter's clear control.
-  // Sessions: `Sessions` (or `Sessions M of S . filter: <name>` while a filter is on) and its count when folded;
+  // The title, its tooltip and the folded summary of this block's header, and whether it carries the filter's clear control.
+  // Sessions: `Sessions` (or `Sessions M of S . filter: <name>` while a filter is on, shortened by sessionsHeader to what fits
+  // the block's width, the whole text in the tooltip) and its count when folded;
   // Agents: `Agents . <session>` and the session's name or "none selected" when folded.
   headParts(m, folded, ag) {
     if (this.section === "sessions") {
       const filter = this.store.get(KEYS.filter) ?? null;
-      const head = sessionsHeader(m.sessions, filterSessions(m.sessions, filter, m.replied), filter);
-      return folded ? { title: "Sessions", summary: foldSummary("sessions", m.sessions), clearable: false } : { title: head.text, summary: "", clearable: head.clearable };
+      const head = sessionsHeader(m.sessions, filterSessions(m.sessions, filter, m.replied), filter, this.width);
+      return folded ? { title: "Sessions", tip: "Sessions", summary: foldSummary("sessions", m.sessions), clearable: false } : { title: head.text, tip: head.full, summary: "", clearable: head.clearable };
     }
-    return folded ? { title: "Agents", summary: foldSummary("agents", ag.name), clearable: false } : { title: ag.head.title, summary: "", clearable: false };
+    const title = folded ? "Agents" : ag.head.title;
+    return { title, tip: title, summary: folded ? foldSummary("agents", ag.name) : "", clearable: false };
   }
 
   headerView(t, m, folded, ag) {
@@ -326,7 +328,7 @@ export default class CaoSide extends View {
     return h_flex().id(`cao-head-${this.section}`).min_h(COLLAPSED_PX - 1).flex_none().px(12).py(4).gap(6).items_center()
       .cursor_pointer().on_click((_e, cx) => { this.setFold(this.section, !folded); cx.notify(); })
       .child(div().w(12).flex_none().text_color(t.dim).child(folded ? "\u25b8" : "\u25be"))   // fixed: the fold arrow
-      .child(div().id(`cao-title-${this.section}`).min_w(0).truncate().text_size(11.5).font_medium().text_color(t.dim).tooltip(head.title).child(head.title))   // truncates: the title with the session's name; the tooltip has it whole
+      .child(div().id(`cao-title-${this.section}`).min_w(0).truncate().text_size(11.5).font_medium().text_color(t.dim).tooltip(head.tip).child(head.title))   // truncates: the title with the session's name; the tooltip has it whole
       .child(div().id(`cao-summary-${this.section}`).flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).tooltip(head.summary).child(head.summary))   // truncates: the folded summary, a session's name; the tooltip has it whole
       .when(head.clearable, (e) => e.child(h_flex().id("cao-clear-filter-head").px(7).py(2).flex_none().items_center().rounded(4).bg(t.surface)   // px and py 1 px more than the old outline took
         .text_size(11).text_color(t.foreground).cursor_pointer().hover((st) => st.bg(t.hover))
@@ -440,10 +442,12 @@ export default class CaoSide extends View {
     return v_flex().id("cao-agents-list").flex_1().min_h(0).overflow_y_scrollbar().p(6).gap(2)
       .when(m.dimmed, (e) => e.opacity(0.5))
       .when(head.note !== null, (e) => e.child(div().id("cao-d-note").px(8).py(4).truncate().text_size(12).text_color(t.dim).tooltip(head.note).child(head.note)))   // truncates: the note about the selected session; the tooltip has it whole
-      .when(head.flow !== null, (e) => e.child(h_flex().id("cao-d-flow").px(8).gap(6).items_center().cursor_pointer().tooltip(flowText)
-        .on_click((_e, cx) => { this.openFlow(head.flow.flow); cx.notify(); })
-        .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.accent).child(flowText))   // truncates: "Started by schedule X" and its times; the tooltip has them whole
-        .child(whole(head.flow.label, t.dim))))
+      // The flow link's label on a line of its own above it, as the recap's: beside the link it took the room and left "Start...".
+      .when(head.flow !== null, (e) => e.child(v_flex().id("cao-tg-flow").px(8).gap(2)
+        .child(whole(head.flow.label, t.dim))
+        .child(h_flex().id("cao-d-flow").items_center().cursor_pointer().tooltip(flowText)
+          .on_click((_e, cx) => { this.openFlow(head.flow.flow); cx.notify(); })
+          .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.accent).child(flowText)))))   // truncates: "Started by schedule X" and its times; the tooltip has them whole
       .when(head.recap !== null, (e) => e.child(this.recapView(t, head.recap)))
       .when(head.context !== null, (e) => e.child(this.tagged(t, `context ${head.context.percent}%`, head.context.label)))
       .children(tree.rows.map((r) => this.agentRowView(t, r, found, focus)));
