@@ -1,5 +1,5 @@
 ---
-name: cao-plugin
+name: cao-event-plugin
 description: Create a new CAO (CLI Agent Orchestrator) plugin. Use this skill whenever the user wants to add a plugin that reacts to CAO lifecycle or messaging events, scaffold a plugin package, understand plugin requirements, or integrate an external system (Discord, Slack, dashboards, logging, metrics) with CAO. Also use when the user asks what plugin events are available, how plugin discovery works, or how to install a plugin into a CAO environment.
 ---
 

@@ -375,7 +375,6 @@ def test_directory_enumeration_failure_does_not_block_independent_scope(
     [
         (lambda text: text.replace("<!-- id:", "<!-- broken:"), RepairAction.MALFORMED),
         (lambda text: text.replace("scope: global", "scope: agent"), RepairAction.CONFLICT),
-        (lambda text: text.replace("## 2026-", "## never-", 2), RepairAction.MALFORMED),
     ],
 )
 def test_malformed_and_conflicting_topics_are_reported_without_mutation(

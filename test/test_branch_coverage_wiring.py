@@ -36,10 +36,10 @@ def _addopts() -> str:
 
 
 def _ci_coverage_invocations() -> list[str]:
-    """Each multi-line ``uv run pytest ... --cov=...`` block in ci.yml."""
+    """The package-wide coverage run, excluding provider-only coverage targets."""
     text = CI_WORKFLOW.read_text()
     blocks = re.findall(r"uv run pytest(?:[^\n]*\\\n)*[^\n]*", text)
-    return [b for b in blocks if "--cov=src/cli_agent_orchestrator" in b]
+    return [b for b in blocks if re.search(r"--cov=src/cli_agent_orchestrator(?:\s|\\)", b)]
 
 
 class TestBranchCoverageIsCollected:

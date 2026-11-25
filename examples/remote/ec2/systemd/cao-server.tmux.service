@@ -1,0 +1,24 @@
+# tmux backend variant. cao-tmux.service owns the tmux server in a separate
+# cgroup, so restarting this unit cannot kill agent sessions.
+[Unit]
+Description=CAO server (tmux backend, 127.0.0.1 only)
+Requires=cao-tmux.service
+After=cao-tmux.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@BOX_USER@
+Group=@BOX_USER@
+WorkingDirectory=@BOX_HOME@
+Environment=HOME=@BOX_HOME@
+Environment=USER=@BOX_USER@
+Environment=PATH=@BOX_HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=LANG=C.UTF-8
+ExecStart=@BOX_HOME@/.local/bin/cao-server --host 127.0.0.1 --port 9889
+TimeoutStartSec=90
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

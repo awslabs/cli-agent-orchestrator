@@ -341,9 +341,31 @@ def _adopt_controller_isolation() -> None:
     if not raw:
         return
     state = json.loads(raw)
-    _ISOLATED_HOME["path"] = state["home"]
     _REAL_HOME_ENV.update(state["real"])
     _PINNED_ROOT_ENV.update(state["pinned"])
+    _ISOLATED_HOME["path"] = _own_worker_home()
+
+
+def _own_worker_home() -> str:
+    """Give this xdist worker a fake home of its own, and point HOME at it.
+
+    Workers used to share the controller's fake home. Everything CAO keeps under
+    ``~/.aws/cli-agent-orchestrator`` (the SQLite database, ``tmp/term-*.mcp.json``,
+    the workflow and ephemeral stores) was then shared by every worker, so tests
+    that are independent in a serial run collided across processes: one worker's
+    cleanup deleted another's ``term-*.mcp.json``, and two workers reused the
+    session name ``cao-test-session`` in one database (#1408). A home per worker
+    keeps each worker serial inside its own state, which is what a serial run is.
+    """
+    import atexit
+    import shutil
+    import tempfile
+
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "worker")
+    home = os.path.realpath(tempfile.mkdtemp(prefix=f"cao-test-home-{worker}-"))
+    os.environ["HOME"] = home
+    atexit.register(shutil.rmtree, home, True)
+    return home
 
 
 # --------------------------------------------------------------------------- #
@@ -547,6 +569,31 @@ def pytest_sessionstart(session):
     }
 
 
+#: Key under an xdist worker's ``config.workeroutput`` carrying the decision-state
+#: files that changed in that worker's startup home (#1408).
+_DECISION_HOME_WORKER_OUTPUT_KEY = "cao_decision_home_changed"
+_DECISION_HOME_WORKER_CHANGES = pytest.StashKey[list[tuple[str, list[str]]]]()
+#: [workers that went down, workers among them that reported], on the controller.
+_DECISION_HOME_WORKER_COUNTS = pytest.StashKey[list[int]]()
+
+
+@pytest.hookimpl(optionalhook=True)  # an xdist hook; -p no:xdist must still load
+def pytest_testnodedown(node, error):
+    """On the xdist controller, keep what one worker's decision-home guard found."""
+    del error
+    workeroutput = getattr(node, "workeroutput", {})
+    counts = node.config.stash.setdefault(_DECISION_HOME_WORKER_COUNTS, [0, 0])
+    counts[0] += 1
+    if _DECISION_HOME_WORKER_OUTPUT_KEY in workeroutput:  # present even when empty
+        counts[1] += 1
+    changed = workeroutput.get(_DECISION_HOME_WORKER_OUTPUT_KEY)
+    if changed:
+        worker = node.workerinput.get("workerid", "?")
+        node.config.stash.setdefault(_DECISION_HOME_WORKER_CHANGES, []).append(
+            (worker, list(changed))
+        )
+
+
 @pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus):
     before = session.stash.get(_DECISION_HOME_SNAPSHOT, {})
@@ -557,13 +604,41 @@ def pytest_sessionfinish(session, exitstatus):
         current = _decision_home_file_state(path)
         if current is not _DECISION_HOME_UNSTATABLE and current != state:
             changed.append(path.name)
+    workeroutput = getattr(session.config, "workeroutput", None)
+    if workeroutput is not None:
+        # An xdist worker: its exit status does not reach the controller, and
+        # each worker has its own fake home, so the controller cannot see this
+        # change in its own home. Hand the names over; xdist sends workeroutput
+        # after every pytest_sessionfinish hook, so this trylast hook is in time.
+        workeroutput[_DECISION_HOME_WORKER_OUTPUT_KEY] = changed
+        return
+    lines = []
     if changed:
+        lines.append("Decision state changed under startup CAO home: " + ", ".join(changed))
+    stash = getattr(session.config, "stash", None)
+    from_workers = stash.get(_DECISION_HOME_WORKER_CHANGES, []) if stash is not None else []
+    for worker, names in from_workers:
+        lines.append(
+            "Decision state changed under startup CAO home: "
+            + ", ".join(names)
+            + f" (pytest-xdist worker {worker})"
+        )
+    # A worker lost after its last test (before this trylast hook ran on it)
+    # sends no report, and xdist may still exit 0: fail closed, as _must_run does.
+    down, reported = (
+        stash.get(_DECISION_HOME_WORKER_COUNTS, [0, 0]) if stash is not None else (0, 0)
+    )
+    if reported != down:
+        lines.append(
+            f"Decision-home guard: only {reported} of {down} pytest-xdist worker(s) "
+            "reported, so the decision state of the others was not checked"
+        )
+    if lines:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
         reporter = session.config.pluginmanager.get_plugin("terminalreporter")
         if reporter is not None:
-            reporter.write_sep(
-                "=", "Decision state changed under startup CAO home: " + ", ".join(changed)
-            )
+            for line in lines:
+                reporter.write_sep("=", line)
 
 
 # The cross-process mutex for the one-time schema build below. Lives beside the

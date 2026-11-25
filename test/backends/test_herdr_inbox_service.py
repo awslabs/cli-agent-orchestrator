@@ -26,6 +26,17 @@ def _run_async(coro):
     return asyncio.run(coro)
 
 
+def _stream_writer() -> MagicMock:
+    """A stand-in for asyncio.StreamWriter: ``write`` is sync, ``drain`` is awaited.
+
+    An AsyncMock here made ``write`` return a coroutine that ``_send`` never awaits
+    (it must not: the real ``write`` is sync), which surfaced as a RuntimeWarning.
+    """
+    writer = MagicMock()
+    writer.drain = AsyncMock()
+    return writer
+
+
 class TestHerdrInboxServiceRegistration:
     """Test terminal registration and unregistration."""
 
@@ -202,7 +213,7 @@ class TestHerdrInboxServiceSubscription:
         subprocess on the API event loop, while every suite stays green.
         """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1"}
         mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
 
@@ -221,7 +232,7 @@ class TestHerdrInboxServiceSubscription:
     def test_subscribe_sends_per_pane_and_broadcast_in_one_call(self, mock_snap):
         """One events.subscribe carrying per-pane agent-status subs + broadcast + lifecycle."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1", "pane-2": "tid2"}
         mock_snap.return_value = {
             "panes": [
@@ -247,7 +258,7 @@ class TestHerdrInboxServiceSubscription:
         herdr answers pane_not_found for it and then RESETS the connection, so
         one stale map entry must not be able to poison every retry."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1", "pane-gone": "tid2"}
         mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
         _run_subscribe_with_ack(service)
@@ -266,7 +277,7 @@ class TestHerdrInboxServiceSubscription:
         connection attempt so _socket_loop retries with backoff instead of
         sending a subscription herdr may reject and reset."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1"}
         mock_snap.return_value = None
 
@@ -280,7 +291,7 @@ class TestHerdrInboxServiceSubscription:
         silently degrade every delivery to the reconciliation sweep, which is
         exactly the failure mode the fire-and-forget subscribe hid."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1"}
         mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
         with pytest.raises(ConnectionError, match="pane_not_found"):
@@ -296,7 +307,7 @@ class TestHerdrInboxServiceSubscription:
         from cli_agent_orchestrator.services import herdr_inbox_service as mod
 
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1"}
         mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
         flood = (
@@ -315,7 +326,7 @@ class TestHerdrInboxServiceSubscription:
             socket_path="/tmp/test.sock",
             delivery_callback=lambda tid, source: (delivered.append(tid) or 0),
         )
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1", "pane-2": "tid2"}
         mock_snap.return_value = {
             "panes": [
@@ -360,7 +371,7 @@ class TestHerdrInboxServiceSubscription:
         """An event line arriving before the ack is dispatched, not dropped."""
         callback = MagicMock()
         service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1"}
         mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
         stray = (
@@ -563,7 +574,7 @@ class TestHerdrInboxServiceReconnect:
         plus the two lifecycle events.
         """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         # Register two terminals with their current pane_ids
         service._terminal_to_pane["tid1"] = "pane-1"
         service._pane_to_terminal["pane-1"] = "tid1"
@@ -1352,7 +1363,7 @@ class TestHerdrInboxServiceSingleSubscribePerConnection:
     def test_socket_setup_issues_exactly_one_subscribe(self, mock_snap):
         """A full connect cycle (reconcile already done) writes exactly one subscribe."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1"}
         service._terminal_to_pane = {"tid1": "pane-1"}
         mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
