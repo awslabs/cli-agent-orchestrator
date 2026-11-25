@@ -1,6 +1,7 @@
 """Runs every ``*.test.mjs`` of examples/herdr-app-cao-window under pytest, one case per file.
 
-The node suites need ``node`` and ``jq``. They are marked ``must_run("unit")``: on the CI leg that
+The node suites need ``node`` (20.19 or later: they load ``.js`` files with ``import`` and no ``package.json``
+``"type": "module"``, which older Node reads as CommonJS) and ``jq``. They are marked ``must_run("unit")``: on the CI leg that
 owns the ``unit`` gate (3.12, ``CAO_MUST_RUN=unit``) a missing tool fails the session instead of
 skipping (``test/_must_run.py``). The portability suite is the one that keeps shipped files free of
 one person's setup, so it must actually run in CI.
@@ -15,7 +16,9 @@ import os
 import shutil
 import subprocess
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -26,7 +29,7 @@ NODE = shutil.which("node")
 JQ = shutil.which("jq")
 SUITES = sorted(p for p in EXAMPLE.rglob("*.test.mjs") if "node_modules" not in p.parts)
 
-# Every suite the example ships. SUITES comes from the folder, so deleting a suite file would just drop
+# Every suite the example ships (25). SUITES comes from the folder, so deleting a suite file would just drop
 # its case and the run would still pass; this list is what makes a deletion fail. A new suite is
 # collected without being added here, but add it so that deleting it later is caught too.
 REQUIRED_SUITES = (
@@ -54,13 +57,20 @@ REQUIRED_SUITES = (
     "portability.test.mjs",
     "test/harness.test.mjs",
     "test/security-wiring.test.mjs",
+    "test/shell-wiring.test.mjs",
 )
 
-# Seconds one suite may run. install.test.mjs runs the installer many times in scratch homes: it took
+# Seconds one suite may run. install.test.mjs runs the installer many times in scratch homes. It took
 # 533 s and 540 s on the CI legs that passed and ran past 600 s on one that did not (two pytest-xdist
-# workers share the runner), so it gets 1500 s. The others finish in seconds.
+# workers share the runner) while it ran its cases one after another; it now spreads them over up to four
+# processes and the installer starts far fewer programs, but a loaded runner can still be slow, so it keeps
+# 1500 s. The others finish in seconds.
 DEFAULT_SUITE_TIMEOUT_S = 300
 SUITE_TIMEOUT_S = {"install.test.mjs": 1500}
+
+# How many suites run at once when the cases are not spread over pytest-xdist workers (which already run
+# them side by side). install.test.mjs is the long one; the rest finish while it runs.
+MAX_PARALLEL_SUITES = 4
 
 pytestmark = [
     pytest.mark.must_run("unit"),
@@ -90,8 +100,13 @@ def run_node_suite(suite: Path) -> subprocess.CompletedProcess[str]:
         The finished process; a non-zero return code means a failed case.
     """
     assert NODE is not None
-    # A CAO_WINDOW_TEST_FILTER left exported in a shell would make a suite run fewer cases than it has.
-    env = {k: v for k, v in os.environ.items() if k != "CAO_WINDOW_TEST_FILTER"}
+    # A CAO_WINDOW_TEST_FILTER or CAO_WINDOW_TEST_SHARD left exported in a shell would make a suite run fewer
+    # cases than it has.
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("CAO_WINDOW_TEST_FILTER", "CAO_WINDOW_TEST_SHARD")
+    }
     return subprocess.run(
         [NODE, str(suite)],
         cwd=EXAMPLE,
@@ -100,6 +115,63 @@ def run_node_suite(suite: Path) -> subprocess.CompletedProcess[str]:
         timeout=suite_timeout(suite),
         env=env,
     )
+
+
+class SuiteRuns:
+    """Runs suites on a small thread pool, started as soon as the object is made.
+
+    The suites are independent node processes, so running them side by side cuts the wall time of the
+    file to that of its longest suite. The first of ``suites`` is started first: pass the long one first.
+
+    Thread Safety:
+        ``result`` may be called from any thread; each suite runs once.
+    """
+
+    def __init__(self, suites: list[Path], max_workers: int = MAX_PARALLEL_SUITES) -> None:
+        self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="node-suite")
+        self._futures: dict[Path, Future[subprocess.CompletedProcess[str]]] = {
+            suite: self._pool.submit(run_node_suite, suite) for suite in suites
+        }
+        self._pool.shutdown(wait=False)
+
+    def result(self, suite: Path) -> subprocess.CompletedProcess[str]:
+        """Wait for ``suite`` and return its finished process.
+
+        Args:
+            suite: A suite given to the constructor.
+
+        Returns:
+            The finished process.
+
+        Raises:
+            subprocess.TimeoutExpired: The suite ran past its limit.
+        """
+        return self._futures[suite].result()
+
+
+def suites_to_run_together(items: list[Any]) -> list[Path]:
+    """The suites among the collected ``items`` that ``test_node_suite`` will run, the longest first.
+
+    Args:
+        items: The items of the pytest session.
+
+    Returns:
+        The selected suites, ``install.test.mjs`` first.
+    """
+    picked = [
+        item.callspec.params["suite"]
+        for item in items
+        if getattr(item, "originalname", None) == "test_node_suite" and hasattr(item, "callspec")
+    ]
+    return sorted(picked, key=lambda p: (suite_timeout(p) != max(SUITE_TIMEOUT_S.values()), str(p)))
+
+
+@pytest.fixture(scope="session")
+def suite_runs(request: pytest.FixtureRequest) -> SuiteRuns | None:
+    """Every selected suite running side by side, or None when pytest-xdist already spreads the cases."""
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        return None
+    return SuiteRuns(suites_to_run_together(request.session.items))
 
 
 def assert_suite_ran_and_passed(result: subprocess.CompletedProcess[str]) -> None:
@@ -159,8 +231,9 @@ def run_this_file(env_overrides: dict[str, str], *extra: str) -> subprocess.Comp
 
 
 @pytest.mark.parametrize("suite", SUITES, ids=lambda p: str(p.relative_to(EXAMPLE)))
-def test_node_suite(suite: Path) -> None:
-    assert_suite_ran_and_passed(run_node_suite(suite))
+def test_node_suite(suite: Path, suite_runs: SuiteRuns | None) -> None:
+    result = run_node_suite(suite) if suite_runs is None else suite_runs.result(suite)
+    assert_suite_ran_and_passed(result)
 
 
 @pytest.mark.parametrize("name", REQUIRED_SUITES)
@@ -169,8 +242,19 @@ def test_every_pinned_suite_is_among_the_suites(name: str) -> None:
 
 
 def test_every_suite_of_lib_is_pinned() -> None:
-    on_disk = {str(p.relative_to(EXAMPLE)) for p in (EXAMPLE / "lib").glob("*.test.mjs")}
+    """Every suite of ``lib/`` and of ``test/`` (the harness, security and shell wiring suites) is pinned."""
+    on_disk = {
+        str(p.relative_to(EXAMPLE))
+        for folder in ("lib", "test")
+        for p in (EXAMPLE / folder).glob("*.test.mjs")
+    }
+    assert on_disk, "no suite found in lib/ or test/"
     assert on_disk <= set(REQUIRED_SUITES), sorted(on_disk - set(REQUIRED_SUITES))
+
+
+def test_every_suite_of_the_example_is_pinned() -> None:
+    on_disk = {str(p.relative_to(EXAMPLE)) for p in SUITES}
+    assert on_disk == set(REQUIRED_SUITES), sorted(on_disk ^ set(REQUIRED_SUITES))
 
 
 def test_the_pinned_list_has_no_repeats_and_the_suites_do_not_shrink_below_it() -> None:
@@ -226,6 +310,47 @@ def test_a_failing_suite_fails_the_guard_with_its_output(tmp_path: Path) -> None
     failing.write_text('console.log("FAIL - boom");\nprocess.exit(1);\n')
     with pytest.raises(AssertionError, match="FAIL - boom"):
         assert_suite_ran_and_passed(run_node_suite(failing))
+
+
+def test_suites_run_side_by_side_on_at_most_the_pool_size(tmp_path: Path) -> None:
+    ticks = tmp_path / "ticks.log"
+    probes = []
+    for n in range(6):
+        probe = tmp_path / f"probe{n}.test.mjs"
+        probe.write_text(
+            'import fs from "node:fs";\n'
+            f"const log = {str(ticks)!r};\n"
+            "fs.appendFileSync(log, `+ ${Date.now()}\\n`);\n"
+            "await new Promise((r) => setTimeout(r, 400));\n"
+            "fs.appendFileSync(log, `- ${Date.now()}\\n`);\n"
+        )
+        probes.append(probe)
+    runs = SuiteRuns(probes, max_workers=3)
+    assert all(runs.result(p).returncode == 0 for p in probes)
+    events = sorted((int(line[2:]), line[0]) for line in ticks.read_text().splitlines())
+    running = peak = 0
+    for _, kind in events:
+        running += 1 if kind == "+" else -1
+        peak = max(peak, running)
+    assert 2 <= peak <= 3, f"{peak} suites ran at once"
+
+
+def test_the_long_suite_is_started_first_and_only_selected_suites_are_run_together() -> None:
+    class Item:
+        def __init__(self, name: str, suite: Path | None) -> None:
+            self.originalname = name
+            if suite is not None:
+                self.callspec = type("Spec", (), {"params": {"suite": suite}})()
+
+    install = EXAMPLE / "install.test.mjs"
+    logic = EXAMPLE / "lib" / "logic.test.mjs"
+    items = [
+        Item("test_node_suite", logic),
+        Item("test_every_pinned_suite_is_among_the_suites", None),
+    ]
+    items.append(Item("test_node_suite", install))
+    assert suites_to_run_together(items) == [install, logic]
+    assert suites_to_run_together(items[:2]) == [logic]
 
 
 def test_install_gets_more_time_than_the_other_suites() -> None:
@@ -296,6 +421,15 @@ def test_the_wrapper_hides_the_test_filter_from_the_suites(
     probe.write_text('console.log("filter=" + (process.env.CAO_WINDOW_TEST_FILTER ?? "unset"));\n')
     result = run_node_suite(probe)
     assert "filter=unset" in result.stdout
+
+
+def test_the_wrapper_hides_the_shard_from_the_suites(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CAO_WINDOW_TEST_SHARD", "1/2")
+    probe = tmp_path / "probe.test.mjs"
+    probe.write_text('console.log("shard=" + (process.env.CAO_WINDOW_TEST_SHARD ?? "unset"));\n')
+    assert "shard=unset" in run_node_suite(probe).stdout
 
 
 def test_the_wrapper_runs_all_cases_even_when_the_filter_is_exported(

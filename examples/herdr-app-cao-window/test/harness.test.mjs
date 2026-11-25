@@ -11,9 +11,10 @@ const HARNESS_URL = pathToFileURL(path.join(path.dirname(fileURLToPath(import.me
 // Writes `body` as a module that imports the harness, runs it with node, returns {status, out}.
 function runScript(body) {
   const file = path.join(mkTmp("cao-window-harness-"), "case.mjs");
-  fs.writeFileSync(file, `import { assert, test, finish, skip, mkTmp, hasTool } from ${JSON.stringify(HARNESS_URL)};\n${body}\n`);
+  fs.writeFileSync(file, `import { assert, test, finish, skip, mkTmp, hasTool, parallel } from ${JSON.stringify(HARNESS_URL)};\n${body}\n`);
   const env = { ...process.env };
   delete env.CAO_WINDOW_TEST_FILTER;                 // a filtered outer run must not filter these inner ones
+  delete env.CAO_WINDOW_TEST_SHARD; delete env.CAO_WINDOW_TEST_WORKERS;   // nor may an outer run's share or worker count
   const r = spawnSync(process.execPath, [file], { encoding: "utf8", env });
   return { status: r.status, out: r.stdout + r.stderr };
 }
@@ -95,6 +96,46 @@ test("a file with no cases at all and a filter set also fails", () => {
 test("without a filter, a file with no cases still exits 0", () => {
   const r = runScript("await finish();");
   assert.equal(r.status, 0, r.out);
+});
+
+// ---- parallel(n): the cases of one file run in several processes ----
+
+test("parallel(3) runs every case once, in separate processes, and prints one summary", () => {
+  const r = runScript(`
+parallel(3);
+for (const n of ["a", "b", "c", "d", "e", "f", "g"]) test("case " + n, () => console.log("PID " + n + " " + process.pid));
+await finish();`);
+  assert.equal(r.status, 0, r.out);
+  for (const n of ["a", "b", "c", "d", "e", "f", "g"]) assert.equal((r.out.match(new RegExp(`^ok - case ${n}$`, "gm")) ?? []).length, 1, `case ${n}`);
+  assert.equal(new Set([...r.out.matchAll(/^PID \w (\d+)$/gm)].map((m) => m[1])).size, 3, "the cases did not run in three processes");
+  assert.equal((r.out.match(/all cases passed/g) ?? []).length, 1, r.out);
+});
+
+test("parallel(3): a failing case fails the run once, and the other cases still run", () => {
+  const r = runScript('parallel(3); for (const n of [1, 2, 3, 4, 5]) test("case " + n, () => { if (n === 4) throw new Error("boom " + n); }); await finish();');
+  assert.equal(r.status, 1, r.out);
+  assert.equal((r.out.match(/^FAIL - /gm) ?? []).length, 1);
+  assert.match(r.out, /boom 4/);
+  assert.equal((r.out.match(/^ok - /gm) ?? []).length, 4);
+  assert.match(r.out, /^1 case\(s\) failed$/m);
+});
+
+test("parallel(3): a process that dies before it reports fails the run, and a SKIP line from a child still shows", () => {
+  const r = runScript('parallel(2); test("quiet", () => console.log("SKIP - part not checked")); test("dies", () => process.kill(process.pid, "SIGKILL")); await finish();');
+  assert.equal(r.status, 1, r.out);
+  assert.match(r.out, /^SKIP - part not checked$/m);
+  assert.match(r.out, /^FAIL - a test process ended with SIGKILL before it reported$/m);
+});
+
+test("parallel(3): CAO_WINDOW_TEST_WORKERS=1 runs the file in one process and a filter that matches nothing still fails", () => {
+  const file = path.join(mkTmp("cao-window-harness-"), "case.mjs");
+  fs.writeFileSync(file, `import { test, finish, parallel } from ${JSON.stringify(HARNESS_URL)};\nparallel(3);\nfor (const n of [1, 2, 3]) test("case " + n, () => console.log("PID " + process.pid));\nawait finish();\n`);
+  const one = spawnSync(process.execPath, [file], { env: { ...process.env, CAO_WINDOW_TEST_WORKERS: "1" }, encoding: "utf8" });
+  assert.equal(one.status, 0, one.stdout + one.stderr);
+  assert.equal(new Set([...one.stdout.matchAll(/^PID (\d+)$/gm)].map((m) => m[1])).size, 1);
+  const none = spawnSync(process.execPath, [file], { env: { ...process.env, CAO_WINDOW_TEST_FILTER: "zz" }, encoding: "utf8" });
+  assert.equal(none.status, 1, none.stdout + none.stderr);
+  assert.match(none.stdout, /no case matches the filter/);
 });
 
 await finish();

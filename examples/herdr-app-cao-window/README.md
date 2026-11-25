@@ -11,6 +11,7 @@ git clone https://github.com/awslabs/cli-agent-orchestrator.git
 cd cli-agent-orchestrator/examples/herdr-app-cao-window
 hc --version; jq --version; which herdr-app                                      # hc 0.1.21 or later
 defaults read /Applications/Herdr.app/Contents/Info CFBundleShortVersionString   # Herdr app 0.1.16 or later
+node --version                                                                   # only to run the automated checks: 18 or later
 sh install.sh --local                    # CAO runs on this Mac ...
 sh install.sh --cao-ssh-host HOST        # ... or on HOST, which `ssh HOST` reaches
 ~/.local/bin/herdr-cao                   # open the window
@@ -47,8 +48,9 @@ You need all of these:
 - A cao-server on the `herdr-app` backend ([docs/herdr-app.md](../../docs/herdr-app.md)), on a known port (default 9889), with no auth token. The window cannot use a cao-server that has auth on. It shows "CAO requires auth - not supported by this window yet" and disables every write control.
 - `herdr-app`, the Herdr app's command-line tool, on the machine where the app runs. Check with `which herdr-app`. The app puts `herdr-app` and `hc` in `~/.local/bin` as links to the app and to herdr-core. `install.sh` does not call it. `uninstall.sh` uses it to quit the window, and CHECKLIST.md uses it for `check` and `status`.
 - A POSIX `sh` to run `install.sh` and `uninstall.sh`.
+- Node.js 18 or later, only to run the automated checks (`*.test.mjs`, see [Run the automated checks](#run-the-automated-checks)). The installer, the launcher and the window do not need it. The folder's `package.json` (`"type": "module"`) is what lets Node 18 read the `.js` files as modules.
 
-A cao-server that carries the role labels and the schedule routes of the same change gives the full window. An older cao-server works with the fallbacks described under [Known limits](#known-limits).
+A cao-server that carries the role labels (`cao.profile`, `cao.caller`, `cao.waiting`) and the flow routes (`POST /flows/validate`, `PUT /flows/{name}`) gives the full window. An older cao-server works with the fallbacks described under [Known limits](#known-limits).
 
 The prerequisites that depend on where CAO runs are under each topology below.
 
@@ -382,6 +384,8 @@ To undo the main-window step, see [Remove the CAO machine from your main window]
 - **List the CAO machine's terminals** to compare with the window: `HC_SESSION=cao hc ls` on the CAO host.
 
 ### Run the automated checks
+
+They need `jq` and Node.js 18 or later (`node --version`).
 
 ```sh
 for f in $(find . -name '*.test.mjs' | sort); do node "$f" || echo "FAILED: $f"; done
