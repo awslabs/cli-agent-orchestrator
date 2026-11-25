@@ -78,8 +78,8 @@ class TestHealthCheck:
 
     def test_health_reports_the_instance_label(self, client, monkeypatch):
         """CAO_INSTANCE_LABEL is reported, trimmed, for the web UI's header."""
-        monkeypatch.setenv("CAO_INSTANCE_LABEL", "  EKS cluster  ")
-        assert client.get("/health").json()["instance_label"] == "EKS cluster"
+        monkeypatch.setenv("CAO_INSTANCE_LABEL", "  Cluster Mode  ")
+        assert client.get("/health").json()["instance_label"] == "Cluster Mode"
 
     @pytest.mark.parametrize("value", [None, "", "   "])
     def test_health_instance_label_is_null_when_unset_or_blank(self, client, monkeypatch, value):

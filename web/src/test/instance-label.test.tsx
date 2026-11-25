@@ -35,11 +35,13 @@ afterEach(() => {
 
 describe('instance label', () => {
   it('shows the label beside the title and in the browser tab', async () => {
-    vi.stubGlobal('fetch', fetchWithHealth({ ...HEALTH, instance_label: 'EKS cluster' }))
+    vi.stubGlobal('fetch', fetchWithHealth({ ...HEALTH, instance_label: 'Cluster Mode' }))
     render(<App />)
-    await waitFor(() => expect(screen.getByTestId('instance-label')).toHaveTextContent('EKS cluster'))
+    await waitFor(() => expect(screen.getByTestId('instance-label')).toHaveTextContent('Cluster Mode'))
     expect(screen.getByRole('banner')).toContainElement(screen.getByTestId('instance-label'))
-    expect(document.title).toBe('EKS cluster · CLI Agent Orchestrator')
+    // The accent: a labelled UI must not look like an unlabelled one at a glance.
+    expect(screen.getByRole('banner')).toHaveAttribute('data-instance-labelled', 'true')
+    expect(document.title).toBe('Cluster Mode · CLI Agent Orchestrator')
   })
 
   it.each([
@@ -54,6 +56,7 @@ describe('instance label', () => {
     await waitFor(() => expect(fetchMock.mock.calls.some(([u]) => String(u).includes('/health'))).toBe(true))
     await act(async () => {})
     expect(screen.queryByTestId('instance-label')).toBeNull()
+    expect(screen.getByRole('banner')).not.toHaveAttribute('data-instance-labelled')
     expect(document.title).toBe('CLI Agent Orchestrator')
   })
 
