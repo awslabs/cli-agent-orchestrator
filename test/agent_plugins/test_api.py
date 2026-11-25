@@ -7,6 +7,7 @@ handler bodies rather than a re-implementation of them.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -110,6 +111,41 @@ class TestInstall:
 
         assert response.status_code == 400
         assert "does not exist" in response.json()["detail"]
+
+    @pytest.mark.parametrize("endpoint", ["/plugins", "/plugins/validate"])
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"source": "/tmp/plugin\x00bad"},
+            {"source": "./plugin\x00bad"},
+            {"source": "/" + "a" * 300},
+            {"source": "https://github.com/org/repo.git", "ref": "main\x00evil"},
+        ],
+    )
+    def test_invalid_source_path_or_ref_is_a_400_not_a_500(self, client, endpoint, payload):
+        response = client.post(endpoint, json=payload)
+
+        assert response.status_code == 400, response.text
+        assert "\x00" not in response.json()["detail"]
+
+    @pytest.mark.parametrize("endpoint", ["/plugins", "/plugins/validate"])
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"source": "~a\x00b"},
+            {"source": "~\ud800"},
+            {"source": "/tmp/nope\udc80"},
+            {"source": "https://github.com/org/repo.git", "ref": "main\ud800"},
+        ],
+    )
+    def test_unencodable_source_or_ref_is_a_400_not_a_500(self, client, endpoint, payload):
+        # json.dumps escapes lone surrogates; httpx json= would fail to encode them.
+        response = client.post(
+            endpoint, content=json.dumps(payload), headers={"content-type": "application/json"}
+        )
+
+        assert response.status_code == 400, response.text
+        assert "\x00" not in response.json()["detail"]
 
     def test_duplicate_install_is_refused_until_forced(self, client, tmp_path):
         source = build_plugin(tmp_path / "src", "demo")

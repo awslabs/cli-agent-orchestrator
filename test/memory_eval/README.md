@@ -14,7 +14,7 @@ decimal places):
 | `default` | 0.48 | 0.74 | 0.56 | 0.59 | 0.00 | 0.50 | 0.40 | 3825.54 | 7 |
 | `bm25` | 0.56 | 0.74 | 0.56 | 0.59 | 0.00 | 0.50 | 0.00 | 3825.54 | 7 |
 
-For BM25 arms, `current first` is a strict measure: a current note counts only
+For every arm, `current first` is a strict measure: a current note counts only
 when it ranks first with the wiki listing sorted in both ascending and
 descending path order, so a stale/current tie does not count. Tokens per recall
 can vary slightly with filesystem listing order.

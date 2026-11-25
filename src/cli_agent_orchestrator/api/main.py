@@ -90,6 +90,7 @@ from cli_agent_orchestrator.constants import (
     INBOX_IMMEDIATE_DELIVERY_WAIT,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
+    INSTANCE_LABEL_ENV,
     MODEL_ID_MAX_LEN,
     MODEL_ID_RE,
     OTEL_SERVICE_NAME,
@@ -2390,6 +2391,9 @@ async def health_check():
         # can compare the two here when the client runs with a different
         # environment or on another host.
         "provider_init_timeout": int(get_server_settings()["provider_init_timeout"]),
+        # The operator's name for this server (CAO_INSTANCE_LABEL), so the web UI
+        # can say which server it is talking to. Read per request: display only.
+        "instance_label": os.environ.get(INSTANCE_LABEL_ENV, "").strip() or None,
         "components": {
             "cao": "ok",
             "herdr": _probe("herdr"),
@@ -11516,6 +11520,16 @@ class InternalMemoryRecallRequest(BaseModel):
     record_access: bool = True
 
 
+class InternalMemoryRelatedRequest(BaseModel):
+    key: str
+    scope: Optional[str] = None
+    depth: int = Field(default=1, ge=1)
+    types: Optional[List[str]] = None
+    direction: str = "both"
+    limit: int = Field(default=20, ge=1, le=100)
+    terminal_context: Optional[InternalMemoryContext] = None
+
+
 class InternalMemoryForgetRequest(BaseModel):
     key: LenientMemoryKey  # see InternalMemoryStoreRequest.key
     scope: MemoryScope = MemoryScope.PROJECT
@@ -11580,6 +11594,58 @@ async def internal_memory_recall(
     # One serializer for both recall surfaces (this route and the MCP
     # memory_recall tool); see models/memory.py.
     return {"memories": [recall_wire_dict(memory) for memory in memories]}
+
+
+@app.post("/internal/memory/related")
+async def internal_memory_related(
+    body: InternalMemoryRelatedRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Any:
+    """Return relationship neighbours using context resolved by a remote worker."""
+    from cli_agent_orchestrator.services.memory_service import InvalidRelatedArgument
+
+    _require_memory_enabled()
+    try:
+        result = cast(
+            Dict[str, Any],
+            await _get_memory_service().related(
+                body.key,
+                scope=body.scope,
+                depth=body.depth,
+                types=body.types,
+                direction=body.direction,
+                limit=body.limit,
+                terminal_context=(
+                    body.terminal_context.model_dump(exclude_none=True)
+                    if body.terminal_context
+                    else None
+                ),
+            ),
+        )
+    except InvalidRelatedArgument as exc:
+        # A fixed literal per cause: the caller's value is never echoed back.
+        return JSONResponse(
+            status_code=422,
+            content={
+                "success": False,
+                "error_kind": "invalid_argument",
+                "error": InvalidRelatedArgument.MESSAGES[exc.code],
+            },
+        )
+    except ValueError:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "success": False,
+                "error_kind": "invalid_argument",
+                "error": "invalid related-memory argument",
+            },
+        )
+    if result.get("error_kind") == "not_found":
+        return JSONResponse(status_code=404, content=result)
+    if result.get("error_kind") == "ambiguous_scope":
+        return JSONResponse(status_code=409, content=result)
+    return result
 
 
 @app.post("/internal/memory/forget")

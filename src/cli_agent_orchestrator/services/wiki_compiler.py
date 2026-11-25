@@ -120,7 +120,6 @@ _PROMPT_SYSTEM = (
     "- Keep article length under 32 KiB and under 4× the input article size.\n"
 )
 
-
 # -----------------------------------------------------------------------------
 # Logging redactor (T9) — exported for U5 audit-log reuse
 # -----------------------------------------------------------------------------

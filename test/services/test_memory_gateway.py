@@ -144,6 +144,48 @@ async def test_remote_recall_omits_none_fields(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_remote_related_has_gateway_parity(monkeypatch):
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner:9889")
+
+    async def run_inline(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(memory_gateway.asyncio, "to_thread", run_inline)
+    expected = {
+        "success": True,
+        "key": "source",
+        "scope": "global",
+        "edges": [],
+        "neighbours": [],
+    }
+    post = Mock(return_value=expected)
+    monkeypatch.setattr(memory_gateway, "_post", post)
+
+    result = await memory_gateway.related_memory(
+        key="source",
+        scope=None,
+        depth=2,
+        types=["relates_to"],
+        direction="both",
+        limit=20,
+        terminal_context={"terminal_id": "fixture-terminal"},
+    )
+
+    assert result == expected
+    assert post.call_args.args == (
+        "/internal/memory/related",
+        {
+            "key": "source",
+            "depth": 2,
+            "types": ["relates_to"],
+            "direction": "both",
+            "limit": 20,
+            "terminal_context": {"terminal_id": "fixture-terminal"},
+        },
+    )
+
+
+@pytest.mark.asyncio
 async def test_remote_store_reconstructs_partial_write_error(monkeypatch):
     monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner:9889")
 
@@ -195,6 +237,33 @@ def test_remote_non_typed_error_still_raises_http_error(monkeypatch):
         pytest.raises(requests.HTTPError, match="503"),
     ):
         memory_gateway._post("/internal/memory/store", {})
+
+
+@pytest.mark.parametrize(
+    ("status_code", "error_kind", "error"),
+    [
+        (404, "not_found", "memory not found: missing"),
+        (409, "ambiguous_scope", "memory key is present in multiple scopes: duplicate"),
+        (422, "invalid_argument", "direction must be one of: in, out, both"),
+    ],
+)
+def test_remote_related_preserves_structured_read_error(
+    monkeypatch, status_code, error_kind, error
+):
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner:9889")
+    response = Mock(status_code=status_code)
+    response.json.return_value = {
+        "success": False,
+        "error_kind": error_kind,
+        "error": error,
+    }
+
+    with patch.object(memory_gateway.requests, "post", return_value=response):
+        result = memory_gateway._post("/internal/memory/related", {"key": "missing"})
+
+    assert result["error_kind"] == error_kind
+    assert result["error"] == error
+    response.raise_for_status.assert_not_called()
 
 
 def test_remote_memory_uses_elastic_gateway_credentials(monkeypatch):
