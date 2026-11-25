@@ -139,6 +139,7 @@ The answer is `200` for any JSON object, whatever its values:
 
 - `errors` holds one `{field, message}` entry for each field that fails: a name outside `^[A-Za-z0-9_-]{1,64}$`, a schedule the scheduler refuses, a schedule longer than 256 characters, a schedule that does not fire within 41 years (`this schedule never fires`), a control character in `schedule`, `agent_profile`, or `provider`, an empty or non-string `agent_profile` or `provider`, or a name that a registered flow already uses.
 - `next_runs` holds the next three fire times in the server's local time zone, computed by the scheduler. It is empty when the schedule has an error.
+- If `TZ` is not a zoneinfo name (for example `AEST-10` or `EST5EDT` without a zone file), the server logs a warning and shows fire times at the current UTC offset, with no daylight-saving rules, so a fire time after the next clock change shows the offset of today. Flows still run at the stored local wall time. Set a zoneinfo name such as `Australia/Sydney` in `TZ` to see the right offset for every date.
 - The route never writes a file or a row, takes no `script` field, and checks no path.
 
 **Create a flow.** `POST /flows` takes the same fields, plus an optional `enabled` boolean that defaults to `true`. Send `"enabled": false` to register the flow without arming it, then enable it with `POST /flows/{name}/enable` or `cao schedule enable`.
