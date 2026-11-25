@@ -217,22 +217,22 @@ for f in $(find . -name '*.test.mjs' | sort); do env -u CAO_LOG_LEVEL node "$f" 
 
 | File | ok |
 |---|---|
-| `install.test.mjs` | 180 |
-| `launcher.test.mjs` | 12 |
-| `lib/agents.test.mjs` | 78 |
+| `install.test.mjs` | 201 |
+| `launcher.test.mjs` | 16 |
+| `lib/agents.test.mjs` | 110 |
 | `lib/cao.test.mjs` | 47 |
 | `lib/draft-followups.test.mjs` | 13 |
 | `lib/draft-view.test.mjs` | 175 |
 | `lib/draft.test.mjs` | 75 |
 | `lib/flows-followups.test.mjs` | 5 |
 | `lib/flows-form.test.mjs` | 96 |
-| `lib/flows.test.mjs` | 152 |
+| `lib/flows.test.mjs` | 154 |
 | `lib/honesty.test.mjs` | 13 |
 | `lib/launch-followups.test.mjs` | 6 |
 | `lib/launch.test.mjs` | 249 |
-| `lib/logic.test.mjs` | 250 |
+| `lib/logic.test.mjs` | 289 |
 | `lib/names.test.mjs` | 9 |
-| `lib/shell.test.mjs` | 76 |
+| `lib/shell.test.mjs` | 86 |
 | `lib/store.test.mjs` | 18 |
 | `lib/workflows-followups.test.mjs` | 3 |
 | `lib/workflows-view.test.mjs` | 295 |
@@ -241,9 +241,9 @@ for f in $(find . -name '*.test.mjs' | sort); do env -u CAO_LOG_LEVEL node "$f" 
 | `portability.test.mjs` | 51 |
 | `test/harness.test.mjs` | 11 |
 | `test/security-wiring.test.mjs` | 23 |
-| `test/shell-wiring.test.mjs` | 114 |
+| `test/shell-wiring.test.mjs` | 139 |
 
-  That is 2070 cases in all. `portability.test.mjs` also prints `private names are not checked: set CAO_PORTABILITY_EXTRA_PATTERNS or CAO_PORTABILITY_EXTRA_PATTERNS_FILE`. That is expected.
+  That is 2203 cases in all. `portability.test.mjs` also prints `private names are not checked: set CAO_PORTABILITY_EXTRA_PATTERNS or CAO_PORTABILITY_EXTRA_PATTERNS_FILE`. That is expected.
 - **Broken means:** a first column other than `0`, a `FAIL - ` line, or a `SKIP - ` line. A `SKIP` is not a pass.
 - **Note:** the parity cases in `lib/launch.test.mjs` read two files from `src/cli_agent_orchestrator/utils/`. Run this from a full repository checkout, not from a copy of the example folder alone.
 
@@ -255,7 +255,7 @@ From the repository root. Run one pytest at a time. On Linux you can put `flock 
 env -u CAO_LOG_LEVEL uv run pytest --no-cov -p no:cacheprovider -q test/examples/test_herdr_app_cao_window_node.py
 ```
 
-- **You should see:** a row of dots and `61 passed` (about 210 seconds on the dev machine this was written on; pytest also prints a few warnings). 23 of the 61 are the node suites of A1; the rest check the wrapper itself.
+- **You should see:** a row of dots and `65 passed` (about 540 seconds on the dev machine this was written on, most of it `install.test.mjs`; pytest also prints a few warnings). 25 of the 65 are the node suites of A1; the rest check the wrapper itself.
 - **Broken means:** any `failed` or `error`, or a `skipped` count above 0 (a skip here means `node` or `jq` was not found).
 - **Note:** `CAO_LOG_LEVEL` must be unset for the CAO test suites. The command above does that with `env -u CAO_LOG_LEVEL`.
 
@@ -316,7 +316,7 @@ curl -s http://127.0.0.1:$CHK_PORT/health
 node install.test.mjs | tail -3
 ```
 
-- **You should see:** the last line is `all cases passed`. The count of `ok - ` lines was 148 on Linux (`node install.test.mjs | grep -c '^ok - '`).
+- **You should see:** the last line is `all cases passed`. The count of `ok - ` lines was 201 on Linux (`node install.test.mjs | grep -c '^ok - '`).
 - **Broken means:** a `FAIL - ` line, or `SKIP - install.test.mjs: jq is not installed`. Report the first FAIL line and the output after it.
 
 ### B2 Install into a fresh scratch home

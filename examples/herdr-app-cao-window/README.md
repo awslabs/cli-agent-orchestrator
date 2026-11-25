@@ -1,6 +1,25 @@
 # CAO window for the Herdr app
 
-A second Herdr app window that shows only CAO. It has its own app home and its own herdr-core session, so your own terminals never appear in it and CAO never appears among them. Each region of the window has one job:
+A second Herdr app window that shows only CAO. It has its own app home and its own herdr-core session, so your own terminals never appear in it and CAO never appears among them.
+
+## Quick start
+
+On a Mac, from this folder in a clone of the repository (needs the `herdr-app` backend on your cao-server, with no auth token; details under [Prerequisites](#prerequisites)):
+
+```sh
+hc --version; jq --version; which herdr-app                                      # hc 0.1.21 or later
+defaults read /Applications/Herdr.app/Contents/Info CFBundleShortVersionString   # Herdr app 0.1.16 or later
+sh install.sh --local                    # CAO runs on this Mac ...
+sh install.sh --cao-ssh-host HOST        # ... or on HOST, which `ssh HOST` reaches
+~/.local/bin/herdr-cao                   # open the window
+sh uninstall.sh                          # remove it again
+```
+
+The installer creates the window's home `~/.config/herdr-app-cao`, the launcher `~/.local/bin/herdr-cao` and `~/Applications/CAO.app` (a copy of the Herdr app named CAO, with its own icon). It never changes your main Herdr home. The options are under [Install](#install).
+
+## What the window shows
+
+Each region of the window has one job:
 
 - **Sessions** (the top block of the left sidebar) lists one line per CAO session, styled like the spaces list of Herdr's own window: a small rounded badge with the first letter of the session's name after its `cao-` prefix (`cao-ws-notes` shows `W`; every session name starts with `cao-`, so the prefix is skipped), the name, a small mark before the status mark when a session needs you (the orange `!` square) or has a reply you have not seen that its own status mark does not show (a green dot; no word is ever drawn), and at the right end the status mark of its first talkable agent (the marks of Herdr's own Agents list: a spinner for working, a ring for idle, a dot for done, the same dot in green (the theme's `ansi2`) for a reply you have not seen, a `!` square for needs you and error; an agent that is idle only because it waits for the workers it assigned shows the same spinner in the muted colour, and its tooltip reads `waiting on N workers`). The badge colour is Herdr's rule for spaces: each new session takes the colour from its palette that is used least, and keeps it (kept in the window's shared state, so it survives a restart). The text carries no weight of its own: it takes the weight of your `font_weight` setting like the rows of Herdr's own lists (the block titles are Herdr's medium 11.5 px). The words of the state (done, idle, working, replied, `needs you: <kind>`) are in the line's tooltip, not on the line. The list is in a stable order, the oldest session first (a session's age is the creation time of its oldest terminal, ties go by name, and a recorded draft session is last), so a row never jumps when a state changes: the marks, the status bar counts and the filters tell you which session needs you. The `+` in its header opens the New session dialog.
 - **Agents** (the block under Sessions) shows the session you selected: "Started by schedule X" when a schedule started it, the agent's recap when it printed one (its label `the agent's own words` on a line of its own, then the text wrapped to at most three lines at the size of the agent rows and ending in `…` when it is longer; the whole text is in its tooltip; it is the one text in the left sidebar that wraps, every row stays one line), and the agents as a tree that shows who started whom. Each agent is one line, as in the Agents list of Herdr's own window: the logo of its program (the Claude Code, Kiro or Codex glyph, the same file Herdr draws from its `icons` folder, and Herdr's generic agent glyph for a program with none), its name (the name of its Herdr tab, for example `conductor-774e`), how long it has been in its state (`12m`, `3h`), its status mark at the right end and, in the slot at the right end, a pin for a worker (a push-pin: upright and filled in the accent colour while pinned, tilted and outline-only in the muted colour while unpinned). The session's main agent, the first talkable one (the conductor you talk to), wears a small crown in that same slot on its row, so the status marks stay in one column and its name keeps the room, and after its name on its top-bar tab; workers and a second talkable agent do not. Its state in words, its turn and its other facts are in the line's tooltip. The tree shows every agent of the session, each worker under the agent that started it. Every worker is always shown, however many the session has, and the block scrolls when the tree is taller than it. A pin on a worker puts its tab in the top bar; it decides nothing else. A click on an agent puts its terminal in the pane, and the row of the terminal you are in, however you got there (a click, a top-bar tab, Herdr's own agent keys, switching space), is highlighted.
