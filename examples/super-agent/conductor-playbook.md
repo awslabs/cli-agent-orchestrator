@@ -188,13 +188,16 @@ outside state first, so no action runs twice.
    `python3 PB/config.py --loop-lock <checked pid>` then `--loop-unlock <checked pid>` to clear the stale lock,
    and start the supervisor again (§9 First start step 4), unless its stopped file says `NOT_WRITER`
    (the lease moved; §Writer lease) or `LOOP_ERROR` (inspect the last error and fix the cause first).
+   A new supervisor archives that stopped file as `PB/state/tick_supervisor.stopped.prev`.
 
 ## 9. Starting the shepherd and its tick supervisor
 You own the tick loop, not the shepherd. `PB/tick_supervisor.sh` runs `tick_loop.sh` detached, posts
 each WAKE to the shepherd's inbox and restarts the loop itself; it is keyed to `SHEPHERD_ID`, writes
-`PB/state/tick_supervisor.pid` and stops for good on `not_writer` or after five consecutive error
-exits (`LOOP_ERROR` in `PB/state/tick_supervisor.stopped`). Why: a loop run as an agent's
+`PB/state/tick_supervisor.pid` and stops for good on `not_writer` or after five error exits
+without a clean poll or exit between them (`LOOP_ERROR` in `PB/state/tick_supervisor.stopped`).
+Why: a loop run as an agent's
 background job dies with that job, or loses its wake when the agent's turn ends.
+On start, an old stopped reason moves to `PB/state/tick_supervisor.stopped.prev`.
 
 **First start:**
 1. Make sure the user has installed `pr_shepherd`. Installing is the user's step.
