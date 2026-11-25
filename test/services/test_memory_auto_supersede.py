@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from cli_agent_orchestrator.clients.database import MemoryMetadataModel
 from cli_agent_orchestrator.services import audit_log, settings_service, wiki_compiler
 from cli_agent_orchestrator.services.memory_service import (
     MemoryPartialWriteError,
@@ -434,6 +435,45 @@ def test_intro_topic_version_metadata_stays_bounded_and_off_mode_clears(service,
     run(service.store("Off mode.", key="relay", scope="global"))
     assert "memory-version" not in path.read_text()
     assert "memory-version" not in run(service.recall(scope="global"))[0].content
+
+
+@pytest.mark.parametrize("id_first", [False, True])
+@pytest.mark.parametrize("blank_line", [False, True])
+def test_hand_edited_header_keeps_exact_tags_through_restore_and_off_mode(
+    service, monkeypatch, id_first, blank_line
+):
+    original = run(service.store("A.", key="relay", scope="global", tags="alpha"))
+    path = Path(original.file_path)
+    preamble, separator, entries = path.read_text().partition("\n## ")
+    title, identity = (line for line in preamble.splitlines() if line.strip())
+    headers = [identity, title] if id_first else [title, identity]
+    path.write_text("\n".join(headers) + ("\n" if blank_line else "") + separator + entries)
+
+    revised = run(service.store("B.", key="relay", scope="global", tags="beta"))
+    assert revised.superseded
+    assert next(line for line in path.read_text().splitlines() if "<!-- id:" in line).endswith(
+        "| tags: beta -->"
+    )
+    result = run(service.restore("relay", scope="global", version=version_from(revised)))
+    assert result["metadata_restored"] is True
+    with service._get_db_session() as db:
+        assert (
+            db.query(MemoryMetadataModel).filter_by(key="relay", scope="global").one().tags
+            == "alpha"
+        )
+
+    monkeypatch.setattr(settings_service, "is_memory_auto_supersede_enabled", lambda: False)
+    run(service.store("C.", key="relay", scope="global", tags="gamma"))
+    text = path.read_text()
+    assert "memory-version:" not in text
+    assert next(line for line in text.splitlines() if "<!-- id:" in line).endswith(
+        "| tags: gamma -->"
+    )
+    with service._get_db_session() as db:
+        assert (
+            db.query(MemoryMetadataModel).filter_by(key="relay", scope="global").one().tags
+            == "gamma"
+        )
 
 
 def test_intro_metadata_is_not_used_to_restore(service):

@@ -1260,8 +1260,11 @@ class MemoryService:
                         header_end = sum(
                             len(line) for line in header_lines[: _version_header_end(header_lines)]
                         )
+                        head = clean_preamble[:header_end]
+                        if head and not head.endswith("\n"):
+                            head += "\n"
                         new_content = (
-                            clean_preamble[:header_end]
+                            head
                             + marker
                             + "\n"
                             + clean_preamble[header_end:]
