@@ -64,7 +64,7 @@ SCHEDULE_TOO_LONG_MESSAGE = f"is too long (at most {SCHEDULE_MAX_LENGTH} charact
 SCHEDULE_INVALID_MESSAGE = (
     "is not a valid cron expression (five fields: minute hour day-of-month month day-of-week)"
 )
-# The scheduler matches day and weekday together, so 29 February on one weekday recurs 28 or
+# The scheduler matches day and weekday together, so 29 February on one weekday recurs 12, 28 or
 # 40 years apart (2072 to 2112 skips the non-leap 2100); no schedule that fires waits longer.
 _LONGEST_FIRE_GAP = timedelta(days=366 * 41)
 
