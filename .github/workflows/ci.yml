@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  merge_group:
 
 permissions:
   contents: read
@@ -29,6 +30,28 @@ env:
   UV_LOCKED: "1"
 
 jobs:
+  changed-paths:
+    name: Changed paths for filtered jobs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      antigravity: ${{ steps.paths.outputs.antigravity }}
+      claude: ${{ steps.paths.outputs.claude }}
+      codex: ${{ steps.paths.outputs.codex }}
+      kiro: ${{ steps.paths.outputs.kiro }}
+      transport: ${{ steps.paths.outputs.transport }}
+      factory: ${{ steps.paths.outputs.factory }}
+      docs: ${{ steps.paths.outputs.docs }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect changed paths
+        id: paths
+        run: python3 scripts/ci_changed_paths.py
+
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
@@ -1209,6 +1232,454 @@ jobs:
         with:
           language: ${{ matrix.language }}
 
+  provider-antigravity:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.antigravity == 'true' }}
+    permissions:
+      contents: read
+    name: Antigravity provider tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Run unit tests with coverage
+        run: |
+          uv run pytest test/providers/test_antigravity_cli_*.py \
+            --cov=src/cli_agent_orchestrator/providers/antigravity_cli.py \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  provider-antigravity-lint:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.antigravity == 'true' }}
+    permissions:
+      contents: read
+    name: Antigravity provider lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Check code formatting with black
+        run: uv run black --check src/ test/
+
+      - name: Check import sorting with isort
+        run: uv run isort --check-only src/ test/
+
+      - name: Run type checker with mypy
+        run: uv run mypy src/
+        continue-on-error: true
+
+  provider-claude:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.claude == 'true' }}
+    permissions:
+      contents: read
+    name: Claude provider tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Run unit tests with coverage
+        run: |
+          # The busy-pattern guard (GH #974) runs here too: this gate fires on a
+          # claude_code.py-only change, which is exactly when a spinner pattern
+          # can be widened back onto settled output. It is named in full because
+          # it sits outside the test_claude_code_* glob.
+          uv run pytest test/providers/test_claude_code_*.py \
+            test/providers/test_busy_pattern_settled_output_guard.py \
+            --cov=src/cli_agent_orchestrator/providers/claude_code.py \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  provider-claude-lint:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.claude == 'true' }}
+    permissions:
+      contents: read
+    name: Claude provider lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Check code formatting with black
+        run: uv run black --check src/ test/
+
+      - name: Check import sorting with isort
+        run: uv run isort --check-only src/ test/
+
+      - name: Run type checker with mypy
+        run: uv run mypy src/
+        continue-on-error: true
+
+  provider-codex:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.codex == 'true' }}
+    permissions:
+      contents: read
+    name: Codex provider tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Run unit tests with coverage
+        run: |
+          uv run pytest test/providers/test_codex_*.py \
+            --cov=src/cli_agent_orchestrator/providers/codex.py \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  provider-codex-lint:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.codex == 'true' }}
+    permissions:
+      contents: read
+    name: Codex provider lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Check code formatting with black
+        run: uv run black --check src/ test/
+
+      - name: Check import sorting with isort
+        run: uv run isort --check-only src/ test/
+
+      - name: Run type checker with mypy
+        run: uv run mypy src/
+        continue-on-error: true
+
+  provider-kiro:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.kiro == 'true' }}
+    permissions:
+      contents: read
+    name: Kiro provider tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Run unit tests with coverage
+        run: |
+          uv run pytest test/providers/test_kiro_cli_*.py \
+            --cov=src/cli_agent_orchestrator/providers/kiro_cli.py \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  provider-kiro-lint:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.kiro == 'true' }}
+    permissions:
+      contents: read
+    name: Kiro provider lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Check code formatting with black
+        run: uv run black --check src/ test/
+
+      - name: Check import sorting with isort
+        run: uv run isort --check-only src/ test/
+
+      - name: Run type checker with mypy
+        run: uv run mypy src/
+        continue-on-error: true
+
+  robotics-transport:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.transport == 'true' }}
+    permissions:
+      contents: read
+    name: Transport simulator
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "examples/robotics/cross-zone-transport/uv.lock"
+      - name: Run measured simulation and MCP boundary tests
+        working-directory: examples/robotics/cross-zone-transport
+        run: uv run --locked --python "${{ matrix.python-version }}" pytest
+
+  robotics-factory:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.factory == 'true' }}
+    permissions:
+      contents: read
+    name: Factory simulator
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "examples/robotics/hierarchical-factory/uv.lock"
+      - name: Run the factory simulation, MCP boundary, and setup tests
+        working-directory: examples/robotics/hierarchical-factory
+        run: uv run --locked --python "${{ matrix.python-version }}" pytest
+
+  docs-build:
+    needs: changed-paths
+    if: ${{ needs.changed-paths.outputs.docs == 'true' }}
+    name: Docs site build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docusaurus/package-lock.json
+
+      - name: Install dependencies
+        run: cd docusaurus && npm ci
+
+      - name: Typecheck
+        run: cd docusaurus && npm run typecheck
+
+      - name: Build website
+        run: cd docusaurus && npm run build
+
+  filtered-gate:
+    name: Filtered jobs gate
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    needs:
+      - changed-paths
+      - provider-antigravity
+      - provider-antigravity-lint
+      - provider-claude
+      - provider-claude-lint
+      - provider-codex
+      - provider-codex-lint
+      - provider-kiro
+      - provider-kiro-lint
+      - robotics-transport
+      - robotics-factory
+      - docs-build
+    permissions: {}
+    env:
+      NEEDS_JSON: ${{ toJSON(needs) }}
+    steps:
+      - name: Verify selected jobs succeeded
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          paths = needs["changed-paths"].get("outputs", {})
+          filtered_jobs = {
+              "provider-antigravity": "antigravity",
+              "provider-antigravity-lint": "antigravity",
+              "provider-claude": "claude",
+              "provider-claude-lint": "claude",
+              "provider-codex": "codex",
+              "provider-codex-lint": "codex",
+              "provider-kiro": "kiro",
+              "provider-kiro-lint": "kiro",
+              "robotics-transport": "transport",
+              "robotics-factory": "factory",
+              "docs-build": "docs",
+          }
+          failures = []
+          for job_id, outcome in needs.items():
+              result = outcome["result"]
+              skipped_by_paths = (
+                  job_id in filtered_jobs
+                  and result == "skipped"
+                  and needs["changed-paths"]["result"] == "success"
+                  and paths.get(filtered_jobs[job_id]) == "false"
+              )
+              if result != "success" and not skipped_by_paths:
+                  failures.append(f"{job_id}: {result}")
+
+          if failures:
+              print("Filtered jobs failed:", ", ".join(failures))
+              sys.exit(1)
+          PY
+
   # Advisory aggregate only: branch protections do not require this job.
   ci-gate:
     name: CI gate (advisory)
@@ -1232,6 +1703,8 @@ jobs:
       - dependency-security
       - dependency-review
       - codeql
+      - changed-paths
+      - filtered-gate
     permissions: {}
     env:
       NEEDS_JSON: ${{ toJSON(needs) }}
@@ -1256,10 +1729,8 @@ jobs:
                   result == "skipped"
                   and job_id == "dependency-review"
                   # Mirrors dependency-review's job-level `if:` condition.
-                  and (
-                      event_name != "pull_request"
-                      or repository != "awslabs/cli-agent-orchestrator"
-                  )
+                  and (event_name != "pull_request"
+                       or repository != "awslabs/cli-agent-orchestrator")
               )
               if result != "success" and not skipped_is_allowed:
                   failures.append(f"{job_id}: {result}")
