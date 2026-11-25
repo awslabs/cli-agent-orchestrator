@@ -5,6 +5,7 @@ VALID_STATUSES = frozenset({"active", "proposal", "rejected", "superseded", "del
 VALID_ORIGINS = frozenset(
     {
         "compiler",
+        "content_link",
         "wiki_lint",
         "human",
         "legacy_related_keys",

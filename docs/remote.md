@@ -6,7 +6,7 @@ Remote CAO moves CAO to one always-on Linux box in AWS. The agents run there, un
 
 This page is the user guide. The reference setup is the sample in [`examples/remote/ec2/`](../examples/remote/ec2/README.md) (PR #1316). The guide links its files for the details.
 
-> **What exists today.** This guide uses **herdr mode**. The sample also has a tmux mode. [`cao remote check`](remote-cli.md) runs a read-only check of the laptop's prerequisites and the box. `cao remote connect` does **not** exist yet. See [Coming next](#coming-next).
+> **What exists today.** This guide uses **herdr mode**. The sample also has a tmux mode. The experimental [`cao remote add/list/remove/check` commands](remote-cli.md) register boxes and check prerequisites; `cao remote connect` does **not** exist yet. See [Coming next](#coming-next).
 
 ## Why run CAO on a box
 
