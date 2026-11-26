@@ -409,9 +409,24 @@ directories must not overlap. The checkout must hold the head commit that
 `policy` is the `REVIEW.md` of a trusted checkout, outside the three directories,
 never the copy in the PR checkout.
 
-`cao-server` gives each agent the `CAO_*`, `KIRO_*`, `MISE_*` and `AWS_*`
-variables of its own environment. So start `cao-server` in a shell that holds no
-credential other than the one of the engine, as the workflow does.
+An agent gets variables from three places:
+
+- `cao-server` gives it the `CAO_*`, `KIRO_*`, `MISE_*` and `AWS_*` variables of
+  its own environment.
+- CAO opens each agent in the tmux server of `TMUX_TMPDIR` (by default `/tmp`).
+  A tmux server gives each new pane the environment of the shell that started
+  the server. So if your own tmux server runs there, the agents get its
+  environment.
+- The pane runs a login shell, which reads the start files in `HOME`, such as
+  `~/.profile`.
+
+So isolate CAO as the workflow does. First stop any other `cao-server`, because
+the `cao` commands use the server on port 9889. Then run `cao-server` and each
+`cao` command through `review_env` below. It gives them a new empty `HOME`
+outside the three directories, their own tmux server, and only the credential of
+the engine and a few basic variables. Run `prepare`, `git` and `collect` in your
+usual shell. The seats can still read each file that your account can read, so
+use an account or a container that holds no other credential.
 
 ```bash
 review_dir=.github/pr-review
@@ -421,11 +436,26 @@ git -C /abs/pr-head fetch origin pull/123/head
 git -C /abs/pr-head checkout --detach "$(jq -r .head_sha /abs/evidence/pr.json)"
 python3 "$review_dir/github_review.py" collect --evidence /abs/evidence --source /abs/pr-head
 
+mkdir -m 700 /abs/review-home
+review_env() (
+  export HOME=/abs/review-home TMUX_TMPDIR=/abs/review-home SHELL=/bin/bash
+  for name in $(compgen -e); do
+    case " HOME PATH SHELL USER LANG TMUX_TMPDIR KIRO_API_KEY " in
+      *" $name "*) ;;
+      *) unset "$name" 2> /dev/null || true ;;
+    esac
+  done
+  exec "$@"
+)
+review_env cao-server > /abs/cao-server.log 2>&1 &
+server_pid=$!
+until curl -sf http://127.0.0.1:9889/health > /dev/null; do sleep 1; done
+
 for profile in pr_reviewer pr_voter pr_adjudicator; do
-  cao install "$review_dir/$profile.md" --provider kiro_cli
+  review_env cao install "$review_dir/$profile.md" --provider kiro_cli
 done
-cao workflow create pr_review --from-file "$review_dir/pr_review.py"
-cao workflow run pr_review --run-id pr-review-123 \
+review_env cao workflow create pr_review --from-file "$review_dir/pr_review.py"
+review_env cao workflow run pr_review --run-id pr-review-123 \
   --input evidence_dir=/abs/evidence \
   --input source_dir=/abs/pr-head \
   --input work_dir=/abs/empty-dir \
@@ -435,16 +465,17 @@ cao workflow run pr_review --run-id pr-review-123 \
   --working-directory /abs/empty-dir --json
 ```
 
-For Copilot, use `copilot_cli` in `cao install` and in the `engine` input. With
+For Copilot, use `copilot_cli` in `cao install` and in the `engine` input, and
+keep `COPILOT_GITHUB_TOKEN` instead of `KIRO_API_KEY` in `review_env`. With
 plan approval on (the default), the first run is refused, and the error gives its
-`plan_id`. Approve it with `cao workflow approve <plan_id>`, then run again with a
-new `--run-id`. The optional `step_timeout` input sets the time of each seat, from
-300 to 2,700 seconds.
+`plan_id`. Approve it with `review_env cao workflow approve <plan_id>`, then run
+again with a new `--run-id`. The optional `step_timeout` input sets the time of
+each seat, from 300 to 2,700 seconds.
 
 If a run stops before it ends, for example at a halted step, continue it with
-`cao workflow resume pr-review-123`. CAO replays the seats that ended and does
-not run them again, and the run takes back its own `panel` directory in the
-evidence. A `panel` directory of another run blocks the review, so give each
+`review_env cao workflow resume pr-review-123`. CAO replays the seats that ended
+and does not run them again, and the run takes back its own `panel` directory in
+the evidence. A `panel` directory of another run blocks the review, so give each
 new run a new evidence directory.
 
 `/abs/evidence/review.json` holds the result. Before you post it or share it,
@@ -457,6 +488,15 @@ python3 "$review_dir/github_review.py" check-secrets \
 
 To see the requests without posting them, add `--dry-run /abs/request.json` to
 `github_review.py publish`.
+
+When you no longer need the run, stop `cao-server` and the tmux server of the
+agents. Give tmux the socket path, so that the command cannot stop another tmux
+server:
+
+```bash
+kill "$server_pid"
+tmux -S "/abs/review-home/tmux-$(id -u)/default" kill-server
+```
 
 ## Files
 

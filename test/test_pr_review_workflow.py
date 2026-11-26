@@ -1813,10 +1813,19 @@ def test_location_error_checks_the_line_in_the_file_of_the_commit(
     source = workspace["source"]
     (source / "src" / "empty.py").write_text("", encoding="utf-8")
     (source / "src" / "tail.py").write_text("a\nb", encoding="utf-8")
+    (source / "src" / "run.sh").write_text("set -e\nexit 0\n", encoding="utf-8")
+    (source / "src" / "run.sh").chmod(0o755)
     (source / ":odd.py").write_text("a\n", encoding="utf-8")
     (source / "alias.py").symlink_to("src/app.py")
     (source / "lib").symlink_to("src", target_is_directory=True)
     _commit_source(source)
+    mode = subprocess.run(
+        ["git", "-C", str(source), "ls-tree", HEAD, "--", "src/run.sh"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split(" ")[0]
+    assert mode == "100755"
     # The checkout changes after the commit.
     (source / "src" / "app.py").write_text("x = 1\n" * 40, encoding="utf-8")
     (source / "src" / "new.py").write_text("x = 1\n", encoding="utf-8")
@@ -1829,6 +1838,9 @@ def test_location_error_checks_the_line_in_the_file_of_the_commit(
     # The last line of a file counts also without a final newline.
     assert error("src/tail.py", 2) == ""
     assert error("src/tail.py", 3) == "the file has 2 lines"
+    # An executable file is a file too.
+    assert error("src/run.sh", 2) == ""
+    assert error("src/run.sh", 3) == "the file has 2 lines"
     assert error("src/empty.py", 1) == "the file has 0 lines"
     # Git reads the path as a plain name, not as a pathspec with magic.
     assert error(":odd.py", 1) == ""
