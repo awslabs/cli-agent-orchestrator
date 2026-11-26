@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
+  <title id="title">Architecture of a CAO workflow run</title>
+  <desc id="desc">Your workflow script runs as a separate operating system process with the cao_workflow shim. It is started with a constructed environment of six variables: CAO_WORKFLOW_RUN_ID, CAO_WORKFLOW_GENERATION, CAO_API_BASE_URL, CAO_WORKFLOW_INPUTS, PATH and HOME. Each step call is an HTTP request to the cao-server's /terminals/run-step route, which checks the generation, runs the replay check, checks that the approved inputs have not changed, reads and writes the SQLite journal, and starts an agent terminal for each step it executes. A replayed step starts no terminal. The server returns a step handle with the output and a replayed flag.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="7" flood-color="#0f172a" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#7c3aed"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#16a34a"/>
+    </marker>
+    <marker id="arrow-slate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#475569"/>
+    </marker>
+    <marker id="arrow-slate-start" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10Z" fill="#475569"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .eyebrow { font-size: 13px; font-weight: 700; letter-spacing: 1.5px; fill: #64748b; }
+      .title { font-size: 30px; font-weight: 750; fill: #0f172a; }
+      .subtitle { font-size: 16px; font-weight: 450; fill: #475569; }
+      .card-title { font-size: 22px; font-weight: 720; fill: #0f172a; }
+      .card-copy { font-size: 15px; font-weight: 450; fill: #475569; }
+      .small { font-size: 13px; font-weight: 500; fill: #475569; }
+      .label { font-size: 12px; font-weight: 700; letter-spacing: 0.8px; fill: #475569; }
+      .pill { font-size: 12px; font-weight: 750; letter-spacing: 0.8px; fill: #ffffff; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; font-weight: 600; fill: #0f172a; }
+      .mono-s { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; font-weight: 600; fill: #334155; }
+    </style>
+  </defs>
+  <rect width="1200" height="620" fill="#ffffff"/>
+  <text class="eyebrow" x="60" y="54">CAO WORKFLOW RUN</text>
+  <text class="title" x="60" y="94">Two processes and one journal.</text>
+  <text class="subtitle" x="60" y="124">Your script asks for steps. The server decides each one, runs the agents, and records everything.</text>
+  <g filter="url(#shadow)">
+  <rect x="60" y="170" width="350" height="330" rx="20" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  </g>
+  <text class="card-title" x="88" y="212">Your script</text>
+  <text class="card-copy" x="88" y="238">workflow.py + cao_workflow shim</text>
+  <text class="card-copy" x="88" y="260">A separate OS process</text>
+  <rect x="84" y="282" width="302" height="196" rx="12" fill="#ffffff" stroke="#bfdbfe" stroke-width="1.5"/>
+  <text class="label" x="102" y="306">ENVIRONMENT (BUILT, NOT INHERITED)</text>
+  <text class="mono" x="102" y="334">CAO_WORKFLOW_RUN_ID</text>
+  <text class="mono" x="102" y="358">CAO_WORKFLOW_GENERATION</text>
+  <text class="mono" x="102" y="382">CAO_API_BASE_URL</text>
+  <text class="mono" x="102" y="406">CAO_WORKFLOW_INPUTS</text>
+  <text class="mono" x="102" y="430">PATH</text>
+  <text class="mono" x="102" y="454">HOME</text>
+  <g filter="url(#shadow)">
+  <rect x="520" y="170" width="330" height="330" rx="20" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2"/>
+  </g>
+  <text class="card-title" x="548" y="212">cao-server</text>
+  <text class="mono" x="548" y="238">/terminals/run-step</text>
+  <rect x="548" y="278" width="274" height="40" rx="10" fill="#ffffff" stroke="#ddd6fe" stroke-width="1.5"/>
+  <circle cx="570" cy="298" r="11" fill="#7c3aed"/>
+  <text class="pill" x="570" y="303" text-anchor="middle">1</text>
+  <text class="card-copy" x="592" y="303">Generation check</text>
+  <rect x="548" y="330" width="274" height="40" rx="10" fill="#ffffff" stroke="#ddd6fe" stroke-width="1.5"/>
+  <circle cx="570" cy="350" r="11" fill="#7c3aed"/>
+  <text class="pill" x="570" y="355" text-anchor="middle">2</text>
+  <text class="card-copy" x="592" y="355">Replay check</text>
+  <rect x="548" y="382" width="274" height="40" rx="10" fill="#ffffff" stroke="#ddd6fe" stroke-width="1.5"/>
+  <circle cx="570" cy="402" r="11" fill="#7c3aed"/>
+  <text class="pill" x="570" y="407" text-anchor="middle">3</text>
+  <text class="card-copy" x="592" y="407">Approval still valid?</text>
+  <rect x="548" y="434" width="274" height="40" rx="10" fill="#ffffff" stroke="#ddd6fe" stroke-width="1.5"/>
+  <circle cx="570" cy="454" r="11" fill="#7c3aed"/>
+  <text class="pill" x="570" y="459" text-anchor="middle">4</text>
+  <text class="card-copy" x="592" y="459">Start an agent terminal</text>
+  <text class="small" x="548" y="486">Step 4 is skipped when a step replays.</text>
+  <line x1="410" y1="300" x2="516" y2="300" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+  <text class="small" x="463" y="288" text-anchor="middle">step()</text>
+  <line x1="520" y1="380" x2="414" y2="380" stroke="#7c3aed" stroke-width="2.5" marker-end="url(#arrow-purple)"/>
+  <text class="small" x="467" y="406" text-anchor="middle">StepHandle</text>
+  <text class="small" x="467" y="424" text-anchor="middle">output, replayed</text>
+  <text class="label" x="463" y="322" text-anchor="middle">HTTP</text>
+  <g filter="url(#shadow)">
+  <rect x="930" y="170" width="220" height="140" rx="20" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
+  </g>
+  <text class="card-title" x="954" y="212">Agent terminals</text>
+  <text class="card-copy" x="954" y="240">One per step</text>
+  <text class="card-copy" x="954" y="262">that actually runs</text>
+  <line x1="850" y1="240" x2="926" y2="240" stroke="#16a34a" stroke-width="2.5" marker-end="url(#arrow-green)"/>
+  <g filter="url(#shadow)">
+  <rect x="930" y="360" width="220" height="140" rx="20" fill="#f8fafc" stroke="#475569" stroke-width="2"/>
+  </g>
+  <text class="card-title" x="954" y="402">SQLite journal</text>
+  <text class="card-copy" x="954" y="430">Runs, steps,</text>
+  <text class="card-copy" x="954" y="452">events</text>
+  <line x1="850" y1="430" x2="926" y2="430" stroke="#475569" stroke-width="2.5" marker-start="url(#arrow-slate-start)" marker-end="url(#arrow-slate)"/>
+  <text class="small" x="888" y="418" text-anchor="middle">read / write</text>
+  <text class="card-copy" x="60" y="560">Nothing else from the server's environment reaches the script. A resume adds CAO_WORKFLOW_RESUME.</text>
+</svg>
