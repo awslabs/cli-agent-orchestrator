@@ -1705,10 +1705,14 @@ def test_location_error_checks_the_line_in_the_file_of_the_commit(
 ) -> None:
     source = workspace["source"]
     (source / "src" / "empty.py").write_text("", encoding="utf-8")
+    (source / "src" / "tail.py").write_text("a\nb", encoding="utf-8")
     (source / "alias.py").symlink_to("src/app.py")
     (source / "lib").symlink_to("src", target_is_directory=True)
 
     assert pr_review.location_error(source, "src/app.py", 30) == ""
+    # The last line of a file counts also without a final newline.
+    assert pr_review.location_error(source, "src/tail.py", 2) == ""
+    assert pr_review.location_error(source, "src/tail.py", 3) == "the file has 2 lines"
     # An empty file has no line. On GitHub, a linked path shows the link, not the
     # linked file, and the commit has no path through a linked directory.
     assert pr_review.location_error(source, "src/empty.py", 1) == "the file has 0 lines"
@@ -1749,6 +1753,32 @@ def test_run_review_reports_missing_seat_reports_as_incomplete(
     assert review["owner_question_ids"] == ["F1"]
     assert review["findings"][0]["notes"] == [pr_review.RULE_NO_ADJUDICATOR]
     assert "| reviewer-b | no report | no report | all |" in review["sections"]
+    _assert_publishable(github_review, review)
+
+
+@pytest.mark.parametrize("failed_seat", ["vote-2", "adjudicator"])
+def test_run_review_is_incomplete_when_only_one_panel_seat_fails(
+    pr_review: ModuleType,
+    github_review: ModuleType,
+    workspace: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    failed_seat: str,
+) -> None:
+    reports: dict[str, Any] = {
+        "reviewer-a": _reviewer_report(_finding("Unused import", "P3", line=3)),
+        "reviewer-b": _reviewer_report(),
+        "vote-1": {"votes": {"F1": _vote("confirm", "P3")}},
+        "vote-2": {"votes": {"F1": _vote("confirm", "P3")}},
+        "adjudicator": {"decisions": {"F1": _decision("accept", "P3")}},
+    }
+    cao = FakeCao({**reports, failed_seat: TimeoutError()})
+
+    review = _run_review(pr_review, workspace, monkeypatch, cao)
+
+    failed = "no report: the step ended in state failed (provider_error); the step call failed: "
+    assert review["panel"] == {**dict.fromkeys(SEATS, "valid"), failed_seat: failed + "timed out"}
+    assert review["result_states"] == ["incomplete"]
+    assert review["review_complete"] is False
     _assert_publishable(github_review, review)
 
 
