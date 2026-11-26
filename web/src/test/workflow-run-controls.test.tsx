@@ -233,6 +233,46 @@ describe('WorkflowLauncher', () => {
     expect(spec).not.toHaveBeenCalled() // a restored draft wins over the prefill
   })
 
+  it('does not bring the approval back after Approve & run starts a run', async () => {
+    localStorage.setItem(LAUNCHER_DRAFT_KEY, JSON.stringify({ selected: 'review_flow', runId: 'run-1', inputs, pendingApproval: { planId: 'plan-v2:abc', forDraft } }))
+    vi.spyOn(api, 'listWorkflows').mockResolvedValue([DEF])
+    const approve = vi.spyOn(api, 'approveWorkflowPlan').mockResolvedValue({ plan_id: 'plan-v2:abc', approved: true, changed: true })
+    const submit = vi.spyOn(api, 'submitWorkflowRun').mockResolvedValue({ run_id: 'run-1', state: 'running' })
+    vi.spyOn(api, 'listWorkflowRuns').mockResolvedValue([])
+    // Opening the run's page replaces the Workflows list, so the launcher
+    // unmounts before startWorkflowRun returns to it.
+    const selectWorkflowRun = useStore.getState().selectWorkflowRun
+    const first = render(<WorkflowLauncher />)
+    useStore.setState({ selectWorkflowRun: async () => { first.unmount() } })
+    try {
+      fireEvent.click(await screen.findByRole('button', { name: /Approve & run/ }))
+      await waitFor(() => expect(submit).toHaveBeenCalledTimes(1))
+      await waitFor(() => expect(loadLauncherDraft()?.pendingApproval).toBeNull())
+    } finally {
+      useStore.setState({ selectWorkflowRun })
+    }
+    expect(approve).toHaveBeenCalledTimes(1)
+
+    // Back on the Workflows list: the run started, so there is nothing to approve.
+    render(<WorkflowLauncher />)
+    expect(screen.queryByText('plan-v2:abc')).toBeNull()
+    expect(screen.queryByRole('button', { name: /Approve & run/ })).toBeNull()
+  })
+
+  it('shows and keeps the new plan when the resubmit after approval is refused again', async () => {
+    localStorage.setItem(LAUNCHER_DRAFT_KEY, JSON.stringify({ selected: 'review_flow', runId: 'run-1', inputs, pendingApproval: { planId: 'plan-v2:abc', forDraft } }))
+    vi.spyOn(api, 'listWorkflows').mockResolvedValue([DEF])
+    vi.spyOn(api, 'approveWorkflowPlan').mockResolvedValue({ plan_id: 'plan-v2:abc', approved: true, changed: true })
+    vi.spyOn(api, 'submitWorkflowRun').mockRejectedValue(Object.assign(new Error('needs approval'), {
+      kind: 'approval_required', detail: 'the script changed', detailMeta: { plan_id: 'plan-v2:def' },
+    }))
+    render(<WorkflowLauncher />)
+    fireEvent.click(await screen.findByRole('button', { name: /Approve & run/ }))
+    expect(await screen.findByText('plan-v2:def')).toBeTruthy()
+    expect(screen.queryByText('plan-v2:abc')).toBeNull()
+    expect(loadLauncherDraft()?.pendingApproval?.planId).toBe('plan-v2:def')
+  })
+
   it('drops a stored approval that no longer matches the draft', () => {
     localStorage.setItem(LAUNCHER_DRAFT_KEY, JSON.stringify({ selected: 'review_flow', runId: 'other', inputs, pendingApproval: { planId: 'plan-v2:abc', forDraft } }))
     vi.spyOn(api, 'listWorkflows').mockResolvedValue([])

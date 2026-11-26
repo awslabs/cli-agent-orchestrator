@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Approve & run no longer comes back after a run starts**. In the Workflows tab, a started run
+  opens its page, and the launcher closed before it saved its cleared state. Going back to
+  Workflows then showed the same, already approved plan again, and each click on Approve & run
+  started another run. The launcher now clears the approval as soon as the plan is approved, and
+  saves its state before the run's page opens. If the resubmit is refused again, it shows the new
+  plan.
 - **Remote worker status polling no longer overruns `--timeout` by up to 60s** (#1059).
   `FleetClient.terminal_status` now reads with a 5s timeout (the same ceiling the local
   status poll in `wait_until_terminal_status` uses) instead of the module-wide 60s read
