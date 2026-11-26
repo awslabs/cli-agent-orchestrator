@@ -62,6 +62,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 import time
 from test.api.conftest import TestClientWithHost
 from typing import Callable, Optional
@@ -308,6 +309,50 @@ def test_composed_flow_script_tier(portal_client, monkeypatch, tmp_path):
     assert result.status_code == 200
     assert result.json()["state"] == "completed"
     assert result.json()["run_id"] == "int-scr"
+
+
+# ===========================================================================
+# #1514 (IP-2, the two-store split): the STATUS route must not advertise a
+# terminal state the RESULT route cannot answer yet. Status reads the live
+# record; the result reads the journal row, which is authoritative (FR-6.2).
+# Pausing the journal write inside ``_finalize`` widens that publication window
+# from microseconds to the length of this test, so the ordering is asserted
+# deterministically instead of hoping a loaded runner races into it.
+# ===========================================================================
+def test_status_does_not_report_terminal_before_the_result_can(
+    portal_client, monkeypatch, tmp_path
+):
+    from cli_agent_orchestrator.services import script_runner
+
+    _write_script_spec(monkeypatch, tmp_path, _SCRIPT_FAST, "scr-publish")
+
+    write_started, release_write = threading.Event(), threading.Event()
+    real_journal = script_runner._journal_run_state
+
+    def _paused_journal(record, *rest):
+        write_started.set()
+        assert release_write.wait(30), "the test never released the paused journal write"
+        real_journal(record, *rest)
+
+    monkeypatch.setattr(script_runner, "_journal_run_state", _paused_journal)
+
+    _submit(portal_client, "scr-publish", "int-publish")
+    assert write_started.wait(30), "the script run never reached _finalize"
+    try:
+        # The terminal state is not durable yet, so NEITHER route may claim it is.
+        # Pre-#1514 the status route already said "completed" here while the result
+        # route still said "running" with no step outputs.
+        status = portal_client.get("/workflows/runs/int-publish").json()
+        result = portal_client.get("/workflows/runs/int-publish/result").json()
+        assert (status["state"], result["state"]) == ("running", "running")
+    finally:
+        release_write.set()
+
+    # Once the row lands, both routes agree and the run is terminally finished.
+    assert _poll_journal_terminal("int-publish", portal_client) == "completed"
+    status = portal_client.get("/workflows/runs/int-publish").json()
+    result = portal_client.get("/workflows/runs/int-publish/result").json()
+    assert (status["state"], result["state"]) == ("completed", "completed")
 
 
 # ===========================================================================

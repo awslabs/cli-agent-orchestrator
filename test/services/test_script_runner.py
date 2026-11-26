@@ -820,6 +820,42 @@ async def test_cancel_signal_first_order(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
+async def test_cancel_journals_cancelled_before_settling_the_record(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Issue #1514, cancel arm: the record settles only after the journal write.
+
+    The same two-store split applies as in ``_finalize``: a client that polled the
+    status route to ``cancelled`` and then fetched ``/result`` could read
+    ``running`` for the duration of the journal write. Positional assertion, no
+    timing: when the row is written the record still reads RUNNING.
+    """
+    observed: dict = {}
+
+    async def _fake_sweep(run_id):
+        return None
+
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _fake_sweep)
+    real_update = workflow_journal.update_run_state
+
+    def _spy(run_id, state, finished_at, *args, **kwargs):
+        observed["state_at_write"] = record.state
+        real_update(run_id, state, finished_at, *args, **kwargs)
+
+    monkeypatch.setattr(workflow_journal, "update_run_state", _spy)
+
+    _seed_script_run("run-cancel-publish", generation="1")
+    record = _make_record("run-cancel-publish", process=_FakeProcess(exit_rc=0), generation="1")
+
+    await cancel_script_run(record)
+
+    assert observed["state_at_write"] == RunState.RUNNING
+    assert record.state == RunState.CANCELLED
+    row = workflow_journal.get_run("run-cancel-publish")
+    assert row is not None and row.state == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_cancel_drive_race_drive_yields_to_cancelled(monkeypatch: pytest.MonkeyPatch):
     """F2: cancel wins a race with the drive's own exit interpretation.
 
@@ -1727,6 +1763,74 @@ async def test_script_result_preserves_provider_error_kind(_patched_journal):
     assert result.steps[0].state == StepState.FAILED
     assert result.steps[0].error_kind == "provider_error"
     assert record.step_states["s1"].attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_finalize_journals_the_terminal_state_before_settling_the_record(
+    monkeypatch, _patched_journal
+):
+    """Issue #1514: the live record must never lead the journal's terminal write.
+
+    ``GET /workflows/runs/{id}`` answers from the record and
+    ``GET /workflows/runs/{id}/result`` from the journal row, so a record settled
+    first let a client poll a terminal status and then read ``running`` from the
+    result. The assertion is positional, not timing-based: at the moment the
+    journal write runs, the record still reads RUNNING, and only afterwards does it
+    carry the terminal state.
+    """
+    run_id = "run-publish-order"
+    _seed_script_run(run_id)
+    record = _make_record(run_id, process=None, generation="1")
+    observed = {}
+    real_journal = script_runner._journal_run_state
+
+    def _spy(rec, *args):
+        observed["state_at_write"] = rec.state
+        real_journal(rec, *args)
+
+    monkeypatch.setattr(script_runner, "_journal_run_state", _spy)
+
+    result = await script_runner._finalize(record, state=RunState.COMPLETED, kind=None)
+
+    assert observed["state_at_write"] == RunState.RUNNING
+    assert result.state == RunState.COMPLETED
+    assert record.state == RunState.COMPLETED
+    row = workflow_journal.get_run(run_id)
+    assert row is not None and row.state == "completed"
+
+
+@pytest.mark.asyncio
+async def test_finalize_still_settles_the_record_when_the_journal_write_fails(
+    monkeypatch, _patched_journal
+):
+    """INV-4 survives the #1514 reorder: a failed journal write still settles the record.
+
+    The journal-first order must not turn a best-effort write into a reason the
+    live record stays RUNNING forever, which would trade a millisecond race for a
+    stuck run. The status route still converges to terminal; only the journal (and
+    so the cold-read result) is degraded, which is the pre-existing INV-4 posture.
+    """
+    from cli_agent_orchestrator.services import workflow_service
+
+    run_id = "run-publish-journal-boom"
+    _seed_script_run(run_id)
+    record = _make_record(run_id, process=None, generation="1")
+    workflow_service.run_registry[run_id] = record
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("db gone")
+
+    # Fail the journal LAYER, not the helper: the helper's own INV-4 swallow is
+    # what must keep the record settling, so patching the helper out would test
+    # the fake instead of the behaviour.
+    monkeypatch.setattr(workflow_journal, "update_run_state", _boom)
+
+    result = await script_runner._finalize(record, state=RunState.COMPLETED, kind=None)
+
+    assert result.state == RunState.COMPLETED
+    assert record.state == RunState.COMPLETED
+    row = workflow_journal.get_run(run_id)
+    assert row is not None and row.state == "running"
 
 
 def test_completion_journal_failure_never_raises(monkeypatch, _patched_journal):

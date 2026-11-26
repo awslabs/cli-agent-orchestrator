@@ -1091,12 +1091,21 @@ def _delete_temp_file(path: Optional[str]) -> None:
 # ---------------------------------------------------------------------------
 # _finalize (INV-5) — construct the tier-neutral WorkflowRunResult
 # ---------------------------------------------------------------------------
-def _journal_run_state(record: ScriptRunRecord, error: Optional[str], kind: Optional[str]) -> None:
-    """Best-effort terminal-state write-through (INV-4/INV-5). Never raises."""
+def _journal_run_state(
+    record: ScriptRunRecord, state: RunState, error: Optional[str], kind: Optional[str]
+) -> None:
+    """Best-effort terminal-state write-through (INV-4/INV-5). Never raises.
+
+    ``state`` is passed explicitly rather than read off ``record``: the journal is
+    the authoritative source for ``GET /workflows/runs/{id}/result`` (FR-6.2), so
+    this write MUST be able to land before the live record is settled, and taking
+    the value as an argument is what removes that ordering temptation from the
+    call site.
+    """
     try:
         workflow_journal.update_run_state(
             record.run_id,
-            record.state.value,
+            state.value,
             record.finished_at,
             error,
             kind,
@@ -1144,11 +1153,26 @@ async def _finalize(
     window, and constructs the SAME ``WorkflowRunResult`` shape a YAML run returns
     plus the additive ``kind``/``output``/``warnings`` fields (E2). A script
     failure/timeout/cancel NEVER raises — it returns a FAILED/CANCELLED result.
+
+    THE JOURNAL WRITE LANDS BEFORE THE LIVE RECORD IS SETTLED, and the order is
+    load-bearing (issue #1514). ``GET /workflows/runs/{id}`` answers from this
+    in-memory record; ``GET /workflows/runs/{id}/result`` answers from the journal
+    row, which is journal-authoritative by contract (FR-6.2, A-5). Settling the
+    record first made the status route report a terminal state for the whole
+    duration of the ``to_thread`` hop and its sqlite commit, so a client that
+    polled the status route to terminal and then fetched the result — which is
+    exactly what ``cao workflow`` and the MCP ``workflow_wait``/``workflow_result``
+    pair do — could read ``running`` with no step outputs for a finished run.
+    Journaling first inverts the window into the harmless direction: while the
+    write is in flight the status route still says ``running``, so no route
+    advertises a terminal state the result route cannot yet answer. The reverse
+    gap (journal landed, record not yet updated) is unobservable from the status
+    route's point of view, which simply converges microseconds later.
     """
+    record.finished_at = _now()
+    await asyncio.to_thread(_journal_run_state, record, state, _sanitise_error(error), kind)
     record.state = state
     record.current_step_id = None
-    record.finished_at = _now()
-    await asyncio.to_thread(_journal_run_state, record, _sanitise_error(error), kind)
     # ``WorkflowRunResult`` has no top-level ``error`` field (per-step only), so a
     # run-level error (stderr tail on crash/timeout) is surfaced in ``warnings`` —
     # the FAILED state + ``kind`` already carry the failure semantics; the tail is
@@ -1952,8 +1976,11 @@ async def cancel_script_run(record: ScriptRunRecord) -> None:
     # 3. THEN sweep in-flight terminals (best-effort, self-guarding).
     await _reconcile_orphans(record.run_id)
 
-    # 4. THEN journal CANCELLED (retained -> resumable for scripts, BR-18).
-    record.state = RunState.CANCELLED
+    # 4. THEN journal CANCELLED (retained -> resumable for scripts, BR-18), and only
+    #    then settle the LIVE record. Same order as ``_finalize``, for the same
+    #    reason (issue #1514): the status route reads the record and the result
+    #    route reads the journal, so the record must never publish a terminal state
+    #    the journal cannot answer yet.
     record.finished_at = _now()
     try:
         await asyncio.to_thread(
@@ -1970,3 +1997,4 @@ async def cancel_script_run(record: ScriptRunRecord) -> None:
             record.run_id,
             e,
         )
+    record.state = RunState.CANCELLED
