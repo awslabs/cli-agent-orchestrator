@@ -1,13 +1,19 @@
 # Pull Request Review Workflow
 
-This workflow reviews one pull request of this repository with a panel of CAO
-agents and posts one `COMMENT` review. Each seat of the panel is a step of a CAO
-workflow, with its own agent and terminal. No seat is a sub-agent of another
-session. A maintainer starts the review by hand and selects the agent CLI:
-`kiro_cli` (the default) or `copilot_cli`.
+This workflow reviews one pull request of this repository with CAO agents. By
+default, one agent reviews the PR. A maintainer can choose a panel of five seats
+instead. Each seat is a step of a CAO workflow, with its own agent and terminal.
+No seat is a sub-agent of another session. A maintainer starts the review by
+hand and selects the agent CLI: `kiro_cli` (the default) or `copilot_cli`. The
+workflow posts one comment on the PR, updates that comment on later runs, and
+adds a neutral check to the reviewed head commit.
 
-The review is advisory. It never approves a PR and never requests changes, so it
-cannot block or allow a merge.
+The review is advisory. It never approves a PR and never requests changes, and
+its check is always neutral, so it cannot block or allow a merge.
+
+The agents apply the review policy in [`REVIEW.md`](../../REVIEW.md). The
+[design](../../docs/pr-review-design.md) explains the decisions, and how the
+review meets #1350 and #464.
 
 ## How it works
 
@@ -18,31 +24,55 @@ three jobs:
 | Job | Token permissions | What it does |
 | --- | --- | --- |
 | `prepare` | `contents: read`, `pull-requests: read` | Reads the PR. A closed PR fails the run. A draft PR is skipped. |
-| `review` | `contents: read`, `copilot-requests: write` | Checks out the PR head as files, writes the diff, starts `cao-server` and runs the CAO workflow [`pr_review.py`](pr_review.py). Then it shows the review in the run summary. |
-| `publish` | `contents: read`, `pull-requests: write` | Validates `review.json`, reads the PR again and posts the review on the reviewed head. It runs no agent. |
+| `review` | `contents: read`, `copilot-requests: write` | Runs in the `ai-review` environment, which holds the engine secret. Checks out the PR head as files, writes the diff, starts `cao-server` and runs the CAO workflow [`pr_review.py`](pr_review.py). Then it stops the agents, checks the result for credentials and shows the review in the run summary. |
+| `publish` | `contents: read`, `pull-requests: write`, `checks: write` | Validates `review.json` and reads the PR again. Then it posts or updates the review comment, and adds a neutral check run to the reviewed head. If the review did not finish or was not posted, it adds a neutral check run that says so. It runs no agent. |
 
-The CAO workflow runs the panel in three phases. The seats of one phase run at the
-same time.
+The `reviewers` input selects the seats.
 
-1. **Review.** Two reviewers, `reviewer-a` and `reviewer-b`, read the evidence and
-   the head checkout. Each one reports the files that it reviewed and at most 8
-   candidate findings.
-2. **Vote.** The script merges exact duplicates (the same path, line and title) and
-   numbers the candidates `F1` to `Fn`. Two fresh voters, `vote-1` and `vote-2`,
-   check each candidate against the source. A voter does not see who proposed a
-   candidate or the other vote.
-3. **Adjudicate.** An adjudicator reads the cited source and decides each
-   candidate: `accept`, `reject` or `owner_decision`.
+- **`single`** (the default) runs one reviewer, `reviewer-a`. The script accepts
+  each finding of the reviewer at its proposed severity. No vote and no
+  adjudication run, and the review says that no second agent checked the
+  findings.
+- **`panel`** runs three phases. The seats of one phase run at the same time.
+  1. **Review.** Two reviewers, `reviewer-a` and `reviewer-b`, read the evidence
+     and the head checkout.
+  2. **Vote.** The script merges exact duplicates (the same path, line and
+     title) and numbers the candidates `F1` to `Fn`. Two fresh voters, `vote-1`
+     and `vote-2`, check each candidate against the source. A voter does not see
+     who proposed a candidate or the other vote.
+  3. **Adjudicate.** An adjudicator reads the cited source and decides each
+     candidate: `accept`, `reject` or `owner_decision`.
 
-With no candidates, the voters and the adjudicator do not run.
+  With no candidates, the voters and the adjudicator do not run.
+
+Each reviewer reports the files that it reviewed, the status of each check in
+`REVIEW.md`, the overall risk with one to five reasons, and at most 8 candidate
+findings. Each finding gives its check, path, line, failure, impact, evidence,
+confidence and suggested fix. Before the vote, the script drops each finding
+whose path is not a file in the head checkout, or whose line is not a line of
+that file. The review lists each dropped finding.
+
+### The review policy
+
+The `review` job gives the driver the absolute path of `REVIEW.md` from the
+dispatched ref, as the `policy` input. Each agent reads that file first and
+applies it. A `REVIEW.md` in the PR checkout is evidence only, also when the PR
+changes it. Each line of the form `### A1. Title` in the policy is one check. Each
+reviewer reports each check as `checked`, `not_checked` or `not_applicable`. The
+review names the policy file and the start of its SHA-256, so you can see which
+policy ran. The prompts keep only the safety rules.
 
 Each seat is one `step(...)` call with its own `step_id` and
 `recovery="idempotent"`. The agent returns its report with CAO's
 `workflow_return` tool and a JSON Schema. The script reads the reports from the
 CAO run view and validates them again. A missing or invalid report never becomes
-a finding or a pass.
+a finding or a pass. If a step call returns before CAO ends the step, the script
+waits up to 150 seconds for the step to end before it reads the report.
 
 ### Verdict rules
+
+These rules apply in panel mode. In single mode, each finding is accepted at its
+proposed severity.
 
 The adjudicator decides. Votes alone never accept a finding. The script changes a
 decision only in these cases:
@@ -50,6 +80,8 @@ decision only in these cases:
 - Both voters confirmed a P1 or P2 finding, and the adjudicator rejected it or
   lowered it to P3. The finding becomes an owner question at the higher voter
   severity.
+- An owner question keeps at least the proposed severity, so the P3 rule below
+  cannot reject an open P1 or P2 question.
 - A P3 candidate that is not settled is rejected, because a P3 finding does not
   block a merge.
 - A `duplicate_of` claim that does not point to an accepted finding of the same or
@@ -64,9 +96,9 @@ is the result.
 
 | State | When |
 | --- | --- |
-| `changes_required` | The panel accepted a P1 or P2 finding. |
+| `changes_required` | The review accepted a P1 or P2 finding. |
 | `owner_decision_required` | A P1 or P2 candidate needs a decision from the PR owner. |
-| `incomplete` | A reviewer did not account for every changed file, or a voter or the adjudicator returned no valid report. |
+| `incomplete` | A reviewer did not account for every changed file, no reviewer checked a check of `REVIEW.md`, the script dropped a finding with a bad location, or a voter or the adjudicator returned no valid report. |
 | `no_blocking_findings` | None of the above. Accepted P3 findings can still be listed. |
 
 If the run cannot make a review, `review.json` is Blocked: `publishable` is
@@ -74,20 +106,31 @@ If the run cannot make a review, `review.json` is Blocked: `publishable` is
 a valid report. The `review` job then fails at its check step, and nothing is
 posted.
 
-The posted review starts with a line that names the engine and the person who
-started the run, and says that the review is not an approval. Then it gives a link
-to the run, the result, each candidate with its votes and decision, the coverage
-of each reviewer, and the panel. An accepted finding on a line of the diff also
-gets an inline comment.
+The review is one comment on the PR. The comment starts with a line that names
+the engine, the reviewers and the person who started the run, and says that the
+review is not an approval. Then it gives a link to the run, the result, the risk
+level with its reasons, and each finding with its check, location, impact,
+evidence and suggested fix. In panel mode, each candidate also shows its votes
+and its decision. Then come the dropped findings, the status of each check of
+`REVIEW.md`, the coverage of each reviewer, and the agents with their models.
+The checks section names the policy file and the start of its SHA-256. A hidden
+marker at the end holds only validated values, such as the run ID and the
+result. A later run finds the comment by this marker and by its author, and
+updates it in place. The workflow posts no inline comments.
+
+Then `publish` adds the check run `PR review (advisory)` to the reviewed head.
+Its conclusion is always `neutral`. Its title gives the result. Its summary gives
+the counts, the risk level, the number of checks that no reviewer checked, and
+links to the comment and the run. The check run holds no agent text.
 
 After the credential check, the `review` job adds the review to the summary page
 of the workflow run. The summary starts with a line that names the PR, the
-reviewed head and the engine. Then it gives the same sections as the posted
-review. The run summary shows the review also when `publish` posts nothing, for
+reviewed head and the engine. Then it gives the same sections as the review
+comment. The run summary shows the review also when `publish` posts nothing, for
 example because the PR became a draft. Each person who is signed in to GitHub
 and can read the repository can see the run summary. The `publish` job adds its
-result to the run summary: the ID of the posted review, or the reason why it
-posted nothing.
+result to the run summary: the IDs of the comment and the check run, or the
+reason why it posted nothing.
 
 ## Set up
 
@@ -109,7 +152,7 @@ Kiro documents API keys for its non-interactive mode. CAO runs Kiro in its
 terminal UI, which also reads `KIRO_API_KEY` at startup. The governance rules of a
 Kiro administrator also apply to API key sessions, for example rules for MCP
 servers and models. Each seat needs the `cao-mcp-server` MCP server. The account
-must offer the models of the panel. See [Models](#models).
+must offer the models of the seats. See [Models](#models).
 
 **`copilot_cli`.** Select one:
 
@@ -126,13 +169,33 @@ must offer the models of the panel. See [Models](#models).
 Each engine gets only its own credential. A `kiro_cli` run never gets the job
 token, and a `copilot_cli` run never gets `KIRO_API_KEY`.
 
-### 2. Limit the secret to the default branch (optional)
+### 2. Limit the secret to the default branch
+
+The `review` job runs in the GitHub environment `ai-review`, with
+`deployment: false`. So the job gets the secrets and the branch rule of the
+environment, and GitHub records no deployment. If the environment does not
+exist, the first run creates it with no rules and no secrets, and the job uses
+the repository secrets.
 
 A user with write access can dispatch this workflow from any branch, and so can
-change the workflow file of that run. To stop this, store the secret as an
-environment secret, not a repository secret, in a GitHub environment with a
-deployment branch policy for the default branch only. Then add
-`environment: <name>` to the `review` job.
+change the workflow file of that run. A changed workflow file can read each
+repository secret. After the workflow is on the default branch, do these steps:
+
+1. In **Settings > Environments > `ai-review`**, set **Deployment branches and
+   tags** to **Selected branches and tags**. Add the default branch only.
+2. Add the secret of the engine to the environment, then delete the repository
+   secret of the same name:
+
+   ```bash
+   gh secret set KIRO_API_KEY --env ai-review --repo OWNER/REPO
+   gh secret delete KIRO_API_KEY --repo OWNER/REPO
+   ```
+
+   Do the same for `COPILOT_GITHUB_TOKEN` if you use it.
+
+Then only a run from the default branch can start the `review` job. Do not add a
+custom deployment protection rule to `ai-review`: with `deployment: false`, such
+a rule fails the job.
 
 ### 3. Put the workflow on the default branch
 
@@ -146,6 +209,7 @@ GitHub CLI:
 
 ```bash
 gh workflow run pr-review.yml --repo OWNER/REPO -f pr=123
+gh workflow run pr-review.yml --repo OWNER/REPO -f pr=123 -f reviewers=panel
 gh workflow run pr-review.yml --repo OWNER/REPO -f pr=123 -f engine=copilot_cli
 ```
 
@@ -153,20 +217,25 @@ gh workflow run pr-review.yml --repo OWNER/REPO -f pr=123 -f engine=copilot_cli
 | --- | --- | --- |
 | `pr` | (required) | Number of the PR to review. |
 | `engine` | `kiro_cli` | `kiro_cli` or `copilot_cli`. |
-| `model_a` | `KIRO_MODEL_A` with `kiro_cli`, the CLI default with `copilot_cli` | Model for `reviewer-a`, `vote-1` and the adjudicator. |
-| `model_b` | `KIRO_MODEL_B` with `kiro_cli`, the CLI default with `copilot_cli` | Model for `reviewer-b` and `vote-2`. |
+| `reviewers` | `single` | `single`: one reviewer. `panel`: two reviewers, two voters and an adjudicator. |
+| `model_a` | `KIRO_MODEL_A` with `kiro_cli`, the CLI default with `copilot_cli` | Model for `reviewer-a`, and in panel mode also for `vote-1` and the adjudicator. |
+| `model_b` | `KIRO_MODEL_B` with `kiro_cli`, the CLI default with `copilot_cli` | Panel mode only. Model for `reviewer-b` and `vote-2`. |
 
-Each seat starts a new agent session, so the two reviewers and the two voters
-work on their own. Two different models make them more independent. Test a
-model before you make it a default (see [Models](#models)). Use model names that
-the selected CLI accepts.
+In panel mode, each seat starts a new agent session, so the two reviewers and
+the two voters work on their own. Two different models make them more
+independent. Test a model before you make it a default (see [Models](#models)).
+Use model names that the selected CLI accepts.
 
-Only one review of a PR runs at a time. A later dispatch for the same PR waits.
+Only one review of a PR runs at a time. A later dispatch for the same PR cancels
+the earlier run, and a cancelled run posts nothing. If an earlier run still
+reaches `publish` after a later run posted, it sees the newer run ID in the
+comment marker and posts nothing.
 
 Each run reviews one head SHA. If the PR head moves during the run, `publish`
-still posts the review on the reviewed head, with a warning, while that commit is
-part of the PR. After a force push removes the commit, `publish` stops as Stale
-and posts nothing.
+still posts the review for the reviewed head, with a warning, while that commit
+is part of the PR. After a force push removes the commit, `publish` stops as
+Stale. It posts no comment, and adds the neutral check run
+`Review not published (advisory)` to the reviewed head.
 
 ### Models
 
@@ -176,8 +245,8 @@ one run.
 
 | Variable | Default | Use |
 | --- | --- | --- |
-| `KIRO_MODEL_A` | `claude-opus-5.5` | Model A: `reviewer-a`, `vote-1` and the adjudicator. The adjudicator is the one seat that decides alone, so it uses model A. |
-| `KIRO_MODEL_B` | `claude-opus-5.5` | Model B: `reviewer-b` and `vote-2`. The default is the same as model A. See the tests of other models below. |
+| `KIRO_MODEL_A` | `claude-opus-5.5` | Model A: `reviewer-a`, and in panel mode also `vote-1` and the adjudicator. The adjudicator is the one seat that decides alone, so it uses model A. |
+| `KIRO_MODEL_B` | `claude-opus-5.5` | Model B, panel mode only: `reviewer-b` and `vote-2`. The default is the same as model A. See the tests of other models below. |
 | `KIRO_MODEL_DEFAULTS` | `{"claude-opus-5.5": {"output_config": {"effort": "max"}}}` | The Kiro setting `chat.modelDefaults` of the seats, with settings for each model ID. The default sets the `max` reasoning effort for Claude Opus 5.5, so every seat uses it. |
 
 - The workflow writes `KIRO_MODEL_DEFAULTS` to the Kiro user settings of the
@@ -206,8 +275,8 @@ one run.
   Before you make a model the default, test it with the `model_a` or `model_b`
   input.
 - A `copilot_cli` run uses the Copilot CLI default model unless you set an input.
-- When the panel completes, the job log shows the model and the report status of
-  each seat.
+- When the CAO run completes, the job log shows the model and the report status
+  of each seat.
 
 ## Trust boundaries
 
@@ -215,8 +284,13 @@ one run.
   `pull_request_target` event. Only a user with write access can dispatch the
   workflow, so a fork PR cannot start it or reach its secrets.
 - **Split tokens.** The `review` job, where the agents run, has no write token.
-  Only `publish` can write, and it runs no agent. It posts with `event: COMMENT`
-  only, and at most one review for each workflow run.
+  Only `publish` can write, and it runs no agent. It writes one comment on the
+  PR, which later runs update in place, and neutral check runs. It never
+  approves, requests changes or posts an inline comment.
+- **Secret in an environment.** The `review` job reads the engine secret from the
+  `ai-review` environment. When the environment allows only the default branch,
+  a workflow file that was changed on another branch cannot read the secret. See
+  [Set up](#2-limit-the-secret-to-the-default-branch).
 - **No PR code runs.** The PR head is checked out as files with
   `persist-credentials: false`. No step builds, installs or runs code from it. CAO,
   the seat profiles and the workflow come from the dispatched ref.
@@ -234,18 +308,23 @@ one run.
   Copilot. No other `GITHUB_*`, `RUNNER_*` or `ACTIONS_*` variable of the job
   reaches them.
 - **Pinned tools.** Kiro CLI is a pinned release with a SHA-256 check. Copilot CLI
-  is a pinned npm version, installed with `--ignore-scripts`. Each action is pinned
-  to a commit SHA. `uv` installs the committed `uv.lock`. No cache is used.
-- **Credential check.** Before the upload, `github_review.py check-secrets` refuses
-  a `review.json` that holds the value of an engine credential (raw, Base64 or hex)
-  or a known token pattern. `summary` and `publish` check for token patterns
-  again.
-- **Safe text.** Agent text in the review has no control characters, no HTML
-  comment delimiters and no live @mentions. The job log never shows agent text.
-  The run summary shows the review only after `check-secrets` and the checks of
-  `github_review.py summary` pass. When the panel completes, the log shows the
-  model and the report status of each seat. When a run fails, it shows only step
-  IDs, states and error kinds.
+  comes from the committed lockfile in [`copilot/`](copilot/), installed with
+  `npm ci --ignore-scripts`, which checks the integrity hash of each package and
+  runs no install script. Each action is pinned to a commit SHA. `uv` installs
+  the committed `uv.lock`. No cache is used.
+- **Credential check.** The `review` job stops `cao-server` and the agents first.
+  Then `github_review.py check-secrets` refuses a `review.json` that holds the
+  value of an engine credential (raw, Base64 or hex) or a known token pattern.
+  This check runs before the upload. `summary` and `publish` check for token
+  patterns again.
+- **Safe text.** Agent text in the review has no control characters and no live
+  @mentions. The script escapes `\`, `[`, `]`, `&`, `<` and `>` in agent text, so
+  agent text cannot add a link, an image, an HTML tag, an HTML comment or an
+  entity. GitHub still makes a bare URL into a link. The check run holds no agent
+  text. The job log never shows agent text. The run summary shows the review only
+  after `check-secrets` and the checks of `github_review.py summary` pass. When
+  the CAO run completes, the log shows the model and the report status of each
+  seat. When a run fails, it shows only step IDs, states and error kinds.
 
 A script-tier CAO workflow needs an approved plan. No person is at the runner to
 approve it, so the `review` job turns `workflow.require_approval` off in a private
@@ -267,13 +346,19 @@ profiles and the PR, and all three come from the dispatched ref.
 ## Limits
 
 - A PR with more than 1,000 changed files is Blocked.
-- Each reviewer reports at most 8 findings and 5 unknowns.
-- Each seat can use 1,800 seconds. The panel step of the job can use 120 minutes.
-- The review body must fit one GitHub review. The full body is used first, then a
-  compact body, then a cut body with a note. The `pr-review-result` artifact keeps
-  `review.json` with every finding for 7 days.
-- At most 100 inline comments are posted. If GitHub refuses the inline comments,
-  the workflow posts the review without them and adds a note.
+- Each reviewer reports at most 8 findings and 5 unknowns. A reviewer can skip
+  at most 50 files, each with a reason. If a reviewer does not account for each
+  changed file, the review is incomplete.
+- `REVIEW.md` can have at most 40 checks.
+- The report of each seat must fit the CAO limit of a step result, 32 KiB. CAO
+  drops a larger report, so the seat has no report.
+- Each seat can use 1,800 seconds. The review step of the job can use 120
+  minutes.
+- The review must fit one GitHub comment. The full text is used first, then a
+  compact text, then a cut text with a note. The `pr-review-result` artifact
+  keeps `review.json` with every finding for 7 days.
+- `publish` reads at most 5,000 comments of the PR to find the earlier review
+  comment. If the PR has more, `publish` posts no comment.
 
 ## Troubleshooting
 
@@ -289,12 +374,22 @@ profiles and the PR, and all three come from the dispatched ref.
 | `Stale: the checkout is not the head that prepare read` | The PR changed during setup. Dispatch again. |
 | `Stale: the reviewed head is no longer a commit of the PR` | A force push removed the reviewed commit. Dispatch again. |
 | `Skipped: … is a draft` | Mark the PR ready for review, then dispatch again. |
+| `Blocked: the review is not publishable: "the policy has no check heading of the form '### A1. Title'"` | `REVIEW.md` on the dispatched ref has no check line. The `policy` errors also include a check ID that is not valid or is used twice, and more than 40 checks. Fix `REVIEW.md`, then dispatch again. |
+| Check run `Review did not finish (advisory)` | The `review` job failed or timed out. The check gives the job result, and the job log gives the reason. A review comment on the PR, if there is one, is from an earlier run. |
+| Check run `Review not published (advisory)` | The review finished, but `publish` did not post or update the comment, for example because the reviewed head is stale. The `publish` job log gives the reason. |
+| The `review` job fails before its first step, with an error about the protection rules of `ai-review` | The environment allows only the default branch. Dispatch from the default branch. |
 
 ## Run the CAO workflow without GitHub Actions
 
 Use absolute paths. `work_dir` must be an empty directory, and the three
 directories must not overlap. The checkout must hold the head commit that
-`prepare` read and `origin/<target branch>`.
+`prepare` read and `origin/<target branch>`. `collect` needs Git 2.40 or later.
+`policy` is the `REVIEW.md` of a trusted checkout, outside the three directories,
+never the copy in the PR checkout.
+
+`cao-server` gives each agent the `CAO_*`, `KIRO_*`, `MISE_*` and `AWS_*`
+variables of its own environment. So start `cao-server` in a shell that holds no
+credential other than the one of the engine, as the workflow does.
 
 ```bash
 review_dir=.github/pr-review
@@ -312,7 +407,9 @@ cao workflow run pr_review --run-id pr-review-123 \
   --input evidence_dir=/abs/evidence \
   --input source_dir=/abs/pr-head \
   --input work_dir=/abs/empty-dir \
+  --input policy=/abs/trusted/REVIEW.md \
   --input engine=kiro_cli \
+  --input reviewers=single \
   --working-directory /abs/empty-dir --json
 ```
 
@@ -322,18 +419,37 @@ plan approval on (the default), the first run is refused, and the error gives it
 new `--run-id`. The optional `step_timeout` input sets the time of each seat, from
 300 to 2,700 seconds.
 
-`/abs/evidence/review.json` holds the result. To see the review request without
-posting it, add `--dry-run /abs/request.json` to `github_review.py publish`.
+If a run stops before it ends, for example at a halted step, continue it with
+`cao workflow resume pr-review-123`. CAO replays the seats that ended and does
+not run them again, and the run takes back its own `panel` directory in the
+evidence. A `panel` directory of another run blocks the review, so give each
+new run a new evidence directory.
+
+`/abs/evidence/review.json` holds the result. Before you post it or share it,
+check it for the credential of the engine:
+
+```bash
+python3 "$review_dir/github_review.py" check-secrets \
+  --file /abs/evidence/review.json --env KIRO_API_KEY
+```
+
+To see the requests without posting them, add `--dry-run /abs/request.json` to
+`github_review.py publish`.
 
 ## Files
 
-- [`pr_review.py`](pr_review.py): the CAO workflow. It runs the panel, applies the
-  verdict rules and writes `review.json`.
+- [`REVIEW.md`](../../REVIEW.md): the review policy. Its checks hold the lessons
+  of this repository.
+- [`docs/pr-review-design.md`](../../docs/pr-review-design.md): the design and the
+  ticket contract.
+- [`pr_review.py`](pr_review.py): the CAO workflow. It runs the reviewers, applies
+  the verdict rules and writes `review.json`.
 - [`github_review.py`](github_review.py): the GitHub and Git side: `prepare`,
-  `collect`, `check-secrets`, `publish` and `summary`. Standard library only, plus
-  `gh` and `git`.
+  `collect`, `check-secrets`, `publish`, `report-failure` and `summary`. Standard
+  library only, plus `gh` and `git`.
 - [`pr_reviewer.md`](pr_reviewer.md), [`pr_voter.md`](pr_voter.md),
   [`pr_adjudicator.md`](pr_adjudicator.md): the read-only seat profiles.
+- [`copilot/`](copilot/): the npm lockfile of the pinned Copilot CLI.
 - [`.github/workflows/pr-review.yml`](../workflows/pr-review.yml):
   the GitHub Actions workflow.
 - [`test/test_pr_review_workflow.py`](../../test/test_pr_review_workflow.py):

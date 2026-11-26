@@ -147,6 +147,7 @@ from the `dependencies` / `devDependencies` labels in `package.json`:
 | `docusaurus/package-lock.json` | the same record from both webpack passes (the **client** bundle and the **server** pass that renders every page's HTML), plus every locked package matching the build-time HTML writers in the policy file (remark, rehype, MDX, Prism and friends) |
 | `tui/Cargo.lock` | `cargo tree --locked -e normal --target all` (the release build, `cargo build --release --locked`, uses default features and the package has none) |
 | `examples/**` | nothing: examples ship nothing (one list, `NO_SHIP_PREFIXES`), except the named exceptions in `SHIPPED_EXAMPLES` |
+| `.github/pr-review/**` | nothing: the Copilot CLI that the [PR Review workflow](.github/workflows/pr-review.yml) installs on a runner (`NO_SHIP_PREFIXES`) |
 | `examples/decision-model-host/aws/cdk/package-lock.json` | the lockfile's non-dev packages: a deployable CDK app, whose runtime dependencies run in the deployed stack |
 
 Membership is by package **name**, at any version: a lockfile can hold several versions of
@@ -185,7 +186,7 @@ version ranges in the wheel's `Requires-Dist` that users resolve at install time
 reads `uv.lock` as a stand-in). Toolchain code still runs in CI and the release build.
 
 The gate **fails closed**: a producer failure, an empty set, a tracked lockfile outside
-`examples/` with no producer, a failed completeness or sentinel check, a missing base on a
+`examples/` and `.github/pr-review/` with no producer, a failed completeness or sentinel check, a missing base on a
 pull request, or any unexpected error is exit 2, never "nothing shipped, so pass". Adding a
 project that ships code means adding a producer and a policy entry. Build locally first
 (`npm run build` in `web/`, `npm run build:all` in `cao_mcp_apps/`, `npm run build` in

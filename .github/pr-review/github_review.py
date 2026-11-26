@@ -8,12 +8,17 @@ agents never hold a GitHub write token and the publisher never runs an agent:
   ``pr.json``.
 - ``collect`` checks that the checkout is the head that ``prepare`` read. Then
   it writes ``diff.patch`` and ``changed_files.json`` from the merge base with
-  the current tip of the target branch.
+  the current tip of the target branch. Git reads the attributes of the merge
+  base, so a ``.gitattributes`` file in the PR cannot hide a change.
 - ``check-secrets`` refuses a file that holds the value of a named environment
   variable (raw, Base64 or hex) or a known token pattern. It never prints a value.
-- ``publish`` validates ``review.json``, reads the PR again, and posts one
-  ``COMMENT`` review on the reviewed head. It never approves or requests
-  changes, and it posts at most one review for each workflow run.
+  It does not check a variable that is not set or is shorter than 8 characters.
+- ``publish`` validates ``review.json`` and reads the PR again. Then it posts
+  one review comment on the PR, or updates the comment of an earlier run in
+  place, and adds a neutral check run to the reviewed head. It never approves,
+  requests changes or blocks a merge.
+- ``report-failure`` adds only a neutral check run with fixed text, when the
+  review did not finish or ``publish`` did not post the comment.
 - ``summary`` runs the local checks of ``publish`` on ``review.json`` and adds
   the review to the job summary of the workflow run. It makes no GitHub call
   and never prints the review to the job log.
@@ -46,7 +51,10 @@ LOGIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?$")
 SERVER_URL_RE = re.compile(r"^https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9._:/-]{0,100}$")
 FINDING_ID_RE = re.compile(r"^F[1-9][0-9]{0,2}$")
+CHECK_ID_RE = re.compile(r"^[A-Z][1-9][0-9]?$")
+POLICY_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 ENGINES = ("kiro_cli", "copilot_cli")
+REVIEWER_MODES = ("single", "panel")
 SEVERITIES = ("P1", "P2", "P3")
 # Precedence order: the first state is the result.
 RESULT_STATES = (
@@ -55,40 +63,86 @@ RESULT_STATES = (
     "incomplete",
     "no_blocking_findings",
 )
+STATE_TITLES = {
+    "changes_required": "Changes required",
+    "owner_decision_required": "Owner decision required",
+    "incomplete": "Incomplete",
+    "no_blocking_findings": "No blocking findings",
+}
+RISK_LEVELS = ("high", "medium", "low")
 PANEL_SEATS = ("reviewer-a", "reviewer-b", "vote-1", "vote-2", "adjudicator")
+MODE_SEATS = {"single": ("reviewer-a",), "panel": PANEL_SEATS}
 ID_GROUPS = (
     "accepted_finding_ids",
     "rejected_finding_ids",
     "owner_question_ids",
     "duplicate_finding_ids",
 )
+# needs.review.result of the workflow, or publish_failure when the review job
+# succeeded and the publish step did not post the comment.
+JOB_RESULTS = ("failure", "cancelled", "skipped", "publish_failure")
 DEFAULT_REVIEWER_LOGIN = "github-actions[bot]"
 MARKER_PREFIX = "<!-- cao-pr-review: "
 MARKER_RE = re.compile(r"<!-- cao-pr-review: (\{[^\n]*?\}) -->")
 FIRST_LINE = (
-    "AI-assisted review run by the `pr-review` workflow (CAO, `{engine}`), "
-    "started by @{actor}. This is not an approval."
+    "AI-assisted review run by the `pr-review` workflow (CAO, `{engine}`, "
+    "reviewers `{reviewers}`), started by @{actor}. This is not an approval. "
+    "A later run of the workflow updates this comment in place."
 )
 SUMMARY_FIRST_LINE = (
     "AI-assisted review of {repo}#{number} at `{head_sha}`, run by the `pr-review` "
-    "workflow (CAO, `{engine}`). This is not an approval. The `publish` job reports "
-    "whether it posted this review on the PR."
+    "workflow (CAO, `{engine}`, reviewers `{reviewers}`). This is not an approval. "
+    "The `publish` job reports whether it posted or updated the review comment on the PR."
 )
-INLINE_FALLBACK_NOTE = (
-    "GitHub refused the inline comments, so this review has none. "
-    "The body gives every accepted finding."
+CHECK_RUN_NAME = "PR review (advisory)"
+ADVISORY_NOTE = "This check is advisory. It is always neutral and never blocks a merge."
+# The check run holds no agent text: only fixed text and validated values.
+CHECK_SUMMARY = (
+    "Result: {states}.\n"
+    "\n"
+    "- Accepted findings: P1 {p1}, P2 {p2}, P3 {p3}\n"
+    "- Questions for the owner: {questions}\n"
+    "- Risk level: {risk}\n"
+    "- Reviewers: {reviewers}\n"
+    "- Engine: {engine}\n"
+    "- Not checked: {not_checked} of {checks} REVIEW.md checks\n"
+    "- Review comment: {comment_url}\n"
+    "- Workflow run: {run_url}\n"
+    "\n"
+    f"{ADVISORY_NOTE}\n"
 )
-# GitHub refuses a review body or comment over 65,536 characters.
+FAILURE_TITLE = "Review did not finish (advisory)"
+PUBLISH_FAILURE_TITLE = "Review not published (advisory)"
+FAILURE_TEXT = (
+    "The review job of {repo}#{number} at `{head_sha}` ended with the result "
+    "`{job_result}`. This run did not post or update a review comment."
+)
+PUBLISH_FAILURE_TEXT = (
+    "The review of {repo}#{number} at `{head_sha}` finished, but this run did not post "
+    "or update the review comment. The workflow run log gives the reason."
+)
+FAILURE_SUMMARY = (
+    "{text} A review comment on the PR, if there is one, is from an earlier run.\n"
+    "\n"
+    "- Reviewers: {reviewers}\n"
+    "- Engine: {engine}\n"
+    "- Workflow run: {run_url}\n"
+    "\n"
+    f"{ADVISORY_NOTE}\n"
+)
+# GitHub refuses a comment body over 65,536 characters.
 MAX_BODY_UTF16 = 65_000
 # Leaves room for the first line, the drift warning, the run link and the marker.
 MAX_SECTIONS_UTF16 = 60_000
-MAX_COMMENTS = 100
-MAX_COMMENT_UTF16 = 4_000
-MAX_PATH_LENGTH = 1_000
 MAX_FINDINGS = 999
+MAX_CHECK_IDS = 40
+MAX_RISK_REASONS = 5
+MAX_RISK_REASON_LENGTH = 200
+MIN_STEP_TIMEOUT = 300
+MAX_STEP_TIMEOUT = 2_700
 # GitHub's "list commits on a pull request" endpoint returns at most 250 commits.
 PR_COMMITS_CAP = 250
-REVIEW_PAGE_LIMIT = 50
+COMMENT_PAGE_LIMIT = 50
 MIN_SECRET_LENGTH = 8
 TOKEN_PATTERNS = (
     ("GitHub token", re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")),
@@ -305,9 +359,12 @@ def collect(evidence_dir: Path, source_dir: Path) -> int:
     merge_base = _git(source_dir, "merge-base", base_sha, head).strip()
     if not SHA_RE.fullmatch(base_sha) or not SHA_RE.fullmatch(merge_base):
         raise Stop(1, "Blocked: git returned an invalid target tip or merge base.")
+    # Attributes come from the merge base, not from the PR checkout: a PR that
+    # adds `* -diff` to .gitattributes must not turn its change into "Binary files differ".
     diff = [
         "-c",
         "core.quotePath=false",
+        f"--attr-source={merge_base}",
         "diff",
         "--no-color",
         "--no-ext-diff",
@@ -427,7 +484,32 @@ def _id_list(review: dict[str, Any], key: str) -> list[str]:
     return list(value)
 
 
-def validate_review(review: Any, repo: str, number: int, head_sha: str, engine: str) -> None:
+def _unique_strings(value: Any, pattern: re.Pattern[str]) -> bool:
+    return (
+        isinstance(value, list)
+        and all(isinstance(item, str) and pattern.fullmatch(item) for item in value)
+        and len(set(value)) == len(value)
+    )
+
+
+def _valid_risk(risk: Any) -> bool:
+    if not isinstance(risk, dict) or set(risk) != {"level", "reasons"}:
+        return False
+    reasons = risk["reasons"]
+    return (
+        risk["level"] in RISK_LEVELS
+        and isinstance(reasons, list)
+        and 0 < len(reasons) <= MAX_RISK_REASONS
+        and all(
+            isinstance(reason, str) and 0 < len(reason) <= MAX_RISK_REASON_LENGTH
+            for reason in reasons
+        )
+    )
+
+
+def validate_review(
+    review: Any, repo: str, number: int, head_sha: str, engine: str, reviewers: str
+) -> None:
     """Check the review job's output before any GitHub write. Raises ``Stop``."""
     _require(isinstance(review, dict), "the document is not an object")
     _require(review.get("schema_version") == SCHEMA_VERSION, "schema_version is not supported")
@@ -436,6 +518,10 @@ def validate_review(review: Any, repo: str, number: int, head_sha: str, engine: 
     _require(review.get("pr") == number, "pr is not the dispatched PR")
     _require(review.get("head_sha") == head_sha, "head_sha is not the prepared head")
     _require(review.get("engine") == engine, "engine is not the dispatched engine")
+    _require(
+        reviewers in REVIEWER_MODES and review.get("reviewers") == reviewers,
+        "reviewers is not the dispatched mode",
+    )
     for key in ("base_sha", "merge_base"):
         _require(isinstance(review.get(key), str) and bool(SHA_RE.fullmatch(review[key])), key)
     _require(
@@ -445,10 +531,30 @@ def validate_review(review: Any, repo: str, number: int, head_sha: str, engine: 
     models = review.get("models")
     _require(
         isinstance(models, dict)
-        and set(models) == set(PANEL_SEATS)
+        and set(models) == set(MODE_SEATS[reviewers])
         and all(isinstance(v, str) and MODEL_RE.fullmatch(v) for v in models.values()),
-        "models",
+        "models do not match the seats of the reviewers mode",
     )
+    step_timeout = review.get("step_timeout")
+    _require(
+        type(step_timeout) is int and MIN_STEP_TIMEOUT <= step_timeout <= MAX_STEP_TIMEOUT,
+        "step_timeout",
+    )
+    policy_sha = review.get("policy_sha256")
+    _require(
+        isinstance(policy_sha, str) and bool(POLICY_SHA_RE.fullmatch(policy_sha)), "policy_sha256"
+    )
+    check_ids = review.get("check_ids")
+    _require(
+        _unique_strings(check_ids, CHECK_ID_RE) and 0 < len(check_ids) <= MAX_CHECK_IDS,
+        "check_ids",
+    )
+    not_checked = review.get("not_checked_ids")
+    _require(
+        _unique_strings(not_checked, CHECK_ID_RE) and set(not_checked) <= set(check_ids),
+        "not_checked_ids are not unique check_ids",
+    )
+    _require(_valid_risk(review.get("risk")), "risk")
     states = review.get("result_states")
     _require(
         isinstance(states, list)
@@ -473,37 +579,24 @@ def validate_review(review: Any, repo: str, number: int, head_sha: str, engine: 
         len(set(finding_ids)) == len(finding_ids) and sorted(grouped) == sorted(finding_ids),
         "every finding ID must be in exactly one group",
     )
-    _require(type(review.get("review_complete")) is bool, "review_complete")
+    complete = review.get("review_complete")
+    _require(type(complete) is bool, "review_complete")
+    _require(
+        complete == ("incomplete" not in states), "review_complete does not match result_states"
+    )
+    _require(
+        not (complete and not_checked), "review_complete is true, but not_checked_ids is not empty"
+    )
     sections = review.get("sections")
     _require(
         isinstance(sections, str) and 0 < utf16_length(sections) <= MAX_SECTIONS_UTF16,
         "sections are empty or too long",
     )
     _require("<!--" not in sections, "sections hold an HTML comment")
-    comments = review.get("comments")
-    _require(isinstance(comments, list) and len(comments) <= MAX_COMMENTS, "comments")
-    for comment in comments:
-        _require(
-            isinstance(comment, dict) and set(comment) == {"path", "line", "body"},
-            "a comment has unexpected fields",
-        )
-        path, line, body = comment["path"], comment["line"], comment["body"]
-        _require(
-            isinstance(path, str)
-            and 0 < len(path) <= MAX_PATH_LENGTH
-            and not path.startswith("/")
-            and not any(ord(ch) < 32 for ch in path),
-            "a comment path is invalid",
-        )
-        _require(type(line) is int and line >= 1, "a comment line is invalid")
-        _require(
-            isinstance(body, str) and 0 < utf16_length(body) <= MAX_COMMENT_UTF16,
-            "a comment body is empty or too long",
-        )
-        _require("<!--" not in body, "a comment holds an HTML comment")
 
 
 def build_marker(review: dict[str, Any], run_id: str, run_attempt: str) -> str:
+    """The HTML comment that identifies the review comment. Only validated values, no agent text."""
     record = {
         "v": SCHEMA_VERSION,
         "run_id": run_id,
@@ -514,8 +607,13 @@ def build_marker(review: dict[str, Any], run_id: str, run_attempt: str) -> str:
         "base_sha": review["base_sha"],
         "merge_base": review["merge_base"],
         "engine": review["engine"],
+        "reviewers": review["reviewers"],
         "models": review["models"],
+        "step_timeout": review["step_timeout"],
+        "policy_sha256": review["policy_sha256"],
         "result_states": review["result_states"],
+        "risk_level": review["risk"]["level"],
+        "not_checked_ids": review["not_checked_ids"],
         "finding_ids": review["finding_ids"],
         **{key: review[key] for key in ID_GROUPS},
         "severity_counts": review["severity_counts"],
@@ -531,23 +629,21 @@ def compose_body(
     review: dict[str, Any],
     *,
     engine: str,
+    reviewers: str,
     actor: str,
     run_url: str,
     marker: str,
     warning: str = "",
-    inline_note: str = "",
 ) -> str:
-    parts = [FIRST_LINE.format(engine=engine, actor=actor)]
+    parts = [FIRST_LINE.format(engine=engine, reviewers=reviewers, actor=actor)]
     if warning:
         parts.append(warning)
     parts.append(f"Workflow run: {run_url}")
     parts.append(review["sections"].strip())
-    if inline_note:
-        parts.append(inline_note)
     parts.append(marker)
     body = "\n\n".join(parts) + "\n"
     if utf16_length(body) > MAX_BODY_UTF16:
-        raise Stop(1, "Blocked: the review body is longer than GitHub accepts.")
+        raise Stop(1, "Blocked: the review comment is longer than GitHub accepts.")
     return body
 
 
@@ -563,19 +659,31 @@ def marker_run_id(body: str) -> Optional[str]:
     return run_id if isinstance(run_id, str) else None
 
 
-def _already_published(repo: str, number: int, run_id: str, reviewer_login: str) -> bool:
-    reviews, truncated = _paged(f"repos/{repo}/pulls/{number}/reviews", REVIEW_PAGE_LIMIT)
+def _is_reviewer(user: Any, reviewer_login: str) -> bool:
+    """True if ``user`` is the publishing account. A ``[bot]`` login must be a Bot."""
+    if not isinstance(user, dict) or user.get("login") != reviewer_login:
+        return False
+    return not reviewer_login.endswith("[bot]") or user.get("type") == "Bot"
+
+
+def _our_comments(repo: str, number: int, reviewer_login: str) -> list[tuple[int, int]]:
+    """(comment ID, run ID) of each review comment of this workflow on the PR, oldest first."""
+    comments, truncated = _paged(f"repos/{repo}/issues/{number}/comments", COMMENT_PAGE_LIMIT)
     if truncated:
-        raise Stop(1, "Blocked: the PR has too many reviews to look for an earlier post.")
-    for item in reviews:
-        user = item.get("user") or {}
-        if user.get("login") != reviewer_login:
+        raise Stop(
+            1,
+            f"Blocked: {repo}#{number} has too many comments to find the review comment. "
+            "Nothing is published.",
+        )
+    ours = []
+    for item in comments:
+        if not isinstance(item, dict) or not _is_reviewer(item.get("user"), reviewer_login):
             continue
-        if reviewer_login.endswith("[bot]") and user.get("type") != "Bot":
-            continue
-        if marker_run_id(str(item.get("body") or "")) == run_id:
-            return True
-    return False
+        comment_id = item.get("id")
+        run_id = marker_run_id(str(item.get("body") or ""))
+        if type(comment_id) is int and run_id is not None and RUN_NUMBER_RE.fullmatch(run_id):
+            ours.append((comment_id, int(run_id)))
+    return sorted(ours)
 
 
 def drift_warning(repo: str, number: int, head_sha: str, live: dict[str, Any]) -> str:
@@ -602,59 +710,89 @@ def drift_warning(repo: str, number: int, head_sha: str, live: dict[str, Any]) -
     )
 
 
-def _comment_key(path: Any, line: Any, body: Any) -> tuple[str, int, str]:
-    return (str(path), line if type(line) is int else -1, _normalize_body(str(body)))
-
-
-def _verify_published(
-    repo: str,
-    number: int,
-    review_id: int,
-    head_sha: str,
-    body: str,
-    comments: list[dict[str, Any]],
-    reviewer_login: str,
+def _verify_comment(
+    repo: str, number: int, comment_id: int, body: str, reviewer_login: str
 ) -> None:
-    published = _gh_api(f"repos/{repo}/pulls/{number}/reviews/{review_id}") or {}
+    comment = _gh_api(f"repos/{repo}/issues/comments/{comment_id}")
+    if not isinstance(comment, dict):
+        comment = {}
     problems = []
-    if published.get("commit_id") != head_sha:
-        problems.append("commit")
-    if published.get("state") != "COMMENTED":
-        problems.append("state")
-    if (published.get("user") or {}).get("login") != reviewer_login:
+    if not _is_reviewer(comment.get("user"), reviewer_login):
         problems.append("author")
-    if _normalize_body(str(published.get("body") or "")) != _normalize_body(body):
+    if _normalize_body(str(comment.get("body") or "")) != _normalize_body(body):
         problems.append("body")
-    # The per-review comments endpoint returns "line": null, so read the PR's
-    # review comments, newest first, and keep the ones of this review.
-    recent, _ = _paged(f"repos/{repo}/pulls/{number}/comments?sort=created&direction=desc", 3)
-    posted = [c for c in recent if c.get("pull_request_review_id") == review_id]
-    expected = sorted(_comment_key(c["path"], c["line"], c["body"]) for c in comments)
-    actual = sorted(_comment_key(c.get("path"), c.get("line"), c.get("body")) for c in posted)
-    if expected != actual or any(c.get("side") != "RIGHT" for c in posted):
-        problems.append("inline comments")
+    if not str(comment.get("issue_url") or "").endswith(f"/issues/{number}"):
+        problems.append("PR")
     if problems:
         raise Stop(
             1,
-            f"Published review {review_id} does not match the request ({', '.join(problems)}). "
-            "It is not posted again. Check it on the PR.",
+            f"Blocked: review comment {comment_id} does not match the request "
+            f"({', '.join(problems)}). It is not changed again. Check it on the PR.",
         )
 
 
+def _run_url(server_url: str, repo: str, run_id: str, run_attempt: str) -> str:
+    return f"{server_url}/{repo}/actions/runs/{run_id}/attempts/{run_attempt}"
+
+
+def _check_run(head_sha: str, run_id: str, run_url: str, title: str, text: str) -> dict[str, Any]:
+    """A completed, neutral check run. ``title`` and ``text`` must hold no agent text."""
+    return {
+        "name": CHECK_RUN_NAME,
+        "head_sha": head_sha,
+        "status": "completed",
+        "conclusion": "neutral",
+        "details_url": run_url,
+        "external_id": run_id,
+        "output": {"title": title, "summary": text},
+    }
+
+
+def review_check_run(
+    review: dict[str, Any], *, run_id: str, run_url: str, comment_url: str
+) -> dict[str, Any]:
+    """The check run of a published review, from validated values only."""
+    states = review["result_states"]
+    counts = review["severity_counts"]
+    text = CHECK_SUMMARY.format(
+        states=", ".join(STATE_TITLES[state] for state in states),
+        p1=counts["P1"],
+        p2=counts["P2"],
+        p3=counts["P3"],
+        questions=len(review["owner_question_ids"]),
+        risk=review["risk"]["level"],
+        reviewers=review["reviewers"],
+        engine=review["engine"],
+        not_checked=len(review["not_checked_ids"]),
+        checks=len(review["check_ids"]),
+        comment_url=comment_url,
+        run_url=run_url,
+    )
+    title = f"{STATE_TITLES[states[0]]} (advisory)"
+    return _check_run(review["head_sha"], run_id, run_url, title, text)
+
+
+def _create_check_run(repo: str, payload: dict[str, Any], note: str) -> int:
+    try:
+        created = _gh_api(f"repos/{repo}/check-runs", method="POST", payload=payload)
+    except GhError as exc:
+        raise Stop(1, f"Blocked: {exc}. {note}") from exc
+    check_id = created.get("id") if isinstance(created, dict) else None
+    if type(check_id) is not int:
+        raise Stop(1, f"Blocked: GitHub returned no check run ID. {note}")
+    return check_id
+
+
 def _checked_review(
-    review_path: Path, repo: str, number: int, head_sha: str, engine: str
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """The review and its inline comments after the local checks. Raises ``Stop``."""
-    review = _load_json(review_path)
-    validate_review(review, repo, number, head_sha, engine)
-    comments = [
-        {"path": c["path"], "line": c["line"], "side": "RIGHT", "body": c["body"]}
-        for c in review["comments"]
-    ]
-    leaks = find_secrets(json.dumps({"sections": review["sections"], "comments": comments}), [])
+    review_path: Path, repo: str, number: int, head_sha: str, engine: str, reviewers: str
+) -> dict[str, Any]:
+    """The review after the local checks. Raises ``Stop``."""
+    review: dict[str, Any] = _load_json(review_path)
+    validate_review(review, repo, number, head_sha, engine, reviewers)
+    leaks = find_secrets(json.dumps({"sections": review["sections"]}), [])
     if leaks:
         raise Stop(1, f"Blocked: the review holds a token pattern: {', '.join(leaks)}.")
-    return review, comments
+    return review
 
 
 def publish(
@@ -667,14 +805,14 @@ def publish(
     run_attempt: str,
     server_url: str,
     engine: str,
+    reviewers: str,
     actor: str,
     reviewer_login: str,
+    github_output: Optional[str],
     dry_run_out: Optional[Path],
 ) -> int:
-    review, comments = _checked_review(review_path, repo, number, head_sha, engine)
+    review = _checked_review(review_path, repo, number, head_sha, engine, reviewers)
     marker = build_marker(review, run_id, run_attempt)
-    if _already_published(repo, number, run_id, reviewer_login):
-        return _report(0, f"Workflow run {run_id} already published its review. Nothing to do.")
 
     live = _gh_api(f"repos/{repo}/pulls/{number}")
     if not isinstance(live, dict) or live.get("state") != "open":
@@ -683,47 +821,107 @@ def publish(
         return _report(0, f"Skipped: {repo}#{number} is now a draft. Nothing is published.")
     warning = drift_warning(repo, number, head_sha, live)
 
-    run_url = f"{server_url}/{repo}/actions/runs/{run_id}/attempts/{run_attempt}"
-    body = compose_body(
-        review, engine=engine, actor=actor, run_url=run_url, marker=marker, warning=warning
-    )
-    payload = {"commit_id": head_sha, "body": body, "event": "COMMENT", "comments": comments}
-    if dry_run_out is not None:
-        _write_json(dry_run_out, payload)
-        return _report(0, f"Dry run: the review request is in {dry_run_out}. Nothing is posted.")
-
-    path = f"repos/{repo}/pulls/{number}/reviews"
-    try:
-        created = _gh_api(path, method="POST", payload=payload)
-    except GhError as exc:
-        # 422 is how GitHub refuses an inline comment on a line outside the diff.
-        # A body-only retry is safe because GitHub made no review.
-        if exc.status != 422 or not comments:
-            raise Stop(1, f"Blocked: {exc}. Nothing is posted again.") from exc
-        comments = []
-        body = compose_body(
-            review,
-            engine=engine,
-            actor=actor,
-            run_url=run_url,
-            marker=marker,
-            warning=warning,
-            inline_note=INLINE_FALLBACK_NOTE,
+    ours = _our_comments(repo, number, reviewer_login)
+    newer = [other for _, other in ours if other > int(run_id)]
+    if newer:
+        return _report(
+            0,
+            f"Skipped: a newer workflow run ({max(newer)}) published the review comment on "
+            f"{repo}#{number}. Nothing is published.",
         )
-        payload = {"commit_id": head_sha, "body": body, "event": "COMMENT", "comments": []}
-        try:
-            created = _gh_api(path, method="POST", payload=payload)
-        except GhError as retry_exc:
-            raise Stop(1, f"Blocked: {retry_exc}. Nothing is posted again.") from retry_exc
-    review_id = created.get("id") if isinstance(created, dict) else None
-    if type(review_id) is not int:
-        raise Stop(1, "Blocked: GitHub returned no review ID. Check the PR by hand.")
-    _verify_published(repo, number, review_id, head_sha, body, comments, reviewer_login)
+
+    run_url = _run_url(server_url, repo, run_id, run_attempt)
+    body = compose_body(
+        review,
+        engine=engine,
+        reviewers=reviewers,
+        actor=actor,
+        run_url=run_url,
+        marker=marker,
+        warning=warning,
+    )
+    pr_url = f"{server_url}/{repo}/pull/{number}"
+    # Update the oldest earlier comment in place, so the PR keeps one review comment.
+    target = ours[0][0] if ours else None
+    if target is not None:
+        method, path = "PATCH", f"repos/{repo}/issues/comments/{target}"
+    else:
+        method, path = "POST", f"repos/{repo}/issues/{number}/comments"
+    if dry_run_out is not None:
+        # A new comment has no ID yet, so its check run links to the PR.
+        comment_url = f"{pr_url}#issuecomment-{target}" if target is not None else pr_url
+        check_run = review_check_run(
+            review, run_id=run_id, run_url=run_url, comment_url=comment_url
+        )
+        _write_json(
+            dry_run_out,
+            {"comment": {"method": method, "path": path, "body": body}, "check_run": check_run},
+        )
+        return _report(0, f"Dry run: the requests are in {dry_run_out}. Nothing is posted.")
+
+    try:
+        written = _gh_api(path, method=method, payload={"body": body})
+    except GhError as exc:
+        raise Stop(1, f"Blocked: {exc}. Nothing is posted again.") from exc
+    # From here on, a failure must not report that this run changed no comment.
+    _set_outputs(github_output, comment_written="true")
+    comment_id = written.get("id") if isinstance(written, dict) else None
+    if type(comment_id) is not int or (target is not None and comment_id != target):
+        raise Stop(1, "Blocked: GitHub returned an unexpected comment ID. Check the PR by hand.")
+    _verify_comment(repo, number, comment_id, body, reviewer_login)
+    check_run = review_check_run(
+        review, run_id=run_id, run_url=run_url, comment_url=f"{pr_url}#issuecomment-{comment_id}"
+    )
+    check_id = _create_check_run(
+        repo,
+        check_run,
+        f"Review comment {comment_id} is posted, but the check run is not added.",
+    )
+    action = "Posted" if target is None else "Updated"
     return _report(
         0,
-        f"Published review {review_id} on {repo}#{number} at {head_sha} "
-        f"with {len(comments)} inline comments.",
+        f"{action} review comment {comment_id} on {repo}#{number} for head {head_sha}. "
+        f"Added neutral check run {check_id}.",
     )
+
+
+# --------------------------------------------------------------------------
+# report-failure
+# --------------------------------------------------------------------------
+
+
+def report_failure(
+    *,
+    repo: str,
+    number: int,
+    head_sha: str,
+    run_id: str,
+    run_attempt: str,
+    server_url: str,
+    engine: str,
+    reviewers: str,
+    job_result: str,
+    dry_run_out: Optional[Path],
+) -> int:
+    """Add a neutral check run with fixed text. It never reads or writes a comment."""
+    run_url = _run_url(server_url, repo, run_id, run_attempt)
+    if job_result == "publish_failure":
+        title = PUBLISH_FAILURE_TITLE
+        text = PUBLISH_FAILURE_TEXT.format(repo=repo, number=number, head_sha=head_sha)
+    else:
+        title = FAILURE_TITLE
+        text = FAILURE_TEXT.format(
+            repo=repo, number=number, head_sha=head_sha, job_result=job_result
+        )
+    summary_text = FAILURE_SUMMARY.format(
+        text=text, reviewers=reviewers, engine=engine, run_url=run_url
+    )
+    payload = _check_run(head_sha, run_id, run_url, title, summary_text)
+    if dry_run_out is not None:
+        _write_json(dry_run_out, {"check_run": payload})
+        return _report(0, f"Dry run: the request is in {dry_run_out}. Nothing is posted.")
+    check_id = _create_check_run(repo, payload, "The check run is not added.")
+    return _report(0, f"Added neutral check run {check_id} to {head_sha}: {title}.")
 
 
 # --------------------------------------------------------------------------
@@ -731,13 +929,15 @@ def publish(
 # --------------------------------------------------------------------------
 
 
-def summary(*, repo: str, number: int, review_path: Path, head_sha: str, engine: str) -> int:
+def summary(
+    *, repo: str, number: int, review_path: Path, head_sha: str, engine: str, reviewers: str
+) -> int:
     target = os.environ.get("GITHUB_STEP_SUMMARY")
     if not target:
         raise Stop(1, "Blocked: GITHUB_STEP_SUMMARY is not set, so there is no run summary.")
-    review, _ = _checked_review(review_path, repo, number, head_sha, engine)
+    review = _checked_review(review_path, repo, number, head_sha, engine, reviewers)
     first_line = SUMMARY_FIRST_LINE.format(
-        repo=repo, number=number, head_sha=head_sha, engine=engine
+        repo=repo, number=number, head_sha=head_sha, engine=engine, reviewers=reviewers
     )
     # validate_review limits the sections to MAX_SECTIONS_UTF16 code units, far
     # below the 1 MiB that GitHub accepts for the summary of one step.
@@ -770,6 +970,15 @@ def _parser() -> argparse.ArgumentParser:
     def pr_arg(value: str) -> int:
         return int(_pattern(NUMBER_RE, "PR number")(value))
 
+    def run_args(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--run-id", required=True, type=_pattern(RUN_NUMBER_RE, "run ID"))
+        command.add_argument(
+            "--run-attempt", required=True, type=_pattern(RUN_NUMBER_RE, "attempt")
+        )
+        command.add_argument(
+            "--server-url", required=True, type=_pattern(SERVER_URL_RE, "server URL")
+        )
+
     prep = commands.add_parser("prepare", help="read the PR and write pr.json")
     prep.add_argument("--repo", required=True, type=repo_arg)
     prep.add_argument("--pr", required=True, type=pr_arg)
@@ -783,20 +992,38 @@ def _parser() -> argparse.ArgumentParser:
     sec.add_argument("--file", required=True, type=Path)
     sec.add_argument("--env", action="append", default=[], help="name of an env var to check")
 
-    pub = commands.add_parser("publish", help="post one COMMENT review")
+    pub = commands.add_parser(
+        "publish", help="post or update the review comment, then add a neutral check run"
+    )
     pub.add_argument("--repo", required=True, type=repo_arg)
     pub.add_argument("--pr", required=True, type=pr_arg)
     pub.add_argument("--review", required=True, type=Path)
     pub.add_argument("--head", required=True, type=_pattern(SHA_RE, "head SHA"))
-    pub.add_argument("--run-id", required=True, type=_pattern(RUN_NUMBER_RE, "run ID"))
-    pub.add_argument("--run-attempt", required=True, type=_pattern(RUN_NUMBER_RE, "attempt"))
-    pub.add_argument("--server-url", required=True, type=_pattern(SERVER_URL_RE, "server URL"))
+    run_args(pub)
     pub.add_argument("--engine", required=True, choices=ENGINES)
+    pub.add_argument("--reviewers", required=True, choices=REVIEWER_MODES)
     pub.add_argument("--actor", required=True, type=_pattern(LOGIN_RE, "login"))
     pub.add_argument(
         "--reviewer-login", default=DEFAULT_REVIEWER_LOGIN, type=_pattern(LOGIN_RE, "login")
     )
-    pub.add_argument("--dry-run", type=Path, help="write the request to this file; post nothing")
+    pub.add_argument("--dry-run", type=Path, help="write the requests to this file; post nothing")
+
+    fail = commands.add_parser(
+        "report-failure", help="add a neutral check run that says the review was not published"
+    )
+    fail.add_argument("--repo", required=True, type=repo_arg)
+    fail.add_argument("--pr", required=True, type=pr_arg)
+    fail.add_argument("--head", required=True, type=_pattern(SHA_RE, "head SHA"))
+    run_args(fail)
+    fail.add_argument("--engine", required=True, choices=ENGINES)
+    fail.add_argument("--reviewers", required=True, choices=REVIEWER_MODES)
+    fail.add_argument(
+        "--job-result",
+        required=True,
+        choices=JOB_RESULTS,
+        help="result of the review job, or publish_failure if the publish step failed",
+    )
+    fail.add_argument("--dry-run", type=Path, help="write the request to this file; post nothing")
 
     summ = commands.add_parser("summary", help="add the review to the job summary")
     summ.add_argument("--repo", required=True, type=repo_arg)
@@ -804,6 +1031,7 @@ def _parser() -> argparse.ArgumentParser:
     summ.add_argument("--review", required=True, type=Path)
     summ.add_argument("--head", required=True, type=_pattern(SHA_RE, "head SHA"))
     summ.add_argument("--engine", required=True, choices=ENGINES)
+    summ.add_argument("--reviewers", required=True, choices=REVIEWER_MODES)
     return parser
 
 
@@ -823,6 +1051,20 @@ def main(argv: Optional[list[str]] = None) -> int:
                 review_path=args.review,
                 head_sha=args.head,
                 engine=args.engine,
+                reviewers=args.reviewers,
+            )
+        if args.command == "report-failure":
+            return report_failure(
+                repo=args.repo,
+                number=args.pr,
+                head_sha=args.head,
+                run_id=args.run_id,
+                run_attempt=args.run_attempt,
+                server_url=args.server_url,
+                engine=args.engine,
+                reviewers=args.reviewers,
+                job_result=args.job_result,
+                dry_run_out=args.dry_run,
             )
         return publish(
             repo=args.repo,
@@ -833,8 +1075,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             run_attempt=args.run_attempt,
             server_url=args.server_url,
             engine=args.engine,
+            reviewers=args.reviewers,
             actor=args.actor,
             reviewer_login=args.reviewer_login,
+            github_output=os.environ.get("GITHUB_OUTPUT"),
             dry_run_out=args.dry_run,
         )
     except Stop as stop:

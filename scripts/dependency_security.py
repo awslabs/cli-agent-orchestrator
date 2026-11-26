@@ -11,7 +11,8 @@ advisories included). Each finding is then classified:
 * ``shipped``   - the (package, version) is in the shipped set measured from the build.
   A HIGH/CRITICAL shipped finding blocks, exactly as #884 does, unless a valid,
   unexpired ignore-file entry covers it.
-* ``toolchain`` - everything else (devDependencies, build tooling, ``examples/``).
+* ``toolchain`` - everything else (devDependencies, build tooling, ``examples/``,
+  ``.github/pr-review/``).
   Listed in the step summary, ``report.json`` and ``toolchain.sarif``; never blocks.
 
 CLI
@@ -31,11 +32,11 @@ CLI
 Exit codes: ``0`` passed (toolchain findings and warnings allowed); ``1`` blocked (a
 shipped HIGH/CRITICAL not covered by a valid unexpired ignore entry); ``2`` error, which
 fails closed: a producer failed or returned an empty set, a tracked lockfile has no
-producer (except ``examples/``), the scanner report is malformed, or the ignore file is
-invalid. ``report.status`` is ``passed`` / ``blocked`` / ``error``.
+producer (except under ``NO_SHIP_PREFIXES``), the scanner report is malformed, or the
+ignore file is invalid. ``report.status`` is ``passed`` / ``blocked`` / ``error``.
 
 shipped-set.json (written by ``collect_shipped_sets``; one entry per tracked lockfile
-that ships code; ``examples/**`` lockfiles are deliberately absent)::
+that ships code; lockfiles under ``NO_SHIP_PREFIXES`` are deliberately absent)::
 
     {"schema": 1,
      "sets": {
@@ -609,7 +610,9 @@ def scan(
 # --- #1398: shipped-set gate ----------------------------------------------------------
 
 #: Lockfiles under these prefixes ship nothing and are always ``toolchain``.
-NO_SHIP_PREFIXES = ("examples/",)
+#: ``.github/pr-review/`` holds the Copilot CLI that the pr-review workflow installs
+#: with ``npm ci``: CI tooling that CAO does not ship.
+NO_SHIP_PREFIXES = ("examples/", ".github/pr-review/")
 #: Named exceptions to NO_SHIP_PREFIXES: example lockfiles whose code is deployed, so their
 #: runtime (non-dev) packages are shipped. Owner ruling on #1400: the decision-model-host
 #: CDK app is a deployable stack, so what it installs at deploy time runs in an account.
@@ -1384,7 +1387,8 @@ def classify_findings(
         ecosystem = ecosystems.get(path, "")
         name = _canonical(ecosystem, finding["package"])
         if ships_nothing(path):
-            record["classification"], record["reason"] = "toolchain", "ships nothing (examples/)"
+            prefix = next(p for p in NO_SHIP_PREFIXES if path.startswith(p))
+            record["classification"], record["reason"] = "toolchain", f"ships nothing ({prefix})"
         elif path not in members:
             record["classification"] = "shipped"
             record["reason"] = "no shipped set for this lockfile; treated as shipped"

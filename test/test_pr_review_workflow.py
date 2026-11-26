@@ -1,23 +1,29 @@
 """Tests for the CAO pull request review workflow of this repository.
 
 The scripts live under ``.github/pr-review/``, so ``--cov=src`` does not cover them, and
-the tests load both scripts by path. Fakes replace every CAO, GitHub and Git
-call: the tests use no network, no subprocess and no CAO server.
+the tests load both scripts by path. Fakes replace every CAO and GitHub call: the
+tests use no network and no CAO server. Fakes also replace the Git calls, except in
+one ``collect`` test that runs git on a new local repository, because only git
+shows which ``.gitattributes`` it applies.
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.util
 import io
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import jsonschema
 import pytest
+import yaml
 
 from cao_workflow import ShimHTTPError, ShimTransportError
 from cli_agent_orchestrator.services.script_lint import lint_script
@@ -36,13 +42,17 @@ RUN_ID = "4242"
 SEATS = ("reviewer-a", "reviewer-b", "vote-1", "vote-2", "adjudicator")
 NO_VOTES: dict[str, Any] = {"vote-1": None, "vote-2": None}
 PULL = f"repos/{REPO}/pulls/{NUMBER}"
-REVIEWS = f"{PULL}/reviews"
-REVIEWS_PAGE = f"{REVIEWS}?per_page=100&page=1"
-COMMENTS_PAGE = f"{PULL}/comments?sort=created&direction=desc&per_page=100&page=1"
+ISSUE_COMMENTS = f"repos/{REPO}/issues/{NUMBER}/comments"
+ISSUE_COMMENTS_PAGE = f"{ISSUE_COMMENTS}?per_page=100&page=1"
+COMMENT = f"repos/{REPO}/issues/comments"
+CHECK_RUNS = f"repos/{REPO}/check-runs"
+RUN_URL = f"https://github.com/{REPO}/actions/runs/{RUN_ID}/attempts/2"
+ADVISORY = "This check is advisory. It is always neutral and never blocks a merge.\n"
 BOT = {"login": "github-actions[bot]", "type": "Bot"}
 GIT_DIFF = (
     "-c",
     "core.quotePath=false",
+    f"--attr-source={MERGE_BASE}",
     "diff",
     "--no-color",
     "--no-ext-diff",
@@ -111,7 +121,6 @@ DIFF = "\n".join(
         "",
     ]
 )
-RIGHT_LINES = {"src/app.py": {1, 2, 3, 4, 5, 21, 22, 23}, "one.txt": {1}, "docs/new.md": {1, 2}}
 FILES = [
     {"index": 1, "status": "M", "path": "src/app.py", "old_path": ""},
     {"index": 2, "status": "M", "path": "one.txt", "old_path": ""},
@@ -124,6 +133,11 @@ NAME_STATUS = "\0".join(
     ["M", "src/app.py", "M", "one.txt", "A", "docs/new.md", "A", "img.png"]
     + ["R100", "old_name.py", "new_name.py", "D", "gone.py", ""]
 )
+# A review policy with two checks, in the form of REVIEW.md.
+POLICY_TEXT = "# Review rules\n\n### A1. Correctness\n\nText.\n\n### A2. Security\n\nText.\n"
+CHECKS = [("A1", "Correctness"), ("A2", "Security")]
+CHECK_IDS = [check_id for check_id, _ in CHECKS]
+REVIEWERS = ("reviewer-a", "reviewer-b")
 
 Result = tuple[int, str, str]
 
@@ -191,13 +205,17 @@ def _write_evidence(
 
 @pytest.fixture
 def workspace(tmp_path: Path) -> dict[str, Path]:
-    """Empty run directories, valid evidence and a PR checkout with ``src/app.py``."""
+    """Empty run directories, valid evidence, a policy and a PR checkout with a
+    30-line ``src/app.py``."""
     paths = {name: tmp_path / name for name in ("evidence", "source", "work")}
     for path in paths.values():
         path.mkdir()
     (paths["source"] / "src").mkdir()
-    (paths["source"] / "src" / "app.py").write_text("import os\n", encoding="utf-8")
+    lines = "".join(f"value_{number} = {number}\n" for number in range(1, 31))
+    (paths["source"] / "src" / "app.py").write_text(lines, encoding="utf-8")
     _write_evidence(paths["evidence"])
+    paths["policy"] = tmp_path / "REVIEW.md"
+    paths["policy"].write_text(POLICY_TEXT, encoding="utf-8")
     return paths
 
 
@@ -207,9 +225,11 @@ def _inputs(workspace: dict[str, Path], **changes: Any) -> dict[str, Any]:
         "source_dir": str(workspace["source"]),
         "work_dir": str(workspace["work"]),
         "engine": "kiro_cli",
+        "reviewers": "panel",
         "model_a": "",
         "model_b": "",
         "step_timeout": 1800,
+        "policy": str(workspace["policy"]),
     }
     inputs.update(changes)
     return inputs
@@ -224,11 +244,14 @@ def _finding(
     return {
         "title": title,
         "severity": severity,
+        "check": "A1",
         "path": path,
         "line": line,
         "pre_existing": False,
         "failure": f"{title}: one tenant reads the widgets of another tenant.",
+        "impact": "A tenant sees the data of another tenant.",
         "evidence": f"{path} line {line} builds the key without the tenant.",
+        "confidence": "high",
         "fix": "Add the tenant to the cache key.",
     }
 
@@ -237,9 +260,17 @@ def _reviewer_report(
     *findings: dict[str, Any],
     reviewed: tuple[int, ...] = (1, 2, 3, 4, 5, 6),
     skipped: tuple[int, ...] = (),
+    risk: str = "medium",
+    statuses: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
+    statuses = {**dict.fromkeys(CHECK_IDS, "checked"), **(statuses or {})}
     return {
         "summary": "The PR adds a widget cache.",
+        "risk": {"level": risk, "reasons": ["The PR changes how widgets are cached."]},
+        "checks": {
+            check_id: {"status": status, "note": f"Read the cache code for {check_id}."}
+            for check_id, status in statuses.items()
+        },
         "files_reviewed": list(reviewed),
         "files_skipped": [{"index": index, "reason": "binary or generated"} for index in skipped],
         "findings": list(findings),
@@ -266,7 +297,16 @@ def _candidate(
     finding_id: str, severity: str = "P2", line: int = 2, path: str = "src/app.py"
 ) -> dict[str, Any]:
     finding = _finding(f"Defect {finding_id}", severity, path, line)
-    fields = ("severity", "pre_existing", "failure", "evidence", "fix")
+    fields = (
+        "severity",
+        "check",
+        "pre_existing",
+        "failure",
+        "impact",
+        "evidence",
+        "confidence",
+        "fix",
+    )
     return {
         "id": finding_id,
         "title": finding["title"],
@@ -289,29 +329,34 @@ def _long_candidates(count: int) -> list[dict[str, Any]]:
 
 
 def _context(pr_review: ModuleType, source_dir: Path, settled: list[Any]) -> dict[str, Any]:
-    """The render context that ``run_panel`` builds, for direct tests of the body."""
+    """The render context that ``run_review`` builds, for direct tests of the body."""
     reports = {
         "reviewer-a": _reviewer_report(reviewed=(1, 2, 3), skipped=(4, 5, 6)),
         "reviewer-b": None,
     }
     groups = pr_review.group_ids(settled)
+    policy = {
+        "path": source_dir.parent / "REVIEW.md",
+        "sha256": hashlib.sha256(POLICY_TEXT.encode("utf-8")).hexdigest(),
+        "checks": CHECKS,
+    }
     return {
         "config": {
             "source_dir": source_dir,
             "engine": "kiro_cli",
+            "reviewers": "panel",
             "models": dict.fromkeys(SEATS, ""),
+            "policy": policy,
         },
-        "evidence": {
-            "pr": _pr_record(),
-            "files": FILES,
-            "right_lines": RIGHT_LINES,
-            "server_url": "https://github.com",
-        },
+        "evidence": {"pr": _pr_record(), "files": FILES, "server_url": "https://github.com"},
         "settled": settled,
         "groups": groups,
         "states": pr_review.result_states(settled, groups, False),
         "severity_counts": {"P1": 0, "P2": 0, "P3": 0},
-        "coverage": pr_review.coverage(reports, len(FILES)),
+        "risk": pr_review.overall_risk(reports, REVIEWERS),
+        "not_checked_ids": [],
+        "dropped": [],
+        "coverage": pr_review.coverage(reports, len(FILES), REVIEWERS),
         "reports": reports,
         "panel": dict.fromkeys(SEATS, "valid"),
     }
@@ -326,7 +371,9 @@ def _schema_check(pr_review: ModuleType, value: Any, schema: dict[str, Any]) -> 
 
 
 def _assert_publishable(github_review: ModuleType, review: Any, engine: str = "kiro_cli") -> None:
-    github_review.validate_review(json.loads(json.dumps(review)), REPO, NUMBER, HEAD, engine)
+    github_review.validate_review(
+        json.loads(json.dumps(review)), REPO, NUMBER, HEAD, engine, review["reviewers"]
+    )
 
 
 class FakeCao:
@@ -368,18 +415,18 @@ class FakeCao:
         return [call["step_id"] for call in self.calls]
 
 
-def _run_panel(
+def _run_review(
     pr_review: ModuleType,
     workspace: dict[str, Path],
     monkeypatch: pytest.MonkeyPatch,
     cao: FakeCao,
     **changes: Any,
 ) -> dict[str, Any]:
-    """Run the panel through the real ``run_seat``, with CAO's ``step`` faked."""
+    """Run the review through the real ``run_seat``, with CAO's ``step`` faked."""
     monkeypatch.setattr(pr_review, "step", cao.step)
     config = pr_review.load_config(_inputs(workspace, **changes))
     evidence = pr_review.load_evidence(config["evidence_dir"])
-    return pr_review.run_panel(config, evidence, pr_review.run_seat, cao.read_view)
+    return pr_review.run_review(config, evidence, pr_review.run_seat, cao.read_view)
 
 
 # --------------------------------------------------------------------------
@@ -391,8 +438,13 @@ def test_workflow_passes_static_validation() -> None:
     path = REVIEW_DIR / "pr_review.py"
     result = lint_script(path.read_text(encoding="utf-8"), str(path))
 
+    # The one warning is for the time module, which settled_view uses only to
+    # poll the CAO run view (see SETTLE_TIMEOUT in pr_review.py).
     assert result.status == "pass"
-    assert result.findings == []
+    assert [(item.rule_id, item.severity) for item in result.findings] == [
+        ("nondeterminism", "warning")
+    ]
+    assert "'time'" in result.findings[0].message
 
 
 @pytest.mark.parametrize(
@@ -410,9 +462,17 @@ def test_workflow_passes_static_validation() -> None:
         "MODEL_RE",
         "FINDING_ID_RE",
         "MAX_SECTIONS_UTF16",
-        "MAX_COMMENTS",
-        "MAX_COMMENT_UTF16",
-        "MAX_PATH_LENGTH",
+        "REVIEWER_MODES",
+        "MODE_SEATS",
+        "RISK_LEVELS",
+        "CHECK_ID_RE",
+        "POLICY_SHA_RE",
+        "MAX_CHECK_IDS",
+        "MAX_RISK_REASONS",
+        "MAX_RISK_REASON_LENGTH",
+        "MIN_STEP_TIMEOUT",
+        "MAX_STEP_TIMEOUT",
+        "STATE_TITLES",
     ],
 )
 def test_constants_shared_with_the_helper_agree(
@@ -440,6 +500,7 @@ def test_load_config_accepts_valid_inputs(
 
     assert config == {
         "engine": "copilot_cli",
+        "reviewers": "panel",
         "models": {
             "reviewer-a": "claude-sonnet-4.5",
             "reviewer-b": "openai/gpt-5:1",
@@ -448,11 +509,23 @@ def test_load_config_accepts_valid_inputs(
             "adjudicator": "claude-sonnet-4.5",
         },
         "step_timeout": 300,
+        "policy": {
+            "path": workspace["policy"].resolve(),
+            "sha256": hashlib.sha256(POLICY_TEXT.encode("utf-8")).hexdigest(),
+            "checks": CHECKS,
+        },
         "evidence_dir": workspace["evidence"].resolve(),
         "source_dir": workspace["source"].resolve(),
         "work_dir": workspace["work"].resolve(),
     }
     assert pr_review.load_config({**inputs, "step_timeout": 2700})["step_timeout"] == 2700
+    # Without the reviewers input, one agent reviews, and only its model is used.
+    del inputs["reviewers"]
+    single = pr_review.load_config(inputs)
+    assert (single["reviewers"], single["models"]) == (
+        "single",
+        {"reviewer-a": "claude-sonnet-4.5"},
+    )
 
 
 TIMEOUT_MESSAGE = "step_timeout must be from 300 to 2700 seconds"
@@ -462,6 +535,7 @@ TIMEOUT_MESSAGE = "step_timeout must be from 300 to 2700 seconds"
     ("changes", "message"),
     [
         ({"engine": "claude_code"}, "engine must be one of kiro_cli, copilot_cli"),
+        ({"reviewers": "both"}, "reviewers must be one of single, panel"),
         ({"model_a": "bad model!"}, "model_a is not a valid model name"),
         ({"model_a": "gpt-5\n"}, "model_a is not a valid model name"),
         ({"model_b": 5}, "model_b is not a valid model name"),
@@ -480,6 +554,10 @@ TIMEOUT_MESSAGE = "step_timeout must be from 300 to 2700 seconds"
             "evidence_dir and source_dir must be separate directories",
         ),
         ({"work_dir": "{root}/busy"}, "work_dir must be an empty directory"),
+        ({"policy": "REVIEW.md"}, "policy must be an absolute path"),
+        ({"policy": "{root}/missing.md"}, "policy is not a file"),
+        # The PR can change REVIEW.md, so the copy in its checkout is refused.
+        ({"policy": "{root}/source/REVIEW.md"}, "policy must not be in source_dir"),
     ],
 )
 def test_load_config_blocks_invalid_inputs(
@@ -492,6 +570,7 @@ def test_load_config_blocks_invalid_inputs(
     (tmp_path / "plain-file").write_text("x", encoding="utf-8")
     (tmp_path / "alias").symlink_to(workspace["source"], target_is_directory=True)
     (tmp_path / "busy" / ".kiro").mkdir(parents=True)
+    (workspace["source"] / "REVIEW.md").write_text(POLICY_TEXT, encoding="utf-8")
     rooted = {
         key: value.format(root=tmp_path) if isinstance(value, str) else value
         for key, value in changes.items()
@@ -503,6 +582,41 @@ def test_load_config_blocks_invalid_inputs(
     assert str(caught.value) == message
 
 
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("# Rules\n\n## A1. Not a check heading\n", "the policy has no check heading"),
+        ("### A1. One\n\n### A1. Again\n", "the policy has an invalid or repeated check ID A1"),
+        ("### A0. Zero\n", "the policy has an invalid or repeated check ID A0"),
+        ("### a1. Lower case\n", "the policy has an invalid or repeated check ID a1"),
+        (
+            "".join(f"### A{number}. Check {number}\n" for number in range(1, 42)),
+            "the policy has more than 40 checks",
+        ),
+    ],
+)
+def test_load_config_blocks_an_invalid_policy(
+    pr_review: ModuleType, workspace: dict[str, Path], text: str, message: str
+) -> None:
+    workspace["policy"].write_text(text, encoding="utf-8")
+
+    with pytest.raises(pr_review.Blocked) as caught:
+        pr_review.load_config(_inputs(workspace))
+
+    assert str(caught.value).startswith(message)
+
+
+def test_load_config_blocks_a_policy_that_is_not_utf8(
+    pr_review: ModuleType, workspace: dict[str, Path]
+) -> None:
+    workspace["policy"].write_bytes(b"### A1. Caf\xe9\n")
+
+    with pytest.raises(pr_review.Blocked) as caught:
+        pr_review.load_config(_inputs(workspace))
+
+    assert str(caught.value).startswith("cannot read the policy: ")
+
+
 def test_load_evidence_reads_valid_evidence(
     pr_review: ModuleType, workspace: dict[str, Path]
 ) -> None:
@@ -512,7 +626,6 @@ def test_load_evidence_reads_valid_evidence(
     assert pr_review.load_evidence(workspace["evidence"]) == {
         "pr": _pr_record(html_url=enterprise_url),
         "files": FILES,
-        "right_lines": RIGHT_LINES,
         "server_url": "https://ghe.example.com",
     }
 
@@ -560,10 +673,6 @@ def test_load_evidence_blocks_invalid_evidence(
     assert str(caught.value) == message
 
 
-def test_parse_right_side_lines_reads_the_head_side_of_each_hunk(pr_review: ModuleType) -> None:
-    assert pr_review.parse_right_side_lines(DIFF) == RIGHT_LINES
-
-
 # --------------------------------------------------------------------------
 # pr_review.py: report schemas
 # --------------------------------------------------------------------------
@@ -591,7 +700,7 @@ def test_finding_path_must_be_a_safe_relative_path(
 ) -> None:
     report = _reviewer_report({**_finding(), "path": path})
 
-    errors = _schema_check(pr_review, report, pr_review.reviewer_schema(len(FILES)))
+    errors = _schema_check(pr_review, report, pr_review.reviewer_schema(len(FILES), CHECK_IDS))
 
     assert (errors == []) is valid
 
@@ -602,7 +711,7 @@ def test_reviewer_schema_accepts_a_valid_report(pr_review: ModuleType) -> None:
     )
     report["unknowns"] = ["The tests could not be read."]
 
-    assert _schema_check(pr_review, report, pr_review.reviewer_schema(len(FILES))) == []
+    assert _schema_check(pr_review, report, pr_review.reviewer_schema(len(FILES), CHECK_IDS)) == []
 
 
 @pytest.mark.parametrize(
@@ -634,12 +743,26 @@ def test_reviewer_schema_accepts_a_valid_report(pr_review: ModuleType) -> None:
             _reviewer_report(*[_finding()] * 9),
             "$.findings has a number of items outside the limits",
         ),
+        (_reviewer_report(risk="severe"), "$.risk.level is not an allowed value"),
+        (
+            {**_reviewer_report(), "checks": {"A1": {"status": "checked", "note": "Read it."}}},
+            "$.checks.A2 is missing",
+        ),
+        (_reviewer_report(statuses={"A3": "checked"}), "$.checks has an unexpected field"),
+        (
+            _reviewer_report(statuses={"A1": "skipped"}),
+            "$.checks.A1.status is not an allowed value",
+        ),
+        (
+            _reviewer_report({**_finding(), "check": "B1"}),
+            "$.findings[0].check is not an allowed value",
+        ),
     ],
 )
 def test_reviewer_schema_rejects_an_invalid_report(
     pr_review: ModuleType, report: dict[str, Any], first_error: str
 ) -> None:
-    errors = _schema_check(pr_review, report, pr_review.reviewer_schema(len(FILES)))
+    errors = _schema_check(pr_review, report, pr_review.reviewer_schema(len(FILES), CHECK_IDS))
 
     assert errors and errors[0].startswith(first_error)
 
@@ -725,7 +848,7 @@ def test_build_candidates_merges_exact_duplicates_and_numbers_by_severity(
             (_vote("confirm", "P2"), _vote("confirm", "P1")),
             _decision("owner_decision", "P3"),
             ("owner_decision", "P1"),
-            ["RULE_OVERRULED"],
+            [],
         ),
         (
             (_vote("confirm", "P2"), _vote("confirm", "P1")),
@@ -746,16 +869,17 @@ def test_build_candidates_merges_exact_duplicates_and_numbers_by_severity(
             [],
         ),
         ((_vote("confirm", "P1"), None), _decision("reject", "P1"), ("reject", "P1"), []),
+        # An open question keeps the proposed P1, so the P3 rule cannot reject it.
         (
             (_vote("refute", "P3"), _vote("refute", "P3")),
             _decision("owner_decision", "P3"),
-            ("reject", "P3"),
-            ["RULE_P3_OWNER"],
+            ("owner_decision", "P1"),
+            [],
         ),
         (
             (_vote("unsure", "P2"), _vote("refute", "P2")),
             _decision("owner_decision", "P2"),
-            ("owner_decision", "P2"),
+            ("owner_decision", "P1"),
             [],
         ),
     ],
@@ -777,6 +901,18 @@ def test_settle_applies_the_verdict_rules(
     assert (item["decision"], item["final_severity"]) == expected
     assert item["notes"] == [getattr(pr_review, rule) for rule in rules]
     assert item["votes"] == list(cast)
+
+
+def test_settle_rejects_an_open_question_about_a_p3_candidate(pr_review: ModuleType) -> None:
+    decisions = {"F1": _decision("owner_decision", "P3")}
+
+    [item] = pr_review.settle([_candidate("F1", "P3")], NO_VOTES, decisions)
+
+    assert (item["decision"], item["final_severity"], item["notes"]) == (
+        "reject",
+        "P3",
+        [pr_review.RULE_P3_OWNER],
+    )
 
 
 def test_settle_without_an_adjudicator_settles_no_candidate(pr_review: ModuleType) -> None:
@@ -859,7 +995,7 @@ def test_coverage_counts_reviewed_skipped_and_missing_files(pr_review: ModuleTyp
         "reviewer-b": None,
     }
 
-    assert pr_review.coverage(reports, len(FILES)) == {
+    assert pr_review.coverage(reports, len(FILES), REVIEWERS) == {
         "reviewer-a": {
             "reviewed": {1, 2, 3},
             "skipped": {4: "binary or generated"},
@@ -867,20 +1003,70 @@ def test_coverage_counts_reviewed_skipped_and_missing_files(pr_review: ModuleTyp
         },
         "reviewer-b": None,
     }
+    assert pr_review.coverage(reports, len(FILES), ("reviewer-a",)).keys() == {"reviewer-a"}
+
+
+def test_not_checked_ids_lists_the_checks_that_no_reviewer_covered(pr_review: ModuleType) -> None:
+    first = _reviewer_report(statuses={"A1": "not_checked", "A2": "not_applicable"})
+    second = _reviewer_report(statuses={"A1": "not_checked"})
+
+    assert pr_review.not_checked_ids(
+        {"reviewer-a": first, "reviewer-b": second}, REVIEWERS, CHECK_IDS
+    ) == ["A1"]
+    assert (
+        pr_review.not_checked_ids(
+            {"reviewer-a": first, "reviewer-b": _reviewer_report()}, REVIEWERS, CHECK_IDS
+        )
+        == []
+    )
+    # A missing report covers no check, and only the seats of the mode count.
+    assert pr_review.not_checked_ids(
+        {"reviewer-a": None, "reviewer-b": _reviewer_report()}, ("reviewer-a",), CHECK_IDS
+    ) == ["A1", "A2"]
+
+
+def test_overall_risk_takes_the_highest_level_and_its_reasons(pr_review: ModuleType) -> None:
+    def report(level: str, *reasons: str) -> dict[str, Any]:
+        return {**_reviewer_report(), "risk": {"level": level, "reasons": list(reasons)}}
+
+    reports: dict[str, Any] = {
+        "reviewer-a": report("medium", "It changes the cache.", "Shared state."),
+        "reviewer-b": report("medium", "shared  STATE.", "A new lock."),
+    }
+
+    assert pr_review.overall_risk(reports, REVIEWERS) == {
+        "level": "medium",
+        "reasons": ["It changes the cache.", "Shared state.", "A new lock."],
+    }
+    reports["reviewer-b"] = report("high", "It logs the token.")
+    assert pr_review.overall_risk(reports, REVIEWERS) == {
+        "level": "high",
+        "reasons": ["It logs the token."],
+    }
+    assert pr_review.overall_risk(reports, ("reviewer-a",))["level"] == "medium"
+    many = {
+        "reviewer-a": report("low", *[f"Reason {n}." for n in range(1, 6)]),
+        "reviewer-b": report("low", "Reason 6."),
+    }
+    assert pr_review.overall_risk(many, REVIEWERS)["reasons"] == [
+        f"Reason {n}." for n in range(1, 6)
+    ]
 
 
 # --------------------------------------------------------------------------
-# pr_review.py: text helpers, the review body and the inline comments
+# pr_review.py: text helpers and the review body
 # --------------------------------------------------------------------------
 
 
-def test_clean_text_removes_controls_and_breaks_mentions_and_comments(
+def test_clean_text_removes_controls_and_escapes_markup_and_mentions(
     pr_review: ModuleType,
 ) -> None:
     raw = "x\x00y\x1bz\u202eq\u200bw @octo a@b.c <!-- c --> "
 
-    assert pr_review.clean_text(raw, 100) == (
-        "xyzqw @\u200bocto a@\u200bb.c <\u200b!-- c --\u200b>"
+    assert pr_review.clean_text(raw, 100) == "xyzqw @\u200bocto a@\u200bb.c &lt;!-- c --&gt;"
+    # An entity cannot decode into a mention, and a link or an image stays text.
+    assert pr_review.clean_text("&#64;user <img src=x> ![x](http://a) \\[y]", 100) == (
+        "&amp;#64;user &lt;img src=x&gt; !\\[x\\](http://a) \\\\\\[y\\]"
     )
     assert pr_review.clean_text("a\nb\tc\r\nd  e\u2028f", 100) == "a b c d e f"
     assert pr_review.clean_text("abcdef", 4) == "abc…"
@@ -967,43 +1153,53 @@ def test_compose_sections_cuts_a_body_that_is_too_long_when_compact(
     assert pr_review.utf16_length(text) <= pr_review.SECTIONS_BUDGET_UTF16
 
 
-def test_inline_comments_cover_accepted_findings_on_head_side_lines(
-    pr_review: ModuleType,
+HOSTILE = "<!-- x --> <img src=x> ![p](http://a) &#64;team @admins"
+
+
+def test_render_sections_escapes_every_agent_text(
+    pr_review: ModuleType, workspace: dict[str, Path]
 ) -> None:
-    candidates = [
-        _candidate("F1", "P1", line=2),
-        _candidate("F2", line=10),  # not a line of the diff
-        _candidate("F3", line=3),  # rejected
-        _candidate("F4", "P1", line=4),  # a duplicate of F1
-        _candidate("F5", line=1, path="gone.py"),  # a deleted file
-    ]
-    candidates[0]["proposals"][0]["failure"] = "It leaks <!-- hidden --> data. Ask @admins."
-    decisions = {
-        "F1": _decision("accept", "P1"),
-        "F2": _decision("accept"),
-        "F3": _decision("reject"),
-        "F4": _decision("accept", "P1", "F1"),
-        "F5": _decision("accept"),
-    }
-    settled = pr_review.settle(candidates, NO_VOTES, decisions)
+    candidate = {**_candidate("F1", "P1"), "title": HOSTILE}
+    for field in ("failure", "impact", "evidence", "fix"):
+        candidate["proposals"][0][field] = HOSTILE
+    votes = {"vote-1": {"F1": {**_vote("confirm", "P1"), "evidence": HOSTILE}}, "vote-2": None}
+    decisions = {"F1": {**_decision("accept", "P1"), "reason": HOSTILE}}
+    settled = pr_review.settle([candidate], votes, decisions)
+    context = _context(pr_review, workspace["source"], settled)
+    report = context["reports"]["reviewer-a"]
+    report.update(summary=HOSTILE, unknowns=[HOSTILE])
+    report["checks"]["A1"] = {"status": "not_checked", "note": HOSTILE}
+    report["files_skipped"] = [{"index": 4, "reason": HOSTILE}]
+    context["coverage"] = pr_review.coverage(context["reports"], len(FILES), REVIEWERS)
+    context["risk"] = {"level": "high", "reasons": [HOSTILE]}
+    dropped = {"seat": "reviewer-a", "severity": "P2", "path": "src/app.py", "line": 99}
+    context["dropped"] = [{**dropped, "title": HOSTILE, "reason": "the file has 30 lines"}]
 
-    comments = pr_review.inline_comments(settled, pr_review.group_ids(settled), RIGHT_LINES)
+    for compact in (False, True):
+        text = pr_review.render_sections(context, compact)
 
-    assert [(c["path"], c["line"]) for c in comments] == [("src/app.py", 2)]
-    body = comments[0]["body"]
-    assert body.startswith("**F1 · P1 · Defect F1**\n\n")
-    assert "<!--" not in body
-    assert "@admins" not in body
+        assert "&lt;img src=x&gt;" in text
+        for raw in ("<!--", "<img", "![p](", "&#64;team", "@admins"):
+            assert raw not in text
 
 
-def test_inline_comments_are_capped(pr_review: ModuleType) -> None:
-    candidates = [_candidate(f"F{n}", line=1) for n in range(1, 151)]
-    decisions = {candidate["id"]: _decision() for candidate in candidates}
-    settled = pr_review.settle(candidates, NO_VOTES, decisions)
+def test_render_sections_shows_the_checks_the_risk_and_single_mode(
+    pr_review: ModuleType, workspace: dict[str, Path]
+) -> None:
+    context = _context(pr_review, workspace["source"], [])
+    context["config"].update(reviewers="single", models={"reviewer-a": ""})
+    context["reports"]["reviewer-a"]["checks"]["A2"]["status"] = "not_checked"
+    context["not_checked_ids"] = ["A2"]
+    sha = hashlib.sha256(POLICY_TEXT.encode("utf-8")).hexdigest()
 
-    comments = pr_review.inline_comments(settled, pr_review.group_ids(settled), RIGHT_LINES)
+    text = pr_review.render_sections(context, False)
 
-    assert len(comments) == pr_review.MAX_COMMENTS
+    assert "One agent reviewed this PR. No second agent checked its findings." in text
+    assert "Risk: **medium**\n\n- The PR changes how widgets are cached." in text
+    assert f"Policy `REVIEW.md`, SHA-256 `{sha[:12]}`, 2 checks. Not covered: A2." in text
+    assert "| Check | reviewer-a |" in text
+    assert "reviewer-b" not in text
+    assert "| adjudicator |" not in text
 
 
 # --------------------------------------------------------------------------
@@ -1138,8 +1334,9 @@ DROPPED = {"cao_output_dropped": "oversize", "original_bytes": 300_000, "detail"
         ),
         (
             {"state": "completed_unvalidated", "output_json": json.dumps({"summary": "x"})},
-            "invalid report: $.files_reviewed is missing",
+            "invalid report: $.risk is missing",
         ),
+        ({"state": "running"}, "no report: the step did not end in time (state running)"),
     ],
 )
 def test_seat_report_explains_a_missing_or_invalid_report(
@@ -1147,7 +1344,7 @@ def test_seat_report_explains_a_missing_or_invalid_report(
 ) -> None:
     view = {} if item is None else {"reviewer-a": {"id": "reviewer-a", **item}}
 
-    assert pr_review.seat_report(view, "reviewer-a", pr_review.reviewer_schema(6)) == (
+    assert pr_review.seat_report(view, "reviewer-a", pr_review.reviewer_schema(6, CHECK_IDS)) == (
         None,
         reason,
     )
@@ -1158,7 +1355,7 @@ def test_seat_report_returns_a_valid_report(pr_review: ModuleType, state: str) -
     report = _reviewer_report(_finding())
     view = {"reviewer-a": {"id": "reviewer-a", "state": state, "output_json": json.dumps(report)}}
 
-    assert pr_review.seat_report(view, "reviewer-a", pr_review.reviewer_schema(6)) == (
+    assert pr_review.seat_report(view, "reviewer-a", pr_review.reviewer_schema(6, CHECK_IDS)) == (
         report,
         "valid",
     )
@@ -1166,7 +1363,7 @@ def test_seat_report_returns_a_valid_report(pr_review: ModuleType, state: str) -
 
 def test_seat_report_reads_a_whole_number_float_as_an_integer(pr_review: ModuleType) -> None:
     # CAO accepts 12.0 as an integer (JSON Schema Draft 2020-12), so the script must too.
-    schema = pr_review.reviewer_schema(6)
+    schema = pr_review.reviewer_schema(6, CHECK_IDS)
     whole = json.dumps(_reviewer_report(_finding(line=12))).replace('"line": 12', '"line": 12.0')
     part = whole.replace('"line": 12.0', '"line": 12.5')
 
@@ -1182,12 +1379,41 @@ def test_seat_report_reads_a_whole_number_float_as_an_integer(pr_review: ModuleT
     assert jsonschema.Draft202012Validator(schema).is_valid(json.loads(whole))
 
 
+def test_settled_view_reads_again_until_a_timed_out_seat_ends(pr_review: ModuleType) -> None:
+    views = [{"reviewer-a": {"state": state}} for state in ("pending", "running", "completed")]
+    reads = iter(views)
+    sleeps: list[float] = []
+
+    view = pr_review.settled_view(lambda: next(reads), ["reviewer-a"], sleeps.append, lambda: 0.0)
+
+    assert view == views[2]
+    assert sleeps == [pr_review.SETTLE_POLL_INTERVAL] * 2
+    assert pr_review.settled_view(lambda: {}, [], sleeps.append, lambda: 0.0) == {}
+    assert len(sleeps) == 2
+
+
+def test_settled_view_returns_the_last_view_at_the_deadline(pr_review: ModuleType) -> None:
+    now = [0.0]
+    reads: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    def read() -> dict[str, dict[str, Any]]:
+        reads.append(now[0])
+        return {}
+
+    assert pr_review.settled_view(read, ["reviewer-a"], sleep, lambda: now[0]) == {}
+    assert reads[-1] == pr_review.SETTLE_TIMEOUT
+    assert len(reads) == int(pr_review.SETTLE_TIMEOUT / pr_review.SETTLE_POLL_INTERVAL) + 1
+
+
 # --------------------------------------------------------------------------
-# pr_review.py: the panel and the script entry point
+# pr_review.py: the review and the script entry point
 # --------------------------------------------------------------------------
 
 
-def test_run_panel_settles_candidates_with_the_voters_and_the_adjudicator(
+def test_run_review_settles_candidates_with_the_voters_and_the_adjudicator(
     pr_review: ModuleType,
     github_review: ModuleType,
     workspace: dict[str, Path],
@@ -1229,7 +1455,7 @@ def test_run_panel_settles_candidates_with_the_voters_and_the_adjudicator(
         }
     )
 
-    review = _run_panel(
+    review = _run_review(
         pr_review, workspace, monkeypatch, cao, model_a="model-a", model_b="model-b"
     )
 
@@ -1260,7 +1486,14 @@ def test_run_panel_settles_candidates_with_the_voters_and_the_adjudicator(
     assert review["severity_counts"] == {"P1": 1, "P2": 0, "P3": 0}
     assert review["panel"] == dict.fromkeys(SEATS, "valid")
     assert review["findings"][1]["notes"] == [pr_review.RULE_OVERRULED]
-    assert [(c["path"], c["line"]) for c in review["comments"]] == [("src/app.py", 2)]
+    assert "comments" not in review
+    assert review["policy_sha256"] == hashlib.sha256(POLICY_TEXT.encode("utf-8")).hexdigest()
+    assert (review["check_ids"], review["not_checked_ids"]) == (CHECK_IDS, [])
+    assert review["risk"] == {
+        "level": "medium",
+        "reasons": ["The PR changes how widgets are cached."],
+    }
+    assert review["dropped_findings"] == []
     assert "**Changes required** (also: Owner decision required)" in review["sections"]
     _assert_publishable(github_review, review)
 
@@ -1275,12 +1508,15 @@ def test_run_panel_settles_candidates_with_the_voters_and_the_adjudicator(
     ]
     assert (panel_dir / "reports.json").is_file()
     prompts = {c["step_id"]: c["prompt"] for c in cao.calls}
+    policy_line = f"apply it: {workspace['policy'].resolve()}\n"
+    assert all(policy_line in prompt for prompt in prompts.values())
+    assert "- A2. Security" in prompts["reviewer-a"]
     assert str(panel_dir / "candidates.json") in prompts["vote-1"]
     assert json.dumps(pr_review.voter_schema(3), separators=(",", ":")) in prompts["vote-2"]
     assert str(panel_dir / "adjudication.json") in prompts["adjudicator"]
 
 
-def test_run_panel_without_candidates_runs_only_the_reviewers(
+def test_run_review_without_candidates_runs_only_the_reviewers(
     pr_review: ModuleType,
     github_review: ModuleType,
     workspace: dict[str, Path],
@@ -1288,7 +1524,7 @@ def test_run_panel_without_candidates_runs_only_the_reviewers(
 ) -> None:
     cao = FakeCao({"reviewer-a": _reviewer_report(), "reviewer-b": _reviewer_report()})
 
-    review = _run_panel(pr_review, workspace, monkeypatch, cao)
+    review = _run_review(pr_review, workspace, monkeypatch, cao)
 
     assert sorted(cao.seats()) == ["reviewer-a", "reviewer-b"]
     assert review["panel"] == {
@@ -1300,11 +1536,88 @@ def test_run_panel_without_candidates_runs_only_the_reviewers(
     }
     assert review["result_states"] == ["no_blocking_findings"]
     assert review["review_complete"] is True
-    assert [p.name for p in (workspace["evidence"] / "panel").iterdir()] == ["reports.json"]
+    panel_files = sorted(p.name for p in (workspace["evidence"] / "panel").iterdir())
+    assert panel_files == ["reports.json", "run.json"]
     _assert_publishable(github_review, review)
 
 
-def test_run_panel_reports_missing_seat_reports_as_incomplete(
+def test_run_review_in_single_mode_runs_one_reviewer_and_accepts_its_findings(
+    pr_review: ModuleType,
+    github_review: ModuleType,
+    workspace: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    findings = (_finding("Missing cache test", "P2"), _finding("Unused import", "P3", line=3))
+    cao = FakeCao({"reviewer-a": _reviewer_report(*findings)})
+
+    review = _run_review(
+        pr_review,
+        workspace,
+        monkeypatch,
+        cao,
+        reviewers="single",
+        model_a="model-a",
+        model_b="model-b",
+    )
+
+    assert [(c["step_id"], c["model"]) for c in cao.calls] == [("reviewer-a", "model-a")]
+    assert (review["reviewers"], review["models"]) == ("single", {"reviewer-a": "model-a"})
+    assert review["panel"] == {"reviewer-a": "valid"}
+    assert review["accepted_finding_ids"] == ["F1", "F2"]
+    assert review["severity_counts"] == {"P1": 0, "P2": 1, "P3": 1}
+    assert review["result_states"] == ["changes_required"]
+    assert "One agent reviewed this PR. No second agent checked its findings." in review["sections"]
+    _assert_publishable(github_review, review)
+
+
+def test_run_review_is_incomplete_when_no_reviewer_checked_a_check(
+    pr_review: ModuleType,
+    github_review: ModuleType,
+    workspace: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cao = FakeCao({"reviewer-a": _reviewer_report(statuses={"A2": "not_checked"})})
+
+    review = _run_review(pr_review, workspace, monkeypatch, cao, reviewers="single")
+
+    assert review["not_checked_ids"] == ["A2"]
+    assert (review["result_states"], review["review_complete"]) == (["incomplete"], False)
+    assert "Not covered: A2." in review["sections"]
+    _assert_publishable(github_review, review)
+
+
+def test_run_review_drops_a_finding_that_is_not_in_the_head_checkout(
+    pr_review: ModuleType,
+    github_review: ModuleType,
+    workspace: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "outside.py").write_text("token = 1\n", encoding="utf-8")
+    (workspace["source"] / "link.py").symlink_to(tmp_path / "outside.py")
+    findings = (
+        _finding("Last line", "P2", line=30),
+        _finding("Past the end", "P2", line=31),
+        _finding("No such file", "P1", path="src/missing.py"),
+        _finding("Through a link", "P1", path="link.py", line=1),
+    )
+    cao = FakeCao({"reviewer-a": _reviewer_report(*findings)})
+
+    review = _run_review(pr_review, workspace, monkeypatch, cao, reviewers="single")
+
+    outside = "the path is not a file in the head checkout"
+    assert [(item["title"], item["reason"]) for item in review["dropped_findings"]] == [
+        ("Past the end", "the file has 30 lines"),
+        ("No such file", outside),
+        ("Through a link", outside),
+    ]
+    assert [item["title"] for item in review["findings"]] == ["Last line"]
+    assert review["result_states"] == ["changes_required", "incomplete"]
+    assert "## Dropped findings" in review["sections"]
+    _assert_publishable(github_review, review)
+
+
+def test_run_review_reports_missing_seat_reports_as_incomplete(
     pr_review: ModuleType,
     github_review: ModuleType,
     workspace: dict[str, Path],
@@ -1320,7 +1633,7 @@ def test_run_panel_reports_missing_seat_reports_as_incomplete(
         }
     )
 
-    review = _run_panel(pr_review, workspace, monkeypatch, cao)
+    review = _run_review(pr_review, workspace, monkeypatch, cao)
 
     failed = "no report: the step ended in state failed (provider_error); the step call failed: "
     assert review["panel"] == {
@@ -1338,13 +1651,13 @@ def test_run_panel_reports_missing_seat_reports_as_incomplete(
     _assert_publishable(github_review, review)
 
 
-def test_run_panel_blocks_when_no_reviewer_returns_a_report(
+def test_run_review_blocks_when_no_reviewer_returns_a_report(
     pr_review: ModuleType, workspace: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cao = FakeCao({"reviewer-a": None, "reviewer-b": ShimTransportError("connection reset")})
 
     with pytest.raises(pr_review.Blocked) as caught:
-        _run_panel(pr_review, workspace, monkeypatch, cao)
+        _run_review(pr_review, workspace, monkeypatch, cao)
 
     assert str(caught.value) == (
         "no reviewer returned a valid report: "
@@ -1355,15 +1668,51 @@ def test_run_panel_blocks_when_no_reviewer_returns_a_report(
     assert sorted(cao.seats()) == ["reviewer-a", "reviewer-b"]
 
 
-def test_run_panel_refuses_the_panel_directory_of_an_earlier_run(
-    pr_review: ModuleType, workspace: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("owner", "run_id"),
+    [(None, "run-2"), ({"run_id": "run-1"}, "run-2"), ({"run_id": ""}, "")],
+    ids=["no-owner-file", "another-run", "no-run-id"],
+)
+def test_run_review_refuses_the_panel_directory_of_another_run(
+    pr_review: ModuleType,
+    workspace: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    owner: Optional[dict[str, str]],
+    run_id: str,
 ) -> None:
-    (workspace["evidence"] / "panel").mkdir()
+    panel_dir = workspace["evidence"] / "panel"
+    panel_dir.mkdir()
+    if owner is not None:
+        (panel_dir / "run.json").write_text(json.dumps(owner), encoding="utf-8")
+    monkeypatch.setenv("CAO_WORKFLOW_RUN_ID", run_id)
     cao = FakeCao({})
 
-    with pytest.raises(pr_review.Blocked, match="panel directory from an earlier run"):
-        _run_panel(pr_review, workspace, monkeypatch, cao)
+    with pytest.raises(pr_review.Blocked, match="panel directory from another run"):
+        _run_review(pr_review, workspace, monkeypatch, cao)
     assert cao.calls == []
+
+
+def test_run_review_takes_back_its_own_panel_directory_on_resume(
+    pr_review: ModuleType,
+    github_review: ModuleType,
+    workspace: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # cao workflow resume runs the script again with the same run ID. The panel
+    # files of the first attempt must not reach a seat that runs again.
+    monkeypatch.setenv("CAO_WORKFLOW_RUN_ID", "run-1")
+    panel_dir = workspace["evidence"] / "panel"
+    panel_dir.mkdir()
+    (panel_dir / "run.json").write_text(json.dumps({"run_id": "run-1"}), encoding="utf-8")
+    for name in ("candidates.json", "adjudication.json", "reports.json"):
+        (panel_dir / name).write_text("stale", encoding="utf-8")
+    cao = FakeCao({"reviewer-a": _reviewer_report(), "reviewer-b": _reviewer_report()})
+
+    review = _run_review(pr_review, workspace, monkeypatch, cao)
+
+    assert sorted(p.name for p in panel_dir.iterdir()) == ["reports.json", "run.json"]
+    assert json.loads((panel_dir / "reports.json").read_text(encoding="utf-8"))["panel"]
+    _assert_publishable(github_review, review)
 
 
 def test_main_writes_a_blocked_review(
@@ -1489,11 +1838,12 @@ class FakeProcess:
             answer = answer.pop(0)
         return answer() if callable(answer) else answer
 
-    def posted(self) -> list[dict[str, Any]]:
+    def writes(self) -> list[tuple[str, str, Any]]:
+        """(method, path, payload) of each gh call that is not a GET, in order."""
         return [
-            json.loads(text or "")
+            (cmd[3], cmd[4], json.loads(text or "null"))
             for cmd, text in self.calls
-            if cmd[0] == "gh" and cmd[3] == "POST"
+            if cmd[0] == "gh" and cmd[3] != "GET"
         ]
 
     def paths(self) -> list[str]:
@@ -1554,7 +1904,7 @@ def _git_routes() -> dict[tuple[str, ...], Result]:
 
 
 def _review(**changes: Any) -> dict[str, Any]:
-    """A minimal valid ``review.json``."""
+    """A minimal valid ``review.json`` of a single-reviewer run."""
     review: dict[str, Any] = {
         "schema_version": 1,
         "publishable": True,
@@ -1565,7 +1915,13 @@ def _review(**changes: Any) -> dict[str, Any]:
         "base_sha": BASE,
         "merge_base": MERGE_BASE,
         "engine": "kiro_cli",
-        "models": dict.fromkeys(SEATS, ""),
+        "reviewers": "single",
+        "models": {"reviewer-a": ""},
+        "step_timeout": 1800,
+        "policy_sha256": "e" * 64,
+        "check_ids": ["A1", "A2", "A3"],
+        "not_checked_ids": [],
+        "risk": {"level": "low", "reasons": ["The change adds a cache."]},
         "result_states": ["changes_required"],
         "severity_counts": {"P1": 1, "P2": 0, "P3": 0},
         "finding_ids": ["F1", "F2"],
@@ -1575,60 +1931,83 @@ def _review(**changes: Any) -> dict[str, Any]:
         "duplicate_finding_ids": [],
         "review_complete": True,
         "sections": "## Result\n\n**Changes required**\n",
-        "comments": [{"path": "src/app.py", "line": 2, "body": "**F1 · P1 · Cache key**"}],
-        "panel": dict.fromkeys(SEATS, "valid"),
+        "panel": {"reviewer-a": "valid"},
         "findings": [],
+        "dropped_findings": [],
     }
     review.update(changes)
     return review
 
 
-def _publish(github_review: ModuleType, tmp_path: Path, review: Any, *extra: str) -> int:
+def _panel_review(**changes: Any) -> dict[str, Any]:
+    return _review(
+        reviewers="panel",
+        models=dict.fromkeys(SEATS, ""),
+        panel=dict.fromkeys(SEATS, "valid"),
+        **changes,
+    )
+
+
+def _publish(
+    github_review: ModuleType,
+    tmp_path: Path,
+    review: Any,
+    *extra: str,
+    reviewers: str = "single",
+) -> int:
     path = tmp_path / "review.json"
     path.write_text(json.dumps(review), encoding="utf-8")
     return github_review.main(
         ["publish", "--repo", REPO, "--pr", str(NUMBER), "--review", str(path)]
         + ["--head", HEAD, "--run-id", RUN_ID, "--run-attempt", "2"]
-        + ["--server-url", "https://github.com", "--engine", "kiro_cli", "--actor", "octocat"]
+        + ["--server-url", "https://github.com", "--engine", "kiro_cli"]
+        + ["--reviewers", reviewers, "--actor", "octocat"]
         + list(extra)
     )
+
+
+def _our_comment(
+    github_review: ModuleType, comment_id: int, run_id: str, user: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
+    """An issue comment with the marker of workflow run ``run_id``, by default from the bot."""
+    marker = github_review.build_marker(_review(), run_id, "1")
+    return {"id": comment_id, "user": user or BOT, "body": f"An earlier review.\n\n{marker}\n"}
 
 
 def _github(
     process: FakeProcess,
     *,
-    reviews: Optional[list[dict[str, Any]]] = None,
+    comments: Optional[list[dict[str, Any]]] = None,
     live: Optional[dict[str, Any]] = None,
-    published: Optional[dict[str, Any]] = None,
-    comment_changes: Optional[dict[str, Any]] = None,
+    read_back: Optional[dict[str, Any]] = None,
 ) -> None:
-    """gh routes for ``publish``: earlier reviews, the live PR, the post and its check.
+    """gh routes for ``publish``: the live PR, its comments, the write, its read-back and the check.
 
-    The check reads back what the last post sent, changed by ``published`` and
-    ``comment_changes``.
+    A new comment gets ID 99. The read-back returns what the last write sent,
+    changed by ``read_back``. The check run gets ID 555.
     """
 
-    def review_view() -> Result:
-        sent = process.posted()[-1]
-        view = {
-            "id": 99,
-            "commit_id": sent["commit_id"],
-            "state": "COMMENTED",
-            "user": BOT,
-            "body": sent["body"],
-        }
-        return _ok({**view, **(published or {})})
+    def view(comment_id: int) -> Callable[[], Result]:
+        def answer() -> Result:
+            sent = process.writes()[-1][2]
+            comment = {
+                "id": comment_id,
+                "user": BOT,
+                "body": sent["body"],
+                "issue_url": f"https://api.github.com/repos/{REPO}/issues/{NUMBER}",
+            }
+            return _ok({**comment, **(read_back or {})})
 
-    def comment_list() -> Result:
-        sent = process.posted()[-1]
-        extra = {"pull_request_review_id": 99, **(comment_changes or {})}
-        return _ok([{**comment, **extra} for comment in sent["comments"]])
+        return answer
 
-    process.routes[("GET", REVIEWS_PAGE)] = _ok(reviews or [])
     process.routes[("GET", PULL)] = _ok(live or _live_pr())
-    process.routes[("POST", REVIEWS)] = _ok({"id": 99})
-    process.routes[("GET", f"{REVIEWS}/99")] = review_view
-    process.routes[("GET", COMMENTS_PAGE)] = comment_list
+    process.routes[("GET", ISSUE_COMMENTS_PAGE)] = _ok(comments or [])
+    process.routes[("POST", ISSUE_COMMENTS)] = _ok({"id": 99})
+    process.routes[("GET", f"{COMMENT}/99")] = view(99)
+    for comment in comments or []:
+        process.routes[("PATCH", f"{COMMENT}/{comment['id']}")] = _ok({"id": comment["id"]})
+        process.routes[("GET", f"{COMMENT}/{comment['id']}")] = view(comment["id"])
+    process.routes[("POST", CHECK_RUNS)] = _ok({"id": 555})
 
 
 def _collect_inputs(
@@ -1729,7 +2108,10 @@ def test_prepare_stops_for_a_pr_that_is_not_ready(
         ["prepare", "--repo", REPO, "--pr", "7\n", "--out", "evidence"],
         ["publish", "--repo", REPO, "--pr", "7", "--review", "review.json", "--head", "HEAD"]
         + ["--run-id", RUN_ID, "--run-attempt", "1", "--server-url", "https://github.com"]
-        + ["--engine", "kiro_cli", "--actor", "octocat"],
+        + ["--engine", "kiro_cli", "--reviewers", "single", "--actor", "octocat"],
+        ["report-failure", "--repo", REPO, "--pr", "7", "--head", HEAD, "--run-id", RUN_ID]
+        + ["--run-attempt", "1", "--server-url", "https://github.com", "--engine", "kiro_cli"]
+        + ["--reviewers", "single", "--job-result", "success"],
     ],
 )
 def test_invalid_arguments_are_a_usage_error(
@@ -1763,7 +2145,7 @@ def test_collect_writes_the_diff_and_the_changed_files(
     assert changed == {"schema_version": 1, "files": FILES}
     assert json.loads((evidence / "pr.json").read_text(encoding="utf-8")) == _pr_record()
     loaded = pr_review.load_evidence(evidence)
-    assert (loaded["files"], loaded["right_lines"]) == (FILES, RIGHT_LINES)
+    assert loaded["files"] == FILES
 
 
 @pytest.mark.parametrize(
@@ -1806,6 +2188,72 @@ def test_collect_stops_without_changing_the_evidence(
     assert capsys.readouterr().out == f"{message}\n"
     assert [path.name for path in evidence.iterdir()] == ["pr.json"]
     assert json.loads((evidence / "pr.json").read_text(encoding="utf-8")) == _prepared_record()
+
+
+def _git_version() -> tuple[int, ...]:
+    if shutil.which("git") is None:
+        return ()
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True, check=False).stdout
+    match = re.search(r"(\d+)\.(\d+)", out)
+    return tuple(int(part) for part in match.groups()) if match else ()
+
+
+def _git_commit(repo: Path, message: str) -> str:
+    subprocess.run(["git", "-C", str(repo), "add", "--all"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "--quiet", "-m", message], check=True)
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    )
+    return head.stdout.strip()
+
+
+# must_run("unit"): the runners of the Unit Tests job have git 2.40 or later, so
+# this regression must run there and must not skip.
+@pytest.mark.must_run("unit")
+@pytest.mark.skipif(_git_version() < (2, 40), reason="git --attr-source needs git 2.40 or later")
+def test_collect_ignores_the_gitattributes_of_the_pr(
+    github_review: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A PR that adds ``* -diff`` must not turn its text change into "Binary files differ"."""
+    config = tmp_path / "gitconfig"
+    config.write_text("", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for role in ("AUTHOR", "COMMITTER"):
+        monkeypatch.setenv(f"GIT_{role}_NAME", "Test")
+        monkeypatch.setenv(f"GIT_{role}_EMAIL", "test@example.com")
+    source = tmp_path / "source"
+    (source / "src").mkdir(parents=True)
+    git = ["git", "-C", str(source)]
+    subprocess.run([*git, "init", "--quiet", "--initial-branch=main"], check=True)
+    (source / "src" / "app.py").write_text("import os\nimport sys\n", encoding="utf-8")
+    base = _git_commit(source, "Base")
+    subprocess.run([*git, "update-ref", "refs/remotes/origin/main", base], check=True)
+    subprocess.run([*git, "checkout", "--quiet", "-b", "feature"], check=True)
+    (source / ".gitattributes").write_text("* -diff\n", encoding="utf-8")
+    (source / "src" / "app.py").write_text("import os\nimport re\n", encoding="utf-8")
+    (source / "logo.bin").write_bytes(b"\x00\x01binary")
+    head = _git_commit(source, "Hide the change")
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    record = {**_prepared_record(), "head_sha": head}
+    (evidence / "pr.json").write_text(json.dumps(record), encoding="utf-8")
+
+    code = github_review.main(["collect", "--evidence", str(evidence), "--source", str(source)])
+
+    assert code == 0
+    assert capsys.readouterr().out == (
+        f"Collected 3 changed files from merge base {base} to head {head}.\n"
+    )
+    patch = (evidence / "diff.patch").read_text(encoding="utf-8")
+    assert "@@ -1,2 +1,2 @@\n import os\n-import sys\n+import re\n" in patch
+    assert "+* -diff\n" in patch
+    # A real binary file stays binary.
+    assert "Binary files /dev/null and b/logo.bin differ\n" in patch
+    assert patch.count("Binary files") == 1
 
 
 # --------------------------------------------------------------------------
@@ -1904,83 +2352,175 @@ def test_check_secrets_ignores_a_value_shorter_than_eight_characters(
 # --------------------------------------------------------------------------
 
 
-def test_publish_posts_one_comment_review_and_verifies_it(
+def test_publish_posts_one_comment_and_a_neutral_check_run(
     github_review: ModuleType,
     process: FakeProcess,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    output = tmp_path / "github_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
     _github(process)
 
     assert _publish(github_review, tmp_path, _review()) == 0
 
     assert capsys.readouterr().out == (
-        f"Published review 99 on {REPO}#{NUMBER} at {HEAD} with 1 inline comments.\n"
+        f"Posted review comment 99 on {REPO}#{NUMBER} for head {HEAD}. "
+        "Added neutral check run 555.\n"
     )
-    [payload] = process.posted()
-    assert (payload["commit_id"], payload["event"]) == (HEAD, "COMMENT")
-    assert payload["comments"] == [
-        {"path": "src/app.py", "line": 2, "side": "RIGHT", "body": "**F1 · P1 · Cache key**"}
+    assert process.paths() == [
+        PULL,
+        ISSUE_COMMENTS_PAGE,
+        ISSUE_COMMENTS,
+        f"{COMMENT}/99",
+        CHECK_RUNS,
     ]
-    body = payload["body"]
-    first_line = github_review.FIRST_LINE.format(engine="kiro_cli", actor="octocat")
-    assert body.startswith(f"{first_line}\n\nWorkflow run: ")
-    run_url = f"https://github.com/{REPO}/actions/runs/{RUN_ID}/attempts/2"
-    assert f"Workflow run: {run_url}\n\n## Result\n\n**Changes required**\n\n" in body
-    assert github_review.marker_run_id(body) == RUN_ID
-    assert process.paths() == [REVIEWS_PAGE, PULL, REVIEWS, f"{REVIEWS}/99", COMMENTS_PAGE]
+    (method, _, comment), (_, _, check_run) = process.writes()
+    first_line = github_review.FIRST_LINE.format(
+        engine="kiro_cli", reviewers="single", actor="octocat"
+    )
+    marker = github_review.build_marker(_review(), RUN_ID, "2")
+    assert method == "POST"
+    assert comment == {
+        "body": f"{first_line}\n\nWorkflow run: {RUN_URL}\n\n"
+        f"## Result\n\n**Changes required**\n\n{marker}\n"
+    }
+    assert f"- Review comment: {PR_URL}#issuecomment-99\n" in check_run["output"]["summary"]
+    assert output.read_text(encoding="utf-8") == "comment_written=true\n"
 
 
-def test_publish_dry_run_writes_the_request_and_posts_nothing(
+def test_publish_updates_the_oldest_comment_of_an_earlier_run_in_place(
     github_review: ModuleType,
     process: FakeProcess,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    comments = [
+        {"id": 10, "user": {"login": "octocat", "type": "User"}, "body": "Thanks."},
+        _our_comment(github_review, 41, "4000"),
+        _our_comment(github_review, 57, RUN_ID),
+    ]
+    _github(process, comments=comments)
+
+    assert _publish(github_review, tmp_path, _review()) == 0
+
+    assert capsys.readouterr().out == (
+        f"Updated review comment 41 on {REPO}#{NUMBER} for head {HEAD}. "
+        "Added neutral check run 555.\n"
+    )
+    (method, path, comment), (_, _, check_run) = process.writes()
+    assert (method, path) == ("PATCH", f"{COMMENT}/41")
+    assert github_review.marker_run_id(comment["body"]) == RUN_ID
+    assert f"- Review comment: {PR_URL}#issuecomment-41\n" in check_run["output"]["summary"]
+
+
+def test_publish_skips_when_a_newer_run_published(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _github(process, comments=[_our_comment(github_review, 41, "5000")])
+
+    assert _publish(github_review, tmp_path, _review()) == 0
+
+    assert capsys.readouterr().out == (
+        f"Skipped: a newer workflow run (5000) published the review comment on "
+        f"{REPO}#{NUMBER}. Nothing is published.\n"
+    )
+    assert process.writes() == []
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        pytest.param({"user": {"login": "mallory", "type": "User"}}, id="other-author"),
+        pytest.param(
+            {"user": {"login": "github-actions[bot]", "type": "User"}}, id="user-with-bot-login"
+        ),
+        pytest.param({"body": '<!-- cao-pr-review: {"run_id":"05000"} -->'}, id="invalid-run-id"),
+    ],
+)
+def test_publish_ignores_a_comment_that_is_not_ours(
+    github_review: ModuleType, process: FakeProcess, tmp_path: Path, changes: dict[str, Any]
+) -> None:
+    _github(process, comments=[{**_our_comment(github_review, 41, "5000"), **changes}])
+
+    assert _publish(github_review, tmp_path, _review()) == 0
+
+    assert [write[:2] for write in process.writes()] == [
+        ("POST", ISSUE_COMMENTS),
+        ("POST", CHECK_RUNS),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("read_back", "problems"),
+    [
+        ({"user": {"login": "mallory", "type": "User"}, "body": "Edited."}, "author, body"),
+        ({"user": {"login": "github-actions[bot]", "type": "User"}}, "author"),
+        ({"issue_url": f"https://api.github.com/repos/{REPO}/issues/{NUMBER + 10}"}, "PR"),
+    ],
+)
+def test_publish_never_writes_again_when_the_comment_does_not_match(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    read_back: dict[str, Any],
+    problems: str,
+) -> None:
+    output = tmp_path / "github_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    _github(process, read_back=read_back)
+
+    assert _publish(github_review, tmp_path, _review()) == 1
+
+    assert capsys.readouterr().out == (
+        f"Blocked: review comment 99 does not match the request ({problems}). "
+        "It is not changed again. Check it on the PR.\n"
+    )
+    assert [write[:2] for write in process.writes()] == [("POST", ISSUE_COMMENTS)]
+    assert output.read_text(encoding="utf-8") == "comment_written=true\n"
+
+
+@pytest.mark.parametrize(
+    ("failed", "note", "outputs"),
+    [
+        pytest.param(ISSUE_COMMENTS, "Nothing is posted again.", "", id="comment"),
+        pytest.param(
+            CHECK_RUNS,
+            "Review comment 99 is posted, but the check run is not added.",
+            "comment_written=true\n",
+            id="check-run",
+        ),
+    ],
+)
+def test_publish_stops_at_a_failed_write(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failed: str,
+    note: str,
+    outputs: str,
+) -> None:
+    output = tmp_path / "github_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
     _github(process)
-    request = tmp_path / "request.json"
+    process.routes[("POST", failed)] = _http_error(500)
 
-    assert _publish(github_review, tmp_path, _review(), "--dry-run", str(request)) == 0
-
-    assert capsys.readouterr().out == (
-        f"Dry run: the review request is in {request}. Nothing is posted.\n"
-    )
-    payload = json.loads(request.read_text(encoding="utf-8"))
-    assert set(payload) == {"commit_id", "body", "event", "comments"}
-    assert payload["event"] == "COMMENT"
-    assert process.posted() == []
-
-
-def test_publish_skips_a_run_that_already_published(
-    github_review: ModuleType,
-    process: FakeProcess,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    marker = github_review.build_marker(_review(), RUN_ID, "1")
-    _github(process, reviews=[{"user": BOT, "body": f"An earlier attempt.\n\n{marker}\n"}])
-
-    assert _publish(github_review, tmp_path, _review()) == 0
+    assert _publish(github_review, tmp_path, _review()) == 1
 
     assert capsys.readouterr().out == (
-        f"Workflow run {RUN_ID} already published its review. Nothing to do.\n"
+        f"Blocked: gh api {failed} failed: gh: Request failed (HTTP 500). {note}\n"
     )
-    assert process.paths() == [REVIEWS_PAGE]
-
-
-def test_publish_ignores_a_marker_from_another_author(
-    github_review: ModuleType, process: FakeProcess, tmp_path: Path
-) -> None:
-    marker = github_review.build_marker(_review(), RUN_ID, "1")
-    forged = [
-        {"user": {"login": "mallory", "type": "User"}, "body": marker},
-        {"user": {"login": "github-actions[bot]", "type": "User"}, "body": marker},
-    ]
-    _github(process, reviews=forged)
-
-    assert _publish(github_review, tmp_path, _review()) == 0
-
-    assert len(process.posted()) == 1
+    assert process.writes()[-1][1] == failed
+    # The workflow adds a "not published" check run only if no comment was written.
+    assert (output.read_text(encoding="utf-8") if output.exists() else "") == outputs
 
 
 @pytest.mark.parametrize(
@@ -2004,7 +2544,7 @@ def test_publish_reads_the_pr_again_before_posting(
     assert _publish(github_review, tmp_path, _review()) == expected_code
 
     assert capsys.readouterr().out == f"{message}\n"
-    assert process.posted() == []
+    assert process.paths() == [PULL]
 
 
 def test_publish_warns_when_the_head_moved_within_the_pr(
@@ -2015,10 +2555,10 @@ def test_publish_warns_when_the_head_moved_within_the_pr(
 
     assert _publish(github_review, tmp_path, _review()) == 0
 
-    [payload] = process.posted()
-    assert payload["commit_id"] == HEAD
+    (_, _, comment), (_, _, check_run) = process.writes()
     warning = f"Warning: the PR head moved to `{NEW_HEAD}` after this review started."
-    assert warning in payload["body"]
+    assert warning in comment["body"]
+    assert check_run["head_sha"] == HEAD
 
 
 @pytest.mark.parametrize(
@@ -2056,82 +2596,91 @@ def test_publish_stops_when_the_reviewed_head_cannot_be_found(
     assert _publish(github_review, tmp_path, _review()) == 1
 
     assert capsys.readouterr().out == f"{message}\n"
-    assert process.posted() == []
-
-
-def test_publish_retries_once_without_inline_comments_after_a_422(
-    github_review: ModuleType,
-    process: FakeProcess,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _github(process)
-    process.routes[("POST", REVIEWS)] = [_http_error(422), _ok({"id": 99})]
-
-    assert _publish(github_review, tmp_path, _review()) == 0
-
-    first, retry = process.posted()
-    assert len(first["comments"]) == 1
-    assert github_review.INLINE_FALLBACK_NOTE not in first["body"]
-    assert retry["comments"] == []
-    assert github_review.INLINE_FALLBACK_NOTE in retry["body"]
-    assert capsys.readouterr().out.endswith(" with 0 inline comments.\n")
+    assert process.writes() == []
 
 
 @pytest.mark.parametrize(
-    ("status", "comments"),
+    ("ours", "method", "path", "comment_url"),
     [
-        (500, _review()["comments"]),
-        (422, []),
+        pytest.param(False, "POST", ISSUE_COMMENTS, PR_URL, id="new-comment"),
+        pytest.param(True, "PATCH", f"{COMMENT}/41", f"{PR_URL}#issuecomment-41", id="update"),
     ],
 )
-def test_publish_does_not_retry_any_other_failed_post(
+def test_publish_dry_run_writes_the_requests_and_posts_nothing(
     github_review: ModuleType,
     process: FakeProcess,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
-    status: int,
-    comments: list[dict[str, Any]],
+    ours: bool,
+    method: str,
+    path: str,
+    comment_url: str,
 ) -> None:
+    _github(process, comments=[_our_comment(github_review, 41, "4000")] if ours else [])
+    request = tmp_path / "request.json"
+
+    code = _publish(
+        github_review, tmp_path, _panel_review(), "--dry-run", str(request), reviewers="panel"
+    )
+
+    assert code == 0
+    assert capsys.readouterr().out == (
+        f"Dry run: the requests are in {request}. Nothing is posted.\n"
+    )
+    payload = json.loads(request.read_text(encoding="utf-8"))
+    assert set(payload) == {"comment", "check_run"}
+    assert (payload["comment"]["method"], payload["comment"]["path"]) == (method, path)
+    assert "reviewers `panel`" in payload["comment"]["body"]
+    assert payload["check_run"]["conclusion"] == "neutral"
+    assert f"- Review comment: {comment_url}\n" in payload["check_run"]["output"]["summary"]
+    assert process.writes() == []
+
+
+def test_the_check_run_is_neutral_and_holds_no_agent_text(
+    github_review: ModuleType, process: FakeProcess, tmp_path: Path
+) -> None:
+    agent_text = "Zebra-agent-text"
+    review = _review(
+        sections=f"## Result\n\n**Changes required**\n\n{agent_text} in a section.\n",
+        risk={"level": "medium", "reasons": [f"{agent_text} as a risk reason."]},
+        result_states=["changes_required", "owner_decision_required", "incomplete"],
+        severity_counts={"P1": 1, "P2": 0, "P3": 2},
+        rejected_finding_ids=[],
+        owner_question_ids=["F2"],
+        not_checked_ids=["A2"],
+        review_complete=False,
+    )
     _github(process)
-    process.routes[("POST", REVIEWS)] = _http_error(status)
 
-    assert _publish(github_review, tmp_path, _review(comments=comments)) == 1
+    assert _publish(github_review, tmp_path, review) == 0
 
-    assert len(process.posted()) == 1
-    assert capsys.readouterr().out == (
-        f"Blocked: gh api {REVIEWS} failed: gh: Request failed (HTTP {status}). "
-        "Nothing is posted again.\n"
-    )
-
-
-@pytest.mark.parametrize(
-    ("published", "comment_changes", "problems"),
-    [
-        ({"commit_id": NEW_HEAD, "state": "APPROVED"}, None, "commit, state"),
-        ({"user": {"login": "mallory"}, "body": "Edited."}, None, "author, body"),
-        (None, {"side": "LEFT"}, "inline comments"),
-        (None, {"line": 3}, "inline comments"),
-    ],
-)
-def test_publish_reports_a_posted_review_that_does_not_match_the_request(
-    github_review: ModuleType,
-    process: FakeProcess,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    published: Optional[dict[str, Any]],
-    comment_changes: Optional[dict[str, Any]],
-    problems: str,
-) -> None:
-    _github(process, published=published, comment_changes=comment_changes)
-
-    assert _publish(github_review, tmp_path, _review()) == 1
-
-    assert capsys.readouterr().out == (
-        f"Published review 99 does not match the request ({problems}). "
-        "It is not posted again. Check it on the PR.\n"
-    )
-    assert len(process.posted()) == 1
+    (_, _, comment), (_, _, check_run) = process.writes()
+    assert agent_text in comment["body"]
+    assert agent_text not in json.dumps(check_run)
+    assert agent_text not in github_review.build_marker(review, RUN_ID, "2")
+    assert check_run == {
+        "name": "PR review (advisory)",
+        "head_sha": HEAD,
+        "status": "completed",
+        "conclusion": "neutral",
+        "details_url": RUN_URL,
+        "external_id": RUN_ID,
+        "output": {
+            "title": "Changes required (advisory)",
+            "summary": (
+                "Result: Changes required, Owner decision required, Incomplete.\n\n"
+                "- Accepted findings: P1 1, P2 0, P3 2\n"
+                "- Questions for the owner: 1\n"
+                "- Risk level: medium\n"
+                "- Reviewers: single\n"
+                "- Engine: kiro_cli\n"
+                "- Not checked: 1 of 3 REVIEW.md checks\n"
+                f"- Review comment: {PR_URL}#issuecomment-99\n"
+                f"- Workflow run: {RUN_URL}\n\n"
+                f"{ADVISORY}"
+            ),
+        },
+    }
 
 
 @pytest.mark.parametrize(
@@ -2140,6 +2689,10 @@ def test_publish_reports_a_posted_review_that_does_not_match_the_request(
         ({"head_sha": NEW_HEAD}, "head_sha is not the prepared head"),
         ({"publishable": False}, "publishable is not true"),
         ({"engine": "copilot_cli"}, "engine is not the dispatched engine"),
+        (
+            {"reviewers": "panel", "models": dict.fromkeys(SEATS, "")},
+            "reviewers is not the dispatched mode",
+        ),
         ({"base_ref": "main\n"}, "base_ref"),
         (
             {"result_states": ["owner_decision_required", "changes_required"]},
@@ -2151,10 +2704,6 @@ def test_publish_reports_a_posted_review_that_does_not_match_the_request(
         ),
         ({"rejected_finding_ids": []}, "every finding ID must be in exactly one group"),
         ({"sections": "## Result\n\n<!-- hidden -->\n"}, "sections hold an HTML comment"),
-        (
-            {"comments": [{"path": "/etc/passwd", "line": 1, "body": "Read it."}]},
-            "a comment path is invalid",
-        ),
     ],
 )
 def test_publish_refuses_an_invalid_review_before_any_github_call(
@@ -2169,6 +2718,94 @@ def test_publish_refuses_an_invalid_review_before_any_github_call(
 
     assert capsys.readouterr().out == f"Blocked: review.json is invalid: {message}.\n"
     assert process.calls == []
+
+
+@pytest.mark.parametrize(
+    ("reviewers", "changes", "message"),
+    [
+        pytest.param(
+            "single",
+            {"models": dict.fromkeys(SEATS, "")},
+            "models do not match the seats of the reviewers mode",
+            id="single-with-panel-seats",
+        ),
+        pytest.param(
+            "panel",
+            {"reviewers": "panel"},
+            "models do not match the seats of the reviewers mode",
+            id="panel-with-one-seat",
+        ),
+        pytest.param("single", {"step_timeout": 299}, "step_timeout", id="short-step-timeout"),
+        pytest.param("single", {"step_timeout": 2701}, "step_timeout", id="long-step-timeout"),
+        pytest.param("single", {"step_timeout": "1800"}, "step_timeout", id="text-step-timeout"),
+        pytest.param("single", {"policy_sha256": "E" * 64}, "policy_sha256", id="policy-sha"),
+        pytest.param("single", {"check_ids": []}, "check_ids", id="no-check"),
+        pytest.param("single", {"check_ids": ["A1", "A1"]}, "check_ids", id="duplicate-check"),
+        pytest.param("single", {"check_ids": ["A0"]}, "check_ids", id="invalid-check-id"),
+        pytest.param(
+            "single",
+            {"check_ids": [f"A{n}" for n in range(1, 42)]},
+            "check_ids",
+            id="too-many-checks",
+        ),
+        pytest.param(
+            "single",
+            {"not_checked_ids": ["B1"]},
+            "not_checked_ids are not unique check_ids",
+            id="unknown-not-checked-id",
+        ),
+        pytest.param(
+            "single",
+            {"not_checked_ids": ["A2", "A2"]},
+            "not_checked_ids are not unique check_ids",
+            id="duplicate-not-checked-id",
+        ),
+        pytest.param(
+            "single", {"risk": {"level": "severe", "reasons": ["Why."]}}, "risk", id="risk-level"
+        ),
+        pytest.param("single", {"risk": {"level": "low", "reasons": []}}, "risk", id="no-reason"),
+        pytest.param(
+            "single", {"risk": {"level": "low", "reasons": ["Why."] * 6}}, "risk", id="six-reasons"
+        ),
+        pytest.param(
+            "single", {"risk": {"level": "low", "reasons": ["x" * 201]}}, "risk", id="long-reason"
+        ),
+        pytest.param(
+            "single",
+            {"risk": {"level": "low", "reasons": ["Why."], "note": "More."}},
+            "risk",
+            id="extra-risk-key",
+        ),
+        pytest.param(
+            "single",
+            {"review_complete": False},
+            "review_complete does not match result_states",
+            id="incomplete-without-the-state",
+        ),
+        pytest.param(
+            "single",
+            {"result_states": ["incomplete"]},
+            "review_complete does not match result_states",
+            id="complete-with-the-incomplete-state",
+        ),
+        pytest.param(
+            "single",
+            {"not_checked_ids": ["A2"]},
+            "review_complete is true, but not_checked_ids is not empty",
+            id="complete-with-a-check-not-done",
+        ),
+    ],
+)
+def test_validate_review_refuses_a_review_that_breaks_the_contract(
+    github_review: ModuleType, reviewers: str, changes: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(github_review.Stop) as caught:
+        github_review.validate_review(_review(**changes), REPO, NUMBER, HEAD, "kiro_cli", reviewers)
+
+    assert (caught.value.code, caught.value.message) == (
+        1,
+        f"Blocked: review.json is invalid: {message}.",
+    )
 
 
 def test_publish_refuses_a_review_with_a_token_pattern(
@@ -2186,6 +2823,105 @@ def test_publish_refuses_a_review_with_a_token_pattern(
 
 
 # --------------------------------------------------------------------------
+# github_review.py: report-failure
+# --------------------------------------------------------------------------
+
+
+def _report_failure(github_review: ModuleType, job_result: str, *extra: str) -> int:
+    return github_review.main(
+        ["report-failure", "--repo", REPO, "--pr", str(NUMBER), "--head", HEAD]
+        + ["--run-id", RUN_ID, "--run-attempt", "2", "--server-url", "https://github.com"]
+        + ["--engine", "copilot_cli", "--reviewers", "panel", "--job-result", job_result]
+        + list(extra)
+    )
+
+
+@pytest.mark.parametrize(
+    ("job_result", "title", "text"),
+    [
+        pytest.param(
+            "failure",
+            "Review did not finish (advisory)",
+            f"The review job of {REPO}#{NUMBER} at `{HEAD}` ended with the result `failure`. "
+            "This run did not post or update a review comment.",
+            id="review-failed",
+        ),
+        pytest.param(
+            "publish_failure",
+            "Review not published (advisory)",
+            f"The review of {REPO}#{NUMBER} at `{HEAD}` finished, but this run did not post "
+            "or update the review comment. The workflow run log gives the reason.",
+            id="publish-failed",
+        ),
+    ],
+)
+def test_report_failure_adds_only_a_neutral_check_run_with_fixed_text(
+    github_review: ModuleType,
+    process: FakeProcess,
+    capsys: pytest.CaptureFixture[str],
+    job_result: str,
+    title: str,
+    text: str,
+) -> None:
+    process.routes[("POST", CHECK_RUNS)] = _ok({"id": 556})
+
+    assert _report_failure(github_review, job_result) == 0
+
+    assert capsys.readouterr().out == f"Added neutral check run 556 to {HEAD}: {title}.\n"
+    summary = (
+        f"{text} A review comment on the PR, if there is one, is from an earlier run.\n\n"
+        f"- Reviewers: panel\n- Engine: copilot_cli\n- Workflow run: {RUN_URL}\n\n{ADVISORY}"
+    )
+    assert process.writes() == [
+        (
+            "POST",
+            CHECK_RUNS,
+            {
+                "name": "PR review (advisory)",
+                "head_sha": HEAD,
+                "status": "completed",
+                "conclusion": "neutral",
+                "details_url": RUN_URL,
+                "external_id": RUN_ID,
+                "output": {"title": title, "summary": summary},
+            },
+        )
+    ]
+    assert process.paths() == [CHECK_RUNS]
+
+
+def test_report_failure_dry_run_writes_the_request_and_posts_nothing(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request = tmp_path / "request.json"
+
+    assert _report_failure(github_review, "cancelled", "--dry-run", str(request)) == 0
+
+    assert capsys.readouterr().out == f"Dry run: the request is in {request}. Nothing is posted.\n"
+    payload = json.loads(request.read_text(encoding="utf-8"))
+    assert list(payload) == ["check_run"]
+    assert payload["check_run"]["conclusion"] == "neutral"
+    assert "ended with the result `cancelled`." in payload["check_run"]["output"]["summary"]
+    assert process.calls == []
+
+
+def test_report_failure_fails_when_github_refuses_the_check_run(
+    github_review: ModuleType, process: FakeProcess, capsys: pytest.CaptureFixture[str]
+) -> None:
+    process.routes[("POST", CHECK_RUNS)] = _http_error(403)
+
+    assert _report_failure(github_review, "failure") == 1
+
+    assert capsys.readouterr().out == (
+        f"Blocked: gh api {CHECK_RUNS} failed: gh: Request failed (HTTP 403). "
+        "The check run is not added.\n"
+    )
+
+
+# --------------------------------------------------------------------------
 # github_review.py: summary
 # --------------------------------------------------------------------------
 
@@ -2195,7 +2931,7 @@ def _summary(github_review: ModuleType, tmp_path: Path, review: Any) -> int:
     path.write_text(json.dumps(review), encoding="utf-8")
     return github_review.main(
         ["summary", "--repo", REPO, "--pr", str(NUMBER), "--review", str(path)]
-        + ["--head", HEAD, "--engine", "kiro_cli"]
+        + ["--head", HEAD, "--engine", "kiro_cli", "--reviewers", "single"]
     )
 
 
@@ -2212,7 +2948,7 @@ def test_summary_adds_the_review_to_the_run_summary_and_not_to_the_log(
     assert _summary(github_review, tmp_path, _review()) == 0
 
     first_line = github_review.SUMMARY_FIRST_LINE.format(
-        repo=REPO, number=NUMBER, head_sha=HEAD, engine="kiro_cli"
+        repo=REPO, number=NUMBER, head_sha=HEAD, engine="kiro_cli", reviewers="single"
     )
     written = summary.read_text(encoding="utf-8")
     assert written == f"{first_line}\n\n## Result\n\n**Changes required**\n"
@@ -2269,3 +3005,199 @@ def test_summary_refuses_and_never_shows_the_review(
         assert not summary.exists()
     assert "## Result" not in out
     assert process.calls == []
+
+
+# --------------------------------------------------------------------------
+# .github/workflows/pr-review.yml: trust boundaries
+# --------------------------------------------------------------------------
+
+WORKFLOW_FILE = REPO_ROOT / ".github" / "workflows" / "pr-review.yml"
+COPILOT_DIR = REVIEW_DIR / "copilot"
+JOB_TOKEN = "${{ github.token }}"
+# Each engine credential is empty unless the run uses that engine.
+ENGINE_CREDENTIALS = {
+    "KIRO_API_KEY": "${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY || '' }}",
+    "COPILOT_GITHUB_TOKEN": (
+        "${{ inputs.engine == 'copilot_cli' && secrets.COPILOT_GITHUB_TOKEN || '' }}"
+    ),
+    "GITHUB_TOKEN": "${{ inputs.engine == 'copilot_cli' && github.token || '' }}",
+}
+CREDENTIAL_CHECK = "Check the review for credentials, then require a publishable result"
+
+
+@pytest.fixture(scope="module")
+def workflow() -> dict[Any, Any]:
+    return yaml.safe_load(WORKFLOW_FILE.read_text(encoding="utf-8"))
+
+
+def _step(job: dict[str, Any], name: str) -> dict[str, Any]:
+    return next(step for step in job["steps"] if step["name"] == name)
+
+
+def _leaves(value: Any, path: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], str]]:
+    """(path, text) of each string in the workflow. A path names a step by its name."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _leaves(item, (*path, str(key)))
+    elif isinstance(value, list):
+        for item in value:
+            name = item.get("name") if isinstance(item, dict) else None
+            yield from _leaves(item, (*path, name) if name else path)
+    elif isinstance(value, str):
+        yield path, value
+
+
+def test_workflow_starts_only_by_hand(workflow: dict[Any, Any]) -> None:
+    # PyYAML uses YAML 1.1, where the unquoted Actions key `on` is a boolean.
+    triggers = workflow[True]
+    assert list(triggers) == ["workflow_dispatch"]
+    reviewers = triggers["workflow_dispatch"]["inputs"]["reviewers"]
+    assert (reviewers["options"], reviewers["default"]) == (["single", "panel"], "single")
+
+
+def test_workflow_permissions_are_least_privilege(workflow: dict[Any, Any]) -> None:
+    assert workflow["permissions"] == {}
+    assert {job_id: job["permissions"] for job_id, job in workflow["jobs"].items()} == {
+        "prepare": {"contents": "read", "pull-requests": "read"},
+        "review": {"contents": "read", "copilot-requests": "write"},
+        "publish": {"contents": "read", "pull-requests": "write", "checks": "write"},
+    }
+
+
+def test_every_checkout_keeps_no_credential(workflow: dict[Any, Any]) -> None:
+    checkouts = [
+        step
+        for job in workflow["jobs"].values()
+        for step in job["steps"]
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    ]
+
+    assert len(checkouts) == 4
+    assert all(step["with"]["persist-credentials"] is False for step in checkouts)
+
+
+def test_only_the_review_job_gets_an_engine_credential(workflow: dict[Any, Any]) -> None:
+    uses = {
+        (*path, text)
+        for path, text in _leaves(workflow)
+        if re.search(r"secrets\.|github\.token", text)
+    }
+
+    gh_token = ("env", "GH_TOKEN", JOB_TOKEN)
+    assert uses == {
+        ("jobs", "prepare", "steps", "Read the PR (a closed PR fails; a draft is skipped)")
+        + gh_token,
+        *[
+            ("jobs", "review", "steps", step, "env", name, value)
+            for step in ("Start cao-server", CREDENTIAL_CHECK)
+            for name, value in ENGINE_CREDENTIALS.items()
+        ],
+        (
+            "jobs",
+            "publish",
+            "steps",
+            "Post or update the review comment, then add a neutral check run",
+        )
+        + gh_token,
+        (
+            "jobs",
+            "publish",
+            "steps",
+            "Add a neutral check run that says the review is not published",
+        )
+        + gh_token,
+    }
+
+
+def test_the_agents_get_only_the_kept_variables(workflow: dict[Any, Any]) -> None:
+    start = _step(workflow["jobs"]["review"], "Start cao-server")["run"]
+
+    assert re.findall(r'^ *keep="([^"]*)"$', start, re.MULTILINE) == [
+        "KIRO_API_KEY KIRO_NO_AUTO_UPDATE",
+        "COPILOT_GITHUB_TOKEN",
+        "GITHUB_TOKEN",
+        "HOME PATH SHELL USER LANG LC_ALL $keep",
+    ]
+    assert '*) unset "$name" 2>/dev/null || true ;;' in start
+
+
+def test_only_the_review_job_uses_the_ai_review_environment(workflow: dict[Any, Any]) -> None:
+    environments = {job_id: job.get("environment") for job_id, job in workflow["jobs"].items()}
+
+    assert environments == {
+        "prepare": None,
+        "review": {"name": "ai-review", "deployment": False},
+        "publish": None,
+    }
+
+
+def test_a_later_dispatch_for_the_same_pr_cancels_the_earlier_run(
+    workflow: dict[Any, Any],
+) -> None:
+    assert workflow["concurrency"] == {
+        "group": "pr-review-${{ inputs.pr }}",
+        "cancel-in-progress": True,
+    }
+
+
+def test_the_agents_stop_before_a_later_step_gets_a_credential(workflow: dict[Any, Any]) -> None:
+    steps = workflow["jobs"]["review"]["steps"]
+    names = [step["name"] for step in steps]
+    stop = names.index("Stop cao-server and the agents")
+
+    assert names[stop - 1] == "Run the review"
+    assert names.index("Start cao-server") < stop < names.index(CREDENTIAL_CHECK)
+    assert names[-1] == "Stop cao-server and the agents (backstop)"
+    assert steps[stop]["if"] == steps[-1]["if"] == "always()"
+    assert steps[stop]["run"] == steps[-1]["run"]
+
+
+def test_the_review_applies_the_review_md_of_the_dispatched_ref(workflow: dict[Any, Any]) -> None:
+    job = workflow["jobs"]["review"]
+    checkout = _step(job, "Check out CAO and the review scripts from the dispatched ref")
+    run = _step(job, "Run the review")["run"]
+
+    assert checkout["with"] == {"path": "trusted", "persist-credentials": False}
+    assert '--input "reviewers=$REVIEWERS"' in run
+    assert '--input "policy=$GITHUB_WORKSPACE/trusted/REVIEW.md"' in run
+    assert (REPO_ROOT / "REVIEW.md").is_file()
+
+
+def test_publish_reports_a_review_that_is_not_published_with_a_neutral_check(
+    workflow: dict[Any, Any],
+) -> None:
+    job = workflow["jobs"]["publish"]
+    download = _step(job, "Download review.json")
+    publish = _step(job, "Post or update the review comment, then add a neutral check run")
+    failure = _step(job, "Add a neutral check run that says the review is not published")
+
+    assert job["if"] == "${{ !cancelled() && needs.prepare.outputs.proceed == 'true' }}"
+    assert download["if"] == publish["if"] == "needs.review.result == 'success'"
+    assert publish["id"] == "publish"
+    assert failure["if"] == (
+        "${{ !cancelled() && (needs.review.result != 'success' || "
+        "(steps.publish.outcome != 'success' && steps.publish.outputs.comment_written != 'true')) }}"
+    )
+    assert failure["env"]["JOB_RESULT"] == (
+        "${{ needs.review.result == 'success' && 'publish_failure' || needs.review.result }}"
+    )
+    assert '--reviewers "$REVIEWERS"' in publish["run"]
+    assert '--job-result "$JOB_RESULT"' in failure["run"]
+
+
+def test_copilot_cli_installs_from_the_committed_lockfile(workflow: dict[Any, Any]) -> None:
+    job = workflow["jobs"]["review"]
+    install = _step(job, "Install Copilot CLI from the committed lockfile")["run"]
+    manifest = json.loads((COPILOT_DIR / "package.json").read_text(encoding="utf-8"))
+    lock = json.loads((COPILOT_DIR / "package-lock.json").read_text(encoding="utf-8"))
+    [(name, version)] = manifest["dependencies"].items()
+    locked = lock["packages"][f"node_modules/{name}"]
+
+    assert "trusted/.github/pr-review/copilot/package-lock.json" in install
+    assert "npm ci --ignore-scripts --no-audit --no-fund" in install
+    assert 'engine_bin="$base/copilot/node_modules/.bin:' in _step(job, "Start cao-server")["run"]
+    assert not any("npm install" in text for _, text in _leaves(workflow))
+    assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version)
+    assert lock["packages"][""]["dependencies"] == manifest["dependencies"]
+    assert locked["version"] == version
+    assert locked["integrity"].startswith("sha512-")

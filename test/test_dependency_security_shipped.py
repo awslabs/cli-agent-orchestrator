@@ -645,6 +645,14 @@ def test_tracked_lockfile_without_a_producer_fails_closed(tmp_path, monkeypatch)
         audit.collect_shipped_sets(tmp_path, INPUTS + [Path("newproject/package-lock.json")])
 
 
+def test_the_pr_review_tool_lockfile_ships_nothing(tmp_path, monkeypatch):
+    # The pr-review workflow installs Copilot CLI from it on a runner; CAO does not ship it.
+    _all_producers(monkeypatch)
+    lockfile = Path(".github/pr-review/copilot/package-lock.json")
+    sets = audit.collect_shipped_sets(tmp_path, INPUTS + [lockfile])
+    assert lockfile.as_posix() not in sets
+
+
 # ── #1398 box 5: ignore-file validation ──────────────────────────────────────
 
 

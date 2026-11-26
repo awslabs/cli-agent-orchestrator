@@ -1,8 +1,11 @@
 name: PR Review
 
-# AI-assisted review of one pull request by a panel of CAO agents. A maintainer
-# starts it by hand and chooses the PR and the agent CLI. It posts one COMMENT
-# review: never an approval and never a change request.
+# AI-assisted review of one pull request by CAO agents. A maintainer starts it
+# by hand and chooses the PR, the agent CLI and the reviewers: `single` (the
+# default) runs one agent, `panel` runs two reviewers, two voters and an
+# adjudicator. The result is one issue comment on the PR, which later runs
+# update in place, and one neutral check run on the reviewed head. It never
+# approves, requests changes or blocks a merge.
 #
 # The procedure, the secrets and the trust boundaries are in
 # .github/pr-review/README.md. In short:
@@ -14,7 +17,7 @@ name: PR Review
 # - The agents read the PR head as files. No step runs code from the PR head.
 # - Each run reviews one head SHA. `publish` refuses a stale result.
 
-run-name: "PR review of #${{ inputs.pr }} (${{ inputs.engine }})"
+run-name: "PR review of #${{ inputs.pr }} (${{ inputs.engine }}, ${{ inputs.reviewers }})"
 
 on:
   workflow_dispatch:
@@ -24,40 +27,49 @@ on:
         required: true
         type: number
       engine:
-        description: Agent CLI that runs the panel
+        description: Agent CLI that runs the review
         required: true
         type: choice
         default: kiro_cli
         options:
           - kiro_cli
           - copilot_cli
+      reviewers:
+        description: "single: one agent reviews (the default). panel: two reviewers, two voters and an adjudicator"
+        required: true
+        type: choice
+        default: single
+        options:
+          - single
+          - panel
       model_a:
-        description: Model for reviewer-a, vote-1 and the adjudicator (empty for KIRO_MODEL_A with kiro_cli, or the CLI default with copilot_cli)
+        description: Model for reviewer-a, and in panel mode also vote-1 and the adjudicator (empty for KIRO_MODEL_A with kiro_cli, or the CLI default with copilot_cli)
         required: false
         type: string
         default: ""
       model_b:
-        description: Model for reviewer-b and vote-2 (empty for KIRO_MODEL_B with kiro_cli, or the CLI default with copilot_cli)
+        description: Panel mode only. Model for reviewer-b and vote-2 (empty for KIRO_MODEL_B with kiro_cli, or the CLI default with copilot_cli)
         required: false
         type: string
         default: ""
 
 permissions: {}
 
-# One review of a PR at a time. A second dispatch waits; it does not cancel a
-# review that is in progress.
+# One review of a PR at a time. A later dispatch for the same PR cancels the
+# earlier run, so the newest run owns the one review comment.
 concurrency:
   group: pr-review-${{ inputs.pr }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   # Every uv command installs exactly the committed uv.lock (see ci.yml).
   UV_LOCKED: "1"
-  # The default models of the kiro_cli panel. Model A runs reviewer-a, vote-1
-  # and the adjudicator, the one seat that works alone. Model B runs
-  # reviewer-b and vote-2. To change a default, change it here. The model_a
-  # and model_b inputs change it for one run. copilot_cli uses the Copilot CLI
-  # default model. See "Models" in .github/pr-review/README.md.
+  # The default models of the kiro_cli seats. Model A runs reviewer-a, and in
+  # panel mode also vote-1 and the adjudicator, the one seat that works alone.
+  # Model B runs reviewer-b and vote-2 in panel mode only. To change a default,
+  # change it here. The model_a and model_b inputs change it for one run.
+  # copilot_cli uses the Copilot CLI default model. See "Models" in
+  # .github/pr-review/README.md.
   KIRO_MODEL_A: claude-opus-5.5
   KIRO_MODEL_B: claude-opus-5.5
   # chat.modelDefaults of the Kiro seats: settings for each model ID, such as
@@ -105,12 +117,20 @@ jobs:
           retention-days: 7
 
   review:
-    name: Run the review panel
+    name: Run the review
     needs: prepare
     if: needs.prepare.outputs.proceed == 'true'
     runs-on: ubuntu-latest
-    # Each of the three panel phases can use the full step timeout of
-    # pr_review.py (1800 s), plus the time to start the agents.
+    # Keep the engine secrets in the ai-review environment, and let only the
+    # main branch use it. deployment: false uses the environment, its secrets
+    # and its branch rule without a deployment record. A job in an environment
+    # with a custom deployment protection rule fails. If the environment does
+    # not exist, the first run creates it with no rules and no secrets.
+    environment:
+      name: ai-review
+      deployment: false
+    # In panel mode, each of the three phases can use the full step timeout of
+    # pr_review.py (1800 s by default), plus the time to start the agents.
     timeout-minutes: 150
     permissions:
       # Check out CAO and the PR head.
@@ -120,16 +140,24 @@ jobs:
       # engine never gets the job token.
       copilot-requests: write
     steps:
-      - name: Choose the models of the panel
+      - name: Choose the models of the seats
         id: models
         env:
           ENGINE: ${{ inputs.engine }}
+          REVIEWERS: ${{ inputs.reviewers }}
           MODEL_A: ${{ inputs.model_a }}
           MODEL_B: ${{ inputs.model_b }}
         run: |
+          if [ "$REVIEWERS" = single ] && [ -n "$MODEL_B" ]; then
+            echo "::notice::Single mode does not use model_b."
+          fi
           if [ "$ENGINE" = kiro_cli ]; then
             MODEL_A="${MODEL_A:-$KIRO_MODEL_A}"
             MODEL_B="${MODEL_B:-$KIRO_MODEL_B}"
+          fi
+          # Single mode runs reviewer-a only, so it has no model B.
+          if [ "$REVIEWERS" = single ]; then
+            MODEL_B=""
           fi
           # The rule of MODEL_RE in pr_review.py, which checks the names again.
           for model in "$MODEL_A" "$MODEL_B"; do
@@ -138,10 +166,15 @@ jobs:
               exit 1
             fi
           done
-          echo "Model A (reviewer-a, vote-1, adjudicator): ${MODEL_A:-CLI default}"
-          echo "Model B (reviewer-b, vote-2): ${MODEL_B:-CLI default}"
+          if [ "$REVIEWERS" = panel ]; then
+            echo "Model A (reviewer-a, vote-1, adjudicator): ${MODEL_A:-CLI default}"
+            echo "Model B (reviewer-b, vote-2): ${MODEL_B:-CLI default}"
+          else
+            echo "Model A (reviewer-a): ${MODEL_A:-CLI default}"
+          fi
           { echo "a=$MODEL_A"; echo "b=$MODEL_B"; } >> "$GITHUB_OUTPUT"
 
+      # A full checkout: the agents apply REVIEW.md at the root of this ref.
       - name: Check out CAO and the review scripts from the dispatched ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -215,13 +248,18 @@ jobs:
           node-version: "24"
           package-manager-cache: false
 
-      - name: Install Copilot CLI (pinned version)
+      - name: Install Copilot CLI from the committed lockfile
         if: inputs.engine == 'copilot_cli'
-        env:
-          COPILOT_VERSION: "1.0.114"
         run: |
-          npm install --global --ignore-scripts --no-audit --no-fund "@github/copilot@${COPILOT_VERSION}"
-          command -v copilot
+          dir="$RUNNER_TEMP/pr-review/copilot"
+          mkdir -p "$dir"
+          cp trusted/.github/pr-review/copilot/package.json \
+            trusted/.github/pr-review/copilot/package-lock.json "$dir/"
+          cd "$dir"
+          # npm ci installs exactly the versions in the lockfile and checks the
+          # integrity hash of each package. No install script runs.
+          npm ci --ignore-scripts --no-audit --no-fund
+          test -x node_modules/.bin/copilot
 
       - name: Prepare the CAO home and an empty agent working directory
         env:
@@ -270,7 +308,8 @@ jobs:
               keep="KIRO_API_KEY KIRO_NO_AUTO_UPDATE"
               ;;
             copilot_cli)
-              engine_bin="$(dirname "$(command -v copilot)")"
+              # The copilot command from npm ci. Its loader runs on node.
+              engine_bin="$base/copilot/node_modules/.bin:$(dirname "$(command -v node)")"
               # A COPILOT_GITHUB_TOKEN secret (a fine-grained PAT) wins.
               # Otherwise the job token pays for the requests.
               if [ -n "$COPILOT_GITHUB_TOKEN" ]; then
@@ -318,7 +357,7 @@ jobs:
                 exit 1
               fi
             done
-            echo "The KIRO_API_KEY account offers the models of the panel."
+            echo "The KIRO_API_KEY account offers the chosen models."
           fi
           (filter_env; exec setsid cao-server) > "$base/cao-server.log" 2>&1 &
           echo "$!" > "$base/cao-server.pid"
@@ -345,10 +384,11 @@ jobs:
           done
           cao workflow create pr_review --from-file "$review_dir/pr_review.py" --json > /dev/null
 
-      - name: Run the review panel
+      - name: Run the review
         timeout-minutes: 120
         env:
           ENGINE: ${{ inputs.engine }}
+          REVIEWERS: ${{ inputs.reviewers }}
           MODEL_A: ${{ steps.models.outputs.a }}
           MODEL_B: ${{ steps.models.outputs.b }}
         run: |
@@ -361,6 +401,8 @@ jobs:
             --input "source_dir=$GITHUB_WORKSPACE/pr-head"
             --input "work_dir=$base/work"
             --input "engine=$ENGINE"
+            --input "reviewers=$REVIEWERS"
+            --input "policy=$GITHUB_WORKSPACE/trusted/REVIEW.md"
           )
           if [ -n "$MODEL_A" ]; then args+=(--input "model_a=$MODEL_A"); fi
           if [ -n "$MODEL_B" ]; then args+=(--input "model_b=$MODEL_B"); fi
@@ -400,13 +442,36 @@ jobs:
               "$review"
           fi
 
+      # always(): stop the agents as soon as the review ends, also when it
+      # failed or the run was cancelled. So no agent runs while a later step
+      # holds a credential. Never fails the job (see ci.yml).
+      - name: Stop cao-server and the agents
+        if: always()
+        run: |
+          pidfile="$RUNNER_TEMP/pr-review/cao-server.pid"
+          if [ -f "$pidfile" ]; then
+            pid="$(cat "$pidfile")"
+            kill -TERM "-${pid}" 2> /dev/null || kill -TERM "$pid" 2> /dev/null || true
+            for _ in 1 2 3 4 5; do
+              kill -0 "$pid" 2> /dev/null || break
+              sleep 1
+            done
+            kill -KILL "-${pid}" 2> /dev/null || kill -KILL "$pid" 2> /dev/null || true
+            rm -f "$pidfile"
+          fi
+          tmux kill-server 2> /dev/null || true
+          echo "cao-server and tmux stopped"
+          exit 0
+
       - name: Check the review for credentials, then require a publishable result
         env:
-          KIRO_API_KEY: ${{ secrets.KIRO_API_KEY }}
-          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ github.token }}
+          # Each engine gets only its own credential, as in "Start cao-server".
+          KIRO_API_KEY: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY || '' }}
+          COPILOT_GITHUB_TOKEN: ${{ inputs.engine == 'copilot_cli' && secrets.COPILOT_GITHUB_TOKEN || '' }}
+          GITHUB_TOKEN: ${{ inputs.engine == 'copilot_cli' && github.token || '' }}
         run: |
           review="$RUNNER_TEMP/pr-review/evidence/review.json"
+          # check-secrets does not check a variable that is empty.
           python3 trusted/.github/pr-review/github_review.py check-secrets \
             --file "$review" --env KIRO_API_KEY --env COPILOT_GITHUB_TOKEN --env GITHUB_TOKEN
           if ! jq -e '.publishable == true' "$review" > /dev/null; then
@@ -431,15 +496,15 @@ jobs:
           PR_NUMBER: ${{ inputs.pr }}
           HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
           ENGINE: ${{ inputs.engine }}
+          REVIEWERS: ${{ inputs.reviewers }}
         run: >-
           python3 trusted/.github/pr-review/github_review.py summary
           --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER"
           --review "$RUNNER_TEMP/pr-review/evidence/review.json"
-          --head "$HEAD_SHA" --engine "$ENGINE"
+          --head "$HEAD_SHA" --engine "$ENGINE" --reviewers "$REVIEWERS"
 
-      # always(): stop the agents also when a step failed or the run was
-      # cancelled. Never fails the job (see ci.yml).
-      - name: Stop cao-server and the agents
+      # A backstop: the same stop again at the end of the job.
+      - name: Stop cao-server and the agents (backstop)
         if: always()
         run: |
           pidfile="$RUNNER_TEMP/pr-review/cao-server.pid"
@@ -458,16 +523,21 @@ jobs:
           exit 0
 
   publish:
-    name: Post the review
+    name: Post the review comment and the check
     needs: [prepare, review]
-    if: needs.prepare.outputs.proceed == 'true'
+    # !cancelled(): this job also runs when the review job failed, to add a
+    # neutral check run that says so. A cancelled run posts nothing.
+    if: ${{ !cancelled() && needs.prepare.outputs.proceed == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       # Check out the review scripts.
       contents: read
-      # Read the PR, its reviews, commits and comments, and post the review.
+      # Read the PR, its commits and comments, and post or update the review
+      # comment. A PR comment is an issue comment, but this permission is enough.
       pull-requests: write
+      # Add the neutral check run to the reviewed head.
+      checks: write
     steps:
       - name: Check out the review scripts from the dispatched ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -477,17 +547,21 @@ jobs:
           sparse-checkout: .github/pr-review
 
       - name: Download review.json
+        if: needs.review.result == 'success'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: pr-review-result
           path: ${{ runner.temp }}/pr-review/result
 
-      - name: Post one COMMENT review on the reviewed head
+      - name: Post or update the review comment, then add a neutral check run
+        id: publish
+        if: needs.review.result == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr }}
           HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
           ENGINE: ${{ inputs.engine }}
+          REVIEWERS: ${{ inputs.reviewers }}
           ACTOR: ${{ github.triggering_actor }}
         run: >-
           python3 trusted/.github/pr-review/github_review.py publish
@@ -496,4 +570,24 @@ jobs:
           --head "$HEAD_SHA"
           --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
           --server-url "$GITHUB_SERVER_URL"
-          --engine "$ENGINE" --actor "$ACTOR"
+          --engine "$ENGINE" --reviewers "$REVIEWERS" --actor "$ACTOR"
+
+      # The review job did not succeed, or this job did not write the review
+      # comment. A neutral check run with fixed text then says so. After the
+      # comment is written (comment_written), a later failure adds no check run,
+      # because that text would be false.
+      - name: Add a neutral check run that says the review is not published
+        if: ${{ !cancelled() && (needs.review.result != 'success' || (steps.publish.outcome != 'success' && steps.publish.outputs.comment_written != 'true')) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr }}
+          HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
+          ENGINE: ${{ inputs.engine }}
+          REVIEWERS: ${{ inputs.reviewers }}
+          JOB_RESULT: ${{ needs.review.result == 'success' && 'publish_failure' || needs.review.result }}
+        run: >-
+          python3 trusted/.github/pr-review/github_review.py report-failure
+          --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" --head "$HEAD_SHA"
+          --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+          --server-url "$GITHUB_SERVER_URL"
+          --engine "$ENGINE" --reviewers "$REVIEWERS" --job-result "$JOB_RESULT"
