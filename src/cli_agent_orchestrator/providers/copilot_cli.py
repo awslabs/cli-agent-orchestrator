@@ -242,13 +242,20 @@ class CopilotCliProvider(BaseProvider):
             from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
 
             disallowed = get_disallowed_tools("copilot_cli", self._allowed_tools)
+            network_off = "url" in disallowed
+            if network_off and "shell" not in disallowed:
+                # The `url` kind also covers shell commands. On the other
+                # providers a shell grant keeps URL access, so hide only the
+                # fetch tool here.
+                disallowed = [tool for tool in disallowed if tool != "url"]
+                command_parts.extend(["--excluded-tools", "web_fetch"])
             for tool in disallowed:
                 command_parts.extend(["--deny-tool", tool])
             # A `url` rule does not reach MCP tools, and Copilot's built-in MCP
             # servers reach GitHub, hosted services, a browser or the desktop.
             # `--disable-builtin-mcps` does not cover `computer-use` (Copilot
             # CLI command reference, 1.0.114). An unknown flag stops the launch.
-            if "url" in disallowed:
+            if network_off:
                 command_parts.extend(
                     ["--disable-builtin-mcps", "--disable-mcp-server", "computer-use"]
                 )

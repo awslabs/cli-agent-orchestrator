@@ -18,33 +18,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status poll in `wait_until_terminal_status` uses) instead of the module-wide 60s read
   timeout. Each status read stops after 5s to connect and 5s without data, so a stalled
   broker can overrun `cao worker send --timeout` by about 6s instead of about 60s.
-
-- **CI: a pull request review by a panel of CAO agents**. The manually dispatched GitHub
-  Actions workflow `.github/workflows/pr-review.yml` reviews one PR of this repository with two
-  reviewers, two fresh voters and an adjudicator. Each seat is a step of the CAO workflow in
-  `.github/pr-review/`, and it returns a validated report with `workflow_return`. The script
-  applies fixed verdict rules. The panel runs with `kiro_cli` (the default) or `copilot_cli`.
-  The agents run with a read-only token, and a separate job posts one `COMMENT` review. The
-  review never approves a PR or requests changes.
-
-- **copilot_cli: `web_fetch` now gates network access**. A Copilot grant without `web_fetch`,
-  such as the `supervisor`, `reviewer` and `workflow_scout` roles, kept URL access and Copilot's
-  built-in MCP servers, because the Copilot tool mapping had no network entry. Such a grant now
-  adds `--deny-tool url`. This rule blocks URL access by Copilot's web-fetch tool and by the
-  shell commands that Copilot checks for URLs, as the other providers already do. A `url` rule
-  does not reach MCP tools, so the same grant also adds `--disable-builtin-mcps` and
-  `--disable-mcp-server computer-use`. These turn off the built-in servers, such as
-  `github-mcp-server`. `cao-mcp-server` stays on. The `developer` role and the no-role default
-  keep `web_fetch`. Add `web_fetch` to any other Copilot profile that needs the network or the
-  built-in GitHub MCP server.
-
-- **copilot_cli: a structured workflow step can return its answer**. Copilot starts a stdio
-  MCP server with only `PATH` and a few platform variables. So `cao-mcp-server` did not get
-  the `CAO_WORKFLOW_RUN_ID` and `CAO_WORKFLOW_STEP_ID` that CAO sets for a workflow step, and
-  `workflow_return` said that they were not set. The provider now forwards both as `${VAR:-}`
-  placeholders, which Copilot expands from its own environment. Outside a workflow step the
-  values are empty, and `workflow_return` refuses them.
-
 - **Workspace split panes fill themselves**. Picking 2 or 4 panes in the Workspace tab now
   shows the session's other agents in the empty panes, in tab order, instead of leaving them
   blank. Panes already showing an agent keep it, and clicking the current layout again refills

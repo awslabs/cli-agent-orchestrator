@@ -411,13 +411,16 @@ class TestCopilotCliProviderCommand:
         assert "shell" in parts
 
     @pytest.mark.parametrize(
-        ("allowed_tools", "gated"),
+        ("allowed_tools", "gated", "shell"),
         [
-            ([], True),
-            (["@builtin", "fs_read", "fs_list", "@cao-mcp-server"], True),
-            (["fs_read", "web_fetch", "@cao-mcp-server"], False),
-            (["*"], False),
-            (None, False),
+            ([], True, False),
+            (["@builtin", "fs_read", "fs_list", "@cao-mcp-server"], True, False),
+            (["execute_bash", "fs_*"], True, True),
+            (["execute_bash", "fs_read", "@cao-mcp-server", "@github-mcp-server"], True, True),
+            (["fs_read", "web_fetch", "@cao-mcp-server"], False, False),
+            (["execute_bash", "web_fetch"], False, True),
+            (["*"], False, True),
+            (None, False, True),
         ],
     )
     @patch("cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._supports_flag")
@@ -427,9 +430,14 @@ class TestCopilotCliProviderCommand:
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     @patch.dict("os.environ", {}, clear=True)
     def test_grant_without_web_fetch_disables_builtin_mcp_servers(
-        self, mock_tmux, mock_build_mcp, mock_supports_flag, allowed_tools, gated
+        self, mock_tmux, mock_build_mcp, mock_supports_flag, allowed_tools, gated, shell
     ):
-        """A url rule does not reach MCP tools, so the built-in servers go off too."""
+        """A grant without web_fetch loses the fetch tool and the built-in MCP servers.
+
+        A shell grant keeps URL access from the shell, as on the other
+        providers, so only the fetch tool is hidden. Without a shell, the
+        `url` rule blocks the fetch tool.
+        """
         mock_supports_flag.return_value = True
         mock_build_mcp.return_value = '{"mcpServers":{"cao-mcp-server":{"command":"x"}}}'
         mock_tmux.return_value.get_pane_working_directory.return_value = "/tmp/project"
@@ -442,7 +450,9 @@ class TestCopilotCliProviderCommand:
 
         assert ("--disable-builtin-mcps" in parts) is gated
         assert (("--disable-mcp-server", "computer-use") in pairs) is gated
-        assert (("--deny-tool", "url") in pairs) is gated
+        assert (("--deny-tool", "url") in pairs) is (gated and not shell)
+        assert (("--excluded-tools", "web_fetch") in pairs) is (gated and shell)
+        assert (("--deny-tool", "shell") in pairs) is not shell
         assert "--additional-mcp-config" in parts
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._supports_flag")
