@@ -374,8 +374,10 @@ def launch(
                 if provider == "copilot_cli":
                     # The names that the provider's flags block: a shell grant
                     # keeps `url` and hides the web_fetch tool instead.
-                    denied, excluded = copilot_tool_rules(resolved_allowed_tools)
+                    denied, excluded, builtin_mcps_off = copilot_tool_rules(resolved_allowed_tools)
                     blocked = sorted(denied + excluded)
+                    if builtin_mcps_off:
+                        blocked.append("built-in MCP servers")
                 blocked_summary = ", ".join(blocked) if blocked else "(none)"
                 level = enforcement_for(provider)
                 if is_install_time(provider):

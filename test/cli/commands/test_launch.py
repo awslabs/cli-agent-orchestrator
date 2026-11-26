@@ -1755,8 +1755,11 @@ def test_launch_gate_blocked_line_matches_the_docs_example(tools):
     ("tools", "blocked"),
     [
         # A shell grant keeps URL access from the shell, so only web_fetch is hidden.
-        (["@cao-mcp-server", "fs_read", "execute_bash"], "grep, list, web_fetch, write"),
-        (["@cao-mcp-server", "fs_read"], "grep, list, shell, url, write"),
+        (
+            ["@cao-mcp-server", "fs_read", "execute_bash"],
+            "grep, list, web_fetch, write, built-in MCP servers",
+        ),
+        (["@cao-mcp-server", "fs_read"], "grep, list, shell, url, write, built-in MCP servers"),
         (["@cao-mcp-server", "fs_read", "execute_bash", "web_fetch"], "grep, list, write"),
     ],
 )

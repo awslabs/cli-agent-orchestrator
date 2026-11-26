@@ -466,6 +466,8 @@ Copilot's built-in MCP servers, such as `github-mcp-server`. This applies also
 when the grant names a built-in server, such as `@github-mcp-server`; add
 `web_fetch` to keep them. `--disable-builtin-mcps` does not cover
 `computer-use`, so CAO turns that server off by name. `cao-mcp-server` stays on.
+The `Blocked` line of the `cao launch` prompt then ends with
+`built-in MCP servers`.
 
 **Grok Build CLI** — For a restricted profile, uses deny-by-default
 `--permission-mode dontAsk`, explicitly grants mapped native tools and known

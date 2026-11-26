@@ -241,7 +241,7 @@ class CopilotCliProvider(BaseProvider):
         if self._allowed_tools is not None and "*" not in self._allowed_tools:
             from cli_agent_orchestrator.utils.tool_mapping import copilot_tool_rules
 
-            denied, excluded = copilot_tool_rules(self._allowed_tools)
+            denied, excluded, builtin_mcps_off = copilot_tool_rules(self._allowed_tools)
             for tool in excluded:
                 command_parts.extend(["--excluded-tools", tool])
             for tool in denied:
@@ -251,7 +251,7 @@ class CopilotCliProvider(BaseProvider):
             # reach GitHub, hosted services, a browser or the desktop.
             # `--disable-builtin-mcps` does not cover `computer-use` (Copilot
             # CLI command reference, 1.0.114). An unknown flag stops the launch.
-            if "url" in denied or excluded:
+            if builtin_mcps_off:
                 command_parts.extend(
                     ["--disable-builtin-mcps", "--disable-mcp-server", "computer-use"]
                 )
