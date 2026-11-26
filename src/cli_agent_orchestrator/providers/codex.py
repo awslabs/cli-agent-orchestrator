@@ -1388,24 +1388,34 @@ def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
 def _find_response_marker(text: str) -> Optional[re.Match[str]]:
     """Find the first model-reply marker after a structural activity prelude.
 
-    Native Codex activity cells have a ``•`` summary followed by a ``└`` tree
-    continuation. Codex draws that continuation under every activity row, even
-    for a command that prints nothing (``└ (no output)``), and it draws the
-    model's reply as its own ``•`` cell below the last of them (captures of
-    0.171.0 in test/providers/fixtures/codex_541_*.txt, issue #541).
+    Codex draws each activity cell and the model's reply as a ``•`` row at
+    column 0. Under an activity summary it draws a ``└`` tree row straight
+    away, even for a command that prints nothing (``└ (no output)``); a
+    multi-line command has ``│`` rows between the two. The reply is its own
+    column-0 cell below the last activity cell, and everything the model
+    writes in it, bullets included, is indented (captures of 0.171.0 in
+    test/providers/fixtures/codex_541_*.txt, issue #541; the ``│`` rows are in
+    codex_approval_long_preview_raw.txt).
 
-    So the reply starts at the first ``•`` marker after the last complete cell.
-    One cell is enough when a marker follows it: before #541 two were required,
-    and a turn with a single command returned Codex's opening line, the cell
-    and the reply together.
+    So only a column-0 ``•`` whose next row is that tree row counts as an
+    activity cell, and the reply starts at the first column-0 marker after the
+    last such cell. One cell is enough: before #541 two were required, and a
+    turn with a single command returned Codex's opening line, the cell and the
+    reply together.
+
+    An indented ``•`` is never a cell and never the start of the reply once a
+    cell has been seen: it is a bullet inside the reply, or a line of command
+    output. A ``└`` further down a reply (a file tree the model drew, a quoted
+    cell) does not make that reply an activity cell either.
 
     Two cases stay as they were, because the layout alone cannot decide them:
 
     - Compact bullet groups with no ``└`` row are preserved whole. They look
       the same as a reply made of several bullets.
-    - When the last cell is the last marker, the text is preserved whole unless
-      there are two or more cells and plain prose follows the last one. A
-      single tree-formatted group at the end may be the reply itself.
+    - When the last cell is the last column-0 marker, the text is preserved
+      whole unless there are two or more cells and plain prose follows the
+      last one. A single tree-formatted group at the end may be the reply
+      itself.
 
     English verbs such as ``Read`` or ``Called`` are deliberately not matched.
     """
@@ -1422,16 +1432,23 @@ def _find_response_marker(text: str) -> Optional[re.Match[str]]:
     if not matches:
         return None
 
+    # Markers that start a cell: no indentation in front of them.
+    top_level = [match for match in matches if not text[match.start()].isspace()]
+
     complete_cells = []
     prose_start = None
-    for index, match in enumerate(matches):
-        next_start = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+    for index, match in enumerate(top_level):
+        next_start = top_level[index + 1].start() if index + 1 < len(top_level) else len(text)
         cell_tail = text[line_end(match.start()) : next_start]
-        continuation = re.search(r"^[^\S\n]*└[^\n]*(?:\n|$)", cell_tail, re.MULTILINE)
+        continuation = (
+            re.match(r"\n(?:[^\S\n]*│[^\n]*\n)*[^\S\n]*└[^\n]*(?:\n|$)", cell_tail)
+            if text[match.start()] == "•"
+            else None
+        )
         contains_mcp_call = re.search(MCP_TOOL_CALL_PATTERN, cell_tail, re.MULTILINE)
         if continuation and not contains_mcp_call:
             complete_cells.append(index)
-            if index == len(matches) - 1:
+            if index == len(top_level) - 1:
                 remaining = cell_tail[continuation.end() :]
                 separator = re.search(r"^[^\S\n]*\n", remaining, re.MULTILINE)
                 following = re.search(r"\S", remaining[separator.end() :]) if separator else None
@@ -1447,8 +1464,8 @@ def _find_response_marker(text: str) -> Optional[re.Match[str]]:
 
     if complete_cells:
         last_cell = complete_cells[-1]
-        if last_cell + 1 < len(matches):
-            return matches[last_cell + 1]
+        if last_cell + 1 < len(top_level):
+            return top_level[last_cell + 1]
         if len(complete_cells) >= 2 and prose_start is not None:
             return re.compile("").match(text, prose_start)
 

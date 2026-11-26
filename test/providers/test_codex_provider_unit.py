@@ -3072,10 +3072,11 @@ class TestCodexBulletFormatExtraction:
     def test_extract_cuts_a_tree_formatted_bullet_above_another_bullet(self):
         """The cost of #541: this layout is read as one activity cell and a reply.
 
-        If a model wrote a reply as two top-level bullets with a ``└`` row under
-        the first, the first would be lost. Codex 0.171.0 does not draw a reply
-        that way: the reply is one ``•`` cell, and bullets the model writes are
-        indented inside it (``• • first`` / ``  • second`` in the capture).
+        If a reply were drawn as two column-0 bullets with a ``└`` row straight
+        under the first, the first would be lost. Codex 0.171.0 does not draw a
+        reply that way: the reply is one column-0 ``•`` cell, and bullets the
+        model writes are indented inside it (``• • first`` / ``  • second`` in
+        the capture). A ``└`` anywhere else in a reply does not count.
         """
         output = (
             "› summarize the fix\n"
@@ -3215,6 +3216,106 @@ class TestCodex541RealCaptures:
         message = self._provider().extract_last_message_from_script(output)
 
         assert message == "• The standup is at\n  4:19 PM"
+
+
+class TestCodex541ReplyCellIsNotActivity:
+    """A ``└`` inside the reply is not an activity cell (review of #1528).
+
+    Codex 0.171.0 draws each activity cell and the reply at column 0, and
+    indents everything the model writes in the reply, bullets included. So a
+    file tree the model drew, or a cell it quoted, sits inside the reply cell.
+
+    The panes are the real one-command capture with its last turn replaced by
+    a turn written here in the same layout. None of these turns was captured.
+    """
+
+    TREE_REPLY = (
+        "• A typical layout:\n"
+        "\n"
+        "  mypkg/\n"
+        "  ├── pyproject.toml\n"
+        "  └── src/\n"
+        "\n"
+        "  • pyproject.toml holds the metadata.\n"
+        "  • src/ holds the code."
+    )
+    QUOTED_CELL_REPLY = (
+        "• Codex draws a command like this:\n"
+        "\n"
+        "  • Ran true\n"
+        "    └ (no output)\n"
+        "\n"
+        "  • That row is activity, not the answer."
+    )
+    ONE_COMMAND = "• Checking.\n\n• Ran true\n  └ (no output)\n\n"
+    TWO_COMMANDS = ONE_COMMAND + "• Ran ls\n  └ calc.py\n    notes.txt\n\n"
+
+    @staticmethod
+    def _pane(turn: str) -> str:
+        """The real capture with ``turn`` in place of its last turn."""
+        capture = load_fixture("codex_541_one_activity_cell_v0171.txt")
+        head = capture[: capture.rindex("› Run true")]
+        tail = capture[capture.rindex("› Ask Codex to do anything") :]
+        return f"{head}› a question\n\n\n{turn}\n\n  Worked for 4s • 3:52 PM\n\n{tail}"
+
+    @staticmethod
+    def _extract(pane: str) -> str:
+        return TestCodex541RealCaptures._provider().extract_last_message_from_script(pane)
+
+    @pytest.mark.parametrize("commands", ["", ONE_COMMAND, TWO_COMMANDS], ids=["0", "1", "2"])
+    def test_a_file_tree_in_the_reply_does_not_cut_it(self, commands):
+        """With no command this was whole before #541; with commands it was cut on main too."""
+        assert self._extract(self._pane(commands + self.TREE_REPLY)) == self.TREE_REPLY
+
+    def test_a_file_tree_with_escape_codes_does_not_cut_it(self):
+        """Escapes are stripped before the layout is read, so this is the same pane."""
+        dimmed = "\n".join(
+            f"\x1b[2m{row}\x1b[0m" if "├" in row or "└" in row else row
+            for row in self.TREE_REPLY.split("\n")
+        )
+        assert self._extract(self._pane(dimmed)) == self.TREE_REPLY
+
+    def test_a_quoted_activity_cell_in_the_reply_does_not_cut_it(self):
+        assert self._extract(self._pane(self.QUOTED_CELL_REPLY)) == self.QUOTED_CELL_REPLY
+
+    def test_bullets_in_command_output_are_not_the_reply(self):
+        """The reply starts at the next column-0 marker, not at an indented one."""
+        turn = "• Checking.\n\n• Ran printf\n  └ items:\n      • one\n      • two\n\n• done"
+        assert self._extract(self._pane(turn)) == "• done"
+
+    def test_a_multi_line_command_summary_is_still_a_cell(self):
+        """``│`` rows sit between the summary and the ``└`` row of a multi-line command.
+
+        The ``│`` rows are as codex_approval_long_preview_raw.txt draws them
+        while the command waits for approval. The finished cell, with a ``└``
+        row under them, was not captured.
+        """
+        turn = (
+            "• Writing the script.\n"
+            "\n"
+            "• Ran bash -lc 'cat > migrate.sh <<'\"'\"'SCRIPT'\"'\"'\n"
+            "  │ #!/usr/bin/env bash\n"
+            "  │ … +9 lines\n"
+            "  └ (no output)\n"
+            "\n"
+            "• done"
+        )
+        assert self._extract(self._pane(turn)) == "• done"
+
+    def test_column_0_bullets_each_with_a_tree_row_are_still_read_as_cells(self):
+        """The case that stays undecidable: this is what activity cells look like."""
+        turn = (
+            "• The project has these directories:\n"
+            "\n"
+            "• src\n"
+            "  └ main.py\n"
+            "\n"
+            "• tests\n"
+            "  └ test_main.py\n"
+            "\n"
+            "• That is the basic structure."
+        )
+        assert self._extract(self._pane(turn)) == "• That is the basic structure."
 
 
 class TestCodexV0111Extraction:
