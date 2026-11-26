@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   any pane you emptied. Shift+click splits and status polling never fill panes, so a pane you
   close stays empty, and going down to fewer panes (or picking 1 pane) never fills.
 
+- **Code-owner review protects CI policy, release scripts, and trust-boundary code** (#1350).
+  Tests pin the owned paths, the active `mypy.ini` settings, and the full ruff
+  configuration; root gate configuration files are owned before they exist, and
+  the ruff gate reads only `pyproject.toml` and ignores `.gitignore` and `.ignore`
+  files; nested ruff configs are owned and ignored.
+
 - **Workflow specs open in a large, readable viewer**. The Workflows page now shows
   Python syntax colouring, line numbers and lint findings in a near-window-size dialog,
   with line wrapping, real browser full screen, and clear Exit/Esc controls.
