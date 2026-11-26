@@ -49,10 +49,12 @@ Each reviewer reports the files that it reviewed, the status of each check in
 `REVIEW.md`, the overall risk with one to five reasons, and at most 8 candidate
 findings. Each finding gives its check, path, line, failure, impact, evidence,
 confidence and suggested fix. Before the vote, the script drops each finding
-whose path is not a file in the head checkout, or whose line is not a line of
-that file. It does not follow a symbolic link, because GitHub shows the link
+whose path is not a file in the head commit, or whose line is not a line of
+that file. The script reads the commit with Git, not the files of the checkout,
+because the checkout also holds `.git` and can hold files that are not in the
+commit. It does not follow a symbolic link, because GitHub shows the link
 itself at that path. An empty file has no lines. The review lists each dropped
-finding.
+finding. If Git cannot read the head commit, the review is Blocked.
 
 ### The review policy
 

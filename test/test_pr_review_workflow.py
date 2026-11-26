@@ -208,16 +208,42 @@ def _write_evidence(
     (evidence_dir / "diff.patch").write_text(DIFF, encoding="utf-8")
 
 
+def _isolate_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make git ignore the user and system configuration, and give it an author."""
+    config = tmp_path / "gitconfig"
+    config.write_text("", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for role in ("AUTHOR", "COMMITTER"):
+        monkeypatch.setenv(f"GIT_{role}_NAME", "Test")
+        monkeypatch.setenv(f"GIT_{role}_EMAIL", "test@example.com")
+
+
+def _commit_source(source: Path) -> None:
+    """Commit the checkout, and make ``HEAD``, the head SHA of the evidence, name
+    that commit with a replace ref."""
+    commit = _git_commit(source, "Head")
+    subprocess.run(
+        ["git", "-C", str(source), "update-ref", f"refs/replace/{HEAD}", commit], check=True
+    )
+
+
 @pytest.fixture
-def workspace(tmp_path: Path) -> dict[str, Path]:
-    """Empty run directories, valid evidence, a policy and a PR checkout with a
-    30-line ``src/app.py``."""
+def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
+    """Empty run directories, valid evidence, a policy and a PR checkout whose head
+    commit ``HEAD`` has a 30-line ``src/app.py``."""
+    _isolate_git(tmp_path, monkeypatch)
     paths = {name: tmp_path / name for name in ("evidence", "source", "work")}
     for path in paths.values():
         path.mkdir()
+    subprocess.run(
+        ["git", "-C", str(paths["source"]), "init", "--quiet", "--initial-branch=main"],
+        check=True,
+    )
     (paths["source"] / "src").mkdir()
     lines = "".join(f"value_{number} = {number}\n" for number in range(1, 31))
     (paths["source"] / "src" / "app.py").write_text(lines, encoding="utf-8")
+    _commit_source(paths["source"])
     _write_evidence(paths["evidence"])
     paths["policy"] = tmp_path / "REVIEW.md"
     paths["policy"].write_text(POLICY_TEXT, encoding="utf-8")
@@ -1662,30 +1688,33 @@ def test_run_review_is_incomplete_when_no_reviewer_checked_a_check(
     _assert_publishable(github_review, review)
 
 
-def test_run_review_drops_a_finding_that_is_not_in_the_head_checkout(
+def test_run_review_drops_a_finding_that_is_not_in_the_head_commit(
     pr_review: ModuleType,
     github_review: ModuleType,
     workspace: dict[str, Path],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    source = workspace["source"]
     (tmp_path / "outside.py").write_text("token = 1\n", encoding="utf-8")
-    (workspace["source"] / "link.py").symlink_to(tmp_path / "outside.py")
-    (workspace["source"] / "loop.py").symlink_to("loop.py")
+    (source / "link.py").symlink_to(tmp_path / "outside.py")
+    (source / "loop.py").symlink_to("loop.py")
+    _commit_source(source)
     findings = (
         _finding("Last line", "P2", line=30),
         _finding("Past the end", "P2", line=31),
         _finding("No such file", "P1", path="src/missing.py"),
         _finding("Through a link", "P1", path="link.py", line=1),
-        # Python 3.12 raises for these two paths.
         _finding("Symlink loop", "P1", path="loop.py", line=1),
         _finding("Long name", "P1", path=f"{'x' * 300}.py", line=1),
+        # The checkout holds this file, but the commit does not.
+        _finding("Git metadata", "P1", path=".git/config", line=1),
     )
     cao = FakeCao({"reviewer-a": _reviewer_report(*findings)})
 
     review = _run_review(pr_review, workspace, monkeypatch, cao, reviewers="single")
 
-    outside = "the path is not a file in the head checkout"
+    outside = "the path is not a file in the head commit"
     link = "the path is a symbolic link"
     assert [(item["title"], item["reason"]) for item in review["dropped_findings"]] == [
         ("Past the end", "the file has 30 lines"),
@@ -1693,6 +1722,7 @@ def test_run_review_drops_a_finding_that_is_not_in_the_head_checkout(
         ("Through a link", link),
         ("Symlink loop", link),
         ("Long name", outside),
+        ("Git metadata", outside),
     ]
     assert [item["title"] for item in review["findings"]] == ["Last line"]
     assert review["result_states"] == ["changes_required", "incomplete"]
@@ -1706,20 +1736,42 @@ def test_location_error_checks_the_line_in_the_file_of_the_commit(
     source = workspace["source"]
     (source / "src" / "empty.py").write_text("", encoding="utf-8")
     (source / "src" / "tail.py").write_text("a\nb", encoding="utf-8")
+    (source / ":odd.py").write_text("a\n", encoding="utf-8")
     (source / "alias.py").symlink_to("src/app.py")
     (source / "lib").symlink_to("src", target_is_directory=True)
+    _commit_source(source)
+    # The checkout changes after the commit.
+    (source / "src" / "app.py").write_text("x = 1\n" * 40, encoding="utf-8")
+    (source / "src" / "new.py").write_text("x = 1\n", encoding="utf-8")
 
-    assert pr_review.location_error(source, "src/app.py", 30) == ""
+    def error(path: str, line: int) -> Any:
+        return pr_review.location_error(source, HEAD, path, line)
+
+    assert error("src/app.py", 30) == ""
+    assert error("src/app.py", 31) == "the file has 30 lines"
     # The last line of a file counts also without a final newline.
-    assert pr_review.location_error(source, "src/tail.py", 2) == ""
-    assert pr_review.location_error(source, "src/tail.py", 3) == "the file has 2 lines"
-    # An empty file has no line. On GitHub, a linked path shows the link, not the
-    # linked file, and the commit has no path through a linked directory.
-    assert pr_review.location_error(source, "src/empty.py", 1) == "the file has 0 lines"
-    assert pr_review.location_error(source, "alias.py", 2) == "the path is a symbolic link"
-    assert pr_review.location_error(source, "lib/app.py", 2) == (
-        "the path is not a file in the head checkout"
-    )
+    assert error("src/tail.py", 2) == ""
+    assert error("src/tail.py", 3) == "the file has 2 lines"
+    assert error("src/empty.py", 1) == "the file has 0 lines"
+    # Git reads the path as a plain name, not as a pathspec with magic.
+    assert error(":odd.py", 1) == ""
+    # On GitHub, a linked path shows the link, not the linked file, and the commit
+    # has no path through a linked directory.
+    assert error("alias.py", 2) == "the path is a symbolic link"
+    # The link uses the path as written, so the name must match a file exactly.
+    for path in (
+        "lib/app.py",
+        ".git/config",
+        "src/new.py",
+        "src",
+        "src/",
+        "./src/app.py",
+        "src//app.py",
+        "SRC/app.py",
+    ):
+        assert error(path, 1) == "the path is not a file in the head commit", path
+    with pytest.raises(pr_review.Blocked, match="git cannot read the head commit"):
+        pr_review.location_error(source, "f" * 40, "src/app.py", 1)
 
 
 def test_run_review_reports_missing_seat_reports_as_incomplete(
@@ -2363,13 +2415,7 @@ def test_collect_ignores_the_gitattributes_of_the_pr(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A PR that adds ``* -diff`` must not turn its text change into "Binary files differ"."""
-    config = tmp_path / "gitconfig"
-    config.write_text("", encoding="utf-8")
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    for role in ("AUTHOR", "COMMITTER"):
-        monkeypatch.setenv(f"GIT_{role}_NAME", "Test")
-        monkeypatch.setenv(f"GIT_{role}_EMAIL", "test@example.com")
+    _isolate_git(tmp_path, monkeypatch)
     source = tmp_path / "source"
     (source / "src").mkdir(parents=True)
     git = ["git", "-C", str(source)]

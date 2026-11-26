@@ -176,7 +176,7 @@ a panel for high-risk rounds, and the step 11 eval decides. Model A runs
   summary gives the reason. So a run that reaches `publish` ends as a neutral
   check or a named skip, not as a run that hangs.
 - **No inline comments.** A finding whose path or line is not in the head
-  checkout is dropped and listed, and the review is Incomplete.
+  commit is dropped and listed, and the review is Incomplete.
 - **Fresh head only.** The publisher refuses a result for a head that is no
   longer a commit of the PR. The comment names the head commit that the agents
   reviewed.
@@ -267,7 +267,7 @@ reason given. "Later" means work after this design.
 | No policy text in the prompts | Two copies drift. The prompts keep only the safety rules, which a policy change must not weaken. |
 | One agent by default; the panel as an option | Follows #1350 step 10 and #464. The step 11 eval can compare both. |
 | One comment updated in place, not a PR review | A PR review cannot be removed from the timeline, so each run adds one. #1350 asks for one comment. |
-| No inline comments | Inline comments add a thread for each finding on each run. A finding outside the head checkout is dropped and makes the review Incomplete, so a reader sees the gap. |
+| No inline comments | Inline comments add a thread for each finding on each run. A finding outside the head commit is dropped and makes the review Incomplete, so a reader sees the gap. |
 | An always-neutral check | Model output is not deterministic, so the AI lane stays advisory. A neutral check shows the result on the head commit without a merge gate. |
 | Cancel an older run of the same PR | #1350 step 10. The latest dispatch is the one that a maintainer wants. |
 | The driver waits until each seat ends | The step call can return before CAO ends the step. The driver reads the reports only after each step ends, or after a fixed wait. |

@@ -13,7 +13,7 @@ checked them.
 1. Two reviewers, ``reviewer-a`` and ``reviewer-b``, read the PR evidence and the
    head checkout. Each one reports its coverage, its checks, the risk and at most
    eight candidate findings.
-2. This script drops each finding whose path or line is not in the head checkout,
+2. This script drops each finding whose path or line is not in the head commit,
    merges exact duplicates and numbers the candidates ``F1`` to ``Fn``.
 3. Two fresh voters, ``vote-1`` and ``vote-2``, check each candidate against the
    source. They do not see who proposed a candidate or the other vote.
@@ -51,6 +51,7 @@ import html
 import json
 import os
 import re
+import subprocess
 
 # CAO's lint warns on this import. time only paces the wait in settled_view: no time
 # value reaches a step ID or a prompt.
@@ -895,37 +896,51 @@ def run_phase(
 # --------------------------------------------------------------------------
 
 
-def location_error(source_dir: Path, path: str, line: int) -> str:
-    """'' if ``line`` is a line of the file ``path`` in the head checkout, or the reason.
+def _git_output(source_dir: Path, *args: str) -> bytes:
+    """The output of a git command that reads the checkout's object store.
 
-    The review links the finding to this line of the head commit on GitHub. Git
-    keeps a symbolic link as a file that holds the link target, so a line that is
-    read through a link is not a line of the commit.
+    A failure blocks the review: without the head commit, no finding location
+    can be checked. --literal-pathspecs makes git read a path as a plain name.
     """
-    root = source_dir.resolve()
-    target = root / path
     try:
-        inside = root in target.parents
-        if inside and target.is_symlink():
-            return "the path is a symbolic link"
-        # resolve() changes a path through a linked directory.
-        found = inside and target.resolve() == target and target.is_file()
-    except (OSError, RuntimeError):
-        # Python 3.12 raises RuntimeError for a symlink loop, and OSError for a
-        # name that is too long.
-        found = False
-    if not found:
-        return "the path is not a file in the head checkout"
-    count = 0
-    last = b"\n"
-    try:
-        with target.open("rb") as handle:
-            while chunk := handle.read(65_536):
-                count += chunk.count(b"\n")
-                last = chunk[-1:]
-    except OSError:
-        return "the file cannot be read"
-    if last != b"\n":
+        result = subprocess.run(
+            ["git", "--literal-pathspecs", "-C", str(source_dir), *args],
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise Blocked("cannot run git to read the head commit") from exc
+    if result.returncode != 0:
+        raise Blocked("git cannot read the head commit in source_dir")
+    return result.stdout
+
+
+def location_error(source_dir: Path, commit: str, path: str, line: int) -> str:
+    """'' if ``line`` is a line of the file ``path`` in ``commit``, or the reason.
+
+    The review links the finding to this line of the head commit on GitHub, so
+    the check reads the commit, not the files of the checkout: the checkout also
+    holds ``.git``, which is not in the commit. Git keeps a symbolic link as a
+    blob that holds the link target, and a commit has no path through a linked
+    directory. The name must match exactly, as in the link.
+    """
+    name = os.fsencode(path)
+    listing = _git_output(source_dir, "ls-tree", "-z", commit, "--", path)
+    for record in listing.split(b"\0"):
+        meta, _, entry = record.partition(b"\t")
+        if entry == name:
+            mode, _, blob = meta.split(b" ")
+            break
+    else:
+        return "the path is not a file in the head commit"
+    if mode == b"120000":
+        return "the path is a symbolic link"
+    if mode not in (b"100644", b"100755"):
+        return "the path is not a file in the head commit"
+    # GitHub refuses a file larger than 100 MiB, so a blob of a PR fits in memory.
+    data = _git_output(source_dir, "cat-file", "blob", blob.decode("ascii"))
+    count = data.count(b"\n")
+    if data and not data.endswith(b"\n"):
         count += 1
     if line > count:
         return f"the file has {count} lines"
@@ -933,10 +948,14 @@ def location_error(source_dir: Path, path: str, line: int) -> str:
 
 
 def drop_misplaced(
-    reports: dict[str, Optional[dict[str, Any]]], seats: tuple[str, ...], source_dir: Path
+    reports: dict[str, Optional[dict[str, Any]]],
+    seats: tuple[str, ...],
+    source_dir: Path,
+    commit: str,
 ) -> tuple[dict[str, Optional[dict[str, Any]]], list[dict[str, Any]]]:
-    """The reports without the findings whose location is not in the head checkout,
-    and the dropped findings. A dropped finding makes the review incomplete."""
+    """The reports without the findings whose location is not a line of a file in
+    ``commit``, and the dropped findings. A dropped finding makes the review
+    incomplete."""
     kept: dict[str, Optional[dict[str, Any]]] = {}
     dropped = []
     for seat in seats:
@@ -946,7 +965,7 @@ def drop_misplaced(
             continue
         findings = []
         for finding in report["findings"]:
-            reason = location_error(source_dir, finding["path"], finding["line"])
+            reason = location_error(source_dir, commit, finding["path"], finding["line"])
             if reason:
                 dropped.append(
                     {
@@ -1385,7 +1404,7 @@ def render_sections(context: dict[str, Any], compact: bool) -> str:
         lines += [
             "## Dropped findings",
             "",
-            "These findings name a path or a line that the head checkout does not have, "
+            "These findings name a path or a line that the head commit does not have, "
             "so nobody checked them.",
             "",
         ]
@@ -1543,7 +1562,9 @@ def run_review(
             + "; ".join(f"{seat}: {panel[seat]}" for seat in reviewers)
         )
 
-    located, dropped = drop_misplaced(reports, reviewers, config["source_dir"])
+    located, dropped = drop_misplaced(
+        reports, reviewers, config["source_dir"], evidence["pr"]["head_sha"]
+    )
     candidates = build_candidates(located)
     count = len(candidates)
     votes: dict[str, Optional[dict[str, dict[str, Any]]]] = {seat: None for seat in VOTER_SEATS}
