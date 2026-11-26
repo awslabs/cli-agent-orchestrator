@@ -1371,8 +1371,11 @@ def test_render_sections_shows_the_checks_the_risk_and_single_mode(
     context["reports"]["reviewer-a"]["checks"]["A2"]["status"] = "not_checked"
     context["not_checked_ids"] = ["A2"]
     sha = hashlib.sha256(POLICY_TEXT.encode("utf-8")).hexdigest()
+    checked_note = "- reviewer-a, A1 checked: Read the cache code for A1."
+    not_checked_note = "- reviewer-a, A2 not checked: Read the cache code for A2."
 
     text = pr_review.render_sections(context, False)
+    compact = pr_review.render_sections(context, True)
 
     assert "One agent reviewed this PR. No second agent checked its findings." in text
     assert "Risk: **medium**\n\n- The PR changes how widgets are cached." in text
@@ -1380,6 +1383,9 @@ def test_render_sections_shows_the_checks_the_risk_and_single_mode(
     assert "| Check | reviewer-a |" in text
     assert "reviewer-b" not in text
     assert "| adjudicator |" not in text
+    assert checked_note in text and not_checked_note in text
+    # The compact body keeps only the notes that say why a check was not done.
+    assert not_checked_note in compact and checked_note not in compact
 
 
 # --------------------------------------------------------------------------

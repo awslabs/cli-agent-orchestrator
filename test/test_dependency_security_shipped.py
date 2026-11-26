@@ -653,6 +653,29 @@ def test_the_pr_review_tool_lockfile_ships_nothing(tmp_path, monkeypatch):
     assert lockfile.as_posix() not in sets
 
 
+@pytest.mark.parametrize(
+    "lockfile, prefix",
+    [
+        ("examples/demo/package-lock.json", "examples/"),
+        (".github/pr-review/copilot/package-lock.json", ".github/pr-review/"),
+    ],
+)
+def test_a_finding_that_ships_nothing_names_its_prefix(lockfile, prefix):
+    finding = {
+        "path": lockfile,
+        "advisory": "CVE-2099-20001",
+        "severity": "CRITICAL",
+        "package": "react",
+        "version": "18.3.1",
+        "fixed_version": "",
+        "malware": False,
+    }
+    inventory = [{"path": lockfile, "ecosystem": "npm", "_graph": []}]
+    [out] = audit.classify_findings([finding], inventory, shipped_set()["sets"], [])
+    assert out["classification"] == "toolchain"
+    assert out["reason"] == f"ships nothing ({prefix})"
+
+
 # ── #1398 box 5: ignore-file validation ──────────────────────────────────────
 
 
