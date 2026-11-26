@@ -20,6 +20,32 @@ sh uninstall.sh                          # remove it again
 
 The installer creates the window's home `~/.config/herdr-app-cao`, the launcher `~/.local/bin/herdr-cao` and `~/Applications/CAO.app` (a copy of the Herdr app named CAO, with its own icon). It never changes your main Herdr home. The options are under [Install](#install).
 
+## What you should see
+
+Run `~/.local/bin/herdr-cao`. Until CAO has a session, the window looks like this. The Sessions list says "No CAO sessions", and the status bar says `cao` and `0 sessions` once the CAO machine is connected:
+
+![The window before any CAO session exists](docs/screenshots/03-no-sessions-dark.png)
+
+Start a session with the `+` in the Sessions header. The New session dialog takes the agent profile, an optional name, the provider, a working directory on the CAO machine, an optional first message and a tool policy. It shows the equivalent `cao launch` command under the form:
+
+![The New session dialog with its profile list open](docs/screenshots/14-new-session-profiles-dark.png)
+
+With sessions running, the Sessions list shows one line per session, the Agents block shows the selected session's agents (the conductor with its crown, pinned workers, a spinner while it waits on them), the top bar holds a tab for each shown agent, and the status bar counts the sessions that need you, have replied or are working:
+
+![The window with a conductor, its workers and the status bar counts](docs/screenshots/01-overview-dark.png)
+
+The window follows your Herdr theme. [The same view in a light theme](docs/screenshots/02-overview-light.png).
+
+The Schedules and Workflows buttons in the top bar open a right sidebar. A click on a schedule shows its switch, its next runs and its target, with Run now and Edit:
+
+![A schedule's details in the right sidebar](docs/screenshots/10-schedule-details-dark.png)
+
+The fold button next to the search icon hides the left sidebar, as Cmd-B does, and a button in the top bar brings it back:
+
+![The window with the left sidebar hidden](docs/screenshots/23-sidebar-hidden-dark.png)
+
+[All screenshots](docs/screenshots/README.md) come from a scratch server with demo data and stand-in terminals; the page says what they leave out.
+
 ## What the window shows
 
 Each region of the window has one job:
