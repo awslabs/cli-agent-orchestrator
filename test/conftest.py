@@ -17,6 +17,7 @@ import fcntl
 import logging
 import os
 import pathlib
+import random
 import time
 import uuid
 from typing import Any, Dict
@@ -24,6 +25,53 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
+from hypothesis import settings
+
+settings.register_profile("ci", max_examples=75, deadline=1000, derandomize=True, print_blob=True)
+settings.register_profile("nightly", max_examples=500, deadline=1000, print_blob=True)
+if os.environ.get("HYPOTHESIS_PROFILE"):
+    settings.load_profile(os.environ["HYPOTHESIS_PROFILE"])
+elif os.environ.get("CI"):
+    settings.load_profile("ci")
+
+TEST_SHUFFLE_SEED_ENV_VAR = "CAO_TEST_SHUFFLE_SEED"
+
+
+def _test_shuffle_seed(environ: Dict[str, str]) -> int | None:
+    """Return the opt-in collection shuffle seed, rejecting ambiguous values."""
+    value = environ.get(TEST_SHUFFLE_SEED_ENV_VAR)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError as error:
+        raise pytest.UsageError(
+            f"{TEST_SHUFFLE_SEED_ENV_VAR} must be an integer, got {value!r}"
+        ) from error
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Shuffle collected tests only when the reproducible canary opts in."""
+    seed = getattr(config, "_cao_test_shuffle_seed", None)
+    if seed is not None:
+        random.Random(seed).shuffle(items)
+
+
+def pytest_report_header(config: pytest.Config) -> str | None:
+    """Make an opted-in order reproducible from the first test output."""
+    seed = getattr(config, "_cao_test_shuffle_seed", None)
+    if seed is not None:
+        return f"{TEST_SHUFFLE_SEED_ENV_VAR}: {seed}"
+    return None
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
+    """Repeat the shuffle seed where failed-job logs end."""
+    seed = getattr(config, "_cao_test_shuffle_seed", None)
+    if seed is not None:
+        terminalreporter.write_line(f"{TEST_SHUFFLE_SEED_ENV_VAR}: {seed}")
+
 
 # Make the `mock_cli` test-fixture binary discoverable for the pytest
 # session so MockCliProvider can `shlex.join(["mock_cli", ...])` without
@@ -427,6 +475,7 @@ _decide_at_import()
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
+    config._cao_test_shuffle_seed = _test_shuffle_seed(os.environ)
     config.addinivalue_line(
         "markers",
         "real_home: run with the developer's real HOME and provider config roots "

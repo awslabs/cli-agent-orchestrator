@@ -63,6 +63,7 @@ A supervisor pod in a CAO cluster already has both set, which is why
 |---------|---------|---------|
 | `CAO_API_HOST` | Bind address for cao-server | `127.0.0.1` |
 | `CAO_API_PORT` | Port for cao-server | `9889` |
+| `CAO_INSTANCE_LABEL` | A short name for this server, shown beside the web UI's title and in the browser tab, and reported by `GET /health` as `instance_label`. Use it to tell two open UIs apart, such as a local server and a cluster supervisor. `/health` needs no token, so do not put anything private in it | *(none)* |
 | `CAO_PYTE_STATUS` | Enable pyte-rendered status detection | `true` |
 | `CAO_EAGER_INBOX_DELIVERY` | Deliver inbox messages during PROCESSING for capable providers | `false` |
 | `CAO_INBOX_SUBMIT_CONFIRMATION` | After each inbox delivery, wait for the receiver to start processing it and recover a swallowed Enter (issue #78). Adds up to 8s per recovery attempt on a dropped delivery, for that terminal only. Set `false` to restore paste-and-forget delivery | `true` |

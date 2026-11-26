@@ -256,6 +256,22 @@ def test_s4_contradiction_symmetric_query(bound, db_engine):
     assert from_a[0].id == from_b[0].id  # same single directed row, seen both ways
 
 
+def test_neighbours_walk_both_directions_and_cap_depth_at_two(bound, db_engine):
+    for key in ("a", "b", "c", "d"):
+        _seed_memory(db_engine, key)
+    svc = _svc()
+    svc.create("global", None, "a", "b", "relates_to", "human")
+    svc.create("global", None, "c", "b", "relates_to", "human")
+    svc.create("global", None, "c", "d", "relates_to", "human")
+
+    walked = svc.neighbours("global", None, ["a"], depth=99)
+
+    assert [(edge.neighbour_key, edge.direction, edge.depth) for edge in walked] == [
+        ("b", "out", 1),
+        ("c", "in", 2),
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # S5 — superseded is queryable (ranking input)
 # --------------------------------------------------------------------------- #

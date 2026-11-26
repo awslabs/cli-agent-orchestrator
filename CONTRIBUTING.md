@@ -40,6 +40,19 @@ GitHub provides additional document on [forking a repository](https://help.githu
 [creating a pull request](https://help.github.com/articles/creating-a-pull-request/).
 
 
+## Property tests
+
+Add a Hypothesis property test when a change affects a stable invariant with a
+large input space (for example, status parsing, scope isolation or state
+transitions). State the invariant in the test docstring and exercise inputs
+beyond a handful of examples. Ordinary local pytest uses Hypothesis defaults;
+CI selects the deterministic `ci` profile automatically. Run an exploratory
+pass with `HYPOTHESIS_PROFILE=nightly uv run pytest <test-file>`.
+
+On failure, rerun the test with the printed `@reproduce_failure` blob pasted
+above it, or use the printed `--hypothesis-seed=<seed>` with the original pytest
+command. Retain the failing example as a regression test when appropriate.
+
 ## Changelog entries
 
 For a notable change, add `changelog.d/<PR>.<type>.md` with the pull request number,

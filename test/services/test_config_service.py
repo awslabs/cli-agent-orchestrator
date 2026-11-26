@@ -580,6 +580,32 @@ def test_config_set_get_explain_enabled(_isolated_settings, monkeypatch):
     assert ConfigService.get("memory.explain_enabled") is True
 
 
+def test_content_links_setting_defaults_off_and_round_trips(_isolated_settings):
+    from cli_agent_orchestrator.services.config_service import ENV_REGISTRY, MemoryConfig
+
+    assert MemoryConfig().relationships.content_links is False
+    assert ConfigService.get("memory.relationships.content_links") is False
+    assert ENV_REGISTRY["CAO_MEMORY_RELATIONSHIPS_CONTENT_LINKS"] == (
+        "memory.relationships.content_links",
+        "bool",
+        False,
+    )
+    ConfigService.set("memory.relationships.content_links", True)
+    assert ConfigService.get("memory.relationships.content_links") is True
+    saved = json.loads(_isolated_settings["settings"].read_text())
+    assert saved["memory"]["relationships"]["content_links"] is True
+
+
+def test_content_links_env_override_has_precedence(_isolated_settings, monkeypatch):
+    from cli_agent_orchestrator.services import settings_service
+
+    ConfigService.set("memory.relationships.content_links", True)
+    monkeypatch.setenv("CAO_MEMORY_RELATIONSHIPS_CONTENT_LINKS", "false")
+
+    assert settings_service.is_memory_content_links_enabled() is False
+    assert ConfigService.get("memory.relationships.content_links") is False
+
+
 @pytest.mark.parametrize(
     "saved,env,expected",
     [

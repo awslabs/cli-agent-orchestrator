@@ -114,6 +114,25 @@ class TestUnreachableSources:
         with pytest.raises(ResolverError, match="empty"):
             resolve(PluginSource(kind="path", location="   "), tmp_path / "staging")
 
+    @pytest.mark.parametrize("location", ["/tmp/plugin\x00bad", "./plugin\x00bad"])
+    def test_nul_byte_local_path_is_a_resolver_error(self, tmp_path, location):
+        with pytest.raises(ResolverError, match="not valid") as exc_info:
+            resolve(PluginSource(kind="path", location=location), tmp_path / "staging")
+        assert "\x00" not in str(exc_info.value)
+
+    @pytest.mark.parametrize("location", ["~a\x00b", "~\ud800"])
+    def test_home_form_that_cannot_expand_is_a_resolver_error(self, tmp_path, location):
+        with pytest.raises(ResolverError, match="not valid") as exc_info:
+            resolve(PluginSource(kind="path", location=location), tmp_path / "staging")
+        assert "\x00" not in str(exc_info.value)
+
+    def test_overlong_local_path_is_a_resolver_error(self, tmp_path):
+        with pytest.raises(ResolverError):
+            resolve(
+                PluginSource(kind="path", location="/" + "a" * 300),
+                tmp_path / "staging",
+            )
+
     @requires_git
     def test_failed_git_clone_reports_the_cause(self, tmp_path):
         with pytest.raises(ResolverError, match="git clone"):
@@ -150,6 +169,14 @@ class TestSubdir:
         with pytest.raises(ResolverError, match="does not exist"):
             resolve(
                 PluginSource(kind="path", location=str(source), subdir="nowhere"),
+                tmp_path / "staging",
+            )
+
+    def test_overlong_subdir_is_a_resolver_error(self, tmp_path):
+        source = build_plugin(tmp_path / "src", "demo")
+        with pytest.raises(ResolverError):
+            resolve(
+                PluginSource(kind="path", location=str(source), subdir="a" * 300),
                 tmp_path / "staging",
             )
 
@@ -342,6 +369,23 @@ class TestGitInvocationHardening:
         clone = next(call for call in captured if "clone" in call["argv"])
         assert "--" in clone["argv"]
         assert clone["argv"].index("--") < clone["argv"].index("https://example.test/repo.git")
+
+    @pytest.mark.parametrize("bad_ref", ["main\x00evil", "main\x01evil", "main\x7fevil"])
+    def test_control_characters_in_ref_are_rejected_before_git_runs(
+        self, tmp_path, monkeypatch, bad_ref
+    ):
+        """NUL and ASCII control chars in ref must raise ResolverError, never reach subprocess."""
+
+        def fail_run(*args, **kwargs):
+            raise AssertionError("git must not be invoked for an invalid ref")
+
+        monkeypatch.setattr(resolver.subprocess, "run", fail_run)
+        with pytest.raises(ResolverError, match="not a valid ref name") as exc_info:
+            resolver.resolve(
+                PluginSource(kind="git", location="https://example.test/repo.git", ref=bad_ref),
+                tmp_path / "dest",
+            )
+        assert "\x00" not in str(exc_info.value)
 
 
 @requires_git

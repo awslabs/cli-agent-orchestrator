@@ -80,19 +80,12 @@ def test_default_baseline_preserves_known_failure_shapes(baseline_report):
         <= report["arms"]["default"]["invisible_notes"]
     )
     assert report["arms"]["default"]["kw_p1"] < report["arms"]["bm25"]["kw_p1"]
+    assert report["arms"]["bm25"]["kw_p1"] == pytest.approx(0.56, abs=0.005)
     assert report["arms"]["default"]["kw_p1"] <= report["arms"]["p3_bm25"]["kw_p1"]
     assert report["arms"]["default"]["multihop_full"] < 1
     assert report["arms"]["default"]["current_first"] < 0.85
     assert report["arms"]["default"]["tokens_per_recall"] > 800
     assert elapsed < 60
-
-
-def test_p1a_arm_matches_default_before_parser_setting(baseline_report):
-    if "parser" in MemoryConfig.model_fields:
-        pytest.skip("memory.parser.lenient is implemented")
-
-    report = baseline_report[0]["arms"]
-    assert report["p1a_visibility"] == report["default"]
 
 
 def test_p1a_arm_does_not_regress_retrieval_when_parser_setting_exists(baseline_report):
@@ -158,7 +151,8 @@ def test_results_are_stable_across_python_hash_seeds(tmp_path):
     assert len(set(outputs)) == 1
 
 
-def test_bm25_current_first_is_independent_of_wiki_listing_order(tmp_path, monkeypatch):
+@pytest.mark.parametrize("arm_name", ARMS)
+def test_current_first_is_independent_of_wiki_listing_order(tmp_path, monkeypatch, arm_name):
     original_rglob = Path.rglob
 
     def current_first(reverse: bool) -> float:
@@ -167,10 +161,11 @@ def test_bm25_current_first_is_independent_of_wiki_listing_order(tmp_path, monke
 
         with monkeypatch.context() as context:
             context.setattr(Path, "rglob", ordered_rglob)
-            metrics = asyncio.run(_evaluate_arm(tmp_path / f"ordered-{reverse}", ARMS["bm25"]))
+            metrics = asyncio.run(_evaluate_arm(tmp_path / f"ordered-{reverse}", ARMS[arm_name]))
         return metrics["current_first"]
 
-    assert current_first(reverse=False) == current_first(reverse=True) == 0.0
+    expected = 0.0 if arm_name in {"bm25", "p4_relationships"} else 0.4
+    assert current_first(reverse=False) == current_first(reverse=True) == expected
 
 
 def test_cli_leaves_process_home_untouched(tmp_path):
