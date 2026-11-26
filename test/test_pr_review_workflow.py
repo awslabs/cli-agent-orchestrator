@@ -446,6 +446,35 @@ class FakeCao:
         return [call["step_id"] for call in self.calls]
 
 
+class LateCao(FakeCao):
+    """The step call of ``late`` times out, and CAO ends the step after one more view read.
+
+    CAO can still end a step after its step call timed out (see SETTLE_TIMEOUT in
+    pr_review.py), so the first view read after the call shows the step as running.
+    """
+
+    def __init__(self, outcomes: dict[str, Any], late: str) -> None:
+        super().__init__(outcomes)
+        self.late = late
+        self.ended: Optional[dict[str, Any]] = None
+
+    def step(self, engine: str, profile: str, prompt: str, **options: Any) -> str:
+        result = super().step(engine, profile, prompt, **options)
+        seat = options["step_id"]
+        if seat != self.late:
+            return result
+        self.ended = self.steps[seat]
+        self.steps[seat] = {**self.ended, "state": "running", "output_json": None}
+        raise TimeoutError()
+
+    def read_view(self) -> dict[str, dict[str, Any]]:
+        view = super().read_view()
+        if self.ended is not None:
+            self.steps[self.late] = self.ended
+            self.ended = None
+        return view
+
+
 def _run_review(
     pr_review: ModuleType,
     workspace: dict[str, Path],
@@ -1834,6 +1863,54 @@ def test_run_review_is_incomplete_when_only_one_panel_seat_fails(
     _assert_publishable(github_review, review)
 
 
+@pytest.mark.parametrize("late_seat", ["reviewer-b", "vote-2", "adjudicator"])
+def test_run_review_waits_for_a_seat_whose_step_call_timed_out(
+    pr_review: ModuleType,
+    github_review: ModuleType,
+    workspace: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    late_seat: str,
+) -> None:
+    monkeypatch.setattr(pr_review, "SETTLE_POLL_INTERVAL", 0.0)
+    cao = LateCao(
+        {
+            "reviewer-a": _reviewer_report(_finding("Unused import", "P3", line=3)),
+            "reviewer-b": _reviewer_report(),
+            "vote-1": {"votes": {"F1": _vote("confirm", "P3")}},
+            "vote-2": {"votes": {"F1": _vote("confirm", "P3")}},
+            "adjudicator": {"decisions": {"F1": _decision("accept", "P3")}},
+        },
+        late_seat,
+    )
+
+    review = _run_review(pr_review, workspace, monkeypatch, cao)
+
+    assert review["panel"] == dict.fromkeys(SEATS, "valid")
+    assert review["result_states"] == ["no_blocking_findings"]
+    assert review["review_complete"] is True
+    _assert_publishable(github_review, review)
+
+
+def test_run_review_is_incomplete_when_a_reviewer_does_not_list_a_changed_file(
+    pr_review: ModuleType,
+    github_review: ModuleType,
+    workspace: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cao = FakeCao(
+        {"reviewer-a": _reviewer_report(), "reviewer-b": _reviewer_report(reviewed=(1, 2, 3, 4, 5))}
+    )
+
+    review = _run_review(pr_review, workspace, monkeypatch, cao)
+
+    assert review["panel"]["reviewer-b"] == "valid"
+    assert review["result_states"] == ["incomplete"]
+    assert review["review_complete"] is False
+    assert "| reviewer-b | 5 | 0 | 1 |" in review["sections"]
+    assert "- reviewer-b did not list `gone.py`." in review["sections"]
+    _assert_publishable(github_review, review)
+
+
 def test_run_review_blocks_when_no_reviewer_returns_a_report(
     pr_review: ModuleType, workspace: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2921,6 +2998,18 @@ def test_publish_refuses_an_invalid_review_before_any_github_call(
     ("reviewers", "changes", "message"),
     [
         pytest.param(
+            "single", {"schema_version": 2}, "schema_version is not supported", id="schema-version"
+        ),
+        pytest.param(
+            "single",
+            {"repo": "octo-org/other"},
+            "repo is not the dispatched repository",
+            id="other-repo",
+        ),
+        pytest.param("single", {"pr": NUMBER + 1}, "pr is not the dispatched PR", id="other-pr"),
+        pytest.param("single", {"base_sha": "main"}, "base_sha", id="base-sha"),
+        pytest.param("single", {"merge_base": MERGE_BASE.upper()}, "merge_base", id="merge-base"),
+        pytest.param(
             "single",
             {"models": dict.fromkeys(SEATS, "")},
             "models do not match the seats of the reviewers mode",
@@ -2975,6 +3064,34 @@ def test_publish_refuses_an_invalid_review_before_any_github_call(
         ),
         pytest.param(
             "single",
+            {"severity_counts": {"P1": -1, "P2": 0, "P3": 0}},
+            "severity_counts",
+            id="negative-count",
+        ),
+        pytest.param(
+            "single",
+            {"severity_counts": {"P1": True, "P2": 0, "P3": 0}},
+            "severity_counts",
+            id="boolean-count",
+        ),
+        pytest.param(
+            "single", {"severity_counts": {"P1": 1, "P2": 0}}, "severity_counts", id="no-p3-count"
+        ),
+        pytest.param(
+            "single",
+            {"owner_question_ids": None},
+            "owner_question_ids is not a list",
+            id="id-group-not-a-list",
+        ),
+        pytest.param(
+            "single",
+            {"finding_ids": ["F1", "F0"], "rejected_finding_ids": ["F0"]},
+            "finding_ids has an invalid ID",
+            id="invalid-finding-id",
+        ),
+        pytest.param("single", {"review_complete": 1}, "review_complete", id="complete-not-bool"),
+        pytest.param(
+            "single",
             {"review_complete": False},
             "review_complete does not match result_states",
             id="incomplete-without-the-state",
@@ -2991,6 +3108,16 @@ def test_publish_refuses_an_invalid_review_before_any_github_call(
             "review_complete is true, but not_checked_ids is not empty",
             id="complete-with-a-check-not-done",
         ),
+        pytest.param(
+            "single", {"sections": ""}, "sections are empty or too long", id="empty-sections"
+        ),
+        # The limit counts UTF-16 code units: these 30,001 characters are 60,002 units.
+        pytest.param(
+            "single",
+            {"sections": "\U0001f600" * 30_001},
+            "sections are empty or too long",
+            id="long-sections",
+        ),
     ],
 )
 def test_validate_review_refuses_a_review_that_breaks_the_contract(
@@ -3003,6 +3130,15 @@ def test_validate_review_refuses_a_review_that_breaks_the_contract(
         1,
         f"Blocked: review.json is invalid: {message}.",
     )
+
+
+def test_validate_review_refuses_a_document_that_is_not_an_object(
+    github_review: ModuleType,
+) -> None:
+    with pytest.raises(github_review.Stop) as caught:
+        github_review.validate_review([_review()], REPO, NUMBER, HEAD, "kiro_cli", "single")
+
+    assert caught.value.message == "Blocked: review.json is invalid: the document is not an object."
 
 
 def test_publish_refuses_a_review_with_a_token_pattern(
