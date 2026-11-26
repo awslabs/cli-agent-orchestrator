@@ -290,7 +290,7 @@ them.
 | Evidence layer | Required coverage |
 | --- | --- |
 | Unit tests | `test/test_pr_review_workflow.py`: the policy file, the schemas, single and panel mode, the wait for a step that ends after its step call, coverage, risk, dropped findings, the verdict rules, safe text, the publisher checks, the comment update, the neutral check, the workflow permissions and triggers, and the shared constants. `test/test_codeowners_risk.py`: the code owners of `REVIEW.md` and `.github/pr-review/`. |
-| Static checks | `actionlint`, `zizmor`, `black`, `isort`, `ruff`, `mypy` and the Markdown link check. |
+| Static checks | The CI Code Quality job runs `black`, `isort` and the `ruff` dead-code gate on both scripts. The zizmor workflow audits `pr-review.yml`. The Markdown link check covers the docs. No CI job runs `mypy` or `actionlint` on these files. |
 | Live run | A dispatch for a real PR with `reviewers=single`. It creates or updates one comment and adds one neutral check to the reviewed head. The comment shows the policy SHA-256 and the coverage of each check. |
 | Calibration | The step 11 eval of #1350: 12 to 30 labelled cases from past PRs. It scores `single` and `panel` on the same cases. It decides the default, and any automatic trigger. |
 

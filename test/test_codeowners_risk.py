@@ -99,7 +99,7 @@ def test_ruff_gate_uses_root_config():
     ruff_steps = [step for step in steps if "ruff check" in step.get("run", "")]
     assert len(ruff_steps) == 1
     assert ruff_steps[0]["run"] == (
-        "uv run ruff check --config pyproject.toml --no-respect-gitignore src/ test/ examples/"
+        "uv run ruff check --config pyproject.toml --no-respect-gitignore src/ test/ examples/ .github/pr-review/"
     )
 
 
