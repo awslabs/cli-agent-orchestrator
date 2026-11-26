@@ -27,7 +27,7 @@ CAO_TERMINAL_BACKEND=herdr-app cao-server     # environment of the cao-server
 cao-server --terminal herdr-app               # this run only
 ```
 
-The herdr-core session defaults to `cao`. To use another one, run `cao config set terminal.herdr_app_session <name>` or set `CAO_HERDR_APP_SESSION`. cao-server starts that session's core when it isn't running. It never uses the `default` session, the one the app opens for your own terminals, and rejects `default` as the value of `terminal.herdr_app_session`.
+The herdr-core session defaults to `cao`. To use another one, run `cao config set terminal.herdr_app_session <name>` or set `CAO_HERDR_APP_SESSION`. cao-server starts that session's core when it isn't running. It never uses the `default` session, the one the app opens for your own terminals: `cao config set` accepts that value, but cao-server refuses to start the `herdr-app` backend while `terminal.herdr_app_session` (or `CAO_HERDR_APP_SESSION`) is `default`.
 
 Check that it took effect with `GET /health`: `terminal_backend` is `"herdr-app"`, and `components["herdr-core"]` is `"ok"` when `hc` or `herdr-core` is on `PATH` (`"unavailable"` otherwise).
 
