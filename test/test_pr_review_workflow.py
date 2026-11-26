@@ -3799,6 +3799,11 @@ def test_the_agents_get_only_the_kept_variables(workflow: dict[Any, Any]) -> Non
         "COPILOT_AUTO_UPDATE=false",
     ]
     assert '*) unset "$name" 2>/dev/null || true ;;' in start
+    # Kiro CLI and cao-server start only with the filtered environment.
+    assert re.findall(r"\((\w+); exec ([^)]*)\)", start) == [
+        ("filter_env", "kiro-cli chat --list-models --format json"),
+        ("filter_env", "setsid cao-server"),
+    ]
 
 
 def test_only_the_review_job_uses_the_ai_review_environment(workflow: dict[Any, Any]) -> None:
@@ -3863,6 +3868,24 @@ def test_publish_reports_a_review_that_is_not_published_with_a_neutral_check(
     )
     assert '--reviewers "$REVIEWERS"' in publish["run"]
     assert '--job-result "$JOB_RESULT"' in failure["run"]
+
+
+def test_kiro_cli_installs_the_pinned_release_after_the_sha256_check(
+    workflow: dict[Any, Any],
+) -> None:
+    install = _step(
+        workflow["jobs"]["review"], "Install Kiro CLI (pinned release, checked with SHA-256)"
+    )
+    check = re.search(
+        r'^ *echo "\$\{KIRO_SHA256\}  \$dir/kirocli\.zip" \| sha256sum --check --strict$',
+        install["run"],
+        re.MULTILINE,
+    )
+
+    assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", install["env"]["KIRO_VERSION"])
+    assert re.fullmatch(r"[0-9a-f]{64}", install["env"]["KIRO_SHA256"])
+    assert check is not None
+    assert check.end() < install["run"].index("unzip ")
 
 
 def test_copilot_cli_installs_from_the_committed_lockfile(workflow: dict[Any, Any]) -> None:
