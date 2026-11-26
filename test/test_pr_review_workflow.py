@@ -615,6 +615,7 @@ TIMEOUT_MESSAGE = "step_timeout must be from 300 to 2700 seconds"
         ),
         ({"work_dir": "{root}/busy"}, "work_dir must be an empty directory"),
         ({"policy": "REVIEW.md"}, "policy must be an absolute path"),
+        ({"policy": None}, "policy must be an absolute path"),
         ({"policy": "{root}/missing.md"}, "policy is not a file"),
         # The PR can change REVIEW.md, so the copy in its checkout is refused.
         ({"policy": "{root}/source/REVIEW.md"}, "policy must not be in source_dir"),
@@ -694,6 +695,14 @@ def test_load_evidence_reads_valid_evidence(
     ("pr", "files", "message"),
     [
         (_pr_record(schema_version=2), None, "pr.json has an unsupported format"),
+        ([_pr_record()], None, "pr.json has an unsupported format"),
+        (_pr_record(repo=None), None, "pr.json has an invalid repository"),
+        (_pr_record(repo="octo-org"), None, "pr.json has an invalid repository"),
+        (_pr_record(number="7"), None, "pr.json has an invalid PR number"),
+        (_pr_record(number=0), None, "pr.json has an invalid PR number"),
+        (_pr_record(base_ref=None), None, "pr.json has an invalid base_ref"),
+        (_pr_record(base_ref="-main"), None, "pr.json has an invalid base_ref"),
+        (_pr_record(html_url=None), None, "pr.json has an invalid html_url"),
         (
             _pr_record(html_url=f"http://github.com/{REPO}/pull/{NUMBER}"),
             None,
@@ -709,8 +718,35 @@ def test_load_evidence_reads_valid_evidence(
             None,
             "pr.json has an invalid merge_base; run github_review.py collect first",
         ),
+        (
+            _pr_record(head_sha="main"),
+            None,
+            "pr.json has an invalid head_sha; run github_review.py collect first",
+        ),
         (None, [FILES[0], FILES[2]], "changed_files.json has an invalid entry at position 2"),
         (None, [], "changed_files.json lists no changed file"),
+        (None, {"1": FILES[0]}, "changed_files.json lists no changed file"),
+        (None, ["src/app.py"], "changed_files.json has an invalid entry at position 1"),
+        (
+            None,
+            [{**FILES[0], "path": None}],
+            "changed_files.json has an invalid entry at position 1",
+        ),
+        (
+            None,
+            [{**FILES[0], "path": ""}],
+            "changed_files.json has an invalid entry at position 1",
+        ),
+        (
+            None,
+            [{**FILES[0], "path": "a" * 1001}],
+            "changed_files.json has an invalid entry at position 1",
+        ),
+        (
+            None,
+            [{**FILES[0], "status": None}],
+            "changed_files.json has an invalid entry at position 1",
+        ),
         (
             None,
             [{**FILES[0], "index": index} for index in range(1, 1002)],
@@ -731,6 +767,18 @@ def test_load_evidence_blocks_invalid_evidence(
         pr_review.load_evidence(workspace["evidence"])
 
     assert str(caught.value) == message
+
+
+def test_load_evidence_blocks_evidence_without_the_diff(
+    pr_review: ModuleType, workspace: dict[str, Path]
+) -> None:
+    _write_evidence(workspace["evidence"])
+    (workspace["evidence"] / "diff.patch").unlink()
+
+    with pytest.raises(pr_review.Blocked) as caught:
+        pr_review.load_evidence(workspace["evidence"])
+
+    assert str(caught.value) == "diff.patch is missing; run github_review.py collect first"
 
 
 # --------------------------------------------------------------------------
@@ -2362,6 +2410,73 @@ def test_prepare_stops_for_a_pr_that_is_not_ready(
 
 
 @pytest.mark.parametrize(
+    ("answer", "message"),
+    [
+        pytest.param([], "Blocked: GitHub did not return the PR.", id="not-an-object"),
+        pytest.param(
+            _live_pr(head={"sha": HEAD.upper(), "ref": "feature/cache"}),
+            "Blocked: GitHub returned an invalid head SHA.",
+            id="head-sha",
+        ),
+        pytest.param(
+            _live_pr(base={"ref": "-main", "sha": BASE}),
+            "Blocked: the target branch name has characters this workflow refuses.",
+            id="branch-characters",
+        ),
+        pytest.param(
+            _live_pr(base={"ref": "release..main", "sha": BASE}),
+            "Blocked: the target branch name has characters this workflow refuses.",
+            id="branch-dots",
+        ),
+        pytest.param(
+            _live_pr(html_url=f"http://github.com/{REPO}/pull/{NUMBER}"),
+            "Blocked: GitHub returned an unexpected PR URL.",
+            id="url-scheme",
+        ),
+        pytest.param(
+            _live_pr(html_url=f"https://github.com/{REPO}/pull/8"),
+            "Blocked: GitHub returned an unexpected PR URL.",
+            id="url-other-pr",
+        ),
+    ],
+)
+def test_prepare_refuses_a_pr_record_it_cannot_trust(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    answer: Any,
+    message: str,
+) -> None:
+    output = tmp_path / "github_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    process.routes[("GET", PULL)] = _ok(answer)
+
+    code = github_review.main(
+        ["prepare", "--repo", REPO, "--pr", str(NUMBER), "--out", str(tmp_path / "evidence")]
+    )
+
+    assert code == 1
+    assert capsys.readouterr().out == f"{message}\n"
+    assert not output.exists()
+    assert not (tmp_path / "evidence").exists()
+
+
+@pytest.mark.parametrize("value", [f"{HEAD}\nproceed=true", f"{HEAD}\rproceed=true"])
+def test_set_outputs_writes_no_output_when_a_value_holds_a_line_break(
+    github_review: ModuleType, tmp_path: Path, value: str
+) -> None:
+    output = tmp_path / "github_output"
+
+    with pytest.raises(github_review.Stop) as caught:
+        github_review._set_outputs(str(output), proceed="true", head_sha=value)
+
+    assert caught.value.message == "Blocked: output head_sha holds a line break."
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
     "argv",
     [
         ["prepare", "--repo", f"{REPO}/extra", "--pr", "7", "--out", "evidence"],
@@ -2428,6 +2543,21 @@ def test_collect_writes_the_diff_and_the_changed_files(
             "Blocked: a git command failed: fatal: Needed a single revision",
         ),
         (
+            {("check-ref-format", "--branch", "main"): (0, "other\n", "")},
+            "Blocked: the target branch name is not a plain branch name.",
+        ),
+        (
+            {
+                ("rev-parse", "--verify", "refs/remotes/origin/main^{commit}"): (0, "e\n", ""),
+                ("merge-base", "e", HEAD): (0, f"{MERGE_BASE}\n", ""),
+            },
+            "Blocked: git returned an invalid target tip or merge base.",
+        ),
+        (
+            {("merge-base", BASE, HEAD): (0, "\n", "")},
+            "Blocked: git returned an invalid target tip or merge base.",
+        ),
+        (
             {(*GIT_DIFF, "--name-status", "-z", MERGE_BASE, HEAD): (0, "", "")},
             f"Blocked: the PR changes no file between merge base {MERGE_BASE} and the head.",
         ),
@@ -2460,8 +2590,38 @@ def test_parse_binary_paths_reads_renames_and_refuses_a_truncated_entry(
     )
 
     assert github_review.parse_binary_paths(output) == {"new.bin", "b.png", "t\tab.js"}
-    with pytest.raises(github_review.Stop):
-        github_review.parse_binary_paths("-\t-\t\0a.png\0")
+    for truncated in ("-\t-\t\0a.png", "-\t-\t\0a.png\0"):
+        with pytest.raises(github_review.Stop) as caught:
+            github_review.parse_binary_paths(truncated)
+        assert caught.value.message == "Blocked: git returned a truncated changed-file entry."
+
+
+def test_collect_refuses_a_target_branch_name_before_git_reads_it(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    argv = _collect_inputs(process, tmp_path)
+    record = {**_prepared_record(), "base_ref": "-main"}
+    (tmp_path / "evidence" / "pr.json").write_text(json.dumps(record), encoding="utf-8")
+
+    assert github_review.main(argv) == 1
+
+    assert capsys.readouterr().out == (
+        "Blocked: the target branch name is not a plain branch name.\n"
+    )
+    assert [cmd[3:] for cmd, _ in process.calls] == [["rev-parse", "--verify", "HEAD^{commit}"]]
+
+
+@pytest.mark.parametrize("output", ["M", "M\0", "R100\0old.py", "R100\0old.py\0"])
+def test_parse_name_status_refuses_a_truncated_entry(
+    github_review: ModuleType, output: str
+) -> None:
+    with pytest.raises(github_review.Stop) as caught:
+        github_review.parse_name_status(output)
+
+    assert caught.value.message == "Blocked: git returned a truncated changed-file entry."
 
 
 def _git_version() -> tuple[int, ...]:
@@ -2798,10 +2958,180 @@ def test_publish_stops_at_a_failed_write(
 
 
 @pytest.mark.parametrize(
-    ("changes", "expected_code", "message"),
+    ("earlier", "route", "answer", "message", "written"),
     [
-        ({"state": "closed"}, 1, f"Blocked: {REPO}#{NUMBER} is not open. Nothing is published."),
-        ({"draft": True}, 0, f"Skipped: {REPO}#{NUMBER} is now a draft. Nothing is published."),
+        pytest.param(
+            False,
+            ("POST", ISSUE_COMMENTS),
+            {"id": "99"},
+            "Blocked: GitHub returned an unexpected comment ID. Check the PR by hand.",
+            [("POST", ISSUE_COMMENTS)],
+            id="comment-id-type",
+        ),
+        pytest.param(
+            True,
+            ("PATCH", f"{COMMENT}/41"),
+            {"id": 42},
+            "Blocked: GitHub returned an unexpected comment ID. Check the PR by hand.",
+            [("PATCH", f"{COMMENT}/41")],
+            id="comment-id-other",
+        ),
+        pytest.param(
+            False,
+            ("POST", CHECK_RUNS),
+            {},
+            "Blocked: GitHub returned no check run ID. "
+            "Review comment 99 is posted, but the check run is not added.",
+            [("POST", ISSUE_COMMENTS), ("POST", CHECK_RUNS)],
+            id="check-run-id",
+        ),
+    ],
+)
+def test_publish_stops_when_github_returns_an_unexpected_id(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    earlier: bool,
+    route: tuple[str, str],
+    answer: dict[str, Any],
+    message: str,
+    written: list[tuple[str, str]],
+) -> None:
+    output = tmp_path / "github_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    _github(process, comments=[_our_comment(github_review, 41, "4000")] if earlier else [])
+    process.routes[route] = _ok(answer)
+
+    assert _publish(github_review, tmp_path, _review()) == 1
+
+    assert capsys.readouterr().out == f"{message}\n"
+    assert [write[:2] for write in process.writes()] == written
+    assert output.read_text(encoding="utf-8") == "comment_written=true\n"
+
+
+def _comment_pages(process: FakeProcess, pages: list[list[dict[str, Any]]]) -> list[str]:
+    """Route the PR comment pages, and return their paths."""
+    paths = [f"{ISSUE_COMMENTS}?per_page=100&page={number}" for number in range(1, len(pages) + 1)]
+    for path, page in zip(paths, pages):
+        process.routes[("GET", path)] = _ok(page)
+    return paths
+
+
+def _others_comments(page: int) -> list[dict[str, Any]]:
+    """A full page of comments that are not review comments."""
+    user = {"login": "octocat", "type": "User"}
+    return [{"id": page * 100 + item, "user": user, "body": "Thanks."} for item in range(100)]
+
+
+def test_publish_posts_nothing_when_the_pr_has_more_comments_than_it_reads(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _github(process)
+    pages = _comment_pages(
+        process, [_others_comments(page) for page in range(1, github_review.COMMENT_PAGE_LIMIT + 1)]
+    )
+
+    assert _publish(github_review, tmp_path, _review()) == 1
+
+    assert capsys.readouterr().out == (
+        f"Blocked: {REPO}#{NUMBER} has too many comments to find the review comment. "
+        "Nothing is published.\n"
+    )
+    assert process.paths() == [PULL, *pages]
+    assert process.writes() == []
+
+
+def test_publish_updates_a_review_comment_on_the_last_page_it_reads(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    earlier = _our_comment(github_review, 41, "4000")
+    _github(process, comments=[earlier])
+    full = [_others_comments(page) for page in range(1, github_review.COMMENT_PAGE_LIMIT)]
+    pages = _comment_pages(process, [*full, [earlier]])
+
+    assert _publish(github_review, tmp_path, _review()) == 0
+
+    assert capsys.readouterr().out == (
+        f"Updated review comment 41 on {REPO}#{NUMBER} for head {HEAD}. "
+        "Added neutral check run 555.\n"
+    )
+    assert process.paths()[: len(pages) + 1] == [PULL, *pages]
+    assert [write[:2] for write in process.writes()] == [
+        ("PATCH", f"{COMMENT}/41"),
+        ("POST", CHECK_RUNS),
+    ]
+
+
+def test_publish_stops_when_the_comment_list_is_not_a_list(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _github(process)
+    process.routes[("GET", ISSUE_COMMENTS_PAGE)] = _ok({"message": "Moved Permanently"})
+
+    assert _publish(github_review, tmp_path, _review()) == 1
+
+    assert capsys.readouterr().out == f"Blocked: gh api {ISSUE_COMMENTS} did not return a list.\n"
+    assert process.writes() == []
+
+
+@pytest.mark.parametrize("model", ["claude-->x", "claude--!>x"])
+def test_build_marker_refuses_text_that_ends_its_html_comment(
+    github_review: ModuleType, model: str
+) -> None:
+    with pytest.raises(github_review.Stop) as caught:
+        github_review.build_marker(_review(models={"reviewer-a": model}), RUN_ID, "1")
+
+    assert caught.value.message == "Blocked: the marker would end its HTML comment early."
+
+
+def test_compose_body_refuses_a_comment_longer_than_github_accepts(
+    github_review: ModuleType,
+) -> None:
+    def compose(sections: str) -> str:
+        return github_review.compose_body(
+            _review(sections=sections),
+            engine="kiro_cli",
+            reviewers="single",
+            actor="octocat",
+            run_url=RUN_URL,
+            marker=github_review.build_marker(_review(), RUN_ID, "2"),
+        )
+
+    room = github_review.MAX_BODY_UTF16 - (github_review.utf16_length(compose("x")) - 1)
+    # The last character is two UTF-16 units, so a count of code points is one short.
+    fits = "x" * (room - 2) + "\U0001f600"
+
+    assert github_review.utf16_length(compose(fits)) == github_review.MAX_BODY_UTF16
+    with pytest.raises(github_review.Stop) as caught:
+        compose("x" + fits)
+    assert caught.value.message == "Blocked: the review comment is longer than GitHub accepts."
+
+
+@pytest.mark.parametrize(
+    ("live", "expected_code", "message"),
+    [
+        (
+            _live_pr(state="closed"),
+            1,
+            f"Blocked: {REPO}#{NUMBER} is not open. Nothing is published.",
+        ),
+        ([_live_pr()], 1, f"Blocked: {REPO}#{NUMBER} is not open. Nothing is published."),
+        (
+            _live_pr(draft=True),
+            0,
+            f"Skipped: {REPO}#{NUMBER} is now a draft. Nothing is published.",
+        ),
     ],
 )
 def test_publish_reads_the_pr_again_before_posting(
@@ -2809,11 +3139,11 @@ def test_publish_reads_the_pr_again_before_posting(
     process: FakeProcess,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
-    changes: dict[str, Any],
+    live: Any,
     expected_code: int,
     message: str,
 ) -> None:
-    _github(process, live=_live_pr(**changes))
+    _github(process, live=live)
 
     assert _publish(github_review, tmp_path, _review()) == expected_code
 
