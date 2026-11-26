@@ -26,6 +26,17 @@ def _run_async(coro):
     return asyncio.run(coro)
 
 
+def _stream_writer() -> MagicMock:
+    """A stand-in for asyncio.StreamWriter: ``write`` is sync, ``drain`` is awaited.
+
+    An AsyncMock here made ``write`` return a coroutine that ``_send`` never awaits
+    (it must not: the real ``write`` is sync), which surfaced as a RuntimeWarning.
+    """
+    writer = MagicMock()
+    writer.drain = AsyncMock()
+    return writer
+
+
 class TestHerdrInboxServiceRegistration:
     """Test terminal registration and unregistration."""
 
@@ -202,7 +213,7 @@ class TestHerdrInboxServiceSubscription:
         subprocess on the API event loop, while every suite stays green.
         """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1"}
         mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
 
@@ -221,7 +232,7 @@ class TestHerdrInboxServiceSubscription:
     def test_subscribe_sends_per_pane_and_broadcast_in_one_call(self, mock_snap):
         """One events.subscribe carrying per-pane agent-status subs + broadcast + lifecycle."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1", "pane-2": "tid2"}
         mock_snap.return_value = {
             "panes": [
@@ -247,7 +258,7 @@ class TestHerdrInboxServiceSubscription:
         herdr answers pane_not_found for it and then RESETS the connection, so
         one stale map entry must not be able to poison every retry."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1", "pane-gone": "tid2"}
         mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
         _run_subscribe_with_ack(service)
@@ -266,7 +277,7 @@ class TestHerdrInboxServiceSubscription:
         connection attempt so _socket_loop retries with backoff instead of
         sending a subscription herdr may reject and reset."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1"}
         mock_snap.return_value = None
 
@@ -280,7 +291,7 @@ class TestHerdrInboxServiceSubscription:
         silently degrade every delivery to the reconciliation sweep, which is
         exactly the failure mode the fire-and-forget subscribe hid."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1"}
         mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
         with pytest.raises(ConnectionError, match="pane_not_found"):
@@ -296,7 +307,7 @@ class TestHerdrInboxServiceSubscription:
         from cli_agent_orchestrator.services import herdr_inbox_service as mod
 
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1"}
         mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
         flood = (
@@ -315,7 +326,7 @@ class TestHerdrInboxServiceSubscription:
             socket_path="/tmp/test.sock",
             delivery_callback=lambda tid, source: (delivered.append(tid) or 0),
         )
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1", "pane-2": "tid2"}
         mock_snap.return_value = {
             "panes": [
@@ -360,7 +371,7 @@ class TestHerdrInboxServiceSubscription:
         """An event line arriving before the ack is dispatched, not dropped."""
         callback = MagicMock()
         service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1"}
         mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
         stray = (
@@ -563,7 +574,7 @@ class TestHerdrInboxServiceReconnect:
         plus the two lifecycle events.
         """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         # Register two terminals with their current pane_ids
         service._terminal_to_pane["tid1"] = "pane-1"
         service._pane_to_terminal["pane-1"] = "tid1"
@@ -1352,7 +1363,7 @@ class TestHerdrInboxServiceSingleSubscribePerConnection:
     def test_socket_setup_issues_exactly_one_subscribe(self, mock_snap):
         """A full connect cycle (reconcile already done) writes exactly one subscribe."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer()
         service._pane_to_terminal = {"pane-1": "tid1"}
         service._terminal_to_pane = {"tid1": "pane-1"}
         mock_snap.return_value = {"panes": [{"pane_id": "pane-1", "agent_status": "idle"}]}
@@ -1728,7 +1739,7 @@ class TestHerdrInboxServiceLifecycleEvents:
         service._retry_pending_tombstone_runtime_cleanup()
         assert service._pending_tombstone_runtime_cleanup == set()
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_locked")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.herdr_inbox_service._retain_deferred_failure_tombstone")
     def test_closed_workspace_retry_never_deletes_replacement_live_label(
@@ -2159,7 +2170,7 @@ class TestHerdrInboxServiceLifecycleEvents:
         mock_retain.assert_called_once_with("tid-failed", on_cleanup_deferred=ANY)
         mock_delete.assert_not_called()
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_locked")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_workspace_closed_removes_all_terminals_for_session(
@@ -2575,7 +2586,7 @@ class TestHerdrInboxServiceWorkspaceClosedLiveResolution:
     live herdr state at event time so a real workspace close always cleans up.
     """
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_locked")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
@@ -2730,3 +2741,66 @@ def test_ghost_deletion_releases_only_after_success(claimed_store, monkeypatch, 
     assert len(writes) == 1
     with env[1]() as db:
         assert db.query(database.EphemeralAgentModel).count() == 1
+
+
+class TestClosedWorkspaceCleanupUnderTheLockDoesNotDeadlock:
+    """#1468: delete_terminal takes the session lifecycle lock, which is not
+    reentrant. _cleanup_closed_session already holds it for ``session_name``
+    while it tears down that session's rows, so it must reach the teardown
+    without taking the lock again. This drives the REAL terminal_service
+    teardown (only the store-touching steps are recorded) and fails by timeout
+    if the cleanup deadlocks on its own lock."""
+
+    def test_the_real_inner_teardown_runs_under_the_held_lock(self, monkeypatch):
+        import threading
+
+        from cli_agent_orchestrator.services import (
+            delegation_callback_service,
+            herdr_inbox_service,
+            session_lock,
+            terminal_service,
+        )
+
+        rows = {"cdl00001": {"id": "cdl00001", "tmux_session": "cao-dl", "tmux_window": "w-dl"}}
+        monkeypatch.setattr(
+            database,
+            "list_terminals_by_session",
+            lambda name: [r for r in rows.values() if r["tmux_session"] == name],
+        )
+        monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda tid: rows.get(tid))
+        monkeypatch.setattr(
+            herdr_inbox_service, "_retain_deferred_failure_tombstone", lambda *a, **k: False
+        )
+        monkeypatch.setattr(
+            delegation_callback_service, "handle_worker_ended", lambda *a, **k: None
+        )
+        monkeypatch.setattr(terminal_service, "capture_terminal_snapshot", lambda tid: {})
+        monkeypatch.setattr(terminal_service, "dismantle_terminal_runtime", lambda tid, m: True)
+        held_during_row_delete = []
+
+        def _delete_row(tid, metadata, registry=None, end_reason=None):
+            entry = session_lock._session_locks.get("cao-dl")
+            held_during_row_delete.append(entry is not None and entry[0].locked())
+            rows.pop(tid, None)
+            return True
+
+        monkeypatch.setattr(terminal_service, "delete_terminal_row", _delete_row)
+
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._live_tab_labels = MagicMock(return_value=set())
+        result = {}
+        worker = threading.Thread(
+            target=lambda: result.setdefault("ok", service._cleanup_closed_session("cao-dl")),
+            daemon=True,
+        )
+        worker.start()
+        worker.join(8)
+
+        assert not worker.is_alive(), (
+            "_cleanup_closed_session deadlocked on its own lifecycle lock "
+            f"(lock registry {dict((k, v[1]) for k, v in session_lock._session_locks.items())})"
+        )
+        assert result == {"ok": True}
+        assert held_during_row_delete == [True]
+        assert rows == {}
+        assert session_lock._session_locks == {}

@@ -106,7 +106,17 @@ jobs:
             --cov-report=json \
             --cov-fail-under=80 \
             --cov-report=term-missing \
+            -n auto --dist loadgroup \
+            --durations=25 \
             -v
+        # `-n auto --dist loadgroup` (#1408): pytest-xdist runs the suite on one
+        # worker per runner CPU. No test carries an `xdist_group` mark today;
+        # `--dist loadgroup` is kept so a mark can be added for a test that shares
+        # a process-global resource (with no marks it behaves as `load`).
+        # pytest-cov combines the workers' data, so `--cov-fail-under`, the
+        # ratchet's coverage.json, CAO_MUST_RUN (test/_must_run.py) and the
+        # decision-home guard (test/conftest.py) read the same as in a serial
+        # run: both session gates merge the workers' reports on the controller.
         # --cov-branch (#1005) also makes --cov-fail-under read the BLENDED
         # line+branch figure rather than line coverage. Whether that reads harder
         # or softer than line-only depends on whether branch % is below or above

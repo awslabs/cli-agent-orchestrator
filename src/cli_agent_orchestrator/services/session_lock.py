@@ -66,9 +66,10 @@ def session_lifecycle_lock(session_name: str) -> Iterator[None]:
     Release is guaranteed on every exit path, exceptions included.
 
     NOT reentrant: a call path already holding the lock for ``name`` must not
-    re-enter it for the same ``name``, or it self-deadlocks. The two critical
-    sections are deliberately narrow and call nothing that re-acquires — plugin
-    dispatch and provider initialization both run outside them.
+    re-enter it for the same ``name``, or it self-deadlocks. The critical sections
+    (create, ``delete_session``, ``delete_terminal``) are deliberately narrow and
+    call nothing that re-acquires — plugin dispatch and provider initialization
+    both run outside them.
     """
     with _registry_guard:
         lock, holders = _session_locks.get(session_name, (threading.Lock(), 0))

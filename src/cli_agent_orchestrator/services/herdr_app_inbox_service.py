@@ -51,7 +51,12 @@ def _teardown(terminal_id: str, end_reason: str) -> None:
         _retain_deferred_failure_tombstone,
     )
     from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
-    from cli_agent_orchestrator.services.terminal_service import delete_terminal
+
+    # This holds session_lifecycle_lock, which is not reentrant, so it calls
+    # the unlocked inner teardown rather than the locked delete_terminal (#1468).
+    from cli_agent_orchestrator.services.terminal_service import (
+        _delete_terminal_locked as delete_terminal,
+    )
 
     if not database.terminal_exists(terminal_id):
         return

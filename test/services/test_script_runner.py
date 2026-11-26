@@ -1354,6 +1354,36 @@ async def test_orphan_sweep_tears_down_in_flight_terminals(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
+async def test_orphan_sweep_runs_the_blocking_teardown_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """``delete_terminal`` waits for the session lifecycle lock, so it must not run on the loop."""
+    on_loop: List[bool] = []
+
+    def _fake_delete(terminal_id, registry=None, *, end_reason):
+        try:
+            asyncio.get_running_loop()
+            on_loop.append(True)
+        except RuntimeError:
+            on_loop.append(False)
+        return True
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.delete_terminal", _fake_delete
+    )
+    record = _make_record("run-sweep-thread", process=None, generation="1")
+    record.step_states = {
+        "s1": StepRunState(step_id="s1", state=StepState.RUNNING, terminal_id="term-1"),
+    }
+    from cli_agent_orchestrator.services import workflow_service
+
+    workflow_service.run_registry["run-sweep-thread"] = record
+
+    await script_runner._reconcile_orphans("run-sweep-thread")
+    assert on_loop == [False]
+
+
+@pytest.mark.asyncio
 async def test_orphan_sweep_teardown_failure_never_raises(monkeypatch: pytest.MonkeyPatch):
     """INV-4: a teardown failure is logged, never raised into the drive path."""
 

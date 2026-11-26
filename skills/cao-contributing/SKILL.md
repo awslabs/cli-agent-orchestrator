@@ -72,7 +72,7 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 
 | Job | Runs | Blocking? |
 |-----|------|-----------|
-| **Unit Tests** (3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ examples/remote/ec2/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-branch --cov-fail-under=80 --cov-report=term-missing --cov-report=json` | **Yes** |
+| **Unit Tests** (3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ examples/remote/ec2/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-branch --cov-fail-under=80 --cov-report=term-missing --cov-report=json -n auto --dist loadgroup` | **Yes** |
 | ↳ step: **Validate Markdown links** | `uv run python scripts/validate_markdown_links.py` — every relative link in every tracked `.md`, including `skills/` | **Yes** |
 | ↳ step: **Check links inside each built agent plugin package** | `make check-agent-plugin-links` — builds each `agent-plugin/` package on its own and checks its links, including the generated `README.md` and `CHANGELOG.md` | **Yes** |
 | **Code Quality** | black `--check`, isort `--check-only`, `uv run ruff check --config pyproject.toml --no-respect-gitignore src/ test/ examples/`, then `uv run python scripts/mypy_ratchet.py` | **Yes** (all four; the mypy step's `continue-on-error` was removed in issue #1005) |

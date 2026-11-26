@@ -41,6 +41,21 @@ def _rows(isolated_memory_db):
     db_create(_TID_B, "cao-session", "worker-efgh", "claude_code", "developer")
 
 
+@pytest.fixture(autouse=True)
+def _fresh_window_registry():
+    """Start each test without a window object left over from an earlier one.
+
+    ``_WEB_INPUT_WINDOWS`` is a ``WeakValueDictionary``, so whether a previous test's
+    window (and its ``asyncio.Lock``, bound to that test's event loop) is still
+    registered depends on when the garbage collector ran. A leftover one made
+    ``turn()`` raise "is bound to a different event loop" in some xdist
+    workers (#1408).
+    """
+    main_module._WEB_INPUT_WINDOWS.clear()
+    yield
+    main_module._WEB_INPUT_WINDOWS.clear()
+
+
 @contextmanager
 def _pty_attach(plan):
     """Real PTYs for the endpoint, the attach client faked, every step recorded.

@@ -493,8 +493,13 @@ class HerdrInboxService:
 
         from cli_agent_orchestrator.clients.database import list_terminals_by_session
         from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
+
+        # The loop below holds session_lifecycle_lock(session_name), which is not
+        # reentrant, and every row it tears down was listed for that same name, so
+        # it calls the unlocked inner teardown, not the locked delete_terminal
+        # (#1468).
         from cli_agent_orchestrator.services.terminal_service import (
-            delete_terminal as teardown_terminal,
+            _delete_terminal_locked as teardown_terminal,
         )
 
         # Creation uses this exact per-session lock. Freeze the DB worklist

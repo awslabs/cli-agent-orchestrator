@@ -1,0 +1,10 @@
+[
+  {"id":"M01","query":"beacon alpha01","needs":["atlas-protocol-01","atlas-link-hub"]},
+  {"id":"M02","query":"beacon alpha02","needs":["atlas-protocol-02","atlas-link-hub"]},
+  {"id":"M03","query":"beacon alpha03","needs":["atlas-protocol-03","atlas-link-hub"]},
+  {"id":"M04","query":"beacon alpha04","needs":["atlas-protocol-04","atlas-link-hub"]},
+  {"id":"M05","query":"beacon alpha05","needs":["atlas-protocol-05","atlas-link-hub"]},
+  {"id":"M06","query":"beacon alpha06","needs":["atlas-protocol-06","atlas-link-hub"]},
+  {"id":"M07","query":"beacon alpha07","needs":["atlas-protocol-07","atlas-link-hub"]},
+  {"id":"M08","query":"beacon alpha08","needs":["atlas-protocol-08","atlas-link-hub"]}
+]

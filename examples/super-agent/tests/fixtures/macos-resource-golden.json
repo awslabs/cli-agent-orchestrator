@@ -1,0 +1,152 @@
+[
+ {
+  "input": {
+   "pressure_level": 1,
+   "free_memory_pct": 60,
+   "swap_used_gib": 1.0,
+   "disk_free_gib": 100.0,
+   "load1": 1.0,
+   "ncpu": 10,
+   "live_terminals": 1
+  },
+  "flags": [],
+  "rc": 0,
+  "stdout": "GO\n"
+ },
+ {
+  "input": {
+   "pressure_level": 1,
+   "free_memory_pct": 60,
+   "swap_used_gib": 1.0,
+   "disk_free_gib": 100.0,
+   "load1": 1.0,
+   "ncpu": 10,
+   "live_terminals": 1
+  },
+  "flags": [
+   "--json"
+  ],
+  "rc": 0,
+  "stdout": "{\n \"verdict\": \"GO\",\n \"reasons\": [],\n \"measurements\": {\n  \"pressure_level\": 1,\n  \"free_memory_pct\": 60,\n  \"swap_used_gib\": 1.0,\n  \"disk_free_gib\": 100.0,\n  \"load1\": 1.0,\n  \"ncpu\": 10,\n  \"live_terminals\": 1\n }\n}\n"
+ },
+ {
+  "input": {
+   "pressure_level": 2,
+   "free_memory_pct": 51,
+   "swap_used_gib": 18.4,
+   "disk_free_gib": 49,
+   "load1": 4.7,
+   "ncpu": 10,
+   "live_terminals": 1
+  },
+  "flags": [],
+  "rc": 3,
+  "stdout": "THROTTLE pressure=2>=2 swap_gib=18.4>16\n"
+ },
+ {
+  "input": {
+   "pressure_level": 2,
+   "free_memory_pct": 51,
+   "swap_used_gib": 18.4,
+   "disk_free_gib": 49,
+   "load1": 4.7,
+   "ncpu": 10,
+   "live_terminals": 1
+  },
+  "flags": [
+   "--json"
+  ],
+  "rc": 3,
+  "stdout": "{\n \"verdict\": \"THROTTLE\",\n \"reasons\": [\n  \"pressure=2>=2\",\n  \"swap_gib=18.4>16\"\n ],\n \"measurements\": {\n  \"pressure_level\": 2,\n  \"free_memory_pct\": 51,\n  \"swap_used_gib\": 18.4,\n  \"disk_free_gib\": 49,\n  \"load1\": 4.7,\n  \"ncpu\": 10,\n  \"live_terminals\": 1\n }\n}\n"
+ },
+ {
+  "input": {
+   "pressure_level": 4,
+   "free_memory_pct": 60,
+   "swap_used_gib": 1.0,
+   "disk_free_gib": 5,
+   "load1": 1.0,
+   "ncpu": 10,
+   "live_terminals": 1
+  },
+  "flags": [],
+  "rc": 1,
+  "stdout": "STOP pressure=4>=4 disk_free_gib=5.0<20\n"
+ },
+ {
+  "input": {
+   "pressure_level": 4,
+   "free_memory_pct": 60,
+   "swap_used_gib": 1.0,
+   "disk_free_gib": 5,
+   "load1": 1.0,
+   "ncpu": 10,
+   "live_terminals": 1
+  },
+  "flags": [
+   "--json"
+  ],
+  "rc": 1,
+  "stdout": "{\n \"verdict\": \"STOP\",\n \"reasons\": [\n  \"pressure=4>=4\",\n  \"disk_free_gib=5.0<20\"\n ],\n \"measurements\": {\n  \"pressure_level\": 4,\n  \"free_memory_pct\": 60,\n  \"swap_used_gib\": 1.0,\n  \"disk_free_gib\": 5,\n  \"load1\": 1.0,\n  \"ncpu\": 10,\n  \"live_terminals\": 1\n }\n}\n"
+ },
+ {
+  "input": {
+   "pressure_level": null,
+   "free_memory_pct": null,
+   "swap_used_gib": null,
+   "disk_free_gib": null,
+   "load1": null,
+   "ncpu": null,
+   "live_terminals": null
+  },
+  "flags": [],
+  "rc": 3,
+  "stdout": "THROTTLE unmeasured:pressure unmeasured:free_mem_pct unmeasured:swap_gib unmeasured:disk_free_gib unmeasured:load unmeasured:live_terminals\n"
+ },
+ {
+  "input": {
+   "pressure_level": null,
+   "free_memory_pct": null,
+   "swap_used_gib": null,
+   "disk_free_gib": null,
+   "load1": null,
+   "ncpu": null,
+   "live_terminals": null
+  },
+  "flags": [
+   "--json"
+  ],
+  "rc": 3,
+  "stdout": "{\n \"verdict\": \"THROTTLE\",\n \"reasons\": [\n  \"unmeasured:pressure\",\n  \"unmeasured:free_mem_pct\",\n  \"unmeasured:swap_gib\",\n  \"unmeasured:disk_free_gib\",\n  \"unmeasured:load\",\n  \"unmeasured:live_terminals\"\n ],\n \"measurements\": {\n  \"pressure_level\": null,\n  \"free_memory_pct\": null,\n  \"swap_used_gib\": null,\n  \"disk_free_gib\": null,\n  \"load1\": null,\n  \"ncpu\": null,\n  \"live_terminals\": null\n }\n}\n"
+ },
+ {
+  "input": {
+   "pressure_level": 3,
+   "free_memory_pct": 60,
+   "swap_used_gib": 1.0,
+   "disk_free_gib": 100.0,
+   "load1": "NaN",
+   "ncpu": 10,
+   "live_terminals": 1
+  },
+  "flags": [],
+  "rc": 3,
+  "stdout": "THROTTLE unknown:pressure=3 invalid:load1=nan\n"
+ },
+ {
+  "input": {
+   "pressure_level": 3,
+   "free_memory_pct": 60,
+   "swap_used_gib": 1.0,
+   "disk_free_gib": 100.0,
+   "load1": "NaN",
+   "ncpu": 10,
+   "live_terminals": 1
+  },
+  "flags": [
+   "--json"
+  ],
+  "rc": 3,
+  "stdout": "{\n \"verdict\": \"THROTTLE\",\n \"reasons\": [\n  \"unknown:pressure=3\",\n  \"invalid:load1=nan\"\n ],\n \"measurements\": {\n  \"pressure_level\": 3,\n  \"free_memory_pct\": 60,\n  \"swap_used_gib\": 1.0,\n  \"disk_free_gib\": 100.0,\n  \"load1\": NaN,\n  \"ncpu\": 10,\n  \"live_terminals\": 1\n }\n}\n"
+ }
+]

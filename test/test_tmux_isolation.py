@@ -144,18 +144,29 @@ def outside_servers():
 def _child_env(probe: str) -> dict:
     """The current environment minus pytest's, tmux's and the outer gates' variables.
 
-    ``CAO_MUST_RUN`` names the assurance gates of the outer session (CI sets it);
-    the child runs only a probe, so an inherited gate would fail it for an
-    unrelated reason.
+    ``CAO_MUST_RUN`` names the assurance gates of the outer session (CI sets it),
+    and ``CAO_TEST_SHUFFLE_SEED`` controls only the outer run's collection
+    order. The child runs only a probe, so either inherited setting would weaken
+    or fail it for an unrelated reason.
     """
     env = {
         k: v
         for k, v in os.environ.items()
         if not k.startswith(("PYTEST_", "COV_CORE_", "TMUX"))
-        and k not in ("_CAO_TEST_HOME_ISOLATION", "CAO_MUST_RUN")
+        and k not in ("_CAO_TEST_HOME_ISOLATION", "CAO_MUST_RUN", "CAO_TEST_SHUFFLE_SEED")
     }
     env["CAO_TEST_TMUX_PROBE"] = probe
     return env
+
+
+def test_child_env_drops_outer_assurance_settings(monkeypatch):
+    monkeypatch.setenv("CAO_MUST_RUN", "unit")
+    monkeypatch.setenv("CAO_TEST_SHUFFLE_SEED", "1")
+
+    child = _child_env("report-env")
+
+    assert "CAO_MUST_RUN" not in child
+    assert "CAO_TEST_SHUFFLE_SEED" not in child
 
 
 def _run_probe(env: dict, *test_names: str) -> None:
