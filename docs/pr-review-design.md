@@ -102,8 +102,8 @@ the publisher. The tests keep the two copies equal.
   The profiles grant only read tools. A change to `REVIEW.md` cannot give an
   agent more access.
 - **Lessons.** When a review misses a defect, a maintainer adds the lesson to
-  the check that should have found it, with its source. "Ownership and
-  changes" in `REVIEW.md` gives this rule.
+  the check that should have found it, with its source. "Add a lesson" in
+  `REVIEW.md` gives this rule.
 - **Ownership.** `.github/CODEOWNERS` gives `REVIEW.md` and
   `.github/pr-review/` to `@awslabs/multiq`, in the block for gate policy and
   trust-boundary code (#1350 Q4). The `main` ruleset requires a code owner's
