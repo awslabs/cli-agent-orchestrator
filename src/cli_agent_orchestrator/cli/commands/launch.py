@@ -354,10 +354,10 @@ def launch(
                         )
                     )
                 elif provider == "opencode_cli":
-                    # OpenCode's `--auto` cannot help here: `opencode mini`
-                    # (what CAO launches on v2) rejects it, and it never
-                    # overrides the explicit deny rules `cao install` writes.
-                    # Permissions are install-time only (docs/opencode-cli.md).
+                    # OpenCode's `--auto` is not passed: v2's `opencode mini`
+                    # rejects it, on v1 CAO does not pass it, and on neither
+                    # does it override the install-time deny rules. So
+                    # permissions are install-time only (docs/opencode-cli.md).
                     click.echo(
                         click.style(
                             "  Note: --yolo has no runtime effect on opencode_cli.\n"
