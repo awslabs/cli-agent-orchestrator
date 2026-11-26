@@ -44,6 +44,7 @@ class Inbox(http.server.BaseHTTPRequestHandler):
         cls.received.append((self.path.split("?")[0], q["sender_id"][0], q["message"][0]))
         self.send_response(200)
         self.end_headers()
+        self.wfile.write(cls.response_body)
 
     def log_message(self, *args):
         pass
@@ -51,7 +52,8 @@ class Inbox(http.server.BaseHTTPRequestHandler):
 
 @pytest.fixture
 def inbox():
-    handler = type("TestInbox", (Inbox,), {"fail": 0, "attempts": 0, "received": []})
+    handler = type("TestInbox", (Inbox,), {"fail": 0, "attempts": 0, "received": [],
+                                          "response_body": b'{"success": true}'})
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -220,6 +222,120 @@ exit 0
                             capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stdout + result.stderr
     assert (tmp_path / "pauses").read_text().splitlines() == ["5", "10", "5", "5", "5"]
+
+
+def test_error_pause_is_capped_at_the_poll_interval(tmp_path, inbox):
+    _, api = inbox
+    pb = tree(tmp_path, "WAKE none :: poll_errors=1/1", rc=2)
+    (pb / "tick_loop.sh").write_text('''#!/bin/bash
+echo run >> "$(dirname "$0")/state/stub_runs"
+echo 'WAKE none :: poll_errors=1/1'; exit 2
+''')
+    sleep_dir = tmp_path / "bin"
+    sleep_dir.mkdir()
+    (sleep_dir / "sleep").write_text(f'#!/bin/bash\necho "$1" >> "{tmp_path}/pauses"\n')
+    (sleep_dir / "sleep").chmod(0o755)
+    env = env_for(api, 6, 1)
+    env.update(PATH=f"{sleep_dir}:/usr/bin:/bin", SUPERVISOR_SLEEP="5", INTERVAL="6")
+    result = subprocess.run(["bash", str(pb / "tick_supervisor.sh")], env=env,
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert (tmp_path / "pauses").read_text().splitlines() == ["5", "6", "6", "6"]
+
+
+def test_quiet_ticks_between_error_exits_reset_the_count(tmp_path, inbox):
+    _, api = inbox
+    pb = tree(tmp_path)
+    (pb / "tick_loop.sh").write_text('''#!/bin/bash
+S="$(dirname "$0")/state"; echo run >> "$S/stub_runs"
+if [ "$(wc -l < "$S/stub_runs")" -gt 1 ]; then touch "$S/tick_loop.clean"; fi
+echo 'WAKE none :: poll_errors=1/1'; exit 2
+''')
+    result = supervise(pb, api, cycles=6, tries=1)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert runs(pb) == 6
+
+
+def test_clean_exit_then_one_error_does_not_stop_after_four_errors(tmp_path, inbox):
+    _, api = inbox
+    pb = tree(tmp_path)
+    (pb / "tick_loop.sh").write_text('''#!/bin/bash
+S="$(dirname "$0")/state"; echo run >> "$S/stub_runs"
+if [ "$(wc -l < "$S/stub_runs")" -eq 5 ]; then
+  echo 'WAKE reports/clean.json :: pr#9:review'; exit 0
+fi
+echo 'WAKE none :: poll_errors=1/1'; exit 2
+''')
+    result = supervise(pb, api, cycles=6, tries=1)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert runs(pb) == 6
+
+
+def test_error_without_wake_reports_no_wake_to_conductor(tmp_path, inbox):
+    handler, api = inbox
+    pb = tree(tmp_path, line="", rc=2)
+    result = supervise(pb, api, cycles=6, tries=1)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert runs(pb) == 5 and len(messages(handler)) == 1
+    assert "exit_status_2" in messages(handler)[0]
+    assert "no wake was sent" in messages(handler)[0]
+
+
+def test_planned_stop_during_fifth_error_does_not_write_stop_reason(tmp_path, inbox):
+    handler, api = inbox
+    pb = tree(tmp_path)
+    (pb / "tick_loop.sh").write_text('''#!/bin/bash
+S="$(dirname "$0")/state"; echo run >> "$S/stub_runs"
+if [ "$(wc -l < "$S/stub_runs")" -eq 5 ]; then
+  echo $$ > "$S/fifth_pid"
+  trap 'exit 143' TERM
+  sleep 30 >/dev/null & wait $!
+  exit 143
+fi
+echo 'WAKE none :: poll_errors=1/1'; exit 2
+''')
+    proc = subprocess.Popen(["bash", str(pb / "tick_supervisor.sh")], env=env_for(api, 0, 1),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        assert wait_for(lambda: (pb / "state" / "fifth_pid").exists())
+        loop_pid = int((pb / "state" / "fifth_pid").read_text())
+        assert wait_for(lambda: subprocess.run(["pgrep", "-P", str(loop_pid), "-x", "sleep"],
+                                               capture_output=True).returncode == 0)
+        sleepers = subprocess.run(["pgrep", "-P", str(loop_pid), "-x", "sleep"],
+                                  capture_output=True, text=True).stdout.splitlines()
+        proc.terminate()
+        os.kill(loop_pid, signal.SIGTERM)
+        for sleeper in sleepers:
+            os.kill(int(sleeper), signal.SIGTERM)
+        assert proc.wait(timeout=5) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+    assert not (pb / "state" / "tick_supervisor.stopped").exists()
+    assert not any(message.startswith("LOOP_ERROR") for message in messages(handler))
+
+
+def test_new_supervisor_archives_previous_stop_reason(tmp_path, inbox):
+    _, api = inbox
+    pb = tree(tmp_path, line="", rc=0)
+    stopped = pb / "state" / "tick_supervisor.stopped"
+    stopped.write_text("LOOP_ERROR old reason\n")
+    result = supervise(pb, api, cycles=1, tries=1)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not stopped.exists()
+    assert (pb / "state" / "tick_supervisor.stopped.prev").read_text() == "LOOP_ERROR old reason\n"
+
+
+@pytest.mark.parametrize("response", [b'{"success": false}', b'not json'])
+def test_unsuccessful_http_200_keeps_wake(tmp_path, inbox, response):
+    handler, api = inbox
+    handler.response_body = response
+    pb = tree(tmp_path)
+    result = supervise(pb, api, cycles=3, tries=1)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert runs(pb) == 1
+    assert (pb / "state" / "tick_supervisor.pending").read_text().startswith(WAKE)
 
 
 def test_real_loop_with_failing_gh_stops_after_five_wakes(tmp_path, inbox):
