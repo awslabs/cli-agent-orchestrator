@@ -12,8 +12,9 @@ name: PR Review
 #
 # - Manual dispatch only. A fork PR cannot start this workflow or reach its
 #   secrets, and nothing runs on a pull_request event.
-# - Three jobs. `prepare` reads the PR. `review` runs the agents with a
-#   read-only token. `publish` holds the only write token and runs no agent.
+# - Three jobs. `prepare` reads the PR. `review` runs the agents. Its token can
+#   read the repository and make Copilot requests, but it cannot write to the
+#   repository. `publish` is the only job that can write, and it runs no agent.
 # - The agents read the PR head as files. No step runs code from the PR head.
 # - Each run reviews one head SHA. `publish` refuses a stale result.
 

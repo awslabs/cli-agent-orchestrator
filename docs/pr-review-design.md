@@ -200,7 +200,7 @@ the design.
 
 | Security note in #1350 | Design |
 | --- | --- |
-| One workflow, two jobs. The review job reads the key and has read-only permissions. The post job writes and has no key. | Three jobs. `prepare` reads the PR with a read-only token. `review` holds the engine credential and cannot write to the repository. `publish` holds the only write token and runs no agent. |
+| One workflow, two jobs. The review job reads the key and has read-only permissions. The post job writes and has no key. | Three jobs. `prepare` reads the PR with a read-only token. `review` holds the engine credential and cannot write to the repository. With `copilot_cli` and no `COPILOT_GITHUB_TOKEN` secret, the engine credential is its job token, which can make Copilot requests. `publish` is the only job that can write to the repository, and it runs no agent. |
 | The key lives in an environment whose branch rule allows only `main`. | The `review` job uses the `ai-review` environment, the name in the comments of #1350 (Q6), with `deployment: false`, so GitHub records no deployment. An administrator sets the branch rule and moves the key. See [Owner decisions](#owner-decisions). |
 | The first trigger is a manual dispatch from `main`. | `workflow_dispatch` only. There is no `pull_request` or `pull_request_target` trigger. |
 | One agent, read-only tools. No shell, no MCP servers, no web access, and the CLI's sandbox mode on. | One agent by default. The profiles grant only `fs_read` and `fs_list`. Each seat has one MCP server, `cao-mcp-server`, to return its report with `workflow_return`. The sandbox mode is off. See [Ticket contract](#ticket-contract). |

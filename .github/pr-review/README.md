@@ -285,10 +285,13 @@ one run.
 - **Manual dispatch only.** Nothing runs on a `pull_request` or
   `pull_request_target` event. Only a user with write access can dispatch the
   workflow, so a fork PR cannot start it or reach its secrets.
-- **Split tokens.** The `review` job, where the agents run, has no write token.
-  Only `publish` can write, and it runs no agent. It writes one comment on the
-  PR, which later runs update in place, and neutral check runs. It never
-  approves, requests changes or posts an inline comment.
+- **Split tokens.** The `review` job, where the agents run, cannot write to the
+  repository. Its job token has only `contents: read` and
+  `copilot-requests: write`. With `copilot_cli` and no `COPILOT_GITHUB_TOKEN`
+  secret, the agents get the job token, and they can use it to make Copilot
+  requests. Only `publish` can write to the repository, and it runs no agent. It
+  writes one comment on the PR, which later runs update in place, and neutral
+  check runs. It never approves, requests changes or posts an inline comment.
 - **Secret in an environment.** The `review` job reads the engine secret from the
   `ai-review` environment. When the environment allows only the default branch,
   a workflow file that was changed on another branch cannot read the secret. See
