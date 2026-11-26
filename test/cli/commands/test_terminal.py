@@ -307,6 +307,64 @@ class TestRestoreCommand:
             window_shell=f"cat '{scrollback_path}'; exec /bin/zsh -l",
         )
 
+    def test_restore_on_herdr_app_backend_carries_no_profile_or_caller_label(
+        self, runner, tmp_path, monkeypatch
+    ):
+        """herdr-app-role-labels, "Restored plain window": the terminal.run call has
+        neither cao.profile nor cao.caller, and every other label is as before."""
+        from test.backends.fake_hc import FakeHc
+
+        from cli_agent_orchestrator.backends.herdr_app_backend import HerdrAppBackend
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.mcp_resolution.cao_server_env",
+            lambda: {"CAO_API": "http://x"},
+        )
+        workdir = tmp_path / "project"
+        workdir.mkdir()
+        snapshot = {
+            "terminal_id": "abc12345",
+            "session_name": "cao-test",
+            "window_name": "dev-abc1",
+            "agent_profile": "developer",
+            "caller_id": "deadbeef",
+            "provider": "kiro_cli",
+            "working_directory": str(workdir),
+            "allowed_tools": None,
+        }
+        (tmp_path / "abc12345.snapshot.json").write_text(json.dumps(snapshot))
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        hc = FakeHc()
+        backend = HerdrAppBackend(herdr_app_session="cao", client=hc)
+
+        with patch("cli_agent_orchestrator.cli.commands.terminal.TERMINAL_LOG_DIR", tmp_path):
+            with patch(
+                "cli_agent_orchestrator.cli.commands.terminal.api_http.get", return_value=mock_resp
+            ):
+                with patch(
+                    "cli_agent_orchestrator.cli.commands.terminal.get_backend",
+                    return_value=backend,
+                ):
+                    result = runner.invoke(terminal, ["restore", "abc12345"])
+
+        assert result.exit_code == 0, result.output
+        [run] = hc.calls_to("terminal.run")
+        labels = run["labels"]
+        assert set(labels) == {
+            "herdr.space",
+            "herdr.tab",
+            "cao.managed",
+            "cao.home",
+            "cao.terminal_id",
+            "cao.session",
+            "cao.window",
+        }
+        assert labels["cao.terminal_id"] == "abc12345"
+        assert labels["cao.session"] == "cao-test"
+        assert labels["cao.window"] == "restored-dev-abc1"
+        assert run["line"].endswith("-l")  # still a plain login shell, no agent
+
     def test_restore_scrollback_missing_still_succeeds(self, runner, tmp_path):
         """Restore succeeds with no window_shell when scrollback file is missing."""
         snapshot = {

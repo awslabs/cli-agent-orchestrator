@@ -7,17 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- **Inbox delivery claims a message in the database before sending it** (#406, #709).
-  `deliver_pending` read PENDING rows and then marked them DELIVERED with an unconditional
-  write, so two deliveries that did not share a lock could both read one row and both send it.
-  The mark is now a compare-and-set (`UPDATE ... WHERE id = ? AND status = 'pending'`), and
-  only rows a delivery claimed are sent. This is defence in depth: inside one server the
-  per-terminal delivery lock already serializes read, mark and send, and a second server on
-  the same `CAO_HOME_DIR` is refused by the one-server-per-home lock, so no supported setup is
-  known to send a message twice this way. It is one plain `UPDATE` with no `RETURNING`, so it
-  does not depend on the SQLite version.
-
-||||||| 454d1c2b
+- **Approve & run no longer comes back after a run starts**. In the Workflows tab, a started run
+  opens its page, and the launcher closed before it saved its cleared state. Going back to
+  Workflows then showed the same, already approved plan again, and each click on Approve & run
+  started another run. The launcher now clears the approval as soon as the plan is approved, and
+  saves its state before the run's page opens. If the resubmit is refused again, it shows the new
+  plan.
 - **Remote worker status polling no longer overruns `--timeout` by up to 60s** (#1059).
   `FleetClient.terminal_status` now reads with a 5s timeout (the same ceiling the local
   status poll in `wait_until_terminal_status` uses) instead of the module-wide 60s read
@@ -28,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blank. Panes already showing an agent keep it, and clicking the current layout again refills
   any pane you emptied. Shift+click splits and status polling never fill panes, so a pane you
   close stays empty, and going down to fewer panes (or picking 1 pane) never fills.
+
+- **Code-owner review protects CI policy, release scripts, and trust-boundary code** (#1350).
+  Tests pin the owned paths, the active `mypy.ini` settings, and the full ruff
+  configuration; root gate configuration files are owned before they exist, and
+  the ruff gate reads only `pyproject.toml` and ignores `.gitignore` and `.ignore`
+  files; nested ruff configs are owned and ignored.
 
 - **Workflow specs open in a large, readable viewer**. The Workflows page now shows
   Python syntax colouring, line numbers and lint findings in a near-window-size dialog,
@@ -78,6 +79,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   update, and `cao workflow run` all refuse such a script before any step starts. A stored workflow
   written that way needs its ids changed. The fan-out example in the `cao-workflow` skill and in
   `docs/workflows.md` used this shape and now builds a valid id from each file name.
+- **`cao update` keeps CAO's extras and its `--with` packages when it unpins a version-pinned install** (#1260).
+  `uv tool install cli-agent-orchestrator@latest --upgrade` rewrote the receipt with only a bare CAO in it,
+  so CAO's own extras (`[agui]`, `[otel]`) and extra packages such as a decider were uninstalled. Both are
+  now passed back. If the receipt holds something `cao update` can't pass back (a git, URL, editable or
+  marker entry, or index settings under `[tool.options]` alongside any carried package, whose dependencies
+  would be resolved without them), it stops before uv runs and prints the receipt path and a command to
+  finish by hand.
 - **Memory inspection and fixture hygiene are safer by default** (#1329).
   This resolves #861 Q3: CLI list/show and REST list/show no longer increment
   `access_count` unless `memory.non_accessing_inspection=false`; MCP recall

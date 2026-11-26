@@ -284,9 +284,14 @@ export function WorkflowLauncher({ reloadKey = 0, focus = null, onEdit }: Workfl
 
   const run = async () => {
     const outcome = await startWorkflowRun(selected, buildPayload(), runId.trim() || undefined)
-    setPendingApproval(outcome && 'approvalPlanId' in outcome
+    const next = outcome && 'approvalPlanId' in outcome
       ? { planId: outcome.approvalPlanId, message: outcome.message, forDraft: currentDraft }
-      : null)
+      : null
+    setPendingApproval(next)
+    // A started run opens its page, which unmounts this launcher before the
+    // state above renders, so the save effect never runs. Save here as well,
+    // or the next mount restores the approved plan and offers to run it again.
+    saveLauncherDraft({ selected, runId, inputs, pendingApproval: next })
   }
 
   const submit = async () => {
@@ -304,6 +309,9 @@ export function WorkflowLauncher({ reloadKey = 0, focus = null, onEdit }: Workfl
     setSubmitting(true)
     try {
       await api.approveWorkflowPlan(pendingApproval.planId)
+      // The plan is approved: the box has done its job. If the resubmit is
+      // refused again, run() shows the new plan.
+      setPendingApproval(null)
       await run()
     } catch (e: any) {
       showSnackbar({ type: 'error', message: e?.detail || e?.message || 'Failed to approve plan' })

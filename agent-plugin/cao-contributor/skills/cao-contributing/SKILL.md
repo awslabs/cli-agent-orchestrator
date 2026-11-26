@@ -50,7 +50,7 @@ uv sync --locked --all-extras --dev # install (mirrors what CI does)
 uv run pytest test/path/to/test_x.py   # run targeted tests while iterating
 uv run black src/ test/             # format (CI checks --check)
 uv run isort src/ test/             # import order (CI checks --check-only)
-uv run ruff check src/ test/ examples/   # dead code -- BLOCKING, and green on main
+uv run ruff check --config pyproject.toml --no-respect-gitignore src/ test/ examples/   # dead code -- BLOCKING, and green on main
 uv run python scripts/mypy_ratchet.py  # type check -- the gate CI runs (see note below)
 uv run mypy src/                    # the raw mypy output, if you want to read it
 ```
@@ -75,7 +75,7 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 | **Unit Tests** (3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ examples/remote/ec2/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-branch --cov-fail-under=80 --cov-report=term-missing --cov-report=json -n auto --dist loadgroup` | **Yes** |
 | ↳ step: **Validate Markdown links** | `uv run python scripts/validate_markdown_links.py` — every relative link in every tracked `.md`, including `skills/` | **Yes** |
 | ↳ step: **Check links inside each built agent plugin package** | `make check-agent-plugin-links` — builds each `agent-plugin/` package on its own and checks its links, including the generated `README.md` and `CHANGELOG.md` | **Yes** |
-| **Code Quality** | black `--check`, isort `--check-only`, `uv run ruff check src/ test/ examples/`, then `uv run python scripts/mypy_ratchet.py` | **Yes** (all four; the mypy step's `continue-on-error` was removed in issue #1005) |
+| **Code Quality** | black `--check`, isort `--check-only`, `uv run ruff check --config pyproject.toml --no-respect-gitignore src/ test/ examples/`, then `uv run python scripts/mypy_ratchet.py` | **Yes** (all four; the mypy step's `continue-on-error` was removed in issue #1005) |
 | **AG-UI demo (shift-left recording)** | boots a `CAO_AGUI_ENABLED` server, drives the viewer, records a GIF artifact | **Yes** |
 | **AG-UI construct demos (shift-left recordings)** | same pattern for the L2 construct library | **Yes** |
 | **AG-UI stock-client live (AC3)** | drives a real third-party AG-UI client against the surface | **Yes** |
@@ -253,7 +253,7 @@ digest together:
 ## Pre-PR checklist
 
 1. `uv run black src/ test/ && uv run isort src/ test/` (or `--check` to verify).
-2. `uv run ruff check src/ test/ examples/` — must be **clean**. Blocking, like the mypy
+2. `uv run ruff check --config pyproject.toml --no-respect-gitignore src/ test/ examples/` — must be **clean**. Blocking, like the mypy
    ratchet, but with no tolerated backlog at all, so any finding is yours. Do not reach for
    `--fix` on a pytest fixture re-import: ruff cannot see that pytest injects the name,
    and removing it breaks collection (it turned `test/decisions` into 113 errors once).

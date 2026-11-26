@@ -7,14 +7,17 @@
 #   CAO_API      optional; default: cao_api from workplace.json / workplace.local.json
 # A WAKE is never dropped. Write-ahead: the WAKE line goes into state/tick_supervisor.pending (fsync'd)
 # before the first delivery attempt; the file is then flushed oldest line first, each line removed only
-# after a 2xx, with a bounded doubling backoff (DELIVER_TRIES, default 4; DELIVER_BACKOFF s, default 2).
+# after a 2xx response with success true, with a bounded doubling backoff
+# (DELIVER_TRIES, default 4; DELIVER_BACKOFF s, default 2).
 # No new loop starts while a line is pending. TERM and INT are taken between steps, so a stop or a kill
 # can only repeat a WAKE, never lose it. A pending path that isn't a usable regular file stops the
 # supervisor (exit 4) and is left as it is; blank lines in it are skipped, never posted.
 # Stops for good on not_writer (the lease moved): the notice goes to the shepherd, or waits in the
 # pending file, and one NOT_WRITER line goes to the log and to state/tick_supervisor.stopped.
-# Five consecutive error exits stop the supervisor with one LOOP_ERROR notice. Error pauses double
-# from SUPERVISOR_SLEEP (default 5 seconds) up to INTERVAL, and a clean exit resets the pause.
+# Five error exits without a clean poll or exit between them stop the supervisor with one
+# LOOP_ERROR notice. Error pauses double
+# from SUPERVISOR_SLEEP (default 5 seconds) up to INTERVAL; a clean poll resets the count,
+# and a clean exit resets the count and pause.
 # Never prints env values.
 set -u
 PB=$(cd -- "$(dirname -- "$0")" && pwd) || exit 2
@@ -26,6 +29,7 @@ LOG="$PB/state/tick_supervisor.log"
 PIDF="$PB/state/tick_supervisor.pid"
 PENDING="$PB/state/tick_supervisor.pending"
 STOPPED="$PB/state/tick_supervisor.stopped"
+STOPPED_PREV="$PB/state/tick_supervisor.stopped.prev"
 TRIES="${DELIVER_TRIES:-4}"
 BACKOFF="${DELIVER_BACKOFF:-2}"
 CYCLES="${SUPERVISOR_CYCLES:-0}"  # tests only: stop after this many cycles (0 = run forever)
@@ -39,6 +43,7 @@ if [ -f "$PIDF" ]; then
     echo "STOP: a supervisor already runs (pid $EXISTING)"; exit 1
   fi
 fi
+if [ -f "$STOPPED" ]; then mv -- "$STOPPED" "$STOPPED_PREV" || exit 2; fi
 echo $$ > "$PIDF"
 STOP_REQ=0
 trap 'STOP_REQ=1' TERM INT  # acted on between steps: a WAKE already kept stays kept
@@ -47,13 +52,20 @@ pause() { sleep "$1" & wait $! 2>/dev/null; }  # a TERM ends the wait at once
 
 deliver_to() {
   python3 - "$API" "$1" "$SENDER" "$2" <<'PY' >> "$LOG" 2>&1
-import sys, urllib.parse, urllib.request
+import json, sys, urllib.parse, urllib.request
 api, to, sender, msg = sys.argv[1:5]
 q = urllib.parse.urlencode({"sender_id": sender, "message": msg})
 req = urllib.request.Request(f"{api}/terminals/{to}/inbox/messages?{q}", method="POST")
 with urllib.request.urlopen(req, timeout=15) as r:
-    print("delivered", r.status)
-    sys.exit(0 if 200 <= r.status < 300 else 1)  # urlopen already raises on any other final status
+    try:
+        answer = json.load(r)
+    except ValueError:
+        answer = None
+    if 200 <= r.status < 300 and isinstance(answer, dict) and answer.get("success") is True:
+        print("delivered", r.status)
+        sys.exit(0)
+    print("delivery not confirmed", r.status)
+    sys.exit(1)
 PY
 }
 
@@ -163,10 +175,16 @@ while true; do
     log "pending WAKE still undelivered; no new loop yet"; pause "${SUPERVISOR_ERROR_SLEEP:-60}"; stop_if_asked; continue
   fi
   stop_if_asked
+  START="$PB/state/tick_loop.start.$$"
+  touch "$START" || { log "cannot record loop start"; rm -f -- "$PIDF"; exit 2; }
   OUT=$(CAO_TERMINAL_ID="$SHEPHERD" bash "$PB/tick_loop.sh" 2>>"$LOG"); RC=$?
+  CLEAN=0
+  [ -f "$PB/state/tick_loop.clean" ] && [ "$PB/state/tick_loop.clean" -nt "$START" ] && CLEAN=1
+  rm -f -- "$START"
   LINE=$(printf '%s\n' "$OUT" | grep -m1 '^WAKE ' || true)
   log "loop exit rc=$RC ${LINE:-no WAKE line}"
   if [ "$RC" -ne 0 ]; then
+    [ "$CLEAN" -eq 0 ] || ERRORS=0
     ERRORS=$((ERRORS + 1))
     REASON="${LINE##* :: }"
     [ -n "$LINE" ] || REASON="exit_status_$RC"
@@ -189,8 +207,11 @@ while true; do
     log "$NOTE"; printf '%s\n' "$NOTE" > "$STOPPED"; echo "$NOTE"
     rm -f -- "$PIDF"; exit 3;;
   esac
+  stop_if_asked
   if [ "$ERRORS" -ge 5 ]; then
-    if pend check 2>/dev/null && [ -f "$PENDING" ]; then WHERE="the error wake waits in $PENDING"; else WHERE="the shepherd was told"; fi
+    if [ -z "$LINE" ]; then WHERE="no wake was sent";
+    elif pend check 2>/dev/null && [ -f "$PENDING" ]; then WHERE="the error wake waits in $PENDING";
+    else WHERE="the shepherd was told"; fi
     NOTE="LOOP_ERROR $(date -u +%Y-%m-%dT%H:%M:%SZ): $REASON; supervisor stopped; $WHERE"
     log "$NOTE"; printf '%s\n' "$NOTE" > "$STOPPED"; echo "$NOTE"
     deliver_to "$SENDER" "$NOTE" || log "conductor stop notice could not be delivered"
