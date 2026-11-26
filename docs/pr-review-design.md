@@ -185,11 +185,12 @@ a panel for high-risk rounds, and the step 11 eval decides. Model A runs
   short issue references. The driver escapes `&`, `<`, `>`, `\`, `` ` ``, `[`
   and `]` in agent text, so the text cannot add HTML, decode an entity into a
   mention, open a code span, or add a Markdown link or image. It breaks each
-  @mention and each short issue reference with a zero-width space. GitHub still
-  makes a bare URL into a link, also a URL to an issue. It also makes a commit
-  SHA into a link. A path is in a code span. When the body is too long, the
-  driver cuts it at the end of a line, so the cut cannot split a code span and
-  make a path live Markdown.
+  @mention and each short issue reference with a zero-width space, but not in a
+  bare `http` or `https` URL that GitHub links as a whole, so the break does not
+  change the link. GitHub still makes a bare URL into a link, also a URL to an
+  issue. It also makes a commit SHA into a link. A path is in a code span. When
+  the body is too long, the driver cuts it at the end of a line, so the cut
+  cannot split a code span and make a path live Markdown.
 
 ## Trust boundaries
 

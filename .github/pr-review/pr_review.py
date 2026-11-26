@@ -171,6 +171,18 @@ ZWSP = "\u200b"
 MENTION_RE = re.compile(r"@(?=[A-Za-z0-9])")
 # GitHub links "#12", "owner/repo#12" and "GH-12" (in any case) to an issue.
 ISSUE_REF_RE = re.compile(r"#(?=\d)|\bgh(?=-\d)", re.IGNORECASE)
+# A bare http or https URL that GitHub makes into one link, up to the next space.
+# GitHub removes only punctuation from the end of the link, so a mention or an issue
+# reference in the URL stays in the link. GitHub does not link such text after a
+# letter, or with "_" or no name in the host, and "#12" in it can then be a live
+# reference. So the host must be a plain name.
+BARE_URL_RE = re.compile(
+    r"(?<!\w)https?://[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*(?![\w.-])\S*", re.IGNORECASE
+)
+BREAK_RE = re.compile(
+    f"(?P<url>{BARE_URL_RE.pattern})|{MENTION_RE.pattern}|{ISSUE_REF_RE.pattern}",
+    re.IGNORECASE,
+)
 
 RULE_OVERRULED = (
     "Both voters confirmed a P1 or P2 finding, and the adjudicator rejected it or "
@@ -246,13 +258,17 @@ def clean_text(value: str, limit: int) -> str:
     span that ends at the fence of a later :func:`code_span` on the same line and
     leaves that span's text as raw HTML. Breaks each @mention and each short
     issue reference with a zero-width space, also the ``#64`` of an escaped
-    entity. A bare URL, also a URL to an issue, stays a link. Then it cuts the
-    text.
+    entity. It does not break them in a bare URL that GitHub links, so the break
+    does not change the link. A bare URL, also a URL to an issue, stays a link.
+    Then it cuts the text.
     """
     text = _one_line(value).replace("\\", "\\\\").replace("`", "\\`")
-    text = text.replace("[", "\\[").replace("]", "\\]")
-    text = MENTION_RE.sub(f"@{ZWSP}", html.escape(text, quote=False))
-    return fit_utf16(ISSUE_REF_RE.sub(f"\\g<0>{ZWSP}", text), limit)
+    text = html.escape(text.replace("[", "\\[").replace("]", "\\]"), quote=False)
+    return fit_utf16(BREAK_RE.sub(_break_reference, text), limit)
+
+
+def _break_reference(match: re.Match[str]) -> str:
+    return match[0] if match["url"] else match[0] + ZWSP
 
 
 def code_span(value: str) -> str:

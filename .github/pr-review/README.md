@@ -330,9 +330,11 @@ one run.
   `[`, `]`, `&`, `<` and `>` in agent text, so agent text cannot add a link, an
   image, an HTML tag, an HTML comment, an entity or a code span. It breaks each
   @mention and each short issue reference, such as `#12`, `owner/repo#12` or
-  `GH-12`, with a zero-width space. GitHub still makes a bare URL into a link,
-  also a URL to an issue. It also makes a commit SHA into a link. The check run
-  holds no agent text. The job log never shows agent text.
+  `GH-12`, with a zero-width space. It does not break them in a bare `http` or
+  `https` URL that GitHub links as a whole, so the break does not change the
+  link. GitHub still makes a bare URL into a link, also a URL to an issue. It
+  also makes a commit SHA into a link. The check run holds no agent text. The
+  job log never shows agent text.
   The run summary shows the review only after `check-secrets` and the checks of
   `github_review.py summary` pass. When the CAO run completes, the log shows the
   model and the report status of each seat. When a run fails, it shows only step

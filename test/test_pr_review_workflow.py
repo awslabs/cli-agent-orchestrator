@@ -1083,6 +1083,29 @@ def test_clean_text_removes_controls_and_escapes_markup_mentions_and_references(
 
 
 @pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # GitHub links each URL as a whole, so a break in it changes the link target.
+        ("https://example.com/doc#3", "https://example.com/doc#3"),
+        (
+            "(https://www.npmjs.com/package/@github/copilot)",
+            "(https://www.npmjs.com/package/@github/copilot)",
+        ),
+        ("HTTPS://A.COM:80/gh-12/x#4. #5 @b", "HTTPS://A.COM:80/gh-12/x#4. #\u200b5 @\u200bb"),
+        # GitHub does not link this text, and makes "#1" in it a live issue reference.
+        ("xhttps://example.com/#1", "xhttps://example.com/#\u200b1"),
+        ("https://a_b/#1", "https://a_b/#\u200b1"),
+        ("https://#1", "https://#\u200b1"),
+        ("ftp://example.com/#1", "ftp://example.com/#\u200b1"),
+    ],
+)
+def test_clean_text_keeps_a_bare_url_that_github_links(
+    pr_review: ModuleType, raw: str, expected: str
+) -> None:
+    assert pr_review.clean_text(raw, 200) == expected
+
+
+@pytest.mark.parametrize(
     ("text", "limit", "expected"),
     [
         (GRIN * 3, 5, GRIN * 2 + "…"),
