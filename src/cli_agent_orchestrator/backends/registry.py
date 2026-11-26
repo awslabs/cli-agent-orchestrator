@@ -23,6 +23,15 @@ def get_backend() -> TerminalBackend:
     return _backend
 
 
+def peek_backend() -> Optional[TerminalBackend]:
+    """Return the backend if one was created or set, else None. Never creates one.
+
+    For best-effort work (publishing labels) that must not be the thing that
+    builds a backend, as ``get_backend()`` would on its first call.
+    """
+    return _backend
+
+
 def set_backend(backend: TerminalBackend) -> None:
     """Set the terminal backend (called at application startup)."""
     global _backend
