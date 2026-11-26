@@ -49,7 +49,7 @@ Use your `terminal.herdr_app_session` value in place of `cao` if you changed it.
 
 If you add CAO as a machine in your main window, its sessions mix with your own work. The repository has an example of a second Herdr window with its own app home and its own herdr-core session, so the window lists only CAO. It shows a list of CAO sessions, the agents of the selected session as a tree of who started whom, top-bar tabs for the agents it shows, and a sidebar for schedules and workflows (CAO flows). It is a macOS setup: the Herdr app 0.1.16 or later, `jq`, and `hc` 0.1.21 or later on the Mac, and a cao-server on the `herdr-app` backend with no auth token.
 
-![The CAO window: the Sessions list, the Agents tree of one session with a conductor and its workers, the top-bar tabs, and the status bar counts](/img/herdr-app-cao-window.png)
+![The CAO window: the Sessions list, the Agents tree of one session with a conductor and its workers, the top-bar tabs, and the status bar counts](../../static/img/herdr-app-cao-window.png)
 
 *The window with demo data on a scratch server. The terminals are stand-ins, not real agents.*
 
