@@ -2823,8 +2823,14 @@ class TestCodexBulletFormatExtraction:
         assert marker is not None
         assert marker.group() == "•"
 
-    def test_extract_preserves_single_tree_formatted_bullet(self):
-        """One tree-formatted bullet can be a legitimate answer, so retain it."""
+    def test_extract_skips_one_activity_cell_before_the_reply(self):
+        """One complete cell with a reply cell under it is activity (#541).
+
+        Until #541 this shape was kept whole, on the reasoning that one
+        tree-formatted bullet could be the answer. Real Codex draws exactly
+        this for a turn that ran one command (the capture in
+        ``TestCodex541RealCaptures``), and it draws the reply as its own cell.
+        """
         output = (
             "› inspect the provider\n"
             "• Explored src/providers\n"
@@ -2838,9 +2844,85 @@ class TestCodexBulletFormatExtraction:
         provider = CodexProvider("test1234", "test-session", "window-0")
         message = provider.extract_last_message_from_script(output)
 
-        assert "Explored src/providers" in message
-        assert "Read codex.py" in message
-        assert "The extraction starts at the wrong marker" in message
+        assert message == "• The extraction starts at the wrong marker."
+
+    def test_extract_preserves_single_tree_formatted_bullet_at_the_end(self):
+        """A tree-formatted group with no cell under it may be the reply, so keep it."""
+        output = "› summarize the layout\n" "• Files changed\n" "  └ src/provider.py\n" "\n" "› \n"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert message == "• Files changed\n  └ src/provider.py"
+
+    def test_extract_preserves_opening_line_and_tree_formatted_group_at_the_end(self):
+        """The last marker is a tree-formatted group: nothing is cut."""
+        output = (
+            "› summarize the layout\n"
+            "• Here is the layout.\n"
+            "\n"
+            "• Files changed\n"
+            "  └ src/provider.py\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert message.startswith("• Here is the layout.")
+        assert "src/provider.py" in message
+
+    def test_extract_keeps_one_cell_then_prose_whole(self):
+        """One cell followed by plain prose is not enough evidence to cut."""
+        output = (
+            "› inspect the provider\n"
+            "• Explored\n"
+            "  └ Read codex.py\n"
+            "\n"
+            "The bug is fixed.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert message.startswith("• Explored")
+        assert message.endswith("The bug is fixed.")
+
+    def test_extract_starts_after_the_last_cell_with_commentary_between(self):
+        """Opening line, cell, mid-turn line, cell, reply: only the reply."""
+        output = (
+            "› fix it\n"
+            "• I will look first.\n"
+            "\n"
+            "• Explored\n"
+            "  └ Read codex.py\n"
+            "\n"
+            "• Now the tests.\n"
+            "\n"
+            "• Ran pytest -q\n"
+            "  └ 170 passed\n"
+            "\n"
+            "• The bug is fixed.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert message == "• The bug is fixed."
+
+    def test_extract_keeps_a_turn_with_no_cells_whole(self):
+        """With no activity cell, the first line is the reply."""
+        output = "› say hi\n• Called attention to the flaky test and fixed it.\n\n› \n"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert message == "• Called attention to the flaky test and fixed it."
 
     def test_extract_skips_multiple_blank_separated_activity_cells(self):
         """The response starts after the last complete native activity cell."""
@@ -2987,8 +3069,14 @@ class TestCodexBulletFormatExtraction:
         assert "Added regression tests" in message
         assert "Verification: all tests pass" in message
 
-    def test_extract_preserves_tree_formatted_legitimate_answer(self):
-        """One tree-formatted answer followed by another bullet is not activity."""
+    def test_extract_cuts_a_tree_formatted_bullet_above_another_bullet(self):
+        """The cost of #541: this layout is read as one activity cell and a reply.
+
+        If a model wrote a reply as two top-level bullets with a ``└`` row under
+        the first, the first would be lost. Codex 0.171.0 does not draw a reply
+        that way: the reply is one ``•`` cell, and bullets the model writes are
+        indented inside it (``• • first`` / ``  • second`` in the capture).
+        """
         output = (
             "› summarize the fix\n"
             "• Files changed\n"
@@ -3002,9 +3090,7 @@ class TestCodexBulletFormatExtraction:
         provider = CodexProvider("test1234", "test-session", "window-0")
         message = provider.extract_last_message_from_script(output)
 
-        assert "Files changed" in message
-        assert "src/provider.py" in message
-        assert "Tests pass" in message
+        assert message == "• Tests pass"
 
     def test_extract_does_not_count_mcp_tree_output_as_activity_cells(self):
         """MCP output must not complete neighboring model-reply bullets."""
@@ -3046,6 +3132,89 @@ class TestCodexBulletFormatExtraction:
 
         assert "parser now uses structural layout" in message
         assert "English verbs remain valid" in message
+
+
+class TestCodex541RealCaptures:
+    """Handoff extraction on real panes of Codex 0.171.0 (issue #541).
+
+    Plain ``tmux capture-pane -p -S`` of one session in a 120x45 pane, and one
+    with escapes (``-e``):
+
+    - ``codex_541_three_activity_cells_v0171.txt``: Codex's opening line, three
+      activity cells (a failed command, a read and listing, a command with
+      output), then a three-bullet reply.
+    - ``codex_541_one_activity_cell_v0171.txt``: the same pane after a second
+      turn: an opening line, ONE activity cell for a command that prints
+      nothing, then the reply ``done``.
+
+    Every activity row has a ``└`` row under it, ``└ (no output)`` included, and
+    the reply is one ``•`` cell with the completion footer under it.
+    """
+
+    ONE_CELL_REPLY = "• done"
+    THREE_CELL_REPLY = (
+        "• • Tiny Python calculator project: calc.py implements add(a, b).\n"
+        "  • Files: calc.py, test_calc.py, and notes.txt.\n"
+        "  • Tests couldn’t run (pytest missing); Git shows all three files untracked."
+    )
+
+    @staticmethod
+    def _provider() -> CodexProvider:
+        """A provider in the state ``initialize()`` leaves it in on 0.171.0."""
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._codex_version = (0, 171, 0)
+        provider._ends_turns_with_footer = True
+        return provider
+
+    def test_one_activity_cell_turn_returns_only_the_reply(self):
+        """Before #541: the opening line, the cell and the reply came back together."""
+        output = load_fixture("codex_541_one_activity_cell_v0171.txt")
+        assert "• Running both checks now." in output
+        assert "  └ (no output)" in output
+
+        assert self._provider().extract_last_message_from_script(output) == self.ONE_CELL_REPLY
+
+    @pytest.mark.parametrize(
+        "fixture",
+        [
+            "codex_541_three_activity_cells_v0171.txt",
+            "codex_541_three_activity_cells_v0171_sgr.txt",
+        ],
+    )
+    def test_three_activity_cell_turn_returns_only_the_reply(self, fixture):
+        output = load_fixture(fixture)
+
+        assert self._provider().extract_last_message_from_script(output) == self.THREE_CELL_REPLY
+
+    def test_every_activity_row_in_the_captures_has_a_tree_row_under_it(self):
+        """The structural fact the rule rests on, checked on the captures themselves."""
+        rows = load_fixture("codex_541_one_activity_cell_v0171.txt").split("\n")
+        cells = [
+            index
+            for index, row in enumerate(rows)
+            if row.startswith(("• Exited", "• Explored", "• Ran "))
+        ]
+        assert len(cells) == 4
+        for index in cells:
+            assert rows[index + 1].startswith("  └ "), rows[index]
+
+    def test_the_footer_is_dropped_only_once_the_version_is_known(self):
+        """A provider that never ran ``initialize()`` has no version, so it keeps the row."""
+        output = load_fixture("codex_541_one_activity_cell_v0171.txt")
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        message = provider.extract_last_message_from_script(output)
+
+        assert message.startswith(self.ONE_CELL_REPLY)
+        assert message.endswith("Worked for 4s • 3:52 PM")
+
+    def test_a_reply_that_ends_with_a_time_keeps_it(self):
+        """A bare clock is a footer only on the releases that drew one (0.156 to 0.158)."""
+        output = "› when is it\n• The standup is at\n  4:19 PM\n\n› \n"
+
+        message = self._provider().extract_last_message_from_script(output)
+
+        assert message == "• The standup is at\n  4:19 PM"
 
 
 class TestCodexV0111Extraction:

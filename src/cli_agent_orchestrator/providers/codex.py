@@ -1389,12 +1389,25 @@ def _find_response_marker(text: str) -> Optional[re.Match[str]]:
     """Find the first model-reply marker after a structural activity prelude.
 
     Native Codex activity cells have a ``•`` summary followed by a ``└`` tree
-    continuation.  Require at least two complete cells before advancing the
-    response boundary: a single tree-formatted group may be a legitimate
-    answer, while two consecutive cells are strong evidence of TUI activity.
-    Compact bullet groups remain ambiguous and are preserved.  This trades a
-    rare false positive for avoiding silent truncation of ordinary replies and
-    deliberately avoids matching English verbs such as ``Read`` or ``Called``.
+    continuation. Codex draws that continuation under every activity row, even
+    for a command that prints nothing (``└ (no output)``), and it draws the
+    model's reply as its own ``•`` cell below the last of them (captures of
+    0.171.0 in test/providers/fixtures/codex_541_*.txt, issue #541).
+
+    So the reply starts at the first ``•`` marker after the last complete cell.
+    One cell is enough when a marker follows it: before #541 two were required,
+    and a turn with a single command returned Codex's opening line, the cell
+    and the reply together.
+
+    Two cases stay as they were, because the layout alone cannot decide them:
+
+    - Compact bullet groups with no ``└`` row are preserved whole. They look
+      the same as a reply made of several bullets.
+    - When the last cell is the last marker, the text is preserved whole unless
+      there are two or more cells and plain prose follows the last one. A
+      single tree-formatted group at the end may be the reply itself.
+
+    English verbs such as ``Read`` or ``Called`` are deliberately not matched.
     """
 
     def line_end(start: int) -> int:
@@ -1432,11 +1445,11 @@ def _find_response_marker(text: str) -> Optional[re.Match[str]]:
                     if text[candidate] != "›":
                         prose_start = candidate
 
-    if len(complete_cells) >= 2:
+    if complete_cells:
         last_cell = complete_cells[-1]
         if last_cell + 1 < len(matches):
             return matches[last_cell + 1]
-        if prose_start is not None:
+        if len(complete_cells) >= 2 and prose_start is not None:
             return re.compile("").match(text, prose_start)
 
     return matches[0]
@@ -3050,8 +3063,8 @@ class CodexProvider(BaseProvider):
             last_user = user_matches[-1]
 
             # Extraction uses a stricter anchor than status detection: skip MCP
-            # calls and at least two complete native activity cells before the
-            # model's actual reply, while preserving ambiguous compact groups.
+            # calls and the complete native activity cells before the model's
+            # actual reply, while preserving ambiguous compact groups.
             asst_after_user = _find_response_marker(clean_output[last_user.start() :])
 
             if asst_after_user:
