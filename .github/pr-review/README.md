@@ -373,8 +373,9 @@ profiles and the PR, and all three come from the dispatched ref.
 - `REVIEW.md` can have at most 40 checks.
 - The report of each seat must fit the CAO limit of a step result, 32 KiB. CAO
   drops a larger report, so the seat has no report.
-- Each seat can use 1,800 seconds. The review step of the job can use 120
-  minutes.
+- Each seat can use 2,700 seconds. The review step of the job can use 150
+  minutes. In ten live `kiro_cli` single runs on one PR with about 35 files and
+  8,900 added lines, the seat used 19 to more than 30 minutes.
 - The review must fit one GitHub comment. The full text is used first, then a
   compact text, then a cut text with a note. The cut is at the end of a line, so
   it cannot split a code span. The `pr-review-result` artifact keeps

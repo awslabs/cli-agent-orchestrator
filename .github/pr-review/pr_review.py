@@ -75,7 +75,7 @@ INPUTS = {
     "engine": {"type": "string", "required": False, "default": "kiro_cli"},
     "model_a": {"type": "string", "required": False, "default": ""},
     "model_b": {"type": "string", "required": False, "default": ""},
-    "step_timeout": {"type": "int", "required": False, "default": 1800},
+    "step_timeout": {"type": "int", "required": False, "default": 2700},
 }
 
 # Shared with github_review.py. CAO runs this script from a private copy, so it
@@ -352,7 +352,7 @@ def load_config(inputs: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, str) or not MODEL_RE.fullmatch(value):
             raise Blocked(f"{name} is not a valid model name")
         model_inputs[name] = value
-    timeout = inputs.get("step_timeout", 1800)
+    timeout = inputs.get("step_timeout", 2700)
     if type(timeout) is not int or not MIN_STEP_TIMEOUT <= timeout <= MAX_STEP_TIMEOUT:
         raise Blocked(f"step_timeout must be from {MIN_STEP_TIMEOUT} to {MAX_STEP_TIMEOUT} seconds")
     dirs = {}

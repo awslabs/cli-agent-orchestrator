@@ -27,6 +27,7 @@ import yaml
 from markdown_it import MarkdownIt
 
 from cao_workflow import ShimHTTPError, ShimTransportError
+from cao_workflow._transport import _TRANSPORT_SLACK
 from cli_agent_orchestrator.services.script_lint import lint_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -3737,6 +3738,22 @@ def test_workflow_permissions_are_least_privilege(workflow: dict[Any, Any]) -> N
         "review": {"contents": "read", "copilot-requests": "write"},
         "publish": {"contents": "read", "pull-requests": "write", "checks": "write"},
     }
+
+
+def test_the_time_limits_hold_a_panel_run_at_the_default_seat_time(
+    workflow: dict[Any, Any], pr_review: ModuleType, workspace: dict[str, Path]
+) -> None:
+    inputs = _inputs(workspace)
+    del inputs["step_timeout"]
+    seat = pr_review.load_config(inputs)["step_timeout"]
+    assert seat == pr_review.INPUTS["step_timeout"]["default"]
+    # The three panel phases run in sequence. Each phase can use the seat time,
+    # the shim slack and SETTLE_TIMEOUT.
+    phase = seat + _TRANSPORT_SLACK + pr_review.SETTLE_TIMEOUT
+    job = workflow["jobs"]["review"]
+    step_minutes = _step(job, "Run the review")["timeout-minutes"]
+    assert step_minutes * 60 >= 3 * phase
+    assert job["timeout-minutes"] > step_minutes
 
 
 def test_every_checkout_keeps_no_credential(workflow: dict[Any, Any]) -> None:

@@ -130,9 +130,11 @@ jobs:
     environment:
       name: ai-review
       deployment: false
-    # In panel mode, each of the three phases can use the full step timeout of
-    # pr_review.py (1800 s by default), plus the time to start the agents.
-    timeout-minutes: 150
+    # In panel mode, the three phases run in sequence. Each phase can use the
+    # step timeout of pr_review.py (2700 s by default), plus 180 s for the shim
+    # slack and SETTLE_TIMEOUT. That is 144 minutes. The review step has 150, and
+    # the other steps have the rest.
+    timeout-minutes: 180
     permissions:
       # Check out CAO and the PR head.
       contents: read
@@ -389,7 +391,7 @@ jobs:
           cao workflow create pr_review --from-file "$review_dir/pr_review.py" --json > /dev/null
 
       - name: Run the review
-        timeout-minutes: 120
+        timeout-minutes: 150
         env:
           ENGINE: ${{ inputs.engine }}
           REVIEWERS: ${{ inputs.reviewers }}
