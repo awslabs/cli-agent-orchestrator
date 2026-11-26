@@ -732,24 +732,33 @@ def test_non_utf8_aws_file_is_fix_not_traceback(box, tmp_path, monkeypatch):
     assert str(configured) in checks["aws-credentials"].detail
 
 
-def test_empty_aws_env_vars_still_check_default_files_and_expand_tilde(box, tmp_path, monkeypatch):
+def test_empty_aws_env_vars_skip_default_files_and_expand_tilde_and_vars(
+    box, tmp_path, monkeypatch
+):
     home = ready_home(tmp_path, box)
     aws = home / ".aws"
     aws.mkdir()
     (aws / "credentials").write_text("[work]\naws_access_key_id = canary\n", encoding="utf-8")
-    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", "")
-    monkeypatch.setenv("AWS_CONFIG_FILE", "")
-    checks = checks_by_name(check_box(box, FakeRunner(command_responses(box)), home))
-    assert checks["aws-credentials"].status == "FIX"
-    assert checks["aws-credentials"].detail == "has aws_access_key_id"
+    (aws / "config").write_text("[profile work]\naws_access_key_id = canary\n", encoding="utf-8")
+
+    # Match AWS CLI / botocore: explicit empty or whitespace env vars disable the default file.
+    for empty_value in ("", "   "):
+        monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", empty_value)
+        monkeypatch.setenv("AWS_CONFIG_FILE", empty_value)
+        checks = checks_by_name(check_box(box, FakeRunner(command_responses(box)), home))
+        assert checks["aws-credentials"].status == "OK"
+        assert checks["aws-credentials"].detail == "no long-lived keys"
 
     (aws / "credentials").unlink()
+    (aws / "config").unlink()
     custom = home / "custom-aws-creds"
     custom.write_text("[work]\naws_access_key_id = canary\n", encoding="utf-8")
-    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", "~/custom-aws-creds")
-    checks = checks_by_name(check_box(box, FakeRunner(command_responses(box)), home))
-    assert checks["aws-credentials"].status == "FIX"
-    assert checks["aws-credentials"].detail == "has aws_access_key_id"
+    monkeypatch.setenv("HOME", str(home))
+    for configured in ("~/custom-aws-creds", "$HOME/custom-aws-creds", "${HOME}/custom-aws-creds"):
+        monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", configured)
+        checks = checks_by_name(check_box(box, FakeRunner(command_responses(box)), home))
+        assert checks["aws-credentials"].status == "FIX"
+        assert checks["aws-credentials"].detail == "has aws_access_key_id"
 
 
 def test_aws_profile_requires_zero_exit_code(box, tmp_path):

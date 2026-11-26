@@ -35,15 +35,25 @@ def _home_path(value: str, home: Path) -> Path:
     return home / value[2:] if value.startswith("~/") else Path(value)
 
 
+def _aws_file_path(env_var: str, default: Path, home: Path) -> Path | None:
+    raw = os.environ.get(env_var)
+    if raw is None:
+        return default
+    expanded = os.path.expandvars(raw)
+    if not expanded.strip():
+        return None
+    return _home_path(expanded, home)
+
+
 def _has_access_key(profile: str, home: Path) -> tuple[bool, Path | None]:
     aws_dir = home / ".aws"
-    credentials_env = os.environ.get("AWS_SHARED_CREDENTIALS_FILE", "").strip()
-    config_env = os.environ.get("AWS_CONFIG_FILE", "").strip()
     filenames = (
-        _home_path(credentials_env, home) if credentials_env else aws_dir / "credentials",
-        _home_path(config_env, home) if config_env else aws_dir / "config",
+        _aws_file_path("AWS_SHARED_CREDENTIALS_FILE", aws_dir / "credentials", home),
+        _aws_file_path("AWS_CONFIG_FILE", aws_dir / "config", home),
     )
     for filename in filenames:
+        if filename is None:
+            continue
         parser = configparser.RawConfigParser()
         try:
             parser.read(filename, encoding="utf-8")
