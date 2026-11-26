@@ -516,4 +516,4 @@ tmux -S "/abs/review-home/tmux-$(id -u)/default" kill-server
 - [`.github/workflows/pr-review.yml`](../workflows/pr-review.yml):
   the GitHub Actions workflow.
 - [`test/test_pr_review_workflow.py`](../../test/test_pr_review_workflow.py):
-  the unit tests of both scripts.
+  the unit tests of both scripts and of the seat profiles.
