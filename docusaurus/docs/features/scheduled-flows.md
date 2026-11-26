@@ -40,13 +40,15 @@ A flow file is Markdown with YAML frontmatter containing schedule metadata. The 
 ```markdown
 ---
 name: daily-standup
-schedule: "0 9 * * 1-5"
+schedule: "0 9 * * mon-fri"
 agent_profile: developer
 provider: kiro_cli
 ---
 
 Review yesterday's commits and create a standup summary.
 ```
+
+The scheduler (APScheduler) counts the day of week from Monday as `0`, so write weekdays as names (`mon-fri`), because a numeric `1-5` runs Tuesday through Saturday.
 
 ### Frontmatter fields
 

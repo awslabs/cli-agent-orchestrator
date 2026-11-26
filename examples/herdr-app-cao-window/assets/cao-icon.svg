@@ -1,0 +1,33 @@
+<!--
+  The icon of the CAO window's app copy (CAO.app), source of CAO.icns. 1024 x 1024 canvas.
+
+  The tile follows the geometry and colours of the Herdr app's own icon, so the two sit together in the Dock and the
+  app switcher: a squircle of 824 px (about 80 percent of the canvas, 100 px of transparent margin), corner radius
+  175, filled warm off-white, with a thin light-grey edge. Only these numbers were taken from Herdr's icon, read from
+  its pixels: tile #F4F1E9, edge #C9C6BD, inner highlight #FAF7F1, glyph charcoal #303438. None of Herdr's artwork is
+  used here.
+
+  The glyph is the CAO mark of this project (docusaurus/static/img/cao-mark.svg, a pointy-top hexagon around a
+  three-node agent graph), at 59 percent of the tile's height. Its ring and edges are Herdr's charcoal; the three
+  nodes keep the mark's brand colours (#0F73E0, #16A0B5, #243F63) so they stay apart from the edges at small sizes.
+  The ring is one closed path with round joins, where the brand file draws four arcs.
+  Rebuild CAO.icns with the commands in README.md, "Rebuilding the icon".
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect x="100" y="100" width="824" height="824" rx="175" ry="175" fill="#F4F1E9"/>
+  <rect x="104.5" y="104.5" width="815" height="815" rx="170.5" ry="170.5" fill="none" stroke="#FAF7F1" stroke-width="3"/>
+  <rect x="101" y="101" width="822" height="822" rx="174" ry="174" fill="none" stroke="#C9C6BD" stroke-width="2"/>
+  <g transform="translate(512 512) scale(4.55) translate(-60 -60)" fill="none" stroke="#303438" stroke-linecap="round" stroke-linejoin="round">
+    <path stroke-width="11" d="M60 11.4L102.09 35.7V84.3L60 108.6L17.91 84.3V35.7Z"/>
+    <g stroke-width="7">
+      <path d="M67 42L32 79"/>
+      <path d="M72 79L41 50"/>
+      <path d="M41 50l26-8"/>
+    </g>
+    <g stroke="none">
+      <circle cx="41" cy="50" r="7.5" fill="#0F73E0"/>
+      <circle cx="72" cy="79" r="9.5" fill="#16A0B5"/>
+      <circle cx="67" cy="42" r="10.5" fill="#243F63"/>
+    </g>
+  </g>
+</svg>

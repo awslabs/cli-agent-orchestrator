@@ -1,0 +1,11 @@
+{
+  "machine": "cao",
+  "caoPort": 9889,
+  "talkableProfiles": [],
+  "hiddenRootProfiles": ["memory_manager"],
+  "quietMinutes": 10,
+  "holdMaxSeconds": 120,
+  "draftProfile": null,
+  "draftProviders": ["claude_code"],
+  "contextPercentRegex": null
+}
