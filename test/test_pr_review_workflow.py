@@ -1686,17 +1686,36 @@ def test_run_review_drops_a_finding_that_is_not_in_the_head_checkout(
     review = _run_review(pr_review, workspace, monkeypatch, cao, reviewers="single")
 
     outside = "the path is not a file in the head checkout"
+    link = "the path is a symbolic link"
     assert [(item["title"], item["reason"]) for item in review["dropped_findings"]] == [
         ("Past the end", "the file has 30 lines"),
         ("No such file", outside),
-        ("Through a link", outside),
-        ("Symlink loop", outside),
+        ("Through a link", link),
+        ("Symlink loop", link),
         ("Long name", outside),
     ]
     assert [item["title"] for item in review["findings"]] == ["Last line"]
     assert review["result_states"] == ["changes_required", "incomplete"]
     assert "## Dropped findings" in review["sections"]
     _assert_publishable(github_review, review)
+
+
+def test_location_error_checks_the_line_in_the_file_of_the_commit(
+    pr_review: ModuleType, workspace: dict[str, Path]
+) -> None:
+    source = workspace["source"]
+    (source / "src" / "empty.py").write_text("", encoding="utf-8")
+    (source / "alias.py").symlink_to("src/app.py")
+    (source / "lib").symlink_to("src", target_is_directory=True)
+
+    assert pr_review.location_error(source, "src/app.py", 30) == ""
+    # An empty file has no line. On GitHub, a linked path shows the link, not the
+    # linked file, and the commit has no path through a linked directory.
+    assert pr_review.location_error(source, "src/empty.py", 1) == "the file has 0 lines"
+    assert pr_review.location_error(source, "alias.py", 2) == "the path is a symbolic link"
+    assert pr_review.location_error(source, "lib/app.py", 2) == (
+        "the path is not a file in the head checkout"
+    )
 
 
 def test_run_review_reports_missing_seat_reports_as_incomplete(

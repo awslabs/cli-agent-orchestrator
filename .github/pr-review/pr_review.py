@@ -896,11 +896,20 @@ def run_phase(
 
 
 def location_error(source_dir: Path, path: str, line: int) -> str:
-    """'' if ``line`` is a line of the file ``path`` in the head checkout, or the reason."""
+    """'' if ``line`` is a line of the file ``path`` in the head checkout, or the reason.
+
+    The review links the finding to this line of the head commit on GitHub. Git
+    keeps a symbolic link as a file that holds the link target, so a line that is
+    read through a link is not a line of the commit.
+    """
     root = source_dir.resolve()
+    target = root / path
     try:
-        target = (root / path).resolve()
-        found = root in target.parents and target.is_file()
+        inside = root in target.parents
+        if inside and target.is_symlink():
+            return "the path is a symbolic link"
+        # resolve() changes a path through a linked directory.
+        found = inside and target.resolve() == target and target.is_file()
     except (OSError, RuntimeError):
         # Python 3.12 raises RuntimeError for a symlink loop, and OSError for a
         # name that is too long.
@@ -918,7 +927,7 @@ def location_error(source_dir: Path, path: str, line: int) -> str:
         return "the file cannot be read"
     if last != b"\n":
         count += 1
-    if line > max(count, 1):
+    if line > count:
         return f"the file has {count} lines"
     return ""
 

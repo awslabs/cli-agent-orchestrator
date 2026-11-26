@@ -50,7 +50,9 @@ Each reviewer reports the files that it reviewed, the status of each check in
 findings. Each finding gives its check, path, line, failure, impact, evidence,
 confidence and suggested fix. Before the vote, the script drops each finding
 whose path is not a file in the head checkout, or whose line is not a line of
-that file. The review lists each dropped finding.
+that file. It does not follow a symbolic link, because GitHub shows the link
+itself at that path. An empty file has no lines. The review lists each dropped
+finding.
 
 ### The review policy
 
