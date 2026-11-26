@@ -2,6 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.update import _DIRECTORY as _DIR
@@ -312,6 +313,310 @@ requirements = [
 
         assert result.exit_code == 0
         mock_run.assert_called_once_with(["uv", "tool", "upgrade", _PACKAGE, "--reinstall"])
+
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._receipt_path")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_constrained_registry_keeps_extra_requirements(
+        self, _which, receipt_path, mock_run, tmp_path
+    ):
+        # `uv tool install <pkg>@latest --upgrade` replaces the receipt's requirements,
+        # so each extra package has to be passed back with --with.
+        receipt_path.return_value = _write(
+            tmp_path,
+            """
+[tool]
+requirements = [
+    { name = "cli-agent-orchestrator", specifier = "==2.1.0" },
+    { name = "cao-decider-example", extras = ["fast"], specifier = ">=1.2" },
+    { name = "cao-decider-wheel", path = "/opt/wheels/cao_decider_wheel-0.1.0-py3-none-any.whl" },
+    { name = "cao-decider-local", directory = "/home/me/decider" },
+]
+""",
+        )
+        mock_run.return_value = _completed(0)
+
+        result = CliRunner().invoke(update, [])
+
+        assert result.exit_code == 0
+        mock_run.assert_called_once_with(
+            [
+                "uv",
+                "tool",
+                "install",
+                f"{_PACKAGE}@latest",
+                "--upgrade",
+                "--with",
+                "cao-decider-example[fast]>=1.2",
+                "--with",
+                "/opt/wheels/cao_decider_wheel-0.1.0-py3-none-any.whl",
+                "--with",
+                "/home/me/decider",
+            ]
+        )
+
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._receipt_path")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_constrained_registry_refuses_extra_it_cannot_rebuild(
+        self, _which, receipt_path, mock_run, tmp_path
+    ):
+        receipt_path.return_value = _write(
+            tmp_path,
+            """
+[tool]
+requirements = [
+    { name = "cli-agent-orchestrator", specifier = "<2.4" },
+    { name = "cao-decider-git", git = "https://example.com/decider.git?rev=v1" },
+]
+""",
+        )
+
+        result = CliRunner().invoke(update, [])
+
+        assert result.exit_code != 0
+        assert "cao-decider-git" in result.output
+        mock_run.assert_not_called()
+
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._receipt_path")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_refusal_names_the_receipt_and_prints_a_complete_command(
+        self, _which, receipt_path, mock_run, tmp_path
+    ):
+        # Running the printed command as written must not drop the packages and
+        # extras that could be rebuilt; only the git entry is left as a placeholder.
+        receipt = _write(
+            tmp_path,
+            """
+[tool]
+requirements = [
+    { name = "cli-agent-orchestrator", extras = ["agui"], specifier = "==2.1.0" },
+    { name = "fastdep" },
+    { name = "cao-decider-jev", git = "https://example.com/decider.git?rev=v1" },
+]
+""",
+        )
+        receipt_path.return_value = receipt
+
+        result = CliRunner().invoke(update, [])
+
+        assert result.exit_code != 0
+        assert str(receipt) in result.output
+        assert (
+            "uv tool install 'cli-agent-orchestrator[agui]@latest' --upgrade "
+            "--with fastdep --with '<cao-decider-jev source>'"
+        ) in result.output
+        mock_run.assert_not_called()
+
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._receipt_path")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_constrained_registry_keeps_cao_extras(self, _which, receipt_path, mock_run, tmp_path):
+        receipt_path.return_value = _write(
+            tmp_path,
+            """
+[tool]
+requirements = [
+    { name = "cli-agent-orchestrator", extras = ["agui", "otel"], specifier = "==1.0.0" },
+    { name = "cao-decider-demo", extras = ["fast"], specifier = ">=1.0,<1.2" },
+]
+""",
+        )
+        mock_run.return_value = _completed(0)
+
+        result = CliRunner().invoke(update, [])
+
+        assert result.exit_code == 0
+        mock_run.assert_called_once_with(
+            [
+                "uv",
+                "tool",
+                "install",
+                f"{_PACKAGE}[agui,otel]@latest",
+                "--upgrade",
+                "--with",
+                "cao-decider-demo[fast]>=1.0,<1.2",
+            ]
+        )
+
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._receipt_path")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_constrained_registry_refuses_a_cao_requirement_it_cannot_carry(
+        self, _which, receipt_path, mock_run, tmp_path
+    ):
+        receipt_path.return_value = _write(
+            tmp_path,
+            """
+[tool]
+requirements = [
+    { name = "cli-agent-orchestrator", specifier = "==1.0.0", marker = "python_version >= '3.10'" },
+]
+""",
+        )
+
+        result = CliRunner().invoke(update, [])
+
+        assert result.exit_code != 0
+        assert "CAO's own requirement" in result.output
+        mock_run.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "option",
+        [
+            # The form uv writes for --index, --default-index and UV_DEFAULT_INDEX.
+            'index = [{ url = "https://packages.example.com/simple", explicit = false, '
+            'default = true, format = "simple", authenticate = "auto" }]',
+            'index-url = "https://packages.example.com/simple"',
+            'extra-index-url = ["https://packages.example.com/simple"]',
+            'find-links = ["file:///opt/wheels"]',
+            "no-index = true",
+        ],
+        ids=lambda option: option.split(" ", 1)[0],
+    )
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._receipt_path")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_constrained_registry_refuses_each_index_setting_with_a_registry_extra(
+        self, _which, receipt_path, mock_run, tmp_path, option
+    ):
+        # `uv tool install` does not reuse the receipt's [tool.options], so the
+        # decider would be looked up on the default index instead.
+        receipt = _write(
+            tmp_path,
+            f"""
+[tool]
+requirements = [
+    {{ name = "cli-agent-orchestrator", specifier = "==1.0.0" }},
+    {{ name = "cao-decider-demo", specifier = ">=1.0" }},
+]
+
+[tool.options]
+{option}
+""",
+        )
+        receipt_path.return_value = receipt
+
+        result = CliRunner().invoke(update, [])
+
+        assert result.exit_code != 0
+        assert f"the install sets {option.split(' ', 1)[0]}," in result.output
+        assert str(receipt) in result.output
+        assert "--with 'cao-decider-demo>=1.0'" in result.output
+        mock_run.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "entry,carried",
+        [
+            (
+                '{ name = "cao-decider-wheel", '
+                'path = "/opt/wheels/cao_decider_wheel-0.1.0-py3-none-any.whl" }',
+                "/opt/wheels/cao_decider_wheel-0.1.0-py3-none-any.whl",
+            ),
+            (
+                '{ name = "cao-decider-dir", directory = "/opt/src/cao-decider" }',
+                "/opt/src/cao-decider",
+            ),
+        ],
+        ids=["path", "directory"],
+    )
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._receipt_path")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_index_settings_block_a_local_extra_too(
+        self, _which, receipt_path, mock_run, tmp_path, entry, carried
+    ):
+        # A local wheel or directory is not looked up on an index, but uv resolves
+        # its dependencies on the new command's indexes, and those may be what the
+        # recorded index was there for.
+        receipt = _write(
+            tmp_path,
+            f"""
+[tool]
+requirements = [
+    {{ name = "cli-agent-orchestrator", specifier = "==1.0.0" }},
+    {entry},
+]
+
+[tool.options]
+no-index = true
+find-links = ["file:///opt/wheels"]
+""",
+        )
+        receipt_path.return_value = receipt
+
+        result = CliRunner().invoke(update, [])
+
+        assert result.exit_code != 0
+        assert "the install sets find-links, no-index," in result.output
+        assert str(receipt) in result.output
+        assert f"--with {carried}" in result.output
+        mock_run.assert_not_called()
+
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._receipt_path")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_index_settings_with_nothing_carried_unpin_as_before(
+        self, _which, receipt_path, mock_run, tmp_path
+    ):
+        # CAO and its extras have public names, so with nothing else to carry the
+        # recorded index changes nothing.
+        receipt_path.return_value = _write(
+            tmp_path,
+            """
+[tool]
+requirements = [{ name = "cli-agent-orchestrator", extras = ["agui"], specifier = "==1.0.0" }]
+
+[tool.options]
+index-url = "https://packages.example.com/simple"
+""",
+        )
+        mock_run.return_value = _completed(0)
+
+        result = CliRunner().invoke(update, [])
+
+        assert result.exit_code == 0
+        mock_run.assert_called_once_with(
+            ["uv", "tool", "install", f"{_PACKAGE}[agui]@latest", "--upgrade"]
+        )
+
+    @pytest.mark.parametrize(
+        "entry,shown",
+        [
+            ('"cao-decider-demo"', "an unnamed requirement"),
+            ('{ specifier = ">=1.0" }', "an unnamed requirement"),
+            ('{ name = "d", path = "/w/d.whl", marker = "sys_platform == \'linux\'" }', "'d'"),
+            ('{ name = "d", extras = "fast" }', "'d'"),
+            ('{ name = "d", extras = [""] }', "'d'"),
+            ('{ name = "d", specifier = 1 }', "'d'"),
+            ('{ name = "d", editable = "/home/me/d" }', "'d'"),
+            ('{ name = "d", marker = "python_version >= \'3.10\'" }', "'d'"),
+        ],
+    )
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._receipt_path")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_constrained_registry_refuses_each_shape_it_cannot_rebuild(
+        self, _which, receipt_path, mock_run, tmp_path, entry, shown
+    ):
+        receipt_path.return_value = _write(
+            tmp_path,
+            f"""
+[tool]
+requirements = [
+    {{ name = "cli-agent-orchestrator", specifier = "==1.0.0" }},
+    {entry},
+]
+""",
+        )
+
+        result = CliRunner().invoke(update, [])
+
+        assert result.exit_code != 0
+        assert f"the extra package {shown} is from a source it can't rebuild" in result.output
+        assert "None" not in result.output
+        mock_run.assert_not_called()
 
     @patch(f"{_MOD}.subprocess.run")
     @patch(f"{_MOD}._classify_source", return_value=(_DIR, "/home/me/cli-agent-orchestrator"))

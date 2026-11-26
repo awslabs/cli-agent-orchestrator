@@ -67,6 +67,24 @@ def test_supervisor_start_uses_the_portable_launcher_and_checks_stale_locks():
     assert "tick_loop.lock" in start and "if it does not, read" in start
 
 
+@pytest.mark.parametrize("argument, code", [("--help", 0), ("-h", 0),
+                                               ("wrong.sh", 2), ("tick_supervisor.sh", 2)])
+def test_supervisor_launcher_rejects_invalid_arguments_without_side_effects(tmp_path, argument, code):
+    script = tmp_path / argument
+    if argument == "tick_supervisor.sh":
+        script.mkdir()
+    elif argument == "wrong.sh":
+        script.write_text("#!/bin/bash\n")
+    result = subprocess.run([sys.executable, str(KIT / "bin" / "start_tick_supervisor.py"),
+                             str(script) if argument not in ("--help", "-h") else argument],
+                            cwd=tmp_path, capture_output=True, text=True, timeout=10)
+    assert result.returncode == code
+    assert "usage: start_tick_supervisor.py PB/tick_supervisor.sh" in result.stdout + result.stderr
+    assert not list(tmp_path.rglob("tick_supervisor.pid"))
+    assert not list(tmp_path.rglob("tick_supervisor.launch.log"))
+    assert not list(tmp_path.rglob("state"))
+
+
 def test_supervisor_stop_is_explained_to_both_agents():
     conductor = text("conductor-playbook.md")
     shepherd = section(text("shepherd-playbook.md"), "## 2. On each wake")

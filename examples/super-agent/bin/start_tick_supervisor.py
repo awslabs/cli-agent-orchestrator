@@ -27,9 +27,16 @@ def supervisor_runs(pid):
 
 
 def main():
+    usage = "usage: start_tick_supervisor.py PB/tick_supervisor.sh"
+    if len(sys.argv) == 2 and sys.argv[1] in ("--help", "-h"):
+        print(usage)
+        return
     if len(sys.argv) != 2:
-        raise SystemExit("usage: start_tick_supervisor.py PB/tick_supervisor.sh")
+        raise SystemExit(usage)
     script = Path(sys.argv[1]).resolve()
+    if script.name != "tick_supervisor.sh" or not script.is_file():
+        print(usage, file=sys.stderr)
+        raise SystemExit(2)
     state = script.parent / "state"
     pid_file = state / "tick_supervisor.pid"
     log_file = state / "tick_supervisor.launch.log"

@@ -11,3 +11,45 @@
 /docusaurus/braces-compat/ @awslabs/multiq
 /web/braces-compat/ @awslabs/multiq
 /cao_mcp_apps/braces-compat/ @awslabs/multiq
+
+# Gate policy, release scripts, and trust-boundary code (#1350)
+/.github/zizmor.yml @awslabs/multiq
+/.github/dependabot.yml @awslabs/multiq
+/.github/dependency-security/ @awslabs/multiq
+/.gitleaks.toml @awslabs/multiq
+# Root gate configs are owned before they exist; CI ignores root ruff.toml and
+# .ruff.toml, but local ruff runs without --config pyproject.toml still read them.
+/.gitleaksignore @awslabs/multiq
+/.trivyignore @awslabs/multiq
+/trivy.yaml @awslabs/multiq
+/trivy-secret.yaml @awslabs/multiq
+/ruff.toml @awslabs/multiq
+/.ruff.toml @awslabs/multiq
+# Nested ruff configs are owned even though CI ignores them.
+**/ruff.toml @awslabs/multiq
+**/.ruff.toml @awslabs/multiq
+/tui/deny.toml @awslabs/multiq
+/.coverage-baseline.json @awslabs/multiq
+/mypy-baseline.json @awslabs/multiq
+/mypy.ini @awslabs/multiq
+/SECURITY.md @awslabs/multiq
+# Gate implementations and their policy tests.
+/scripts/mypy_ratchet.py @awslabs/multiq
+/cao_mcp_apps/scripts/coverage-ratchet.mjs @awslabs/multiq
+/scripts/test-shipped-packages.mjs @awslabs/multiq
+/scripts/assert_no_ffi.py @awslabs/multiq
+/test/_must_run.py @awslabs/multiq
+/test/test_codeowners_risk.py @awslabs/multiq
+# Release scripts.
+/scripts/release_preflight.py @awslabs/multiq
+/scripts/bump_version.py @awslabs/multiq
+/scripts/assert_release_version.py @awslabs/multiq
+/scripts/release_commit.py @awslabs/multiq
+/scripts/assert_wheel_matrix.py @awslabs/multiq
+/scripts/build_tui.py @awslabs/multiq
+/scripts/build_agent_plugin.py @awslabs/multiq
+/scripts/hatch_build_tui_tag.py @awslabs/multiq
+/src/cli_agent_orchestrator/security/ @awslabs/multiq
+/src/cli_agent_orchestrator/services/secret_gate.py @awslabs/multiq
+/src/cli_agent_orchestrator/services/vault/ @awslabs/multiq
+/src/cli_agent_orchestrator/decisions/ @awslabs/multiq

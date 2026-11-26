@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, cast
+from typing import Dict, List, Mapping, Optional, Tuple, cast
 
 from cli_agent_orchestrator.backends.base import (
     TerminalBackend,
@@ -340,6 +340,8 @@ class HerdrBackend(TerminalBackend):
         terminal_id: str,
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        *,
+        extra_labels: Optional[Mapping[str, str]] = None,
     ) -> str:
         """Create a herdr workspace (= CAO session) with an initial tab."""
         import os
@@ -451,6 +453,8 @@ class HerdrBackend(TerminalBackend):
         working_directory: Optional[str] = None,
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        *,
+        extra_labels: Optional[Mapping[str, str]] = None,
     ) -> str:
         """Create a new tab in the workspace."""
         import os
