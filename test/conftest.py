@@ -17,6 +17,7 @@ import fcntl
 import logging
 import os
 import pathlib
+import random
 import time
 import uuid
 from typing import Any, Dict
@@ -24,6 +25,53 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
+from hypothesis import settings
+
+settings.register_profile("ci", max_examples=75, deadline=1000, derandomize=True, print_blob=True)
+settings.register_profile("nightly", max_examples=500, deadline=1000, print_blob=True)
+if os.environ.get("HYPOTHESIS_PROFILE"):
+    settings.load_profile(os.environ["HYPOTHESIS_PROFILE"])
+elif os.environ.get("CI"):
+    settings.load_profile("ci")
+
+TEST_SHUFFLE_SEED_ENV_VAR = "CAO_TEST_SHUFFLE_SEED"
+
+
+def _test_shuffle_seed(environ: Dict[str, str]) -> int | None:
+    """Return the opt-in collection shuffle seed, rejecting ambiguous values."""
+    value = environ.get(TEST_SHUFFLE_SEED_ENV_VAR)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError as error:
+        raise pytest.UsageError(
+            f"{TEST_SHUFFLE_SEED_ENV_VAR} must be an integer, got {value!r}"
+        ) from error
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Shuffle collected tests only when the reproducible canary opts in."""
+    seed = getattr(config, "_cao_test_shuffle_seed", None)
+    if seed is not None:
+        random.Random(seed).shuffle(items)
+
+
+def pytest_report_header(config: pytest.Config) -> str | None:
+    """Make an opted-in order reproducible from the first test output."""
+    seed = getattr(config, "_cao_test_shuffle_seed", None)
+    if seed is not None:
+        return f"{TEST_SHUFFLE_SEED_ENV_VAR}: {seed}"
+    return None
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
+    """Repeat the shuffle seed where failed-job logs end."""
+    seed = getattr(config, "_cao_test_shuffle_seed", None)
+    if seed is not None:
+        terminalreporter.write_line(f"{TEST_SHUFFLE_SEED_ENV_VAR}: {seed}")
+
 
 # Make the `mock_cli` test-fixture binary discoverable for the pytest
 # session so MockCliProvider can `shlex.join(["mock_cli", ...])` without
@@ -427,6 +475,7 @@ _decide_at_import()
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
+    config._cao_test_shuffle_seed = _test_shuffle_seed(os.environ)
     config.addinivalue_line(
         "markers",
         "real_home: run with the developer's real HOME and provider config roots "
@@ -1046,3 +1095,33 @@ def isolated_memory_db(tmp_path, monkeypatch):
         # Land this test's queued status-event writes in its own database.
         _drain_launch_status_writes()
         engine.dispose()
+
+
+@pytest.fixture
+def fire_time_scans(monkeypatch):
+    """Record the work ``flow_service`` asks of the cron scheduler, instead of timing it.
+
+    ``parsed`` lists every expression handed to ``CronTrigger.from_crontab``; ``spans`` holds,
+    for each ``get_next_fire_time``, how far past its start the scan may look. A schedule that
+    never fires costs time in proportion to that span, so asserting on it guards against a
+    runaway scan without a wall-clock limit that a slow runner could trip.
+    """
+    from types import SimpleNamespace
+
+    from cli_agent_orchestrator.services import flow_service
+
+    scans = SimpleNamespace(parsed=[], spans=[])
+    real_parse = flow_service.CronTrigger.from_crontab
+    real_next = flow_service.CronTrigger.get_next_fire_time
+
+    def parse(expression, *args, **kwargs):
+        scans.parsed.append(expression)
+        return real_parse(expression, *args, **kwargs)
+
+    def next_fire_time(self, previous_fire_time, now):
+        scans.spans.append(self.end_date - now.astimezone(self.timezone))
+        return real_next(self, previous_fire_time, now)
+
+    monkeypatch.setattr(flow_service.CronTrigger, "from_crontab", parse)
+    monkeypatch.setattr(flow_service.CronTrigger, "get_next_fire_time", next_fire_time)
+    return scans

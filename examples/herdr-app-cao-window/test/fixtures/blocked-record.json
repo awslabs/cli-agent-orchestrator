@@ -1,0 +1,5 @@
+{"_note": "synthetic: not recorded from a real agent; replace with `hc get <t> --json` of a blocked agent, names made neutral",
+ "address": "cao/t1",
+ "labels": {"cao.session": "cao-demo", "cao.terminal_id": "t1", "cao.profile": "developer"},
+ "status": {"app": "claude-code", "state": "blocked", "kind": "permission", "msg": "Run npm test?"},
+ "turn": 3, "status_ms": 1000}

@@ -499,7 +499,10 @@ async def _reconcile_orphans(run_id: str) -> None:
 
         for terminal_id in terminal_ids:
             try:
-                terminal_service.delete_terminal(terminal_id, end_reason="stale_cleanup")
+                # Blocking: it waits for the session lifecycle lock, so not on the loop.
+                await asyncio.to_thread(
+                    terminal_service.delete_terminal, terminal_id, end_reason="stale_cleanup"
+                )
             except (
                 Exception
             ) as exc:  # noqa: BLE001 — teardown is best-effort; never fail the run (INV-4)

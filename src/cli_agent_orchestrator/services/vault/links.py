@@ -14,7 +14,10 @@ _WIKILINK = re.compile(r"(?P<embed>!)?\[\[(?P<target>[^\]\r\n]+)\]\]")
 _INLINE_MD_LINK = re.compile(
     r"(?<![!\\])\[[^\]\\\r\n]{0,256}\]" r"\((?P<destination>[^\s()\\\r\n]{1,256})\)"
 )
-_FENCED_CODE = re.compile(r"```.*?```", re.DOTALL)
+_FENCED_CODE = re.compile(
+    r"^[ ]{0,3}(?P<marker>```|~~~)[^\n]*(?:\n.*?^[ ]{0,3}(?P=marker)[ \t]*(?=\n|$)|\n.*\Z|$)",
+    re.DOTALL | re.MULTILINE,
+)
 _INLINE_CODE = re.compile(r"`[^`\r\n]*`")
 
 

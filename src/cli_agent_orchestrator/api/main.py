@@ -90,6 +90,7 @@ from cli_agent_orchestrator.constants import (
     INBOX_IMMEDIATE_DELIVERY_WAIT,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
+    INSTANCE_LABEL_ENV,
     MODEL_ID_MAX_LEN,
     MODEL_ID_RE,
     OTEL_SERVICE_NAME,
@@ -197,6 +198,12 @@ from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.event_log_service import RING_CAPACITY
 from cli_agent_orchestrator.services.event_primitives import KINDS as EVENT_KINDS
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.services.flow_service import (
+    FlowDefinitionError,
+    FlowFileMissingError,
+    FlowFileOutsideHomeError,
+    FlowNotFoundError,
+)
 from cli_agent_orchestrator.services.herdr_app_inbox_service import HerdrAppInboxService
 from cli_agent_orchestrator.services.herdr_inbox_registry import set_herdr_inbox_service
 from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
@@ -233,6 +240,7 @@ from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils import delegation, server_lock
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.atomic_file import unlocked_atomic_write
 from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
 from cli_agent_orchestrator.utils.forwarded_env import ForwardedEnvError, validate_forwarded_env
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
@@ -1668,6 +1676,7 @@ class CreateFlowRequest(BaseModel):
     agent_profile: str
     provider: str = "kiro_cli"
     prompt_template: str
+    enabled: bool = True
 
     @field_validator("name")
     @classmethod
@@ -1692,6 +1701,33 @@ class CreateFlowRequest(BaseModel):
         if not v.strip():
             raise ValueError("must not be empty")
         return v
+
+
+class FlowDefinitionInput(BaseModel):
+    """Lax body for ``POST /flows/validate``: every field accepts any JSON value, so a bad
+    value (a number, null, a list) reaches the validator and comes back as a field error
+    instead of a body-parse 422.
+
+    It has no ``script`` field on purpose: validate must never probe a path.
+    """
+
+    name: Any = ""
+    schedule: Any = ""
+    agent_profile: Any = ""
+    provider: Any = "kiro_cli"
+    # Left out means "not given", which validate reports as required, as create does.
+    prompt_template: Any = None
+
+
+class UpdateFlowRequest(BaseModel):
+    """Body of ``PUT /flows/{name}``; every field optional, unknown fields (``script``) refused."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schedule: Optional[str] = None
+    agent_profile: Optional[str] = None
+    provider: Optional[str] = None
+    prompt_template: Optional[str] = None
 
 
 def _reconcile_memory_at_startup() -> None:
@@ -2355,6 +2391,9 @@ async def health_check():
         # can compare the two here when the client runs with a different
         # environment or on another host.
         "provider_init_timeout": int(get_server_settings()["provider_init_timeout"]),
+        # The operator's name for this server (CAO_INSTANCE_LABEL), so the web UI
+        # can say which server it is talking to. Read per request: display only.
+        "instance_label": os.environ.get(INSTANCE_LABEL_ENV, "").strip() or None,
         "components": {
             "cao": "ok",
             "herdr": _probe("herdr"),
@@ -5521,6 +5560,9 @@ async def create_terminal_in_session(
             if existing_edge is None:
                 await asyncio.to_thread(
                     create_delegation_edge, caller_id, result.id, EdgeSource.ASSIGN
+                )
+                await asyncio.to_thread(
+                    delegation_callback_service.refresh_waiting_labels, [caller_id]
                 )
         _set_launch_note(response, launch_plan)
         return result
@@ -11237,6 +11279,21 @@ async def get_flow(
         )
 
 
+@app.post("/flows/validate")
+async def validate_flow(
+    body: FlowDefinitionInput,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Check a flow definition without writing anything (read scope, like workflow validate)."""
+    errors = flow_service.validate_flow_definition(
+        body.model_dump(), must_be_new=True, require_prompt_template=True
+    )
+    next_runs: List[str] = []
+    if not any(e["field"] == "schedule" for e in errors):
+        next_runs = [t.isoformat() for t in flow_service.next_fire_times(body.schedule, 3)]
+    return {"valid": not errors, "errors": errors, "next_runs": next_runs}
+
+
 @app.post("/flows", response_model=Flow, status_code=status.HTTP_201_CREATED)
 async def create_flow(
     body: CreateFlowRequest,
@@ -11244,14 +11301,24 @@ async def create_flow(
 ) -> Flow:
     """Create a new flow.
 
-    Writes a .flow.md file with YAML frontmatter and prompt body, then
-    registers it via flow_service.add_flow().
+    Answers 422 with ``detail.errors`` for a bad definition, then 409 when the name is
+    taken or the target file is the file another flow is registered from; either way
+    nothing is written. Otherwise it writes a .flow.md file with YAML frontmatter and
+    prompt body and registers it via flow_service.add_flow(). ``enabled=false`` registers
+    it disabled.
     """
+    errors = flow_service.validate_flow_definition(body.model_dump(), must_be_new=False)
+    if errors:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"errors": errors}
+        )
+    flows_dir = CAO_HOME_DIR / "flows"
+    file_path = flows_dir / f"{body.name}.flow.md"
+    conflict = flow_service.find_create_conflict(body.name, str(file_path))
+    if conflict:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=conflict)
     try:
-        flows_dir = CAO_HOME_DIR / "flows"
         flows_dir.mkdir(parents=True, exist_ok=True)
-
-        file_path = flows_dir / f"{body.name}.flow.md"
 
         # Serialize via yaml.safe_dump so a multi-line value becomes a quoted
         # scalar rather than injecting a new frontmatter key.
@@ -11266,15 +11333,46 @@ async def create_flow(
         )
         file_content = "---\n" + frontmatter + "---\n" + body.prompt_template
 
-        file_path.write_text(file_content)
+        # A temp file and a rename, so a symlink at the target is replaced, not written through.
+        unlocked_atomic_write(file_path, file_content)
 
-        return flow_service.add_flow(str(file_path))
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except Exception as e:
+        return flow_service.add_flow(str(file_path), enabled=body.enabled)
+    except ValueError:
+        logger.warning("Flow %r was refused at registration", body.name, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="The flow could not be registered; see the server log",
+        )
+    except Exception:
+        logger.exception("Failed to create flow %r", body.name)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create flow: {str(e)}",
+            detail="Failed to create flow; see the server log",
+        )
+
+
+@app.put("/flows/{name}", response_model=Flow)
+async def update_flow(
+    name: str,
+    body: UpdateFlowRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Flow:
+    """Update a flow in place (schedule, profile, provider, prompt); other front-matter keys stay."""
+    try:
+        return flow_service.update_flow(name, body.model_dump(), CAO_HOME_DIR / "flows")
+    except FlowNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except FlowDefinitionError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"errors": e.errors}
+        )
+    except (FlowFileOutsideHomeError, FlowFileMissingError) as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except Exception:
+        logger.exception("Failed to update flow %r", name)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update flow; see the server log",
         )
 
 
@@ -11422,6 +11520,16 @@ class InternalMemoryRecallRequest(BaseModel):
     record_access: bool = True
 
 
+class InternalMemoryRelatedRequest(BaseModel):
+    key: str
+    scope: Optional[str] = None
+    depth: int = Field(default=1, ge=1)
+    types: Optional[List[str]] = None
+    direction: str = "both"
+    limit: int = Field(default=20, ge=1, le=100)
+    terminal_context: Optional[InternalMemoryContext] = None
+
+
 class InternalMemoryForgetRequest(BaseModel):
     key: LenientMemoryKey  # see InternalMemoryStoreRequest.key
     scope: MemoryScope = MemoryScope.PROJECT
@@ -11486,6 +11594,58 @@ async def internal_memory_recall(
     # One serializer for both recall surfaces (this route and the MCP
     # memory_recall tool); see models/memory.py.
     return {"memories": [recall_wire_dict(memory) for memory in memories]}
+
+
+@app.post("/internal/memory/related")
+async def internal_memory_related(
+    body: InternalMemoryRelatedRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Any:
+    """Return relationship neighbours using context resolved by a remote worker."""
+    from cli_agent_orchestrator.services.memory_service import InvalidRelatedArgument
+
+    _require_memory_enabled()
+    try:
+        result = cast(
+            Dict[str, Any],
+            await _get_memory_service().related(
+                body.key,
+                scope=body.scope,
+                depth=body.depth,
+                types=body.types,
+                direction=body.direction,
+                limit=body.limit,
+                terminal_context=(
+                    body.terminal_context.model_dump(exclude_none=True)
+                    if body.terminal_context
+                    else None
+                ),
+            ),
+        )
+    except InvalidRelatedArgument as exc:
+        # A fixed literal per cause: the caller's value is never echoed back.
+        return JSONResponse(
+            status_code=422,
+            content={
+                "success": False,
+                "error_kind": "invalid_argument",
+                "error": InvalidRelatedArgument.MESSAGES[exc.code],
+            },
+        )
+    except ValueError:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "success": False,
+                "error_kind": "invalid_argument",
+                "error": "invalid related-memory argument",
+            },
+        )
+    if result.get("error_kind") == "not_found":
+        return JSONResponse(status_code=404, content=result)
+    if result.get("error_kind") == "ambiguous_scope":
+        return JSONResponse(status_code=409, content=result)
+    return result
 
 
 @app.post("/internal/memory/forget")

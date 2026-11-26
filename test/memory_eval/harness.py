@@ -43,7 +43,7 @@ ARMS: dict[str, dict[str, Any]] = {
         },
     },
     "bm25": {
-        "settings": {},
+        "settings": {"memory": {"parser": {"lenient": False}}},
         "recall": {
             "search_mode": "bm25",
             "sort_by": "recency",
@@ -192,20 +192,10 @@ def _ordered_wiki_listing(*, reverse: bool):
         yield
 
 
-def _uses_bm25_current_first(arm: dict[str, Any]) -> bool:
-    recall = arm["recall"]
-    settings = arm["settings"]
-    return recall.get("search_mode") == "bm25" or (
-        settings.get("memory", {}).get("ranking", {}).get("default_sort") == "bm25"
-    )
-
-
 async def _arm_metrics(
     service: MemoryService,
     home: Path,
     recall: dict[str, Any],
-    *,
-    strict_current_first: bool = False,
 ) -> dict[str, Any]:
     context = _context(home)
     questions = _read_json("questions.json")
@@ -262,17 +252,14 @@ async def _arm_metrics(
             )
         return first
 
-    if strict_current_first:
-        with _ordered_wiki_listing(reverse=False):
-            ascending_current_first = await current_first_for_listing()
-        with _ordered_wiki_listing(reverse=True):
-            descending_current_first = await current_first_for_listing()
-        current_first = [
-            ascending and descending
-            for ascending, descending in zip(ascending_current_first, descending_current_first)
-        ]
-    else:
-        current_first = await current_first_for_listing()
+    with _ordered_wiki_listing(reverse=False):
+        ascending_current_first = await current_first_for_listing()
+    with _ordered_wiki_listing(reverse=True):
+        descending_current_first = await current_first_for_listing()
+    current_first = [
+        ascending and descending
+        for ascending, descending in zip(ascending_current_first, descending_current_first)
+    ]
 
     def precision_at(wording: str, limit: int) -> float:
         return sum(rank is not None and rank <= limit for rank in ranks[wording]) / len(
@@ -317,12 +304,7 @@ def _invisible_notes(service: MemoryService, home: Path) -> int:
 
 async def _evaluate_arm(home: Path, arm: dict[str, Any]) -> dict[str, Any]:
     service = await build_memory_home(home, dict(arm["settings"]))
-    metrics = await _arm_metrics(
-        service,
-        home,
-        dict(arm["recall"]),
-        strict_current_first=_uses_bm25_current_first(arm),
-    )
+    metrics = await _arm_metrics(service, home, dict(arm["recall"]))
     metrics["invisible_notes"] = _invisible_notes(service, home)
     return metrics
 

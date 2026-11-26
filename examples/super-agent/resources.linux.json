@@ -1,0 +1,24 @@
+{
+ "about": "Example thresholds for a Linux host with about 64 GiB and 16 vCPUs: change them for yours. disk_paths lists each path whose free space counts; use the paths your worktrees and scratch live on. Missing or invalid probes THROTTLE; STOP wins.",
+ "stop": {
+  "memory_psi_full_avg10_gt": 10,
+  "memory_available_gib_lt": 4,
+  "live_terminals_gte": 24
+ },
+ "throttle": {
+  "memory_psi_some_avg10_gt": 10,
+  "memory_available_gib_lt": 12,
+  "swap_used_gib_gt": 16,
+  "load_per_cpu_gt": 1.2,
+  "live_terminals_gte": 16
+ },
+ "heavy": {
+  "stale_hours": 3,
+  "lock_timeout_s": 10,
+  "slots": 3
+ },
+ "disk_paths": {
+  "/home": {"stop_lt": 20, "throttle_lt": 40},
+  "/tmp": {"stop_lt": 3, "throttle_lt": 6}
+ }
+}

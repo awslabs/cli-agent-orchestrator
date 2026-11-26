@@ -885,7 +885,10 @@ def _detect_poison_frequency(rows_by_scope: dict) -> list:
 # -----------------------------------------------------------------------------
 
 
-def _detect_graph_density(rows_by_scope: dict) -> list:
+def _detect_graph_density(
+    rows_by_scope: dict,
+    all_key_scopes: Optional[dict[str, set[tuple[str, Optional[str]]]]] = None,
+) -> list:
     issues: list = []
     cap = ISSUE_CAPS["graph_density"]
     truncated = 0
@@ -893,6 +896,64 @@ def _detect_graph_density(rows_by_scope: dict) -> list:
         scope_keys = {r["key"] for r in rows}
         inverse: dict = {}
         for r in rows:
+            try:
+                from cli_agent_orchestrator.services.memory_content_links import (
+                    extract_content_link_targets,
+                )
+                from cli_agent_orchestrator.services.memory_service import MemoryService
+                from cli_agent_orchestrator.services.settings_service import (
+                    is_memory_content_links_enabled,
+                )
+
+                content_targets = (
+                    extract_content_link_targets(
+                        MemoryService._strip_generated_see_also(r.get("content", "")),
+                        MemoryService._sanitize_key,
+                        scope,
+                        scope_id=scope_id,
+                    )
+                    if is_memory_content_links_enabled()
+                    else []
+                )
+                cross_scope_targets = (
+                    extract_content_link_targets(
+                        MemoryService._strip_generated_see_also(r.get("content", "")),
+                        MemoryService._sanitize_key,
+                        scope,
+                        scope_id=scope_id,
+                        cross_scope_only=True,
+                    )
+                    if is_memory_content_links_enabled()
+                    else []
+                )
+            except Exception:
+                content_targets = []
+                cross_scope_targets = []
+            for target in dict.fromkeys([*content_targets, *cross_scope_targets]):
+                if target in scope_keys and target not in cross_scope_targets:
+                    continue
+                locations = (all_key_scopes or {}).get(target, set())
+                cross_scope = target in cross_scope_targets or any(
+                    location != (scope, scope_id) for location in locations
+                )
+                description = (
+                    f"content link crosses scope: {target}"
+                    if cross_scope
+                    else f"content link references missing key: {target}"
+                )
+                if len(issues) >= cap:
+                    truncated += 1
+                else:
+                    issues.append(
+                        _make_issue(
+                            issue_type="stale_claim",
+                            key=r["key"],
+                            related_key=target,
+                            description=description,
+                            severity="warning",
+                            scope_id=scope_id,
+                        )
+                    )
             raw = r.get("related_keys")
             if not raw:
                 continue
@@ -1016,6 +1077,7 @@ async def run_lint(
 
     rows: list = []
     rows_by_scope: dict = {}
+    all_key_scopes: dict[str, set[tuple[str, Optional[str]]]] = {}
     scope_dirs: dict = {}
     base_resolved: Optional[Path] = None
     try:
@@ -1025,6 +1087,12 @@ async def run_lint(
         base_resolved = svc.base_dir.resolve()
         session = _open_readonly_session(db_engine)
         try:
+            for key, row_scope, row_scope_id in session.query(
+                MemoryMetadataModel.key,
+                MemoryMetadataModel.scope,
+                MemoryMetadataModel.scope_id,
+            ).filter(MemoryMetadataModel.source_kind == "native"):
+                all_key_scopes.setdefault(key, set()).add((row_scope, row_scope_id))
             q = session.query(MemoryMetadataModel).filter(
                 MemoryMetadataModel.source_kind == "native"
             )
@@ -1148,7 +1216,7 @@ async def run_lint(
 
     # Detector: graph_density.
     try:
-        issues.extend(_detect_graph_density(rows_by_scope))
+        issues.extend(_detect_graph_density(rows_by_scope, all_key_scopes))
         completion["graph_density"] = True
     except Exception as e:
         logger.warning(f"graph_density detector failed: {e}")
