@@ -433,8 +433,16 @@ requirements = [
                 '{ name = "d", git = "https://example.com/d.git?rev=release/1.2" }',
                 "--with 'd @ git+https://example.com/d.git@release/1.2'",
             ),
+            (
+                '{ name = "d", git = "https://example.com/d.git?rev=feature%2Fx" }',
+                "--with 'd @ git+https://example.com/d.git@feature%2Fx'",
+            ),
+            (
+                '{ name = "d", git = "https://example.com/d.git?rev=release%2f1.2" }',
+                "--with 'd @ git+https://example.com/d.git@release%2f1.2'",
+            ),
         ],
-        ids=["editable", "git", "git-rev"],
+        ids=["editable", "git", "git-rev", "git-branch-with-slash", "git-branch-lower-escape"],
     )
     @patch(f"{_MOD}.subprocess.run")
     @patch(f"{_MOD}._receipt_path")
@@ -444,7 +452,12 @@ requirements = [
     ):
         # `--with <path>` for an editable entry makes a static copy, and a recorded
         # "<url>?rev=<ref>" passed back makes uv ignore the ref. The refusal still
-        # stops before uv runs; only the command it prints is different.
+        # stops before uv runs; only the command it prints is different. uv records
+        # the "/" of a branch as "%2F" and takes it back in that form.
+        checkout = tmp_path / "d"
+        checkout.mkdir()
+        entry = entry.replace("/home/me/d", str(checkout))
+        printed = printed.replace("/home/me/d", str(checkout))
         receipt_path.return_value = _write(
             tmp_path,
             f"""
@@ -471,6 +484,9 @@ requirements = [
             '{ name = "d", git = "https://example.com/d.git?subdirectory=pkg" }',
             '{ name = "d", git = "https://example.com/d.git?rev=" }',
             '{ name = "d", git = "https://example.com/d.git?rev=v1 --index-url=x" }',
+            '{ name = "d", git = "https://example.com/d.git?rev=v1%20--index-url%3Dx" }',
+            '{ name = "d", git = "https://example.com/d.git?rev=%2Fetc%2Fpasswd" }',
+            '{ name = "d", git = "https://example.com/d.git?rev=v1%2" }',
             '{ name = "d", git = "https://example.com/d.git", subdirectory = "pkg" }',
             '{ name = "d", editable = "/home/me/d", marker = "sys_platform == \'linux\'" }',
             '{ name = "d", url = "https://example.com/d-1.0-py3-none-any.whl" }',
@@ -482,6 +498,9 @@ requirements = [
     def test_refusal_leaves_a_placeholder_and_points_at_the_runbook_when_unsure(
         self, _which, receipt_path, mock_run, tmp_path, entry
     ):
+        checkout = tmp_path / "d"
+        checkout.mkdir()
+        entry = entry.replace("/home/me/d", str(checkout))
         receipt_path.return_value = _write(
             tmp_path,
             f"""
@@ -498,11 +517,15 @@ requirements = [
         assert result.exit_code != 0
         assert "--with '<d source>'" in result.output
         assert "replacing each <...>" in result.output
-        assert "docs/ephemeral-agents-agent-setup.md (section 3)" in result.output
+        # A URL: an install from PyPI has no docs/ directory to look in.
+        assert (
+            "https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/"
+            "ephemeral-agents-agent-setup.md#3-install-the-decider-into-the-servers-python"
+        ) in result.output
         assert "what that file records" not in result.output
         mock_run.assert_not_called()
 
-    @pytest.mark.parametrize("key", ["path", "directory"])
+    @pytest.mark.parametrize("key", ["path", "directory", "editable"])
     @patch(f"{_MOD}.subprocess.run")
     @patch(f"{_MOD}._receipt_path")
     @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
@@ -510,7 +533,9 @@ requirements = [
         self, _which, receipt_path, mock_run, tmp_path, key
     ):
         # uv would fail on the missing path, and the hint CAO prints after a uv
-        # failure says to use another package manager. Name the entry instead.
+        # failure says to use another package manager. Name the entry instead. For
+        # an editable entry this also stops a ready-made `--with-editable <path>`
+        # from being printed for a checkout that has moved.
         gone = tmp_path / "moved-away"
         receipt = _write(
             tmp_path,
@@ -533,6 +558,7 @@ requirements = [
         )
         assert str(receipt) in result.output
         assert "--with '<cao-decider-demo source>'" in result.output
+        assert "--with-editable" not in result.output
         mock_run.assert_not_called()
 
     @patch(f"{_MOD}.subprocess.run")
@@ -719,6 +745,9 @@ index-url = "https://packages.example.com/simple"
     def test_constrained_registry_refuses_each_shape_it_cannot_rebuild(
         self, _which, receipt_path, mock_run, tmp_path, entry, shown
     ):
+        checkout = tmp_path / "d"
+        checkout.mkdir()
+        entry = entry.replace("/home/me/d", str(checkout))
         receipt_path.return_value = _write(
             tmp_path,
             f"""
@@ -796,6 +825,52 @@ requirements = [
         result = CliRunner().invoke(update, [])
         assert result.exit_code != 0
         assert "exited with code 2" in result.output
+
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._classify_source", return_value=(_REGISTRY, None))
+    @patch(f"{_MOD}._receipt_path", return_value=None)
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_nonzero_exit_hint_says_nothing_about_a_changed_source(
+        self, _which, _rp, _cls, mock_run
+    ):
+        mock_run.return_value = _completed(2)
+        result = CliRunner().invoke(update, [])
+        assert "update it with the package manager you used instead." in result.output
+        assert "source changed" not in result.output
+
+    @pytest.mark.parametrize("key", ["path", "directory"])
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._receipt_path")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_nonzero_exit_after_carrying_a_named_path_points_at_the_source(
+        self, _which, receipt_path, mock_run, tmp_path, key
+    ):
+        # uv checks `<name> @ <path>` against the project at that path and refuses
+        # a path that now holds another project. The "other package manager" hint
+        # alone would point away from that.
+        location = tmp_path / "decider"
+        location.mkdir()
+        receipt_path.return_value = _write(
+            tmp_path,
+            f"""
+[tool]
+requirements = [
+    {{ name = "cli-agent-orchestrator", specifier = "==1.0.0" }},
+    {{ name = "cao-decider-demo", {key} = "{location}" }},
+]
+""",
+        )
+        mock_run.return_value = _completed(1)
+
+        result = CliRunner().invoke(update, [])
+
+        assert result.exit_code != 0
+        assert mock_run.call_args.args[0][-2:] == ["--with", f"cao-decider-demo @ {location}"]
+        assert (
+            "uv exited with code 1. If CAO was not installed via `uv tool install`, update "
+            "it with the package manager you used instead, or a recorded package's source "
+            "changed (see uv's message above)."
+        ) in result.output
 
     @patch(f"{_MOD}.subprocess.run", side_effect=OSError("cannot exec"))
     @patch(f"{_MOD}._classify_source", return_value=(_REGISTRY, None))

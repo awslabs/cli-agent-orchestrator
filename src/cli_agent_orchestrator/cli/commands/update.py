@@ -33,10 +33,16 @@ _LOCAL_KINDS = (_DIRECTORY, _PATH, _EDITABLE)
 _INDEX_OPTIONS = ("index", "index-url", "extra-index-url", "find-links", "no-index")
 
 # The runbook table that turns each kind of receipt entry into a uv argument.
-_RUNBOOK = "docs/ephemeral-agents-agent-setup.md (section 3)"
+# A URL, not a repository path: an install from PyPI has no ``docs/`` directory.
+_RUNBOOK = (
+    "https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/"
+    "ephemeral-agents-agent-setup.md#3-install-the-decider-into-the-servers-python"
+)
 
-# A git ref that is safe to put after ``@`` in ``git+<url>@<ref>``.
-_GIT_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
+# A git ref that is safe to put after ``@`` in ``git+<url>@<ref>``. uv records
+# the ``/`` of a branch such as ``feature/x`` as ``%2F`` and accepts it back in
+# that form, so that one escape is allowed and the ref is printed as recorded.
+_GIT_REF = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._/-]|%2[Ff])*")
 
 
 def _receipt_path() -> Optional[Path]:
@@ -194,10 +200,12 @@ def _with_requirement(req: object) -> Optional[str]:
 
 
 def _missing_location(req: object) -> Optional[str]:
-    """The wheel ``path`` or ``directory`` of a carried entry, if it no longer exists."""
+    """The ``path``, ``directory`` or ``editable`` location of an entry, if it no longer exists."""
     if not isinstance(req, dict):
         return None
-    location = _str_field(req, "path") or _str_field(req, "directory")
+    location = (
+        _str_field(req, "path") or _str_field(req, "directory") or _str_field(req, "editable")
+    )
     if location is None or Path(location).exists():
         return None
     return location
@@ -257,15 +265,22 @@ def _unpin_args(receipt: Optional[Path]) -> List[str]:
             continue
         value = _with_requirement(req)
         name = _str_field(req, "name") if isinstance(req, dict) else None
+        missing = _missing_location(req)
         if value is None:
             label = repr(name) if name else "an unnamed requirement"
+            placeholder = ["--with", f"<{name or 'requirement'} source>"]
+            hand_finish = _hand_finish_args(req)
+            if hand_finish and hand_finish[0] == "--with-editable" and missing is not None:
+                # An editable checkout that was moved: the ready-made
+                # ``--with-editable <path>`` would only fail in uv.
+                problems.append(
+                    f"the extra package {label} is recorded at {missing}, which is gone"
+                )
+                with_args += placeholder
+                continue
             problems.append(f"the extra package {label} is from a source it can't rebuild")
-            with_args += _hand_finish_args(req) or [
-                "--with",
-                f"<{name or 'requirement'} source>",
-            ]
+            with_args += hand_finish or placeholder
             continue
-        missing = _missing_location(req)
         if missing is not None:
             # uv would fail on the path, and the hint after a uv failure points
             # at the wrong cause. Stop here and name the entry instead.
@@ -406,10 +421,14 @@ def update():
         # uv already printed the underlying reason (e.g. "is not installed" when
         # CAO was installed some other way). Surface a non-zero exit without
         # duplicating uv's message.
-        raise click.ClickException(
-            f"uv exited with code {result.returncode}. If CAO was not installed "
-            "via `uv tool install`, update it with the package manager you used "
-            "instead."
+        hint = (
+            "If CAO was not installed via `uv tool install`, update it with the "
+            "package manager you used instead"
         )
+        if any(" @ " in arg for arg in unpin_args or []):
+            # uv checks a carried wheel or directory against its recorded name,
+            # so a path that now holds another project fails here.
+            hint += ", or a recorded package's source changed (see uv's message above)"
+        raise click.ClickException(f"uv exited with code {result.returncode}. {hint}.")
 
     click.echo("✓ CAO is up to date. Restart any running cao-server to pick up the new version.")
