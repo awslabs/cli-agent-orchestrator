@@ -786,6 +786,20 @@ def get_disallowed_tools(provider: str, allowed: List[str]) -> List[str]:
     return sorted(disallowed)
 
 
+def copilot_tool_rules(allowed: List[str]) -> Tuple[List[str], List[str]]:
+    """Copilot CLI's ``--deny-tool`` kinds and ``--excluded-tools`` names for a grant.
+
+    The provider's command and the ``cao launch`` summary both use this, so the
+    summary names what the launch blocks. Copilot's ``url`` kind also covers URL
+    access by shell commands. On the other providers a shell grant keeps URL
+    access, so a grant that keeps ``shell`` hides only the ``web_fetch`` tool.
+    """
+    denied = get_disallowed_tools("copilot_cli", allowed)
+    if "url" in denied and "shell" not in denied:
+        return [tool for tool in denied if tool != "url"], ["web_fetch"]
+    return denied, []
+
+
 def get_launch_disallowed_tools(
     provider: str, allowed: Optional[List[str]], *, ephemeral: bool = False
 ) -> List[str]:

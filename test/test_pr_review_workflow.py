@@ -24,6 +24,7 @@ from typing import Any, Callable, Iterator, Optional
 import jsonschema
 import pytest
 import yaml
+from markdown_it import MarkdownIt
 
 from cao_workflow import ShimHTTPError, ShimTransportError
 from cli_agent_orchestrator.services.script_lint import lint_script
@@ -1154,6 +1155,8 @@ def test_compose_sections_cuts_a_body_that_is_too_long_when_compact(
 
 
 HOSTILE = "<!-- x --> <img src=x> ![p](http://a) &#64;team @admins"
+# A path that a code span keeps as written; outside a code span it is a live link.
+HTML_PATH = "<a href=https://e.example>ok</a>"
 
 
 def test_render_sections_escapes_every_agent_text(
@@ -1173,7 +1176,11 @@ def test_render_sections_escapes_every_agent_text(
     context["coverage"] = pr_review.coverage(context["reports"], len(FILES), REVIEWERS)
     context["risk"] = {"level": "high", "reasons": [HOSTILE]}
     dropped = {"seat": "reviewer-a", "severity": "P2", "path": "src/app.py", "line": 99}
-    context["dropped"] = [{**dropped, "title": HOSTILE, "reason": "the file has 30 lines"}]
+    context["dropped"] = [
+        {**dropped, "title": HOSTILE, "reason": "the file has 30 lines"},
+        # A backtick in the title must not pair with the fence of the path's code span.
+        {**dropped, "title": "x`", "path": HTML_PATH, "reason": "no such file"},
+    ]
 
     for compact in (False, True):
         text = pr_review.render_sections(context, compact)
@@ -1181,6 +1188,9 @@ def test_render_sections_escapes_every_agent_text(
         assert "&lt;img src=x&gt;" in text
         for raw in ("<!--", "<img", "![p](", "&#64;team", "@admins"):
             assert raw not in text
+        rendered = MarkdownIt("commonmark").render(text)
+        assert "<a href=https://e.example>" not in rendered
+        assert "x` (<code>&lt;a href=https://e.example&gt;ok&lt;/a&gt;</code> line 99)" in rendered
 
 
 def test_render_sections_shows_the_checks_the_risk_and_single_mode(

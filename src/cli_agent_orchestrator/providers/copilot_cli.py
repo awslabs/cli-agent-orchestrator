@@ -239,23 +239,19 @@ class CopilotCliProvider(BaseProvider):
         # A present-but-empty list is deny-all (same as Grok). A falsy check
         # used to skip --deny-tool entirely for allowed_tools=[].
         if self._allowed_tools is not None and "*" not in self._allowed_tools:
-            from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
+            from cli_agent_orchestrator.utils.tool_mapping import copilot_tool_rules
 
-            disallowed = get_disallowed_tools("copilot_cli", self._allowed_tools)
-            network_off = "url" in disallowed
-            if network_off and "shell" not in disallowed:
-                # The `url` kind also covers shell commands. On the other
-                # providers a shell grant keeps URL access, so hide only the
-                # fetch tool here.
-                disallowed = [tool for tool in disallowed if tool != "url"]
-                command_parts.extend(["--excluded-tools", "web_fetch"])
-            for tool in disallowed:
+            denied, excluded = copilot_tool_rules(self._allowed_tools)
+            for tool in excluded:
+                command_parts.extend(["--excluded-tools", tool])
+            for tool in denied:
                 command_parts.extend(["--deny-tool", tool])
-            # A `url` rule does not reach MCP tools, and Copilot's built-in MCP
-            # servers reach GitHub, hosted services, a browser or the desktop.
+            # Without web_fetch, the grant loses `url` or the fetch tool. A `url`
+            # rule does not reach MCP tools, and Copilot's built-in MCP servers
+            # reach GitHub, hosted services, a browser or the desktop.
             # `--disable-builtin-mcps` does not cover `computer-use` (Copilot
             # CLI command reference, 1.0.114). An unknown flag stops the launch.
-            if network_off:
+            if "url" in denied or excluded:
                 command_parts.extend(
                     ["--disable-builtin-mcps", "--disable-mcp-server", "computer-use"]
                 )

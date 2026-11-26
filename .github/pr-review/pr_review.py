@@ -240,10 +240,13 @@ def clean_text(value: str, limit: int) -> str:
 
     Escapes ``&``, ``<`` and ``>``, so the text cannot add HTML or decode an entity
     such as ``&#64;`` into a mention. Escapes ``\\``, ``[`` and ``]``, so it cannot
-    add a Markdown link or image. Breaks each @mention with a zero-width space, and
-    cuts the text.
+    add a Markdown link or image. Escapes the backtick, so it cannot open a code
+    span that ends at the fence of a later :func:`code_span` on the same line and
+    leaves that span's text as raw HTML. Breaks each @mention with a zero-width
+    space, and cuts the text.
     """
-    text = _one_line(value).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+    text = _one_line(value).replace("\\", "\\\\").replace("`", "\\`")
+    text = text.replace("[", "\\[").replace("]", "\\]")
     text = html.escape(text, quote=False)
     return fit_utf16(MENTION_RE.sub(f"@{ZWSP}", text), limit)
 

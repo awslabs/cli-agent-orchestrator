@@ -25,7 +25,7 @@ three jobs:
 | --- | --- | --- |
 | `prepare` | `contents: read`, `pull-requests: read` | Reads the PR. A closed PR fails the run. A draft PR is skipped. |
 | `review` | `contents: read`, `copilot-requests: write` | Runs in the `ai-review` environment, which holds the engine secret. Checks out the PR head as files, writes the diff, starts `cao-server` and runs the CAO workflow [`pr_review.py`](pr_review.py). Then it stops the agents, checks the result for credentials and shows the review in the run summary. |
-| `publish` | `contents: read`, `pull-requests: write`, `checks: write` | Validates `review.json` and reads the PR again. Then it posts or updates the review comment, and adds a neutral check run to the reviewed head. If the review did not finish or was not posted, it adds a neutral check run that says so. It runs no agent. |
+| `publish` | `contents: read`, `pull-requests: write`, `checks: write` | Validates `review.json` and reads the PR again. Then it posts or updates the review comment, and adds a neutral check run to the reviewed head. If the review did not finish or was not posted, it adds a neutral check run that says so. It skips with no check run in two cases: the PR is now a draft, or a newer run posted the comment. It runs no agent. |
 
 The `reviewers` input selects the seats.
 
@@ -318,13 +318,14 @@ one run.
   This check runs before the upload. `summary` and `publish` check for token
   patterns again.
 - **Safe text.** Agent text in the review has no control characters and no live
-  @mentions. The script escapes `\`, `[`, `]`, `&`, `<` and `>` in agent text, so
-  agent text cannot add a link, an image, an HTML tag, an HTML comment or an
-  entity. GitHub still makes a bare URL into a link. The check run holds no agent
-  text. The job log never shows agent text. The run summary shows the review only
-  after `check-secrets` and the checks of `github_review.py summary` pass. When
-  the CAO run completes, the log shows the model and the report status of each
-  seat. When a run fails, it shows only step IDs, states and error kinds.
+  @mentions. The script escapes `\`, `` ` ``, `[`, `]`, `&`, `<` and `>` in agent
+  text, so agent text cannot add a link, an image, an HTML tag, an HTML comment,
+  an entity or a code span. GitHub still makes a bare URL into a link. The check
+  run holds no agent text. The job log never shows agent text. The run summary
+  shows the review only after `check-secrets` and the checks of
+  `github_review.py summary` pass. When the CAO run completes, the log shows the
+  model and the report status of each seat. When a run fails, it shows only step
+  IDs, states and error kinds.
 
 A script-tier CAO workflow needs an approved plan. No person is at the runner to
 approve it, so the `review` job turns `workflow.require_approval` off in a private

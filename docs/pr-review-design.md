@@ -127,6 +127,7 @@ flowchart TD
     Rules --> Stop["Stop cao-server and the agents"]
     Stop --> Scan["Scan review.json for the credentials"]
     Scan --> Publish["publish: write token, no secret, no agent"]
+    Publish -->|"PR now a draft, or a newer run posted"| Late["Skipped: no comment, no check"]
     Publish --> Fresh{"Reviewed head still a commit of the PR?"}
     Fresh -->|"No"| Stale["Stale: no comment"]
     Stale --> NotPublished["Neutral check: the review is not published"]
@@ -163,8 +164,10 @@ a panel for high-risk rounds, and the step 11 eval decides. Model A runs
   cannot block a merge. Its text holds only validated values, never agent text.
   When the review job fails or times out, the check says that the review did
   not finish. When the publisher posts no comment, for example for a stale
-  head, the check says that the review is not published. So a run that reaches
-  `publish` ends as a neutral check, not as a run that hangs.
+  head, the check says that the review is not published. Two skips add no
+  check: the PR is now a draft, or a newer run posted the comment. The run
+  summary gives the reason. So a run that reaches `publish` ends as a neutral
+  check or a named skip, not as a run that hangs.
 - **No inline comments.** A finding whose path or line is not in the head
   checkout is dropped and listed, and the review is Incomplete.
 - **Fresh head only.** The publisher refuses a result for a head that is no
@@ -172,9 +175,9 @@ a panel for high-risk rounds, and the step 11 eval decides. Model A runs
   reviewed.
 - **Safe text.** The publisher renders a fixed template. Agent text has no
   control characters, no HTML comment delimiters and no live @mentions. The
-  driver escapes `&`, `<`, `>`, `\`, `[` and `]` in agent text, so the text
-  cannot add HTML, decode an entity into a mention, or add a Markdown link or
-  image. GitHub still makes a bare URL into a link.
+  driver escapes `&`, `<`, `>`, `\`, `` ` ``, `[` and `]` in agent text, so the
+  text cannot add HTML, decode an entity into a mention, open a code span, or
+  add a Markdown link or image. GitHub still makes a bare URL into a link.
 
 ## Trust boundaries
 
@@ -199,7 +202,7 @@ exact rules.
 | State | Meaning |
 | --- | --- |
 | Blocked | A prerequisite failed, for example a closed PR or an invalid policy file. No comment is posted. If the `review` job is Blocked, a neutral check says that the review did not finish. |
-| Skipped | The PR is a draft. No agent runs. |
+| Skipped | The PR is a draft, so no agent runs. `publish` also skips when the PR became a draft during the run, or when a newer run posted the comment. A skip posts no comment and no check. |
 | Stale | The reviewed head is no longer a commit of the PR. No comment is posted, and a neutral check says that the review is not published. |
 | Incomplete | A seat returned no valid report, a reviewer did not list a changed file, no reviewer covered a check, or a finding was dropped. The comment lists the gaps. |
 | Owner decision required | In panel mode, the agents disagree in a way that the verdict rules leave to a person. |
@@ -218,7 +221,7 @@ reason given. "Later" means work after this design.
 | A single agent | #1350 step 10 | `reviewers=single` is the default | Met |
 | Record which review angles ran; mark a partial review as partial | #1350 step 10 | The checks of `REVIEW.md`, with their coverage; Incomplete | Met |
 | Cancel stale runs; keep one comment updated in place | #1350 step 10 | `cancel-in-progress`; one comment, found by its marker | Met |
-| Check the pinned model first; end as a neutral check, not hang | #1350 step 10 | `kiro_cli` checks that the account offers each model before any agent starts. `copilot_cli` uses the CLI default model, or the model input, with no check. Each seat has a step timeout, and the job has a time limit. When the review fails, times out or is not published, `publish` adds a neutral check that says so. | Met for `kiro_cli` |
+| Check the pinned model first; end as a neutral check, not hang | #1350 step 10 | `kiro_cli` checks that the account offers each model before any agent starts. `copilot_cli` uses the CLI default model, or the model input, with no check. Each seat has a step timeout, and the job has a time limit. When the review fails, times out or is not published, `publish` adds a neutral check that says so. A draft PR or a newer run's comment is a skip, with no check. | Met for `kiro_cli` |
 | The security notes | #1350 | See [Trust boundaries](#trust-boundaries) | Met, except the sandbox mode |
 | CLI sandbox mode on | #1350 security notes | Off. The seats have no shell tool. The local command sandbox of Kiro covers only shell commands and wrapped stdio MCP servers. Its built-in file tools stay outside it ([Kiro docs](https://kiro.dev/docs/sandbox/)), so it does not limit `fs_read` or `fs_list`. | Differs |
 | No MCP servers | #1350 security notes | Each seat has `cao-mcp-server` for `workflow_return`. CAO also allows its callback tools, such as `send_message`, between the seats of one run. | Differs |

@@ -457,7 +457,9 @@ A grant without `web_fetch` and without `execute_bash` adds `--deny-tool url`.
 That rule blocks URL access by Copilot's web-fetch tool. It also covers the shell
 commands that Copilot checks for URLs. So a grant with `execute_bash` gets
 `--excluded-tools web_fetch` instead, which hides only the fetch tool. The shell
-then keeps its URL access, as on the other providers.
+then keeps its URL access, as on the other providers. The `Blocked` line of the
+`cao launch` prompt names the rule that applies: `web_fetch` for a shell grant,
+and `url` for a grant without a shell.
 
 Neither rule reaches MCP tools. So a grant without `web_fetch` also turns off
 Copilot's built-in MCP servers, such as `github-mcp-server`. This applies also
