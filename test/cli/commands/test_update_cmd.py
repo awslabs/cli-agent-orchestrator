@@ -322,15 +322,19 @@ requirements = [
     ):
         # `uv tool install <pkg>@latest --upgrade` replaces the receipt's requirements,
         # so each extra package has to be passed back with --with.
+        wheel = tmp_path / "cao_decider_wheel-0.1.0-py3-none-any.whl"
+        wheel.write_bytes(b"")
+        directory = tmp_path / "decider"
+        directory.mkdir()
         receipt_path.return_value = _write(
             tmp_path,
-            """
+            f"""
 [tool]
 requirements = [
-    { name = "cli-agent-orchestrator", specifier = "==2.1.0" },
-    { name = "cao-decider-example", extras = ["fast"], specifier = ">=1.2" },
-    { name = "cao-decider-wheel", path = "/opt/wheels/cao_decider_wheel-0.1.0-py3-none-any.whl" },
-    { name = "cao-decider-local", directory = "/home/me/decider" },
+    {{ name = "cli-agent-orchestrator", specifier = "==2.1.0" }},
+    {{ name = "cao-decider-example", extras = ["fast"], specifier = ">=1.2" }},
+    {{ name = "cao-decider-wheel", path = "{wheel}" }},
+    {{ name = "cao-decider-local", directory = "{directory}" }},
 ]
 """,
         )
@@ -339,6 +343,8 @@ requirements = [
         result = CliRunner().invoke(update, [])
 
         assert result.exit_code == 0
+        # The name goes back with the location, so uv refuses a wheel or directory
+        # that now holds a different project.
         mock_run.assert_called_once_with(
             [
                 "uv",
@@ -349,9 +355,9 @@ requirements = [
                 "--with",
                 "cao-decider-example[fast]>=1.2",
                 "--with",
-                "/opt/wheels/cao_decider_wheel-0.1.0-py3-none-any.whl",
+                f"cao-decider-wheel @ {wheel}",
                 "--with",
-                "/home/me/decider",
+                f"cao-decider-local @ {directory}",
             ]
         )
 
@@ -385,7 +391,8 @@ requirements = [
         self, _which, receipt_path, mock_run, tmp_path
     ):
         # Running the printed command as written must not drop the packages and
-        # extras that could be rebuilt; only the git entry is left as a placeholder.
+        # extras that could be rebuilt, and the git entry is in the form uv honours:
+        # the receipt's "<url>?rev=<ref>" pasted back would lose the pin.
         receipt = _write(
             tmp_path,
             """
@@ -405,8 +412,127 @@ requirements = [
         assert str(receipt) in result.output
         assert (
             "uv tool install 'cli-agent-orchestrator[agui]@latest' --upgrade "
-            "--with fastdep --with '<cao-decider-jev source>'"
+            "--with fastdep --with 'cao-decider-jev @ git+https://example.com/decider.git@v1'"
         ) in result.output
+        assert "?rev=" not in result.output.split("Reinstall it", 1)[1]
+        assert "replacing each <...>" not in result.output
+        mock_run.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "entry,printed",
+        [
+            (
+                '{ name = "d", editable = "/home/me/d" }',
+                "--with-editable /home/me/d",
+            ),
+            (
+                '{ name = "d", git = "https://example.com/d.git" }',
+                "--with 'd @ git+https://example.com/d.git'",
+            ),
+            (
+                '{ name = "d", git = "https://example.com/d.git?rev=release/1.2" }',
+                "--with 'd @ git+https://example.com/d.git@release/1.2'",
+            ),
+        ],
+        ids=["editable", "git", "git-rev"],
+    )
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._receipt_path")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_refusal_prints_the_form_uv_needs_for_editable_and_git(
+        self, _which, receipt_path, mock_run, tmp_path, entry, printed
+    ):
+        # `--with <path>` for an editable entry makes a static copy, and a recorded
+        # "<url>?rev=<ref>" passed back makes uv ignore the ref. The refusal still
+        # stops before uv runs; only the command it prints is different.
+        receipt_path.return_value = _write(
+            tmp_path,
+            f"""
+[tool]
+requirements = [
+    {{ name = "cli-agent-orchestrator", specifier = "==1.0.0" }},
+    {entry},
+]
+""",
+        )
+
+        result = CliRunner().invoke(update, [])
+
+        assert result.exit_code != 0
+        assert "the extra package 'd' is from a source it can't rebuild" in result.output
+        assert f"cli-agent-orchestrator@latest --upgrade {printed}\n" in result.output
+        assert "<d source>" not in result.output
+        mock_run.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            '{ name = "d", git = "https://example.com/d.git?rev=v1&subdirectory=pkg" }',
+            '{ name = "d", git = "https://example.com/d.git?subdirectory=pkg" }',
+            '{ name = "d", git = "https://example.com/d.git?rev=" }',
+            '{ name = "d", git = "https://example.com/d.git?rev=v1 --index-url=x" }',
+            '{ name = "d", git = "https://example.com/d.git", subdirectory = "pkg" }',
+            '{ name = "d", editable = "/home/me/d", marker = "sys_platform == \'linux\'" }',
+            '{ name = "d", url = "https://example.com/d-1.0-py3-none-any.whl" }',
+        ],
+    )
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._receipt_path")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_refusal_leaves_a_placeholder_and_points_at_the_runbook_when_unsure(
+        self, _which, receipt_path, mock_run, tmp_path, entry
+    ):
+        receipt_path.return_value = _write(
+            tmp_path,
+            f"""
+[tool]
+requirements = [
+    {{ name = "cli-agent-orchestrator", specifier = "==1.0.0" }},
+    {entry},
+]
+""",
+        )
+
+        result = CliRunner().invoke(update, [])
+
+        assert result.exit_code != 0
+        assert "--with '<d source>'" in result.output
+        assert "replacing each <...>" in result.output
+        assert "docs/ephemeral-agents-agent-setup.md (section 3)" in result.output
+        assert "what that file records" not in result.output
+        mock_run.assert_not_called()
+
+    @pytest.mark.parametrize("key", ["path", "directory"])
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._receipt_path")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_refuses_a_carried_location_that_is_gone(
+        self, _which, receipt_path, mock_run, tmp_path, key
+    ):
+        # uv would fail on the missing path, and the hint CAO prints after a uv
+        # failure says to use another package manager. Name the entry instead.
+        gone = tmp_path / "moved-away"
+        receipt = _write(
+            tmp_path,
+            f"""
+[tool]
+requirements = [
+    {{ name = "cli-agent-orchestrator", specifier = "==1.0.0" }},
+    {{ name = "cao-decider-demo", {key} = "{gone}" }},
+]
+""",
+        )
+        receipt_path.return_value = receipt
+
+        result = CliRunner().invoke(update, [])
+
+        assert result.exit_code != 0
+        assert (
+            f"the extra package 'cao-decider-demo' is recorded at {gone}, which is gone"
+            in result.output
+        )
+        assert str(receipt) in result.output
+        assert "--with '<cao-decider-demo source>'" in result.output
         mock_run.assert_not_called()
 
     @patch(f"{_MOD}.subprocess.run")
@@ -504,39 +630,31 @@ requirements = [
         assert f"the install sets {option.split(' ', 1)[0]}," in result.output
         assert str(receipt) in result.output
         assert "--with 'cao-decider-demo>=1.0'" in result.output
+        assert "'<the [tool.options] settings as uv flags>'" in result.output
         mock_run.assert_not_called()
 
-    @pytest.mark.parametrize(
-        "entry,carried",
-        [
-            (
-                '{ name = "cao-decider-wheel", '
-                'path = "/opt/wheels/cao_decider_wheel-0.1.0-py3-none-any.whl" }',
-                "/opt/wheels/cao_decider_wheel-0.1.0-py3-none-any.whl",
-            ),
-            (
-                '{ name = "cao-decider-dir", directory = "/opt/src/cao-decider" }',
-                "/opt/src/cao-decider",
-            ),
-        ],
-        ids=["path", "directory"],
-    )
+    @pytest.mark.parametrize("key", ["path", "directory"])
     @patch(f"{_MOD}.subprocess.run")
     @patch(f"{_MOD}._receipt_path")
     @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
     def test_index_settings_block_a_local_extra_too(
-        self, _which, receipt_path, mock_run, tmp_path, entry, carried
+        self, _which, receipt_path, mock_run, tmp_path, key
     ):
         # A local wheel or directory is not looked up on an index, but uv resolves
         # its dependencies on the new command's indexes, and those may be what the
         # recorded index was there for.
+        location = tmp_path / "cao_decider-0.1.0-py3-none-any.whl"
+        if key == "path":
+            location.write_bytes(b"")
+        else:
+            location.mkdir()
         receipt = _write(
             tmp_path,
             f"""
 [tool]
 requirements = [
     {{ name = "cli-agent-orchestrator", specifier = "==1.0.0" }},
-    {entry},
+    {{ name = "cao-decider", {key} = "{location}" }},
 ]
 
 [tool.options]
@@ -551,7 +669,8 @@ find-links = ["file:///opt/wheels"]
         assert result.exit_code != 0
         assert "the install sets find-links, no-index," in result.output
         assert str(receipt) in result.output
-        assert f"--with {carried}" in result.output
+        assert f"--with 'cao-decider @ {location}'" in result.output
+        assert "'<the [tool.options] settings as uv flags>'" in result.output
         mock_run.assert_not_called()
 
     @patch(f"{_MOD}.subprocess.run")

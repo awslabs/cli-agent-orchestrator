@@ -455,15 +455,19 @@ cao update
 | Install source | What `cao update` does |
 |----------------|------------------------|
 | PyPI (`uv tool install cli-agent-orchestrator`) | Runs `uv tool upgrade cli-agent-orchestrator` |
-| PyPI with version pin (`==2.3.0`, `<3.0`) | Runs `uv tool install cli-agent-orchestrator@latest --upgrade` (unpins) |
-| Git (`uv tool install git+...`) | Runs `uv tool install <git-source> --upgrade --reinstall` |
+| PyPI with version pin (`==2.3.0`, `<3.0`) | Runs `uv tool install 'cli-agent-orchestrator[<extras>]@latest' --upgrade --with …` (unpins, and passes CAO's extras and each `--with` package back), or stops before uv runs when it cannot carry one |
+| Git (`uv tool install git+...`) | Runs `uv tool upgrade cli-agent-orchestrator --reinstall` |
 | Local directory / editable | Prints guidance (cannot auto-update a local install) |
 
 After updating, restart any running `cao-server` to pick up the new version.
 
-Packages you added to CAO's tool environment with `--with`, such as a decider, are kept only by
-the unpinned PyPI path (`uv tool upgrade`). The git and version-pinned paths run without
-`--with` and drop them. Check and reinstall them after an update; see
+Packages you added to CAO's tool environment with `--with`, such as a decider, are kept by the
+unpinned PyPI path and the git path, where uv reuses its install receipt. The version-pinned
+path writes a new receipt, so `cao update` passes CAO's extras and each recorded package back.
+It exits non-zero before uv runs, and prints the receipt path with a command to finish by hand,
+when it cannot do that: a git, URL, editable or marker entry, a wheel or directory that is gone,
+or index settings recorded while any package is carried. A local install prints guidance and
+carries nothing. Check your packages after an update; see
 [the setup runbook](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/ephemeral-agents-agent-setup.md#3-install-the-decider-into-the-servers-python).
 
 ### Examples
