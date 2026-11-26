@@ -766,9 +766,46 @@ def test_internal_memory_get_maps_success_ambiguity_and_record_access(
     assert success.json()["memory"]["content"] == "Global route body."
     assert ambiguous.status_code == 409
     assert ambiguous.json()["error_kind"] == "ambiguous_scope"
+    assert ambiguous.content == (
+        b'{"error_kind":"ambiguous_scope","error":"memory key \'route-note\' exists in '
+        b'scopes: global, federated","scopes":["global","federated"]}'
+    )
     with service._get_db_session() as db:
         row = db.query(MemoryMetadataModel).filter_by(key="route-note", scope="global").one()
         assert row.access_count == 0
+
+
+def test_internal_memory_get_errors_do_not_stringify_exceptions(
+    service: MemoryService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from cli_agent_orchestrator.api import main
+
+    _topic(service, "same-key", "Global body.", scope="global")
+    _topic(service, "same-key", "Federated body.", scope="federated")
+    monkeypatch.setattr(main, "_get_memory_service", lambda: service)
+
+    def unexpected_stringification(_error: Exception) -> str:
+        raise AssertionError("response must not stringify the exception")
+
+    monkeypatch.setattr(MemoryAmbiguousScopeError, "__str__", unexpected_stringification)
+    monkeypatch.setattr(MemoryNotFoundError, "__str__", unexpected_stringification)
+    client = TestClient(main.app, base_url="http://localhost")
+
+    ambiguous = client.post("/internal/memory/get", json={"key": "SAME-KEY!"})
+    missing = client.post("/internal/memory/get", json={"key": "Missing-Note!", "scope": "global"})
+
+    assert ambiguous.status_code == 409
+    assert ambiguous.content == (
+        b'{"error_kind":"ambiguous_scope","error":"memory key \'same-key\' exists in '
+        b'scopes: global, federated","scopes":["global","federated"]}'
+    )
+    assert missing.status_code == 404
+    assert (
+        missing.content
+        == b'{"error_kind":"not_found","error":"memory not found: \'missing-note\'"}'
+    )
 
 
 def test_memory_get_returns_headingless_body_and_counts_access(service: MemoryService) -> None:
@@ -949,15 +986,55 @@ def test_memory_get_tool_reports_exact_error_kinds(
     )
     tool = getattr(server.memory_get, "fn", server.memory_get)
 
+    ambiguous = asyncio.run(
+        tool(key="SAME-KEY!", scope=None, include_history=False, max_chars=8000)
+    )
+    missing = asyncio.run(
+        tool(key="Missing-Note!", scope="global", include_history=False, max_chars=8000)
+    )
+
+    assert ambiguous["error_kind"] == "ambiguous_scope"
+    assert ambiguous["scopes"] == ["global", "federated"]
+    assert ambiguous["error"] == "memory key 'same-key' exists in scopes: global, federated"
+    assert missing["error_kind"] == "not_found"
+    assert missing["error"] == "memory not found: 'missing-note'"
+
+
+def test_memory_get_tool_does_not_stringify_exact_errors(
+    service: MemoryService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cli_agent_orchestrator.mcp_server import server
+
+    _topic(service, "same-key", "Global body.", scope="global")
+    _topic(service, "same-key", "Federated body.", scope="federated")
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.memory_service.MemoryService",
+        lambda *args, **kwargs: service,
+    )
+
+    def unexpected_stringification(_error: Exception) -> str:
+        raise AssertionError("response must not stringify the exception")
+
+    monkeypatch.setattr(MemoryAmbiguousScopeError, "__str__", unexpected_stringification)
+    monkeypatch.setattr(MemoryNotFoundError, "__str__", unexpected_stringification)
+    tool = getattr(server.memory_get, "fn", server.memory_get)
+
     ambiguous = asyncio.run(tool(key="same-key", scope=None, include_history=False, max_chars=8000))
     missing = asyncio.run(
         tool(key="missing-note", scope="global", include_history=False, max_chars=8000)
     )
 
-    assert ambiguous["error_kind"] == "ambiguous_scope"
-    assert ambiguous["scopes"] == ["global", "federated"]
-    assert missing["error_kind"] == "not_found"
-    assert missing["error"] == "memory not found: 'missing-note'"
+    assert ambiguous == {
+        "success": False,
+        "error_kind": "ambiguous_scope",
+        "error": "memory key 'same-key' exists in scopes: global, federated",
+        "scopes": ["global", "federated"],
+    }
+    assert missing == {
+        "success": False,
+        "error_kind": "not_found",
+        "error": "memory not found: 'missing-note'",
+    }
 
 
 def test_memory_get_tool_rejects_bad_scope_before_remote_call(

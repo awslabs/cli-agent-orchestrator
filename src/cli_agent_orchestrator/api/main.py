@@ -11556,14 +11556,14 @@ async def internal_memory_get(
             status_code=status.HTTP_409_CONFLICT,
             content={
                 "error_kind": error.error_kind,
-                "error": str(error),
+                "error": f"memory key {error.key!r} exists in scopes: {', '.join(error.scopes)}",
                 "scopes": error.scopes,
             },
         )
     except MemoryNotFoundError as error:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
-            content={"error_kind": error.error_kind, "error": str(error)},
+            content={"error_kind": error.error_kind, "error": f"memory not found: {error.key!r}"},
         )
     return {"memory": memory}
 

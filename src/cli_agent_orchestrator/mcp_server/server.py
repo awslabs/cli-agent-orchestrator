@@ -2252,11 +2252,15 @@ async def memory_get(
         return {
             "success": False,
             "error_kind": error.error_kind,
-            "error": str(error),
+            "error": f"memory key {error.key!r} exists in scopes: {', '.join(error.scopes)}",
             "scopes": error.scopes,
         }
     except MemoryNotFoundError as error:
-        return {"success": False, "error_kind": error.error_kind, "error": str(error)}
+        return {
+            "success": False,
+            "error_kind": error.error_kind,
+            "error": f"memory not found: {error.key!r}",
+        }
     except Exception as error:
         return {"success": False, "error": str(error)}
 
