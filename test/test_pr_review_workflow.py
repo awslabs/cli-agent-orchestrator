@@ -2541,8 +2541,8 @@ def test_collect_writes_the_diff_and_the_changed_files(
     [
         (
             {("rev-parse", "--verify", "HEAD^{commit}"): (0, f"{NEW_HEAD}\n", "")},
-            "Stale: the checkout is not the head that prepare read, so the PR changed during "
-            "setup. Dispatch again.",
+            "Blocked: the checkout is not the head_sha of pr.json. Check out that commit, "
+            "or use the evidence folder that matches the checkout.",
         ),
         (
             {

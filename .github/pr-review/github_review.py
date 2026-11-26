@@ -363,8 +363,8 @@ def collect(evidence_dir: Path, source_dir: Path) -> int:
     if head != record.get("head_sha"):
         return _report(
             1,
-            "Stale: the checkout is not the head that prepare read, so the PR changed "
-            "during setup. Dispatch again.",
+            "Blocked: the checkout is not the head_sha of pr.json. Check out that commit, "
+            "or use the evidence folder that matches the checkout.",
         )
     base_ref = str(record.get("base_ref") or "")
     if (
