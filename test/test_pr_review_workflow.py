@@ -1202,6 +1202,40 @@ def test_render_sections_escapes_every_agent_text(
         assert "x` (<code>&lt;a href=https://e.example&gt;ok&lt;/a&gt;</code> line 99)" in rendered
 
 
+def test_compose_sections_cuts_at_a_line_end(
+    pr_review: ModuleType, workspace: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A cut inside a code span leaves its fence open, so the rest of the path
+    # renders as live Markdown. Move the cut through each position of that line.
+    context = _context(pr_review, workspace["source"], [])
+    context["dropped"] = [
+        {
+            "seat": "reviewer-a",
+            "severity": "P2",
+            "path": HTML_PATH,
+            "line": 1,
+            "title": "Defect",
+            "reason": "no such file",
+        }
+    ]
+    compact = pr_review.render_sections(context, True)
+    monkeypatch.setattr(pr_review, "SECTIONS_BUDGET_UTF16", 300)
+    first = pr_review.compose_sections(context)
+    note = first[first.index("\n\nThe review was cut") :]
+    span = compact.index(HTML_PATH)
+
+    for cut in range(compact.rindex("\n", 0, span) + 1, compact.index("\n", span)):
+        budget = pr_review.utf16_length(compact[:cut]) + pr_review.utf16_length(note)
+        assert pr_review.utf16_length(compact) > budget
+        monkeypatch.setattr(pr_review, "SECTIONS_BUDGET_UTF16", budget)
+
+        text = pr_review.compose_sections(context)
+
+        assert text.endswith(note)
+        assert compact.startswith(text[: -len(note)] + "\n")
+        assert "<a href=https://e.example>" not in MarkdownIt("commonmark").render(text)
+
+
 def test_render_sections_shows_the_checks_the_risk_and_single_mode(
     pr_review: ModuleType, workspace: dict[str, Path]
 ) -> None:

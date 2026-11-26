@@ -1438,7 +1438,10 @@ def compose_sections(context: dict[str, Any]) -> str:
         "\n\nThe review was cut to fit one GitHub comment. The workflow artifact "
         "`review.json` has every finding.\n"
     )
-    return fit_utf16(text, SECTIONS_BUDGET_UTF16 - utf16_length(note)) + note
+    kept = fit_utf16(text, SECTIONS_BUDGET_UTF16 - utf16_length(note), suffix="")
+    # Cut at a line end. A code span is on one line, so the cut cannot leave its
+    # fence open and the rest of a path as live Markdown.
+    return kept.rpartition("\n")[0] + note
 
 
 # --------------------------------------------------------------------------

@@ -367,8 +367,9 @@ profiles and the PR, and all three come from the dispatched ref.
 - Each seat can use 1,800 seconds. The review step of the job can use 120
   minutes.
 - The review must fit one GitHub comment. The full text is used first, then a
-  compact text, then a cut text with a note. The `pr-review-result` artifact
-  keeps `review.json` with every finding for 7 days.
+  compact text, then a cut text with a note. The cut is at the end of a line, so
+  it cannot split a code span. The `pr-review-result` artifact keeps
+  `review.json` with every finding for 7 days.
 - `publish` reads at most 5,000 comments of the PR to find the earlier review
   comment. If the PR has more, `publish` posts no comment.
 
