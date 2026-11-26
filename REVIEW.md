@@ -179,7 +179,8 @@ Docs, changelog fragments, the names of new concepts, and duplicate code.
 
 ## Ownership and changes
 
-Maintainers own this file. When a review misses a defect, add the lesson to the
-check that should have found it, with its source. Keep each rule short and
-generic. A PR that changes this file is reviewed with the copy on the
+Maintainers own this file. `.github/CODEOWNERS` gives it to `@awslabs/multiq`,
+so a change needs a code owner's review. When a review misses a defect, add the
+lesson to the check that should have found it, with its source. Keep each rule
+short and generic. A PR that changes this file is reviewed with the copy on the
 dispatched ref.

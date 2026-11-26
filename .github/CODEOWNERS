@@ -53,3 +53,6 @@
 /src/cli_agent_orchestrator/services/secret_gate.py @awslabs/multiq
 /src/cli_agent_orchestrator/services/vault/ @awslabs/multiq
 /src/cli_agent_orchestrator/decisions/ @awslabs/multiq
+# PR review: the policy, and the scripts that run with the review credentials.
+/REVIEW.md @awslabs/multiq
+/.github/pr-review/ @awslabs/multiq

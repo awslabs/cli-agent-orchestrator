@@ -53,6 +53,8 @@ EXPECTED_PATHS = {
     "/src/cli_agent_orchestrator/services/secret_gate.py",
     "/src/cli_agent_orchestrator/services/vault/",
     "/src/cli_agent_orchestrator/decisions/",
+    "/REVIEW.md",
+    "/.github/pr-review/",
     "/.gitleaksignore",
     "/.trivyignore",
     "/trivy.yaml",

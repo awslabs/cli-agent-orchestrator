@@ -104,6 +104,13 @@ the publisher. The tests keep the two copies equal.
 - **Lessons.** When a review misses a defect, a maintainer adds the lesson to
   the check that should have found it, with its source. "Ownership and
   changes" in `REVIEW.md` gives this rule.
+- **Ownership.** `.github/CODEOWNERS` gives `REVIEW.md` and
+  `.github/pr-review/` to `@awslabs/multiq`, in the block for gate policy and
+  trust-boundary code (#1350 Q4). The `main` ruleset requires a code owner's
+  review, so a PR that changes the policy or the scripts needs one.
+  `test/test_codeowners_risk.py` pins both entries.
+- **Contributors.** `CONTRIBUTING.md` tells contributors to check a change
+  against `REVIEW.md` before they send it.
 
 ## End-to-end flow
 
@@ -230,6 +237,7 @@ reason given. "Later" means work after this design.
 | The security notes | #1350 | See [Trust boundaries](#trust-boundaries) | Met, except the sandbox mode |
 | CLI sandbox mode on | #1350 security notes | Off. The seats have no shell tool. The local command sandbox of Kiro covers only shell commands and wrapped stdio MCP servers. Its built-in file tools stay outside it ([Kiro docs](https://kiro.dev/docs/sandbox/)), so it does not limit `fs_read` or `fs_list`. | Differs |
 | No MCP servers | #1350 security notes | Each seat has `cao-mcp-server` for `workflow_return`. CAO also allows its callback tools, such as `send_message`, between the seats of one run. | Differs |
+| Code-owner review of the gate policy and the trust-boundary code | #1350 Q4 | `.github/CODEOWNERS` gives `REVIEW.md` and `.github/pr-review/` to `@awslabs/multiq` | Met |
 | No dependency on CAO sessions, workflows or the runtime | #464 | The review is a CAO workflow. The Phase 3 proposal and the Q6 and Q7 answers in the comments of #1350 plan it that way. | Differs |
 | Kiro CLI in headless mode with a read-only profile | #464 | CAO runs Kiro CLI in a tmux terminal with no person at it, not in headless mode. The profile is read-only. | Differs |
 | Run on PR events: opened, reopened, ready for review, updated | #464 | Manual dispatch only, as the security notes of #1350 say for the first trigger | Later |
@@ -274,14 +282,13 @@ them.
 | Set a deployment branch rule on the `ai-review` environment that allows only `main`. GitHub creates the environment, with no rule, at the first run that names it. Set the rule after the workflow is on `main`, because a run from another branch then cannot use the environment. Do not add a custom deployment protection rule: with `deployment: false`, it fails the job. | A workflow on any branch can use the environment. | Only a user with write access can dispatch the workflow. |
 | Move `KIRO_API_KEY`, and `COPILOT_GITHUB_TOKEN` if you use it, into the environment. Then delete the repository secret. | Any workflow of the repository can read a repository secret. | No other workflow reads `KIRO_API_KEY`. |
 | Who owns the key and its budget (#1350 Q6). The comments prefer GitHub OIDC to Amazon Bedrock, with the Kiro key as the fallback. | A long-lived key. `check-secrets` does not find an obfuscated copy. | Rotate the key if a review shows unexpected text. |
-| Add `REVIEW.md` and `.github/pr-review/` to CODEOWNERS (#1350 Q4). The workflow file is already covered by `/.github/workflows/`. | A PR can change the policy or the driver without an owner's review. | The review of such a PR uses the copy on the dispatched ref, and check A4 tells the reviewer to report the change. |
 | Keep `single` as the default, or use the panel (#1350 step 11). | A single agent has no second check of its findings. | The comment says so. |
 
 ## Validation and adoption
 
 | Evidence layer | Required coverage |
 | --- | --- |
-| Unit tests | `test/test_pr_review_workflow.py`: the policy file, the schemas, single and panel mode, coverage, risk, dropped findings, the verdict rules, safe text, the publisher checks, the comment update, the neutral check, the workflow permissions and triggers, and the shared constants. |
+| Unit tests | `test/test_pr_review_workflow.py`: the policy file, the schemas, single and panel mode, coverage, risk, dropped findings, the verdict rules, safe text, the publisher checks, the comment update, the neutral check, the workflow permissions and triggers, and the shared constants. `test/test_codeowners_risk.py`: the code owners of `REVIEW.md` and `.github/pr-review/`. |
 | Static checks | `actionlint`, `zizmor`, `black`, `isort`, `ruff`, `mypy` and the Markdown link check. |
 | Live run | A dispatch for a real PR with `reviewers=single`. It creates or updates one comment and adds one neutral check to the reviewed head. The comment shows the policy SHA-256 and the coverage of each check. |
 | Calibration | The step 11 eval of #1350: 12 to 30 labelled cases from past PRs. It scores `single` and `panel` on the same cases. It decides the default, and any automatic trigger. |
