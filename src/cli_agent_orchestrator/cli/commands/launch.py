@@ -354,9 +354,10 @@ def launch(
                         )
                     )
                 elif provider == "opencode_cli":
-                    # opencode's TUI has no runtime skip-permissions flag
-                    # (tracked upstream in sst/opencode#8463). Permissions are
-                    # install-time only, so --yolo cannot loosen them here.
+                    # OpenCode's `--auto` cannot help here: `opencode mini`
+                    # (what CAO launches on v2) rejects it, and it never
+                    # overrides the explicit deny rules `cao install` writes.
+                    # Permissions are install-time only (docs/opencode-cli.md).
                     click.echo(
                         click.style(
                             "  Note: --yolo has no runtime effect on opencode_cli.\n"

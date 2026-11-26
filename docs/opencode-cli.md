@@ -337,7 +337,10 @@ The `test_assign_with_callback` test validates all four orchestration modes:
 
 Unlike every other CAO provider, `opencode_cli` does **not** honour `cao launch --yolo` at runtime. Permissions are baked into the installed agent's frontmatter `permission:` block at `cao install` time and cannot be loosened by a launch flag.
 
-Root cause: OpenCode's TUI (the mode CAO drives) has no equivalent to `--dangerously-skip-permissions` / `--yolo` / `--trust-all-tools`. The flag exists only on the `opencode run` headless one-shot command, which CAO does not use. Tracked upstream in [sst/opencode#8463](https://github.com/sst/opencode/issues/8463) and sibling issues.
+Why a launch flag cannot do it (checked against OpenCode 2.3.2 and the OpenCode source in November 2026):
+
+- **OpenCode has an auto-approve flag, `--auto`**, with `--yolo` and `--dangerously-skip-permissions` as hidden spellings of it. The full TUI (`opencode`) and `opencode run` accept it. `opencode mini` does not: it answers `Unrecognized flag: --auto`. On OpenCode v2 CAO launches `opencode mini`, so there is no flag to pass.
+- **The flag would not loosen a CAO-installed agent anyway.** `--auto` approves only requests that would otherwise ask. It never overrides an explicit deny. `cao install` writes each of the 13 tools as `allow` or `deny`, never `ask`, so a restricted profile stays restricted with or without it.
 
 **To get unrestricted access on `opencode_cli`:**
 
@@ -352,7 +355,13 @@ cao install my_agent --provider opencode_cli
 cao launch --agents my_agent --provider opencode_cli
 ```
 
-Runtime permission bypass support remains unavailable for OpenCode's TUI mode. CAO can revisit this either with a temp-agent workaround or by consuming an upstream TUI flag once one ships.
+What `allowedTools: ["*"]` does and does not cover:
+
+- It sets all 13 tools to `allow`, including the five that are otherwise always denied (`task`, `question`, `webfetch`, `websearch`, `codesearch`).
+- The widening is stored in the installed agent, so it applies to every later launch until the profile is changed and re-installed. On other providers `--yolo` applies to one launch.
+- **OpenCode v1 can still prompt.** Its defaults ask before touching a path outside the project (`external_directory`) and when it detects a repeated tool call (`doom_loop`). CAO does not write those two, so an unattended v1 worker can stop on either prompt even with `["*"]`. OpenCode v2 allows `external_directory` by default and has no `doom_loop` check.
+
+A `--yolo` that works at launch would have to replace the installed agent's permission block for that one launch. CAO does not do that today.
 
 ### Project-local `opencode.json` override
 
