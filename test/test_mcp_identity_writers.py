@@ -192,7 +192,7 @@ ALLOWED: Dict[str, str] = {
     ),
     "providers/codex.py::_build_codex_command": (
         "forwards into the `env` table (the value Codex actually passes), and "
-        "additionally names the key in Codex's `env_vars` inheritance list, "
+        "references the key once to build Codex's `env_vars` inheritance list, "
         "which requests the REAL parent value and can hold no foreign one"
     ),
     "providers/kiro_launch_home.py::_cao_mcp_entry": (
@@ -260,7 +260,7 @@ ALLOWED_OCCURRENCES: Dict[str, int] = {
     "mcp_server/server.py::emit_ui": 1,
     "providers/antigravity_cli.py::_is_pinned_terminal_entry": 1,
     "providers/antigravity_cli.py::_register_mcp_servers": 2,
-    "providers/codex.py::_build_codex_command": 2,
+    "providers/codex.py::_build_codex_command": 1,
     "providers/kimi_cli.py::_build_kimi_code_command": 2,
     "providers/kiro_launch_home.py::_cao_mcp_entry": 1,
     "providers/minimax_code.py::_serialize_server": 0,
