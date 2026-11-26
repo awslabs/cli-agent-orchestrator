@@ -79,5 +79,6 @@ while true; do
   fi
   writer_check
   echo "- $(date -u '+%Y-%m-%d %H:%M') UTC tick (loop $LOOP_OWNER): $MODE ($FILTER_REPORT)" | "$PYTHON" "$SCRIPT_DIR/config.py" --append-log || exit 2
+  touch state/tick_loop.clean || exit 2
   pause "$INTERVAL"
 done
