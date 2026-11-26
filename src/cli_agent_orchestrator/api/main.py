@@ -9935,12 +9935,18 @@ async def cancel_workflow_run_endpoint(
 
     if getattr(record, "tier", "yaml") == "script":
         record_state = getattr(record, "state", None)
-        if record_state in (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED):
+        # A run whose ``_finalize`` has started (``finished_at`` set, journal write in
+        # flight) is terminal for cancel even while ``state`` still reads RUNNING, or
+        # the cancel would overwrite the terminal row being written and leave the run
+        # resumable, which re-runs the script (issue #1514 P1-1).
+        settled = record_state in (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED)
+        if getattr(record, "finished_at", None) is not None or settled:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
                     f"run '{run_id}' is already "
-                    f"{getattr(record_state, 'value', record_state)}; cannot cancel"
+                    f"{getattr(record_state, 'value', record_state) if settled else 'finishing'}"
+                    "; cannot cancel"
                 ),
             )
         await script_runner.cancel_script_run(

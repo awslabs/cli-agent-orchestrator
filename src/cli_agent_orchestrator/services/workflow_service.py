@@ -439,10 +439,17 @@ def _journal_current_step(record: RunRecord) -> None:
         logger.debug("journal: update_run_current_step '%s' failed: %s", record.run_id, e)
 
 
-def _journal_run_state(record: RunRecord) -> None:
-    """Best-effort UPDATE of the terminal run state (logged at WARNING — gates resume)."""
+def _journal_run_state(record: RunRecord, state: RunState) -> None:
+    """Best-effort UPDATE of the terminal run state (logged at WARNING — gates resume).
+
+    ``state`` is passed explicitly rather than read off ``record`` so this write can
+    land BEFORE the live record is settled: ``GET /workflows/runs/{id}`` answers from
+    the record and ``/result`` from the journal row, so a record settled first makes
+    the status route advertise a terminal state the result route cannot answer yet
+    (issue #1514).
+    """
     try:
-        workflow_journal.update_run_state(record.run_id, record.state.value, record.finished_at)
+        workflow_journal.update_run_state(record.run_id, state.value, record.finished_at)
     except (
         Exception
     ) as e:  # noqa: BLE001 — journal write is best-effort; in-memory floor still serves live reads
@@ -1313,18 +1320,21 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
                 StepState.COMPLETED_UNVALIDATED,
             ):
                 cur.state = StepState.FAILED
-        record.state = RunState.FAILED
         record.current_step_id = None
         record.finished_at = _now()
         # Persist the terminal FAILED state (best-effort) before re-raising (§1).
         await _ajournal(_journal_current_step, record)
-        # U2 emission (BR-1, after the in-memory FAILED settle): an engine-internal
-        # invariant violation faulted the run (error_kind "error", not a step
-        # timeout). Emitted before the raise so the forensic timeline records it.
-        # Event BEFORE state, for the same trailing-gap reason as the finalize path
-        # below — see the ORDER IS LOAD-BEARING comment there.
-        await _journal_event(record, "run.failed", state=record.state.value, error_kind="error")
-        await _ajournal(_journal_run_state, record)
+        # U2 emission (BR-1): an engine-internal invariant violation faulted the run
+        # (error_kind "error", not a step timeout). Emitted before the raise so the
+        # forensic timeline records it. Event BEFORE state, for the same trailing-gap
+        # reason as the finalize path below — see the ORDER IS LOAD-BEARING comment
+        # there.
+        await _journal_event(record, "run.failed", state=RunState.FAILED.value, error_kind="error")
+        # The journal row turns terminal BEFORE the live record does (issue #1514):
+        # the status route reads the record and /result reads the journal, so settling
+        # the record first lets status say FAILED while /result still says running.
+        await _ajournal(_journal_run_state, record, RunState.FAILED)
+        record.state = RunState.FAILED
         logger.error("drive: run '%s' failed with an engine error", record.run_id)
         raise
 
@@ -1335,13 +1345,15 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
     # last-step cancel) are marked SKIPPED for consistency with the boundary path.
     if record.cancelled and record.state not in (RunState.FAILED, RunState.CANCELLED):
         await _skip_remaining(record, order, from_index=0)
-        record.state = RunState.CANCELLED
-    if record.state not in (RunState.FAILED, RunState.CANCELLED):
-        record.state = RunState.COMPLETED
+        terminal_state = RunState.CANCELLED
+    elif record.state in (RunState.FAILED, RunState.CANCELLED):
+        terminal_state = record.state
+    else:
+        terminal_state = RunState.COMPLETED
     record.current_step_id = None
     record.finished_at = _now()
     await _ajournal(_journal_current_step, record)
-    # U2 emission (BR-1, after the in-memory terminal settle): the run reached its
+    # U2 emission (BR-1, BEFORE the run row turns terminal): the run reached its
     # terminal state. Branch on the final state — run.completed for a clean finish,
     # run.cancelled for a cooperative cancel, run.failed for a halted (on_failure=
     # halt) run (its error_kind is already carried on the step.failed event).
@@ -1357,17 +1369,27 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
     # web store latches that marker for the session. Appending the event first
     # closes the window: by the time the run is observably terminal, its last
     # event has already landed.
-    if record.state == RunState.CANCELLED:
-        await _journal_event(record, "run.cancelled", state=record.state.value)
-    elif record.state == RunState.FAILED:
-        await _journal_event(record, "run.failed", state=record.state.value, error_kind="error")
+    if terminal_state == RunState.CANCELLED:
+        await _journal_event(record, "run.cancelled", state=terminal_state.value)
+    elif terminal_state == RunState.FAILED:
+        await _journal_event(record, "run.failed", state=terminal_state.value, error_kind="error")
     else:
-        await _journal_event(record, "run.completed", state=record.state.value)
+        await _journal_event(record, "run.completed", state=terminal_state.value)
     # Journal the terminal run state last (§1, B4-BR-5). Still best-effort: a lost
     # state write leaves the run non-terminal in the journal, which the F-1 guard
     # in _follow_run_events handles — it re-reads state each poll and closes on the
     # transition, so a follower is not pinned forever.
-    await _ajournal(_journal_run_state, record)
+    #
+    # THE LIVE RECORD IS SETTLED AFTER THIS WRITE, not before (issue #1514):
+    # ``GET /workflows/runs/{id}`` answers from the record and ``/result`` from the
+    # journal row, so a record settled first made the status route report a terminal
+    # state for the whole span of the three journal awaits above, while ``cao
+    # workflow wait`` / MCP ``workflow_wait`` -> ``workflow_result`` still read
+    # ``running`` with no step outputs. ``finished_at`` is already set, and
+    # ``cancel_run`` refuses a run whose settlement has begun, so the overlapping
+    # request is answered 409 rather than racing the terminal row.
+    await _ajournal(_journal_run_state, record, terminal_state)
+    record.state = terminal_state
 
     # Aggregate the result.
     return _build_result(record, order)
@@ -1538,8 +1560,16 @@ def cancel_run(run_id: str) -> None:
     record = run_registry.get(run_id)
     if record is None:
         raise KeyError(f"unknown run_id '{run_id}'")
-    if record.state in (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED):
-        raise ValueError(f"run '{run_id}' is already {record.state.value}; cannot cancel")
+    # ``finished_at`` is set by the drive before it journals the terminal state, so a
+    # run whose settlement has begun is terminal for cancel even while ``state`` still
+    # reads RUNNING (issue #1514 P1-1): accepting it would flag a run that is already
+    # finishing and answer 200 for a cancel that cannot happen.
+    terminal = record.state in (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED)
+    if record.finished_at is not None or terminal:
+        raise ValueError(
+            f"run '{run_id}' is already {record.state.value if terminal else 'finishing'};"
+            " cannot cancel"
+        )
     record.cancelled = True
     # Interrupt any in-flight step wait immediately (#409b). Guard the attribute
     # for records rebuilt from an older journal shape that predates the field.

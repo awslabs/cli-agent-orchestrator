@@ -856,6 +856,36 @@ async def test_cancel_journals_cancelled_before_settling_the_record(
 
 
 @pytest.mark.asyncio
+async def test_cancel_refuses_a_run_whose_finalize_has_started(monkeypatch: pytest.MonkeyPatch):
+    """Issue #1514 P1-1: a settling run is terminal for cancel even while RUNNING.
+
+    ``_finalize`` sets ``finished_at`` before awaiting the journal write, so the state
+    still reads RUNNING during that write. Accepting a cancel there would overwrite the
+    terminal row it just wrote, and a cancelled script run is resumable (BR-18), so a
+    resume would run the script a second time.
+    """
+    from cli_agent_orchestrator.services import workflow_service
+
+    called = []
+
+    async def _sweep(run_id):
+        called.append("sweep")
+
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _sweep)
+    _seed_script_run("run-settling", generation="1")
+    record = _make_record("run-settling", process=_FakeProcess(exit_rc=0), generation="1")
+    record.finished_at = script_runner._now()  # _finalize has begun; state is still RUNNING
+    workflow_service.run_registry["run-settling"] = record
+
+    await cancel_script_run(record)
+
+    assert record.state == RunState.RUNNING
+    assert called == []
+    row = workflow_journal.get_run("run-settling")
+    assert row is not None and row.state == "running"
+
+
+@pytest.mark.asyncio
 async def test_cancel_drive_race_drive_yields_to_cancelled(monkeypatch: pytest.MonkeyPatch):
     """F2: cancel wins a race with the drive's own exit interpretation.
 

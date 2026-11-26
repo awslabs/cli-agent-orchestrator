@@ -1166,8 +1166,10 @@ async def _finalize(
     Journaling first inverts the window into the harmless direction: while the
     write is in flight the status route still says ``running``, so no route
     advertises a terminal state the result route cannot yet answer. The reverse
-    gap (journal landed, record not yet updated) is unobservable from the status
-    route's point of view, which simply converges microseconds later.
+    gap (journal landed, record not yet updated) cannot be cancelled into a
+    contradiction either: ``finished_at`` is set here before the await, and
+    ``cancel_script_run`` and the cancel route both refuse a run whose settlement
+    has begun, so the status route simply converges microseconds later.
     """
     record.finished_at = _now()
     await asyncio.to_thread(_journal_run_state, record, state, _sanitise_error(error), kind)
@@ -1939,9 +1941,18 @@ async def cancel_script_run(record: ScriptRunRecord) -> None:
 
     # The API route rejects this as 409. Keep the service safe for direct callers:
     # cancellation must never rewrite a retained COMPLETED/FAILED record.
-    if record.state in (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED):
+    # ``finished_at`` is set by ``_finalize`` before it awaits the journal write, so a
+    # run whose settlement has begun is terminal for cancel even while ``state`` still
+    # reads RUNNING (issue #1514 P1-1). Without this the cancel overwrote the terminal
+    # row that was being written, and a cancelled script run is resumable (BR-18), so a
+    # resume ran the script a second time.
+    if record.finished_at is not None or record.state in (
+        RunState.COMPLETED,
+        RunState.FAILED,
+        RunState.CANCELLED,
+    ):
         logger.info(
-            "cancel: run '%s' already terminal (%s) — no-op",
+            "cancel: run '%s' already terminal or settling (%s) — no-op",
             record.run_id,
             record.state.value,
         )
