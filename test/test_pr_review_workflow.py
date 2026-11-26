@@ -1614,11 +1614,15 @@ def test_run_review_drops_a_finding_that_is_not_in_the_head_checkout(
 ) -> None:
     (tmp_path / "outside.py").write_text("token = 1\n", encoding="utf-8")
     (workspace["source"] / "link.py").symlink_to(tmp_path / "outside.py")
+    (workspace["source"] / "loop.py").symlink_to("loop.py")
     findings = (
         _finding("Last line", "P2", line=30),
         _finding("Past the end", "P2", line=31),
         _finding("No such file", "P1", path="src/missing.py"),
         _finding("Through a link", "P1", path="link.py", line=1),
+        # Python 3.12 raises for these two paths.
+        _finding("Symlink loop", "P1", path="loop.py", line=1),
+        _finding("Long name", "P1", path=f"{'x' * 300}.py", line=1),
     )
     cao = FakeCao({"reviewer-a": _reviewer_report(*findings)})
 
@@ -1629,6 +1633,8 @@ def test_run_review_drops_a_finding_that_is_not_in_the_head_checkout(
         ("Past the end", "the file has 30 lines"),
         ("No such file", outside),
         ("Through a link", outside),
+        ("Symlink loop", outside),
+        ("Long name", outside),
     ]
     assert [item["title"] for item in review["findings"]] == ["Last line"]
     assert review["result_states"] == ["changes_required", "incomplete"]

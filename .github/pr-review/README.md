@@ -80,8 +80,8 @@ decision only in these cases:
 - Both voters confirmed a P1 or P2 finding, and the adjudicator rejected it or
   lowered it to P3. The finding becomes an owner question at the higher voter
   severity.
-- An owner question keeps at least the proposed severity, so the P3 rule below
-  cannot reject an open P1 or P2 question.
+- An owner question that the adjudicator opens keeps at least the proposed
+  severity, so the P3 rule below cannot reject an open P1 or P2 question.
 - A P3 candidate that is not settled is rejected, because a P3 finding does not
   block a merge.
 - A `duplicate_of` claim that does not point to an accepted finding of the same or

@@ -882,8 +882,14 @@ def run_phase(
 def location_error(source_dir: Path, path: str, line: int) -> str:
     """'' if ``line`` is a line of the file ``path`` in the head checkout, or the reason."""
     root = source_dir.resolve()
-    target = (root / path).resolve()
-    if root not in target.parents or not target.is_file():
+    try:
+        target = (root / path).resolve()
+        found = root in target.parents and target.is_file()
+    except (OSError, RuntimeError):
+        # Python 3.12 raises RuntimeError for a symlink loop, and OSError for a
+        # name that is too long.
+        found = False
+    if not found:
         return "the path is not a file in the head checkout"
     count = 0
     last = b"\n"
