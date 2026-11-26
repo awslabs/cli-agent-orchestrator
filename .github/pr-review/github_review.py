@@ -9,7 +9,9 @@ agents never hold a GitHub write token and the publisher never runs an agent:
 - ``collect`` checks that the checkout is the head that ``prepare`` read. Then
   it writes ``diff.patch`` and ``changed_files.json`` from the merge base with
   the current tip of the target branch. Git reads the attributes of the merge
-  base, so a ``.gitattributes`` file in the PR cannot hide a change.
+  base, so a ``.gitattributes`` file in the PR cannot hide a change. Git still
+  shows a file with a NUL byte only as "Binary files differ", so
+  ``changed_files.json`` marks each such file with ``binary``.
 - ``check-secrets`` refuses a file that holds the value of a named environment
   variable (raw, Base64 or hex) or a known token pattern. It never prints a value.
   It does not check a variable that is not set or is shorter than 8 characters.
@@ -337,6 +339,24 @@ def parse_name_status(output: str) -> list[dict[str, Any]]:
     return files
 
 
+def parse_binary_paths(output: str) -> set[str]:
+    """The paths that ``git diff --numstat -z`` shows as binary, with ``-`` counts."""
+    tokens = output.split("\0")
+    paths: set[str] = set()
+    index = 0
+    while index < len(tokens) and tokens[index]:
+        added, _, rest = tokens[index].partition("\t")
+        deleted, _, path = rest.partition("\t")
+        # A rename has an empty path here, then the old and the new path.
+        width = 1 if path else 3
+        if index + width - 1 >= len(tokens) or not tokens[index + width - 1]:
+            raise Stop(1, "Blocked: git returned a truncated changed-file entry.")
+        if added == "-" and deleted == "-":
+            paths.add(tokens[index + width - 1] if width == 3 else path)
+        index += width
+    return paths
+
+
 def collect(evidence_dir: Path, source_dir: Path) -> int:
     record = _load_json(evidence_dir / "pr.json")
     head = _git(source_dir, "rev-parse", "--verify", "HEAD^{commit}").strip()
@@ -379,6 +399,9 @@ def collect(evidence_dir: Path, source_dir: Path) -> int:
         return _report(
             1, f"Blocked: the PR changes no file between merge base {merge_base} and the head."
         )
+    binary = parse_binary_paths(_git(source_dir, *diff, "--numstat", "-z", merge_base, head))
+    for item in files:
+        item["binary"] = item["path"] in binary
     (evidence_dir / "diff.patch").write_text(patch, encoding="utf-8")
     _write_json(
         evidence_dir / "changed_files.json", {"schema_version": SCHEMA_VERSION, "files": files}

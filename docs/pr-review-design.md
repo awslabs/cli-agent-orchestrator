@@ -174,10 +174,13 @@ a panel for high-risk rounds, and the step 11 eval decides. Model A runs
   longer a commit of the PR. The comment names the head commit that the agents
   reviewed.
 - **Safe text.** The publisher renders a fixed template. Agent text has no
-  control characters, no HTML comment delimiters and no live @mentions. The
-  driver escapes `&`, `<`, `>`, `\`, `` ` ``, `[` and `]` in agent text, so the
-  text cannot add HTML, decode an entity into a mention, open a code span, or
-  add a Markdown link or image. GitHub still makes a bare URL into a link.
+  control characters, no HTML comment delimiters, no live @mentions and no live
+  short issue references. The driver escapes `&`, `<`, `>`, `\`, `` ` ``, `[`
+  and `]` in agent text, so the text cannot add HTML, decode an entity into a
+  mention, open a code span, or add a Markdown link or image. It breaks each
+  @mention and each short issue reference with a zero-width space. GitHub still
+  makes a bare URL into a link, also a URL to an issue. It also makes a commit
+  SHA into a link.
 
 ## Trust boundaries
 
@@ -191,7 +194,7 @@ the design.
 | The key lives in an environment whose branch rule allows only `main`. | The `review` job uses the `ai-review` environment, the name in the comments of #1350 (Q6), with `deployment: false`, so GitHub records no deployment. An administrator sets the branch rule and moves the key. See [Owner decisions](#owner-decisions). |
 | The first trigger is a manual dispatch from `main`. | `workflow_dispatch` only. There is no `pull_request` or `pull_request_target` trigger. |
 | One agent, read-only tools. No shell, no MCP servers, no web access, and the CLI's sandbox mode on. | One agent by default. The profiles grant only `fs_read` and `fs_list`. Each seat has one MCP server, `cao-mcp-server`, to return its report with `workflow_return`. The sandbox mode is off. See [Ticket contract](#ticket-contract). |
-| Base-branch config. The PR's diff and files are plain data in a folder outside the working directory. No PR code runs. | CAO, the scripts, the profiles and `REVIEW.md` come from the dispatched ref. The PR head is a checkout of files, and the diff is in the evidence folder. The agents start in an empty working directory. |
+| Base-branch config. The PR's diff and files are plain data in a folder outside the working directory. No PR code runs. | CAO, the scripts, the profiles and `REVIEW.md` come from the dispatched ref. The PR head is a checkout of files, and the diff is in the evidence folder. The agents start in an empty working directory. Git attributes come from the merge base. `changed_files.json` marks each file that the diff shows only as binary, so a reviewer reads it in the checkout. |
 | Schema-checked advisory output, a secret scan, a fixed template, one comment updated in place, and a neutral check that is never required. | CAO checks each report against its schema, and the driver checks it again. `check-secrets` scans `review.json` before it leaves the job. The publisher checks `review.json` and renders a fixed template. See [Publication](#publication). |
 
 ## Result and failure states
@@ -257,7 +260,7 @@ reason given. "Later" means work after this design.
 | An always-neutral check | Model output is not deterministic, so the AI lane stays advisory. A neutral check shows the result on the head commit without a merge gate. |
 | Cancel an older run of the same PR | #1350 step 10. The latest dispatch is the one that a maintainer wants. |
 | The driver waits until each seat ends | The step call can return before CAO ends the step. The driver reads the reports only after each step ends, or after a fixed wait. |
-| Copilot CLI from a lockfile, installed with `npm ci --ignore-scripts` | Pins each dependency of the CLI, not only the CLI version. |
+| Copilot CLI from a lockfile, installed with `npm ci --ignore-scripts` | Pins each dependency of the CLI, not only the CLI version. The filtered environment has no `CI`, so `COPILOT_AUTO_UPDATE=false` keeps that version at run time. |
 
 ## Owner decisions
 

@@ -123,16 +123,20 @@ DIFF = "\n".join(
     ]
 )
 FILES = [
-    {"index": 1, "status": "M", "path": "src/app.py", "old_path": ""},
-    {"index": 2, "status": "M", "path": "one.txt", "old_path": ""},
-    {"index": 3, "status": "A", "path": "docs/new.md", "old_path": ""},
-    {"index": 4, "status": "A", "path": "img.png", "old_path": ""},
-    {"index": 5, "status": "R", "path": "new_name.py", "old_path": "old_name.py"},
-    {"index": 6, "status": "D", "path": "gone.py", "old_path": ""},
+    {"index": 1, "status": "M", "path": "src/app.py", "old_path": "", "binary": False},
+    {"index": 2, "status": "M", "path": "one.txt", "old_path": "", "binary": False},
+    {"index": 3, "status": "A", "path": "docs/new.md", "old_path": "", "binary": False},
+    {"index": 4, "status": "A", "path": "img.png", "old_path": "", "binary": True},
+    {"index": 5, "status": "R", "path": "new_name.py", "old_path": "old_name.py", "binary": False},
+    {"index": 6, "status": "D", "path": "gone.py", "old_path": "", "binary": False},
 ]
 NAME_STATUS = "\0".join(
     ["M", "src/app.py", "M", "one.txt", "A", "docs/new.md", "A", "img.png"]
     + ["R100", "old_name.py", "new_name.py", "D", "gone.py", ""]
+)
+NUMSTAT = "\0".join(
+    ["2\t1\tsrc/app.py", "1\t1\tone.txt", "2\t0\tdocs/new.md", "-\t-\timg.png"]
+    + ["0\t0\t", "old_name.py", "new_name.py", "0\t2\tgone.py", ""]
 )
 # A review policy with two checks, in the form of REVIEW.md.
 POLICY_TEXT = "# Review rules\n\n### A1. Correctness\n\nText.\n\n### A2. Security\n\nText.\n"
@@ -1059,15 +1063,20 @@ def test_overall_risk_takes_the_highest_level_and_its_reasons(pr_review: ModuleT
 # --------------------------------------------------------------------------
 
 
-def test_clean_text_removes_controls_and_escapes_markup_and_mentions(
+def test_clean_text_removes_controls_and_escapes_markup_mentions_and_references(
     pr_review: ModuleType,
 ) -> None:
     raw = "x\x00y\x1bz\u202eq\u200bw @octo a@b.c <!-- c --> "
 
     assert pr_review.clean_text(raw, 100) == "xyzqw @\u200bocto a@\u200bb.c &lt;!-- c --&gt;"
-    # An entity cannot decode into a mention, and a link or an image stays text.
+    # An entity cannot decode into a mention or an issue link, and a link or an
+    # image stays text.
     assert pr_review.clean_text("&#64;user <img src=x> ![x](http://a) \\[y]", 100) == (
-        "&amp;#64;user &lt;img src=x&gt; !\\[x\\](http://a) \\\\\\[y\\]"
+        "&amp;#\u200b64;user &lt;img src=x&gt; !\\[x\\](http://a) \\\\\\[y\\]"
+    )
+    # An issue reference stays text. Other uses of "#" and "GH" do not change.
+    assert pr_review.clean_text("#12 o/r#3 GH-4 gh-5 C# 7 #x GHz-6", 100) == (
+        "#\u200b12 o/r#\u200b3 GH\u200b-4 gh\u200b-5 C# 7 #x GHz-6"
     )
     assert pr_review.clean_text("a\nb\tc\r\nd  e\u2028f", 100) == "a b c d e f"
     assert pr_review.clean_text("abcdef", 4) == "abc…"
@@ -1910,6 +1919,7 @@ def _git_routes() -> dict[tuple[str, ...], Result]:
         ("merge-base", BASE, HEAD): (0, f"{MERGE_BASE}\n", ""),
         (*GIT_DIFF, *patch_args): (0, DIFF, ""),
         (*GIT_DIFF, "--name-status", "-z", MERGE_BASE, HEAD): (0, NAME_STATUS, ""),
+        (*GIT_DIFF, "--numstat", "-z", MERGE_BASE, HEAD): (0, NUMSTAT, ""),
     }
 
 
@@ -2200,6 +2210,19 @@ def test_collect_stops_without_changing_the_evidence(
     assert json.loads((evidence / "pr.json").read_text(encoding="utf-8")) == _prepared_record()
 
 
+def test_parse_binary_paths_reads_renames_and_refuses_a_truncated_entry(
+    github_review: ModuleType,
+) -> None:
+    output = "\0".join(
+        ["1\t1\tapp.py", "-\t-\tnew.bin", "0\t0\t", "old.py", "new.py"]
+        + ["-\t-\t", "a.png", "b.png", "-\t-\tt\tab.js", ""]
+    )
+
+    assert github_review.parse_binary_paths(output) == {"new.bin", "b.png", "t\tab.js"}
+    with pytest.raises(github_review.Stop):
+        github_review.parse_binary_paths("-\t-\t\0a.png\0")
+
+
 def _git_version() -> tuple[int, ...]:
     if shutil.which("git") is None:
         return ()
@@ -2264,6 +2287,12 @@ def test_collect_ignores_the_gitattributes_of_the_pr(
     # A real binary file stays binary.
     assert "Binary files /dev/null and b/logo.bin differ\n" in patch
     assert patch.count("Binary files") == 1
+    changed = json.loads((evidence / "changed_files.json").read_text(encoding="utf-8"))
+    assert {item["path"]: item["binary"] for item in changed["files"]} == {
+        ".gitattributes": False,
+        "logo.bin": True,
+        "src/app.py": False,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -3124,9 +3153,14 @@ def test_the_agents_get_only_the_kept_variables(workflow: dict[Any, Any]) -> Non
 
     assert re.findall(r'^ *keep="([^"]*)"$', start, re.MULTILINE) == [
         "KIRO_API_KEY KIRO_NO_AUTO_UPDATE",
-        "COPILOT_GITHUB_TOKEN",
-        "GITHUB_TOKEN",
+        "COPILOT_GITHUB_TOKEN COPILOT_AUTO_UPDATE",
+        "GITHUB_TOKEN COPILOT_AUTO_UPDATE",
         "HOME PATH SHELL USER LANG LC_ALL $keep",
+    ]
+    # The kept CI-less environment would let each CLI replace its pinned version.
+    assert re.findall(r"^ *export (\w+_AUTO_UPDATE=\S+)$", start, re.MULTILINE) == [
+        "KIRO_NO_AUTO_UPDATE=1",
+        "COPILOT_AUTO_UPDATE=false",
     ]
     assert '*) unset "$name" 2>/dev/null || true ;;' in start
 

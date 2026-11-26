@@ -294,6 +294,12 @@ one run.
 - **No PR code runs.** The PR head is checked out as files with
   `persist-credentials: false`. No step builds, installs or runs code from it. CAO,
   the seat profiles and the workflow come from the dispatched ref.
+- **Diff evidence.** `collect` reads Git attributes from the merge base, so a
+  `.gitattributes` file in the PR cannot turn a change into
+  `Binary files differ`. Git still shows a file with a NUL byte that way, also a
+  source file. So `changed_files.json` marks each such file with `binary`, and
+  the reviewer prompt says to read the file in the checkout before a seat skips
+  it.
 - **Empty working directory.** The agents start in an empty directory, not in the
   PR checkout. Agent instructions and tool settings in the PR do not load.
 - **Read-only seats.** The profiles grant only `fs_read` and `fs_list`. CAO turns
@@ -304,25 +310,30 @@ one run.
 - **Filtered environment.** `cao-server`, tmux, the agents and the Kiro model
   check get only `HOME`, `PATH`, `SHELL`, `USER`, `LANG`, `LC_ALL` and the
   variables of the selected engine: `KIRO_API_KEY` and `KIRO_NO_AUTO_UPDATE` for
-  Kiro, and `COPILOT_GITHUB_TOKEN` or the job token as `GITHUB_TOKEN` for
-  Copilot. No other `GITHUB_*`, `RUNNER_*` or `ACTIONS_*` variable of the job
-  reaches them.
+  Kiro, and `COPILOT_AUTO_UPDATE` and `COPILOT_GITHUB_TOKEN` (or the job token
+  as `GITHUB_TOKEN`) for Copilot. No other `GITHUB_*`, `RUNNER_*` or
+  `ACTIONS_*` variable of the job reaches them.
 - **Pinned tools.** Kiro CLI is a pinned release with a SHA-256 check. Copilot CLI
   comes from the committed lockfile in [`copilot/`](copilot/), installed with
   `npm ci --ignore-scripts`, which checks the integrity hash of each package and
-  runs no install script. Each action is pinned to a commit SHA. `uv` installs
-  the committed `uv.lock`. No cache is used.
+  runs no install script. The filtered environment has no `CI`, so
+  `COPILOT_AUTO_UPDATE=false` stops Copilot CLI from downloading a newer
+  version. Each action is pinned to a commit SHA. `uv` installs the committed
+  `uv.lock`. No cache is used.
 - **Credential check.** The `review` job stops `cao-server` and the agents first.
   Then `github_review.py check-secrets` refuses a `review.json` that holds the
   value of an engine credential (raw, Base64 or hex) or a known token pattern.
   This check runs before the upload. `summary` and `publish` check for token
   patterns again.
-- **Safe text.** Agent text in the review has no control characters and no live
-  @mentions. The script escapes `\`, `` ` ``, `[`, `]`, `&`, `<` and `>` in agent
-  text, so agent text cannot add a link, an image, an HTML tag, an HTML comment,
-  an entity or a code span. GitHub still makes a bare URL into a link. The check
-  run holds no agent text. The job log never shows agent text. The run summary
-  shows the review only after `check-secrets` and the checks of
+- **Safe text.** Agent text in the review has no control characters, no live
+  @mentions and no live short issue references. The script escapes `\`, `` ` ``,
+  `[`, `]`, `&`, `<` and `>` in agent text, so agent text cannot add a link, an
+  image, an HTML tag, an HTML comment, an entity or a code span. It breaks each
+  @mention and each short issue reference, such as `#12`, `owner/repo#12` or
+  `GH-12`, with a zero-width space. GitHub still makes a bare URL into a link,
+  also a URL to an issue. It also makes a commit SHA into a link. The check run
+  holds no agent text. The job log never shows agent text.
+  The run summary shows the review only after `check-secrets` and the checks of
   `github_review.py summary` pass. When the CAO run completes, the log shows the
   model and the report status of each seat. When a run fails, it shows only step
   IDs, states and error kinds.

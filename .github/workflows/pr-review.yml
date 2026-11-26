@@ -310,12 +310,15 @@ jobs:
             copilot_cli)
               # The copilot command from npm ci. Its loader runs on node.
               engine_bin="$base/copilot/node_modules/.bin:$(dirname "$(command -v node)")"
+              # filter_env drops CI, so stop the CLI from replacing the locked
+              # version with a download.
+              export COPILOT_AUTO_UPDATE=false
               # A COPILOT_GITHUB_TOKEN secret (a fine-grained PAT) wins.
               # Otherwise the job token pays for the requests.
               if [ -n "$COPILOT_GITHUB_TOKEN" ]; then
-                keep="COPILOT_GITHUB_TOKEN"
+                keep="COPILOT_GITHUB_TOKEN COPILOT_AUTO_UPDATE"
               else
-                keep="GITHUB_TOKEN"
+                keep="GITHUB_TOKEN COPILOT_AUTO_UPDATE"
               fi
               ;;
             *)
