@@ -759,7 +759,12 @@ class InboxService:
         batch FAILED.
         """
         try:
-            close_edges_replied_by([m.id for m in batch])
+            if close_edges_replied_by([m.id for m in batch]):
+                # Imported here because that module imports this one. The
+                # receiver of a delivered reply is the caller whose wait ended.
+                from cli_agent_orchestrator.services import delegation_callback_service
+
+                delegation_callback_service.refresh_waiting_labels([terminal_id])
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Could not settle reply edges for {terminal_id}: {exc}")
 

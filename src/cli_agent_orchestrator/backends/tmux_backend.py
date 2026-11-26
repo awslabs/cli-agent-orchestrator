@@ -6,7 +6,7 @@ no alternative is configured.
 """
 
 import logging
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 from cli_agent_orchestrator.backends.base import (
     TerminalBackend,
@@ -77,6 +77,8 @@ class TmuxBackend(TerminalBackend):
         terminal_id: str,
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        *,
+        extra_labels: Optional[Mapping[str, str]] = None,
     ) -> str:
         try:
             return self._client.create_session(
@@ -115,6 +117,8 @@ class TmuxBackend(TerminalBackend):
         working_directory: Optional[str] = None,
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        *,
+        extra_labels: Optional[Mapping[str, str]] = None,
     ) -> str:
         try:
             if self._spawn_mode == "pane":

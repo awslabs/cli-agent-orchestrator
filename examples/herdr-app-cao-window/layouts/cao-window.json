@@ -1,0 +1,290 @@
+{
+  "id": "root",
+  "type": "row",
+  "titlebar": "none",
+  "traffic_lights": [
+    12,
+    16
+  ],
+  "background": "canvas",
+  "terminal_padding": [
+    14,
+    12
+  ],
+  "divider": {
+    "width": 1,
+    "color": "border"
+  },
+  "children": [
+    {
+      "id": "sidebar",
+      "type": "column",
+      "size": {
+        "px": 268
+      },
+      "min": 200,
+      "max": 640,
+      "background": "chrome",
+      "resizable": false,
+      "children": [
+        {
+          "id": "brand",
+          "type": "block",
+          "size": {
+            "px": 46
+          },
+          "window_drag": true,
+          "content": {
+            "mod": "cao-window-brand",
+            "props": {
+              "machine": "cao",
+              "caoPort": 9889,
+              "talkableProfiles": [],
+              "hiddenRootProfiles": [
+                "memory_manager"
+              ],
+              "quietMinutes": 10,
+              "holdMaxSeconds": 120,
+              "draftProfile": null,
+              "draftProviders": [
+                "claude_code"
+              ],
+              "contextPercentRegex": null
+            }
+          }
+        },
+        {
+          "id": "sidebar-lists",
+          "type": "column",
+          "children": [
+            {
+              "id": "cao-sessions",
+              "type": "block",
+              "size": {
+                "weight": 1
+              },
+              "min": 34,
+              "content": {
+                "mod": "cao-window-side",
+                "props": {
+                  "machine": "cao",
+                  "caoPort": 9889,
+                  "talkableProfiles": [],
+                  "hiddenRootProfiles": [
+                    "memory_manager"
+                  ],
+                  "quietMinutes": 10,
+                  "holdMaxSeconds": 120,
+                  "draftProfile": null,
+                  "draftProviders": [
+                    "claude_code"
+                  ],
+                  "contextPercentRegex": null,
+                  "section": "sessions"
+                }
+              }
+            },
+            {
+              "id": "cao-agents",
+              "type": "block",
+              "size": {
+                "weight": 1
+              },
+              "min": 34,
+              "content": {
+                "mod": "cao-window-side",
+                "props": {
+                  "machine": "cao",
+                  "caoPort": 9889,
+                  "talkableProfiles": [],
+                  "hiddenRootProfiles": [
+                    "memory_manager"
+                  ],
+                  "quietMinutes": 10,
+                  "holdMaxSeconds": 120,
+                  "draftProfile": null,
+                  "draftProviders": [
+                    "claude_code"
+                  ],
+                  "contextPercentRegex": null,
+                  "section": "agents"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "id": "sidebar-footer",
+          "type": "block",
+          "size": {
+            "px": 69
+          },
+          "content": {
+            "mod": "workspace-chrome",
+            "props": {
+              "footer": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "work",
+      "type": "column",
+      "resizable": false,
+      "children": [
+        {
+          "id": "cao-window-tabs",
+          "type": "block",
+          "size": {
+            "px": 34
+          },
+          "min": 34,
+          "window_drag": true,
+          "content": {
+            "mod": "cao-window-tabs",
+            "props": {
+              "machine": "cao",
+              "caoPort": 9889,
+              "talkableProfiles": [],
+              "hiddenRootProfiles": [
+                "memory_manager"
+              ],
+              "quietMinutes": 10,
+              "holdMaxSeconds": 120,
+              "draftProfile": null,
+              "draftProviders": [
+                "claude_code"
+              ],
+              "contextPercentRegex": null
+            }
+          }
+        },
+        {
+          "id": "work-body",
+          "type": "row",
+          "padding": 8,
+          "gap": 8,
+          "children": [
+            {
+              "id": "main",
+              "type": "block",
+              "content": {
+                "tab": "active",
+                "pane": {
+                  "gap": 8,
+                  "radius": 10,
+                  "background": "background",
+                  "lone": true,
+                  "border": {
+                    "width": 1,
+                    "color": "border"
+                  },
+                  "focus": {
+                    "width": 1,
+                    "color": "accent"
+                  },
+                  "header": {
+                    "content": {
+                      "mod": "pane"
+                    },
+                    "height": 30,
+                    "position": "top",
+                    "reveal": "always"
+                  }
+                }
+              }
+            },
+            {
+              "id": "panel",
+              "type": "column",
+              "hidden": true,
+              "size": {
+                "px": 368
+              },
+              "min": 280,
+              "max": 900,
+              "children": [
+                {
+                  "id": "panel-body",
+                  "type": "stack",
+                  "active": "files",
+                  "children": [
+                    {
+                      "id": "files",
+                      "type": "block",
+                      "content": {
+                        "mod": "files"
+                      }
+                    },
+                    {
+                      "id": "changes",
+                      "type": "block",
+                      "content": {
+                        "mod": "changes"
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "id": "cao-window-panel",
+              "type": "block",
+              "size": {
+                "px": 368
+              },
+              "hidden": true,
+              "min": 280,
+              "max": 900,
+              "content": {
+                "mod": "cao-window-panel",
+                "props": {
+                  "machine": "cao",
+                  "caoPort": 9889,
+                  "talkableProfiles": [],
+                  "hiddenRootProfiles": [
+                    "memory_manager"
+                  ],
+                  "quietMinutes": 10,
+                  "holdMaxSeconds": 120,
+                  "draftProfile": null,
+                  "draftProviders": [
+                    "claude_code"
+                  ],
+                  "contextPercentRegex": null
+                }
+              }
+            }
+          ]
+        },
+        {
+          "id": "status",
+          "type": "block",
+          "size": {
+            "px": 28
+          },
+          "content": {
+            "mod": "cao-window-status",
+            "props": {
+              "machine": "cao",
+              "caoPort": 9889,
+              "talkableProfiles": [],
+              "hiddenRootProfiles": [
+                "memory_manager"
+              ],
+              "quietMinutes": 10,
+              "holdMaxSeconds": 120,
+              "draftProfile": null,
+              "draftProviders": [
+                "claude_code"
+              ],
+              "contextPercentRegex": null
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "resizable": true
+}

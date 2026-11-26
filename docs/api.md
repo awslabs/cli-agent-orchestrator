@@ -675,10 +675,52 @@ See [Memory](memory.md), [Self-Learning](self-learning.md), and
 
 ### Flows
 
-- `/flows*` creates, lists, reads, deletes, enables, disables, and runs
-  scheduled flows.
+- `/flows*` creates, validates, lists, reads, edits, deletes, enables, disables, and runs
+  scheduled flows. `GET` routes require `cao:read`, `cao:write`, or `cao:admin`; the routes
+  that change a flow require `cao:write` or `cao:admin`; `DELETE /flows/{name}` requires
+  `cao:admin`.
+- `POST /flows/validate` checks a flow definition and writes nothing (`200`); requires
+  `cao:read`, `cao:write`, or `cao:admin`. The body is `{name, schedule, agent_profile,
+  provider, prompt_template}`, and `provider` defaults to `kiro_cli`. A value that `POST /flows`
+  would refuse while parsing the body, such as a name with `/` or a `prompt_template` that is
+  missing, `null`, or not a string, comes back from this route as a field error. A `schedule`
+  longer than 256 characters, or one that does not fire within 41 years
+  (`this schedule never fires`), is a field error too. The result is `{valid, errors, next_runs}`:
+  `errors` lists `{field, message}` entries,
+  and `next_runs` holds the next three fire times in the server's local time zone (empty when
+  the schedule has an error). The route takes no `script` field and checks no path.
+- `POST /flows` creates a flow (`201`); requires `cao:write` or `cao:admin`. The body is
+  `{name, schedule, agent_profile, provider, prompt_template, enabled}`. `enabled` is optional
+  and defaults to `true`; `false` registers the flow without arming it. The server writes
+  `<name>.flow.md` under `CAO_HOME_DIR/flows` only after the definition passes validation.
+  - `422` with `{"detail": [{loc, msg, type}]}` when the body fails parsing, including a name
+    that contains `/`, `\`, or `..`, a control character in `schedule`, `agent_profile`, or
+    `provider`, and an empty `agent_profile` or `provider`.
+  - `422` with `{"detail": {"errors": [{field, message}]}}` when the definition fails
+    validation. Nothing is written.
+  - `409` when the name is registered, or when the new file is the file another flow is
+    registered from. The existing file and row are unchanged. The server reports a
+    definition error before a name conflict.
+  - `422` with a message string in `detail` for any other `ValueError` while registering the
+    file, and `500` for a storage failure.
+- `PUT /flows/{name}` edits a flow in place (`200`) and returns it; requires `cao:write` or
+  `cao:admin`. The body takes `schedule`, `agent_profile`, `provider`, and `prompt_template`,
+  each optional. Any other field, including `script`, returns `422`. The server validates the
+  merged definition, rewrites the flow file through a temporary file and a rename, and updates
+  the row. Other front-matter keys, such as `script` and `engine`, are kept, and comments in
+  the front matter are not. An enabled flow gets a new `next_run`; a disabled flow stays
+  disabled.
+  - `404` for an unknown name.
+  - `422` with `{"detail": {"errors": [{field, message}]}}` for an invalid merged definition.
+    Nothing is written.
+  - `409` when the flow's file is not under `CAO_HOME_DIR/flows`, or no longer exists. The
+    server does not touch the file.
+- `DELETE /flows/{name}` removes the registration and leaves the flow file in place.
+- `POST /flows/{name}/enable`, `POST /flows/{name}/disable`, and `POST /flows/{name}/run` change
+  or run a registered flow; `run` returns `{executed}`.
 
-See [Flows](flows.md).
+See [Flows](flows.md), including
+[the changes for existing callers](flows.md#changes-for-existing-callers).
 
 ## PTY WebSocket
 
