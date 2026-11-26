@@ -25,6 +25,12 @@ PROOF_PATH = WORKFLOWS / "release-key-proof.yml"
 PROOF_TEXT = PROOF_PATH.read_text(encoding="utf-8")
 PROOF: Dict[Any, Any] = yaml.safe_load(PROOF_TEXT)
 KEY = "secrets.RELEASE_DEPLOY_KEY"
+# GitHub matches secret names without regard to case, so every search for the
+# key does too: `secrets.release_deploy_key` reads the same secret.
+KEY_NAME = re.compile(r"release_deploy_key", re.IGNORECASE)
+# `git push`, and also `git -C <dir> push` and other spellings with options
+# between the two words.
+GIT_PUSH = re.compile(r"\bgit\b.*\bpush\b")
 
 
 def _job() -> Dict[str, Any]:
@@ -55,13 +61,13 @@ class TestTheProofCannotDoHarm:
         assert _job()["if"] == "github.repository == 'awslabs/cli-agent-orchestrator'"
 
     def test_every_push_is_a_dry_run(self):
-        pushes = [line for line in _run_lines() if re.search(r"\bgit\s+push\b", line)]
+        pushes = [line for line in _run_lines() if GIT_PUSH.search(line)]
         assert pushes, "the write check is gone"
         for line in pushes:
             assert "--dry-run" in line, line
 
     def test_the_dry_run_does_not_target_a_real_branch(self):
-        (push,) = [line for line in _run_lines() if re.search(r"\bgit\s+push\b", line)]
+        (push,) = [line for line in _run_lines() if GIT_PUSH.search(line)]
         assert push.endswith("HEAD:refs/heads/release-key-proof-dry-run")
 
     def test_it_reads_no_other_secret(self):
@@ -95,6 +101,15 @@ class TestTheProofCannotPassWithoutTheKey:
         holders = [step for step in _job()["steps"] if "${{ " + KEY + " }}" in str(step)]
         assert [step.get("uses", "")[:17] for step in holders] == ["actions/checkout@"]
 
+    def test_the_key_is_not_in_the_job_environment(self):
+        """A job-level ``env:`` would hand the key to every step, not only the checkout."""
+        assert not KEY_NAME.search(yaml.safe_dump(_job().get("env", {})))
+        for step in _job()["steps"]:
+            if "uses" not in step:
+                assert "${{ secrets." not in yaml.safe_dump(step.get("env", {})).replace(
+                    "${{ secrets.RELEASE_DEPLOY_KEY != '' }}", ""
+                )
+
     def test_the_remote_must_be_ssh_before_the_key_is_trusted(self):
         text = "\n".join(_run_lines())
         assert "git remote get-url origin" in text
@@ -123,8 +138,9 @@ class TestWhoReadsTheReleaseKey:
         for path in self._files():
             document = yaml.safe_load(path.read_text(encoding="utf-8"))
             for name, job in (document.get("jobs") or {}).items():
-                # The bare name, so `secrets['RELEASE_DEPLOY_KEY']` counts too.
-                if "RELEASE_DEPLOY_KEY" in yaml.safe_dump(job):
+                # The bare name in any case, so `secrets['RELEASE_DEPLOY_KEY']`
+                # and `secrets.release_deploy_key` count too.
+                if KEY_NAME.search(yaml.safe_dump(job)):
                     found.add((path.name, name))
         assert found == self.READERS
 
@@ -133,7 +149,7 @@ class TestWhoReadsTheReleaseKey:
         for path in self._files():
             document = yaml.safe_load(path.read_text(encoding="utf-8"))
             outside_jobs = {key: value for key, value in document.items() if key != "jobs"}
-            assert "RELEASE_DEPLOY_KEY" not in yaml.safe_dump(outside_jobs), path.name
+            assert not KEY_NAME.search(yaml.safe_dump(outside_jobs)), path.name
 
     def test_no_workflow_reads_secrets_wholesale(self):
         """These reach the key without naming it, so the walk above would miss them."""
@@ -147,4 +163,4 @@ class TestWhoReadsTheReleaseKey:
     def test_no_composite_action_reads_it(self):
         actions = REPO_ROOT / ".github" / "actions"
         for path in sorted(actions.rglob("*.y*ml")):
-            assert "RELEASE_DEPLOY_KEY" not in path.read_text(encoding="utf-8"), path
+            assert not KEY_NAME.search(path.read_text(encoding="utf-8")), path
