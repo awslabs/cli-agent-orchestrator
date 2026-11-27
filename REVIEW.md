@@ -52,22 +52,18 @@ All reviewers, people and agents, apply these rules.
 Apply these rules with the general rules.
 
 - **Review against the contract, not the CI result.** The contract is the
-  linked issue, the docs and the existing interfaces. Green CI does not prove
-  it: trace the changed data through the success and failure paths. Do not
-  invent requirements; lint owns code style.
-- **Review one head and the whole PR.** Evidence from another commit does not
-  prove this head. CI on a head behind `main` tested an older merge, and a
-  retarget starts no CI run. Each review covers the full PR, not only the new
-  commits. If you did not check an earlier finding again at this head, say
-  so; do not call it open.
+  linked issue, the docs and the existing interfaces. Do not invent
+  requirements; lint owns code style.
+- **Review one head and the whole PR.** CI on a head behind `main` tested an
+  older merge, and a retarget starts no CI run. Each review covers the full
+  PR, not only the new commits. If you did not check an earlier finding again
+  at this head, say so; do not call it open.
 - **Trace, and say what you did not check.** The review agents only read: they
-  trace the code and do not run it. Record each check as checked, not checked
-  or not applicable. A risk that you name is a candidate finding, not a note:
-  trace its trigger, or mark the check not checked.
+  trace the code and do not run it. A risk that you name is a candidate
+  finding, not a note: trace its trigger, or mark the check not checked.
 - **Prove each finding.** A finding needs a failing input or a code path at the
-  head. Agreement does not prove it, and doubt without evidence does not
-  refute it. A suggested fix is untested code: check it against the same
-  inputs, or say that it is not tested.
+  head. A suggested fix is untested code: check it against the same inputs, or
+  say that it is not tested.
 - **Check a claim at its source.** Take a claim about a tool or a control from
   the vendor docs, the config that the tool reads, the ruleset or the run log,
   not from another document. A control binds only the people who cannot
@@ -81,8 +77,8 @@ The change does what its contract says, for each allowed input.
   prompt line on its own. Shared code, prompts and tests have no text for one
   provider only.
 - **No pass without work.** A check that did no work fails, such as a scan
-  with no commit range, an empty input or a skipped job. Code, not a model,
-  sets a failed, partial or skipped state, and a failed fan-out never passes.
+  with no commit range, an empty input or a skipped job. A failed fan-out
+  never passes.
 - **Catch narrowly.** A broad catch must not turn a stop, such as a `409`
   halt, into a partial result.
 
