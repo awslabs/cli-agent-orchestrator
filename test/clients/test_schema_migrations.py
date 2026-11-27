@@ -102,6 +102,38 @@ def test_manifest_missing_column_refuses_stamp(schema_db, monkeypatch):
     assert baseline.rerunnable
 
 
+def test_missing_required_unique_index_refuses_start(schema_db, monkeypatch):
+    database_module.init_db()
+    with sqlite3.connect(schema_db) as connection:
+        connection.execute("DROP INDEX uq_memory_rel")
+    monkeypatch.setattr(database_module, "_migrate_memory_relationships", lambda: None)
+    with pytest.raises(migrations.MigrationFailedError, match="memory_relationships.uq_memory_rel"):
+        database_module.init_db()
+
+
+def test_missing_nonunique_index_only_warns(schema_db, monkeypatch, caplog):
+    database_module.init_db()
+    with sqlite3.connect(schema_db) as connection:
+        connection.execute("DROP INDEX idx_memory_type")
+    monkeypatch.setattr(database_module, "_migrate_memory_indexes", lambda: None)
+    database_module.init_db()
+    assert "Missing non-unique index idx_memory_type" in caplog.text
+
+
+def test_duplicate_null_scope_memories_tolerate_unique_index(schema_db, caplog):
+    database_module.init_db()
+    with sqlite3.connect(schema_db) as connection:
+        connection.execute("DROP INDEX uq_memory_key_scope_null")
+        connection.executemany(
+            "INSERT INTO memory_metadata "
+            "(id, key, memory_type, scope, scope_id, file_path, tags, access_count) "
+            "VALUES (?, 'duplicate', 'project', 'global', NULL, ?, '', 0)",
+            (("fixture-one", "/note-one"), ("fixture-two", "/note-two")),
+        )
+    database_module.init_db()
+    assert "cao memory repair" in caplog.text
+
+
 def test_started_nonrerunnable_step_is_refused(schema_db, monkeypatch):
     database_module.init_db()
     second = migrations.Migration(2, "unfinished", lambda connection: None, True, False)
