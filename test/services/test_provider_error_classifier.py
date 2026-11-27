@@ -38,9 +38,19 @@ _REFUSALS = (
     ("codex", "Unsupported model: gpt-5.6-terra"),
     ("codex", "Model gpt-5.6-terra is not supported by this account"),
     # Provider-native chrome captured from real CLI sessions (see the fixtures below):
-    # Codex renders upstream refusals on its own `■` / `⚠️ stream error` chrome.
+    # Codex renders upstream refusals on its own `■` / `⚠️ stream error` chrome,
+    # and Daybreak / content-filter refusals on its own `ⓘ` info cell.
     ("codex", '■ unexpected status 400 Bad Request: {"code":20015}'),
     ("codex", '⚠️ stream error: unexpected status 400 Bad Request: {"code":20015}'),
+    (
+        "codex",
+        "ⓘ This content can’t be shown\n"
+        "  We take extra care with some cybersecurity requests. If you’re doing authorized security work, apply for Daybreak to get\n"
+        "  broader access.\n"
+        "  Learn more: https://help.openai.com/en/articles/20001326\n"
+        "  Apply for Daybreak: https://chatgpt.com/admin/status-and-access",
+    ),
+    ("codex", "ⓘ This content can't be shown"),
 )
 
 _NON_REFUSALS = (
@@ -72,6 +82,11 @@ _NON_REFUSALS = (
     ("codex", "unexpected status 400 Bad Request: bad model"),
     # A leading assistant marker is not the error chrome (Codex never prefixes one).
     ("codex", "• ■ unexpected status 400 Bad Request: bad model"),
+    ("codex", "• ⓘ This content can’t be shown"),
+    # Plain prose without the `ⓘ` chrome is not provider-owned evidence.
+    ("codex", "This content can't be shown"),
+    # Scoped to codex only.
+    ("claude_code", "ⓘ This content can’t be shown"),
     # Non-error statuses are not refusals even under the real chrome.
     ("codex", "■ unexpected status 200 OK"),
     ("kiro_cli", "API Error: 401 invalid_api_key"),
@@ -286,6 +301,48 @@ _REAL_CODEX_STREAM_ERROR_4270 = (
 )
 
 
+_REAL_CODEX_DAYBREAK_BODY = (
+    "ⓘ This content can’t be shown\n"
+    "  We take extra care with some cybersecurity requests. If you’re doing authorized security work, apply for Daybreak to get\n"
+    "  broader access.\n"
+    "  Learn more: https://help.openai.com/en/articles/20001326\n"
+    "  Apply for Daybreak: https://chatgpt.com/admin/status-and-access\n"
+)
+
+_REAL_CODEX_DAYBREAK_MULTILINE_PROMPT = (
+    "› Review the security patch\n"
+    "  Check auth boundaries and reply with findings.\n"
+    f"{_REAL_CODEX_DAYBREAK_BODY}"
+    "› \n"
+    "  ? for shortcuts                                            87% context left\n"
+)
+
+_REAL_CODEX_DAYBREAK_AFTER_TOOL = (
+    "› Review the security patch\n"
+    "• Ran git diff --stat\n"
+    "  └ 10 files changed\n"
+    "\n"
+    f"{_REAL_CODEX_DAYBREAK_BODY}"
+    "› \n"
+    "  ? for shortcuts                                            87% context left\n"
+)
+
+_REAL_CODEX_DAYBREAK_SCROLLED_TOOL = (
+    "• Ran git diff --stat\n"
+    "  └ 10 files changed\n"
+    "\n"
+    f"{_REAL_CODEX_DAYBREAK_BODY}"
+    "› \n"
+    "  ? for shortcuts                                            87% context left\n"
+)
+
+_REAL_CODEX_DAYBREAK_SCROLLED_BARE = (
+    f"{_REAL_CODEX_DAYBREAK_BODY}"
+    "› \n"
+    "  ? for shortcuts                                            87% context left\n"
+)
+
+
 @pytest.mark.parametrize(
     ("provider", "raw_capture", "expected_line_start"),
     (
@@ -293,6 +350,10 @@ _REAL_CODEX_STREAM_ERROR_4270 = (
         ("claude_code", _REAL_CLAUDE_API_ERROR_92316, "API Error: 400 invalid params"),
         ("codex", _REAL_CODEX_UNEXPECTED_STATUS_6933, "■ unexpected status 400"),
         ("codex", _REAL_CODEX_STREAM_ERROR_4270, "⚠️ stream error: unexpected status 400"),
+        ("codex", _REAL_CODEX_DAYBREAK_MULTILINE_PROMPT, "ⓘ This content can’t be shown"),
+        ("codex", _REAL_CODEX_DAYBREAK_AFTER_TOOL, "ⓘ This content can’t be shown"),
+        ("codex", _REAL_CODEX_DAYBREAK_SCROLLED_TOOL, "ⓘ This content can’t be shown"),
+        ("codex", _REAL_CODEX_DAYBREAK_SCROLLED_BARE, "ⓘ This content can’t be shown"),
     ),
 )
 def test_real_cli_captures_are_classified_through_the_adapters(
@@ -303,7 +364,7 @@ def test_real_cli_captures_are_classified_through_the_adapters(
     This is the regression the review reproduced: the refusal text sits where the
     model's answer belongs, so an ownership guard keyed on marker ABSENCE misses the
     real renderings.  Claude Code marks the error on its response bullet; Codex uses
-    its own ``■`` / ``⚠️ stream error`` chrome.  Both must classify.
+    its own ``■`` / ``⚠️ stream error`` / ``ⓘ`` chrome.  Both must classify.
     """
     from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
     from cli_agent_orchestrator.providers.codex import CodexProvider
@@ -318,8 +379,42 @@ def test_real_cli_captures_are_classified_through_the_adapters(
     match = classify_provider_error(provider, extracted, script_output=raw_capture)
 
     assert match is not None
-    assert match.slug in ("api_error", "unexpected_status")
+    assert match.slug in ("api_error", "unexpected_status", "content_filtered")
     assert match.line.startswith(expected_line_start)
+
+
+def test_codex_indented_daybreak_quotation_is_not_classified():
+    """An indented Daybreak heading under a bare ``•`` bullet is an answer, not chrome."""
+    from cli_agent_orchestrator.providers.codex import CodexProvider
+
+    codex = CodexProvider("terminal", "session", "window")
+    raw_scrolled = (
+        "•\n"
+        "  ⓘ This content can’t be shown\n"
+        "  Worked for 2s • 4:19 PM\n"
+        "› \n"
+        "  ? for shortcuts                                            87% context left\n"
+    )
+    extracted = codex.extract_last_message_from_script(raw_scrolled)
+    assert classify_provider_error("codex", extracted, script_output=raw_scrolled) is None
+
+
+def test_codex_daybreak_multi_turn_ownership():
+    """Latest turn decides ownership for Codex Daybreak refusals vs quoted answers."""
+    heading = "ⓘ This content can’t be shown"
+    later_answer = f"› first\n{heading}\n› quote it\n• {heading}\n› "
+    assert classify_provider_error("codex", heading, script_output=later_answer) is None
+
+    later_refusal = f"› quote it\n• {heading}\n› second\n{heading}\n› "
+    match = classify_provider_error("codex", heading, script_output=later_refusal)
+    assert match is not None
+    assert match.slug == "content_filtered"
+
+    # Turn 1 column-0 refusal followed by Turn 2 indented quotation under bare `•`
+    later_indented_quote = (
+        f"› first\n{heading}\n› quote it\n•\n  {heading}\n  Worked for 2s • 4:19 PM\n› "
+    )
+    assert classify_provider_error("codex", heading, script_output=later_indented_quote) is None
 
 
 @pytest.mark.parametrize(
@@ -399,3 +494,66 @@ def test_codex_stream_error_retries_exhausted_is_a_refusal():
     )
     extracted = CodexProvider("terminal", "session", "window").extract_last_message_from_script(raw)
     assert classify_provider_error("codex", extracted, script_output=raw) is not None
+
+
+def test_codex_clipped_bar_and_trailing_warning_daybreak_classify():
+    """Clipped-status-bar frames, Disabled copy, and trailing column-0 warnings all extract
+    only the refusal cell and classify as ``content_filtered``."""
+    from cli_agent_orchestrator.providers.codex import CodexProvider
+
+    codex = CodexProvider("terminal", "session", "window")
+    daybreak_apply = (
+        "ⓘ This content can’t be shown\n"
+        "  We take extra care with some cybersecurity requests. If you’re doing authorized security work, apply for Daybreak to get\n"
+        "  broader access.\n"
+        "  Learn more: https://help.openai.com/en/articles/20001326\n"
+        "  Apply for Daybreak: https://chatgpt.com/admin/status-and-access"
+    )
+    # 1. Bare refusal with clipped status bar (trailing idle composer only)
+    bare_clipped = f"› Audit auth\n{daybreak_apply}\n› Ask Codex to do anything\n"
+    extracted_bare = codex.extract_last_message_from_script(bare_clipped)
+    assert extracted_bare == daybreak_apply
+    match_bare = classify_provider_error("codex", extracted_bare, script_output=bare_clipped)
+    assert match_bare is not None
+    assert match_bare.slug == "content_filtered"
+
+    # 2. Tool output + refusal with clipped status bar
+    tool_clipped = (
+        f"› Audit auth\n• Ran git diff --stat\n  └ 4 files changed\n\n"
+        f"{daybreak_apply}\n› Ask Codex to do anything\n"
+    )
+    extracted_tool = codex.extract_last_message_from_script(tool_clipped)
+    assert extracted_tool == daybreak_apply
+    match_tool = classify_provider_error("codex", extracted_tool, script_output=tool_clipped)
+    assert match_tool is not None
+    assert match_tool.slug == "content_filtered"
+
+    # 3. Trailing column-0 warnings must not push refusal text over PROVIDER_ERROR_MAX_CHARS
+    with_warnings = (
+        f"› Audit auth\n{daybreak_apply}\n\n"
+        "⚠ Approaching usage limit: 90% of your 5-hour window is used; consider switching models.\n"
+        "⚠ Weekly quota notice: 85% of your weekly quota is used across active Codex sessions.\n"
+        "⚠ Third warning banner that would exceed 512 characters if swallowed into extraction.\n"
+        "› Ask Codex to do anything\n"
+        "  gpt-5.6-codex · ~/project\n"
+    )
+    extracted_clean = codex.extract_last_message_from_script(with_warnings)
+    assert extracted_clean == daybreak_apply
+    assert "⚠" not in extracted_clean
+    match_warn = classify_provider_error("codex", extracted_clean, script_output=with_warnings)
+    assert match_warn is not None
+    assert match_warn.slug == "content_filtered"
+
+    # 4. Notice::Disabled copy (after picker dismissal)
+    disabled = (
+        "› Audit auth\n"
+        "ⓘ This content can’t be shown\n"
+        "  Daybreak is currently off. Turn on Daybreak to continue with authorized security work.\n"
+        "› Ask Codex to do anything\n"
+        "  gpt-5.6-codex · ~/project\n"
+    )
+    extracted_disabled = codex.extract_last_message_from_script(disabled)
+    assert "Daybreak is currently off." in extracted_disabled
+    match_disabled = classify_provider_error("codex", extracted_disabled, script_output=disabled)
+    assert match_disabled is not None
+    assert match_disabled.slug == "content_filtered"
