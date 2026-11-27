@@ -2663,16 +2663,32 @@ class TestDialogGuardCoversSubmitRecovery:
             "guard below; confirm that is what you want, then update OVERLAP."
         )
 
+    #: The one real dialog capture on which a composer IS read (#896 live run,
+    #: Claude Code 2.1.330 through herdr). In a named session, with the cursor on
+    #: an AskUserQuestion's "Chat about this" row, that row sits between the
+    #: dialog's inner rule and the session-name rule, which is the shape of an
+    #: input box: ``❯ 4. Chat about this`` is read as the composer. The text
+    #: read is the dialog's own, never a delivered message, so the bare Enter
+    #: is still not sent for it; but "a dialog hides the composer" is no longer
+    #: true of every capture, which is the case the explicit guard is for.
+    DIALOG_CAPTURES_THAT_SHOW_A_COMPOSER = {
+        "claude_code_896_herdr_named_session_focus_chat.txt": "4. Chat about this",
+        # The same shape, captured later with 13 padding rows above the rule (#1502).
+        "claude_code_896_herdr_named_session_page2_padded_13_rows.txt": "4. Chat about this",
+    }
+
     @pytest.mark.parametrize("provider_type", sorted(OVERLAP))
     def test_real_dialog_captures_hide_the_composer(self, provider_type):
         """Why this is latent rather than live today.
 
-        On every real dialog capture in test/providers/fixtures the prompt
+        On the real dialog captures in test/providers/fixtures the prompt
         replaces the composer box, so ``extract_current_composer`` returns None
         and the inbox path (``full_resend_requires_composer_evidence=True``)
         sends nothing at all. That is what keeps the unguarded bare Enter out of
         reach -- a property of these two extractors, not an invariant, which is
         exactly why the guard is checked explicitly rather than inherited.
+        ``DIALOG_CAPTURES_THAT_SHOW_A_COMPOSER`` is the capture that shows it is
+        not an invariant.
         """
         from cli_agent_orchestrator.providers.manager import ProviderManager
 
@@ -2688,6 +2704,14 @@ class TestDialogGuardCoversSubmitRecovery:
         if not dialogs:
             pytest.skip(f"no WAITING_USER_ANSWER capture for {provider_type}")
         for path in dialogs:
+            known = self.DIALOG_CAPTURES_THAT_SHOW_A_COMPOSER.get(path.name)
+            if known is not None:
+                composer = provider.extract_current_composer(path.read_text())
+                assert composer is not None and composer.startswith(known), (
+                    f"{path.name} no longer reads a composer under its dialog; "
+                    "remove it from DIALOG_CAPTURES_THAT_SHOW_A_COMPOSER"
+                )
+                continue
             assert provider.extract_current_composer(path.read_text()) is None, (
                 f"{path.name} now exposes a composer while a dialog is open; the "
                 "bare-Enter guard in redeliver_dropped_message_with_boundary is what "

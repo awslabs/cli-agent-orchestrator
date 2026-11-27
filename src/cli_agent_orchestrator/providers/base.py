@@ -419,6 +419,22 @@ class BaseProvider(ABC):
         """
         return False
 
+    def shows_user_answer_dialog(self, pane_text: str) -> bool:
+        """Whether ``pane_text``, a fresh read of this terminal's screen, shows a
+        dialog that only a user may answer.
+
+        The backstop behind ``blocks_orchestrated_input_while_waiting_user_answer``
+        for backends whose status is the backend's own agent state rather than a
+        screen read (#896): herdr has reported ``idle`` and ``done`` with a Claude
+        Code dialog open, so ``terminal_service`` reads the pane once before
+        typing orchestrated input and asks the provider. ``pane_text`` is the
+        visible screen with escapes stripped; trailing blank rows may be present.
+
+        Default False, meaning "cannot tell": the status is then trusted as before.
+        Override by calling the provider's existing dialog detection, not a copy.
+        """
+        return False
+
     @property
     def assume_processing_on_dispatch(self) -> bool:
         """Publish PROCESSING immediately when a task is dispatched.

@@ -1,0 +1,60 @@
+     · Given that a failed nightly customer survey export needs a responsible human to notice quickly and take
+     corrective action before stakeholders are affected, who should be notified on any failure? → Notify the on call
+     engineer for the data platform team via the existing paging system
+
+● Captured:
+
+  - Storage: versioned, date-partitioned S3 bucket
+  - Checks: schema validation, PII scan, row count reconciliation (all three)
+  - Schedule: custom — weekdays at 2:30 AM Pacific, after upstream ingestion finishes, skipping public holidays (not
+    one of the two offered options)
+  - Owner: page the data platform on-call engineer
+
+  No further action was requested — let me know if you want this turned into an implementation.
+
+✻ Cogitated for 28s · done 5:28 PM
+
+❯ VALIDATION-MARKER-22: reply with exactly ACK-22 and nothing else
+
+● ACK-22
+
+✻ Cooked for 1s · done 5:29 PM
+
+❯ VALIDATION-MARKER-23: reply with exactly ACK-23 and nothing else
+
+● ACK-23
+
+✻ Cooked for 1s · done 5:29 PM
+
+❯ Make ONE AskUserQuestion tool call with exactly two questions and do nothing else first. Question 1 (header Layout):
+  Which layout? with two options, Stacked and Sidebar, and give EACH option a preview field containing a 12-line
+  ASCII mockup box of that layout. Question 2 (header Colour): Which colour? with two plain options, Teal and Amber,
+  with no preview fields.
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Layout  ☐ Colour  ✔ Submit  →
+
+Which colour?
+
+  1. Teal
+     Teal colour scheme
+  2. Amber
+     Amber colour scheme
+  3. Type something.
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 4. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · ctrl+g to edit in Vim · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────── colour-survey ─

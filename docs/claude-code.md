@@ -123,7 +123,7 @@ The reason is practical. A Claude Code helper once answered with Claude Code's o
 
 ## Eager Inbox Delivery
 
-Claude Code's Ink TUI buffers pasted input even while the agent is processing. CAO exploits this to deliver queued inbox messages during PROCESSING, eliminating inter-turn latency. Enable with `CAO_EAGER_INBOX_DELIVERY=true`. WAITING_USER_ANSWER is excluded: Claude Code's Ink Select widget would consume the paste as the dialog's answer (issue #896), so the message is held until the dialog closes.
+Claude Code's Ink TUI buffers pasted input even while the agent is processing. CAO exploits this to deliver queued inbox messages during PROCESSING, eliminating inter-turn latency. Enable with `CAO_EAGER_INBOX_DELIVERY=true`. WAITING_USER_ANSWER is excluded: Claude Code's Ink Select widget would consume the paste as the dialog's answer (issue #896), so the message is held until the dialog closes. On the herdr backends, where herdr can report a pane with an open dialog as idle or done, CAO also reads the pane before each delivery and holds the message if a dialog is on screen.
 
 See [Inbox Delivery](inbox-delivery.md) for the full architecture, two-flag gate, and how to enable this for other providers.
 

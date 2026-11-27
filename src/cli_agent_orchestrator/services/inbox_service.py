@@ -578,9 +578,12 @@ class InboxService:
                     requeued_pending = True
                     for message in batch:
                         update_message_status(message.id, MessageStatus.PENDING)
-                    logger.warning(
+                    # WARNING, except for a pane-check hold already logged
+                    # once (#896): this retry repeats while the dialog is open.
+                    logger.log(
+                        logging.DEBUG if e.repeat_of_logged_hold else logging.WARNING,
                         f"Terminal {terminal_id} cannot take input yet; leaving "
-                        f"{len(batch)} message(s) pending for retry: {e}"
+                        f"{len(batch)} message(s) pending for retry: {e}",
                     )
                 else:
                     # Refused before typing, and no later attempt can succeed.

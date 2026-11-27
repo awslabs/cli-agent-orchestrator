@@ -31,7 +31,17 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+)
 
 import requests
 from pydantic import ValidationError
@@ -273,6 +283,157 @@ def _dialog_blocks_orchestrated_input(
         and _orchestration_value(orchestration_type) in _ORCHESTRATED_INPUT_VALUES
         and current_status == TerminalStatus.WAITING_USER_ANSWER
     )
+
+
+class _PaneDialogCheck(NamedTuple):
+    """What :func:`_check_pane_for_unreported_dialog` found.
+
+    ``held``: a dialog is on screen and the input must not be sent.
+    ``repeat``: this hold continues an episode whose start was already logged,
+    so the caller logs its own refusal at DEBUG too. Never True without ``held``.
+    """
+
+    held: bool
+    repeat: bool = False
+
+
+_NO_PANE_HOLD = _PaneDialogCheck(held=False)
+
+# Terminals the native-status pane check is currently holding (#896). Delivery
+# is re-attempted on every herdr event while a dialog stays open, as often as
+# every 3 seconds and for as long as the dialog does, which can be overnight.
+# One hold episode is logged when it starts and when it ends; the attempts in
+# between are refused the same way and logged at DEBUG.
+#
+# An episode starts when the check finds a dialog for a terminal not in this
+# set, and ends when a later check for that terminal reads the pane and finds
+# none. A check that could not read the pane, or that did not apply (operator
+# input, another backend), leaves the set alone. Checks run on delivery worker
+# threads, hence the lock. ``dismantle_terminal_runtime`` drops the entry.
+_pane_check_holding: set[str] = set()
+_pane_check_holding_lock = threading.Lock()
+
+
+def _pane_shows_dialog_native_status_missed(
+    terminal_id: str,
+    provider: Any,
+    orchestration_type: "Optional[OrchestrationType]",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """:func:`_check_pane_for_unreported_dialog` as a plain yes or no.
+
+    For a caller that does not log per attempt and so has no use for ``repeat``.
+    """
+    return _check_pane_for_unreported_dialog(
+        terminal_id, provider, orchestration_type, metadata
+    ).held
+
+
+def _provider_can_see_dialogs(provider: Any) -> bool:
+    """False only when ``provider`` inherits ``BaseProvider.shows_user_answer_dialog``.
+
+    The inherited method answers False for every pane, so reading one for it
+    buys nothing. Anything else, a stand-in object included, is asked.
+    """
+    return (
+        getattr(type(provider), "shows_user_answer_dialog", None)
+        is not BaseProvider.shows_user_answer_dialog
+    )
+
+
+def _check_pane_for_unreported_dialog(
+    terminal_id: str,
+    provider: Any,
+    orchestration_type: "Optional[OrchestrationType]",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> _PaneDialogCheck:
+    """Whether the pane shows a user-answer dialog the backend's status did not report.
+
+    #896 case 2. On a backend that supplies native agent status (herdr), the
+    status the guard above acts on was never read off the screen, and herdr has
+    reported ``idle`` and ``done`` with a Claude Code dialog open. So for the
+    input ``_dialog_blocks_orchestrated_input`` would refuse had the status said
+    WAITING_USER_ANSWER, read the visible screen once, here, and ask the provider.
+
+    ``supports_event_inbox()`` is the signal for "status is native": it is the
+    same test ``status_monitor.get_status`` uses to derive status from the
+    backend instead of the pane. On tmux it is False, so nothing is captured and
+    nothing changes. A provider that inherits the base
+    ``shows_user_answer_dialog`` cannot answer, so its pane is not read at all
+    (``_provider_can_see_dialogs``). The ``is True`` tests keep a stand-in
+    object's truthy non-answer out.
+
+    Fails open on purpose: a pane read that raises or comes back empty returns
+    False and the send proceeds as it did before this check existed. This is a
+    backstop for a wrong status, and a herdr CLI hiccup must not become an inbox
+    that never drains.
+
+    Logging: the first hold of an episode is one INFO line, the holds that
+    follow while the dialog stays open are the same line at DEBUG and come back
+    with ``repeat=True``, and the first successful read that finds no dialog is
+    one INFO line saying the hold was released. See ``_pane_check_holding``. A
+    read that fails neither starts nor ends an episode.
+    """
+    # Same provider and input condition as the status guard, by construction.
+    if not _dialog_blocks_orchestrated_input(
+        provider, orchestration_type, TerminalStatus.WAITING_USER_ANSWER
+    ):
+        return _NO_PANE_HOLD
+    if not _provider_can_see_dialogs(provider):
+        return _NO_PANE_HOLD
+    try:
+        backend = get_backend()
+        if backend.supports_event_inbox() is not True:
+            return _NO_PANE_HOLD
+        if metadata is None:
+            metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            return _NO_PANE_HOLD
+        # The same bounded read the composer check uses: the current screen,
+        # escapes stripped. The dialog is drawn at the bottom of it.
+        pane_text = backend.get_history(
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            strip_escapes=True,
+            visible_only=True,
+        )
+        if not isinstance(pane_text, str) or not pane_text.strip():
+            logger.warning(
+                "Could not read the pane of %s to check for an open dialog (empty read); "
+                "sending on the backend's status alone",
+                terminal_id,
+            )
+            return _NO_PANE_HOLD
+        if provider.shows_user_answer_dialog(pane_text) is not True:
+            with _pane_check_holding_lock:
+                released = terminal_id in _pane_check_holding
+                _pane_check_holding.discard(terminal_id)
+            if released:
+                logger.info(
+                    "Native-status pane check released %s: no dialog on screen any more",
+                    terminal_id,
+                )
+            return _NO_PANE_HOLD
+        with _pane_check_holding_lock:
+            repeat = terminal_id in _pane_check_holding
+            _pane_check_holding.add(terminal_id)
+        # One line that only this check writes, so a hold by it can be told
+        # apart from a hold by the status guard. The pane itself is not logged.
+        logger.log(
+            logging.DEBUG if repeat else logging.INFO,
+            "Native-status pane check held input to %s: a user-answer dialog is open "
+            "on screen that the backend's status did not report",
+            terminal_id,
+        )
+        return _PaneDialogCheck(held=True, repeat=repeat)
+    except Exception as exc:
+        logger.warning(
+            "Could not read the pane of %s to check for an open dialog (%s); "
+            "sending on the backend's status alone",
+            terminal_id,
+            exc,
+        )
+        return _NO_PANE_HOLD
 
 
 _DEFERRED_INIT_FAILURE_MESSAGE_MAX = 4096
@@ -5417,14 +5578,26 @@ def redeliver_dropped_message_with_boundary(
         # the composer under an overlaying permission prompt, this Enter starts
         # answering dialogs. Check the guard here rather than inherit it by
         # coincidence.
-        if _dialog_blocks_orchestrated_input(
+        #
+        # The pane check is here for the reason it is in ``dispatch_input``: on
+        # a native-status backend that status can read ready with a dialog open.
+        blocked_by_status = _dialog_blocks_orchestrated_input(
             provider, orchestration_type, status_monitor.get_status(terminal_id)
+        )
+        if blocked_by_status or _pane_shows_dialog_native_status_missed(
+            terminal_id, provider, orchestration_type
         ):
             logger.warning(
                 "Delivery to %s is unsubmitted but the terminal is waiting on a user "
-                "answer; skipping the bare-Enter re-submit so it cannot answer the "
+                "answer%s; skipping the bare-Enter re-submit so it cannot answer the "
                 "dialog (attempt %d)",
                 terminal_id,
+                (
+                    ""
+                    if blocked_by_status
+                    else " (its reported status was ready; the native-status pane check "
+                    "found a dialog on screen)"
+                ),
                 attempt,
             )
             return False, None
@@ -6643,12 +6816,42 @@ def dispatch_input(
             # typing by hand (no orchestration type, so an empty value here) may
             # resolve a prompt. Shared with the bare-Enter recovery's own check;
             # see ``_dialog_blocks_orchestrated_input``.
-            if _dialog_blocks_orchestrated_input(provider, orchestration_type, current_status):
+            #
+            # The second test covers a status that is wrong (#896 case 2): on a
+            # backend with native status it reads the pane, once, and refuses
+            # the same way. It runs whatever that status says, because herdr's
+            # ``done`` reaches here as PROCESSING during the flush wait. It sits
+            # before inject_memory_context so a refusal, which the inbox retries,
+            # does not spend the terminal's one-time memory block.
+            #
+            # Both refusals are the same exception type and reason, which is what
+            # callers branch on. The message says which of the two it was. A
+            # pane-check refusal that repeats one already logged says so on the
+            # exception, and is then logged at DEBUG here and by the inbox.
+            blocked_by_status = _dialog_blocks_orchestrated_input(
+                provider, orchestration_type, current_status
+            )
+            pane_check = (
+                _NO_PANE_HOLD
+                if blocked_by_status
+                else _check_pane_for_unreported_dialog(
+                    terminal_id, provider, orchestration_type, metadata
+                )
+            )
+            if blocked_by_status or pane_check.held:
+                reported = getattr(current_status, "value", current_status)
                 raise TerminalInputBlockedError(
-                    f"Terminal {terminal_id} is waiting for a user answer. "
-                    "Use answer_user_prompt to submit a selection or approval before "
+                    f"Terminal {terminal_id} is waiting for a user answer"
+                    + (
+                        ". "
+                        if blocked_by_status
+                        else f": its reported status was {reported}, but a dialog is "
+                        "open on screen (native-status pane check). "
+                    )
+                    + "Use answer_user_prompt to submit a selection or approval before "
                     f"sending {orchestration_value} input.",
                     reason=TerminalInputBlockedReason.WAITING_USER_ANSWER,
+                    repeat_of_logged_hold=pane_check.repeat,
                 )
 
         # Inject memory context into the very first user message after init.
@@ -6793,7 +6996,17 @@ def dispatch_input(
         return dispatch_boundary
 
     except Exception as e:
-        logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
+        # ERROR, except for a pane-check hold whose episode was already logged
+        # at ERROR once (#896): the inbox retries it for as long as the dialog
+        # stays open.
+        logger.log(
+            (
+                logging.DEBUG
+                if isinstance(e, TerminalInputBlockedError) and e.repeat_of_logged_hold
+                else logging.ERROR
+            ),
+            f"Failed to send input to terminal {terminal_id}: {e}",
+        )
         # Nothing reached the pane before send_keys (reply-delivery-failure D4).
         # Refusals and an unresolved pane keep their own types: their callers
         # branch on them. A missing row is already an InputNotSentError. A
@@ -7511,6 +7724,8 @@ def dismantle_terminal_runtime(
     ephemeral_service.release(terminal_id, "terminal_deleted")
     with _memory_injected_lock:
         _memory_injected_terminals.discard(terminal_id)
+    with _pane_check_holding_lock:
+        _pane_check_holding.discard(terminal_id)
     # Drop any per-curator dispatch lock so the registry doesn't grow
     # forever as memory_manager terminals come and go.
     from cli_agent_orchestrator.services.memory_service import _curator_locks

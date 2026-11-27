@@ -183,10 +183,68 @@ IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" pro
 # "↑/↓ to navigate" or "Enter to confirm ·". Anchored to the same-line "[ \t]*·[ \t]*Tab to amend"
 # chrome structure so completed prose mentioning "Esc to cancel" or "Tab to amend" without the
 # "·" separator does not false-match.
+#
+# Claude Code 2.1.330 multi-question AskUserQuestion pages without previews render the footer
+# "Enter to select · Tab/Arrow keys to navigate · Esc to cancel" (#896, captured live through
+# herdr: test/providers/fixtures/claude_code_896_herdr_two_question_page1.txt), which none of the
+# arms above match. The new arm does not match a bare "... to navigate" phrase: it requires the
+# select hint, the chrome separator and the navigate hint in that order on ONE line
+# ("Enter to select · <keys> to navigate"), the same same-line "[ \t]*·" anchoring as the
+# "Enter to confirm" and "Tab to amend" arms. That adjacency is the stable part of the footer
+# ("Esc to cancel" is not adjacent once "n to add notes" or "Tab to switch questions" sit between
+# them), and prose has to quote the whole footer to trip it, not just mention arrow keys.
+# "Tab/Arrow keys" is the captured wording. "Arrow keys", "Arrows" and "↑↓" are not captured
+# here: they are the other navigate hints herdr's own Claude Code detection manifest
+# (2026.10.11.1, rule live_blocked_form) pairs with "enter to select" for the same footer, and
+# they ride on the same anchor.
 WAITING_USER_ANSWER_PATTERN = (
     r"↑/↓ to navigate|Enter to confirm[ \t]*·|Esc to cancel[ \t]*·[ \t]*Tab to amend"
+    r"|Enter to select[ \t]*·[ \t]*(?:Tab/Arrow keys|[Aa]rrow keys|[Aa]rrows|↑↓) to navigate"
 )
 PLAN_APPROVAL_PATTERN = r"Would you like to proceed\?"
+# The last page of a multi-question AskUserQuestion (#896, Claude Code 2.1.330):
+#
+#   ←  ☒ Color  ☒ Size  ✔ Submit  →
+#
+#   Review your answers
+#
+#    ● Pick a color:
+#      → Red
+#    ● Pick a size:
+#      → Small
+#
+#   ❯ 1. Submit answers
+#     2. Cancel
+#
+# It has NO footer, so no arm of WAITING_USER_ANSWER_PATTERN can see it, and an Enter typed
+# into it submits the answers. Matched by structure, not by phrase (see
+# ``_review_answers_page_at_bottom``): the heading alone on a row, then the two choices as
+# consecutive numbered rows.
+REVIEW_ANSWERS_HEADING_PATTERN = re.compile(r"^[ \t]*Review your answers[ \t]*$")
+REVIEW_ANSWERS_SUBMIT_PATTERN = re.compile(
+    r"^[ \t]*(?:(?P<cursor>[❯>])[ \t]+)?1\.[ \t]+Submit answers[ \t]*$"
+)
+REVIEW_ANSWERS_CANCEL_PATTERN = re.compile(
+    r"^[ \t]*(?:(?P<cursor>[❯>])[ \t]+)?2\.[ \t]+Cancel[ \t]*$"
+)
+# A row that starts with the prompt glyph: the input box, or an echoed user turn.
+_PROMPT_ROW_PATTERN = re.compile(r"^[ \t]*[❯>](?:[\s\xa0]|$)")
+# The tab row that heads every page of a multi-question AskUserQuestion, e.g.
+# "←  ☒ Layout  ☒ Theme  ✔ Submit  →". The review page's heading is below it.
+_ASK_TAB_ROW_PATTERN = re.compile(r"^[ \t]*←.*→[ \t]*$")
+# How many NON-BLANK rows from the bottom the review page's two choices are looked for in:
+# "1. Submit answers", "2. Cancel", the session-name rule a named session draws under them,
+# and three rows for anything drawn under that. Counted in non-blank rows, not screen rows,
+# because the page keeps the height of the tallest question page before it: the named-session
+# capture (claude_code_896_herdr_review_page_named_session.txt) has 8 blank rows between
+# "2. Cancel" and the rule. The heading above the choices has NO row budget: the page prints
+# every question and answer in full, and a long one wraps, so its height is not bounded by
+# the number of questions. The search for it stops at the dialog's own top instead (the tab
+# row, or the rule above it).
+_REVIEW_ANSWERS_CHOICES_BOTTOM_ROWS = 6
+# The rule a NAMED session draws as the last row under a dialog, e.g. "──────── my-session ─"
+# (claude_code_896_herdr_named_session_*.txt). A plain rule has no text in it.
+_SESSION_NAME_RULE_PATTERN = re.compile(r"^[ \t]*─{8,}[ \t]+\S(?:.*\S)?[ \t]+─+[ \t]*$")
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
 # Bedrock model-upgrade nudge, e.g.
@@ -1408,6 +1466,137 @@ class ClaudeCodeProvider(BaseProvider):
         )
         return False
 
+    @staticmethod
+    def _without_session_name_rule(lines: List[str]) -> List[str]:
+        """``lines`` without a trailing session-name rule and the blank rows above it.
+
+        A named session draws "──────── <name> ─" as the last row under a dialog.
+        All pages of one AskUserQuestion call keep the height of the tallest page,
+        and the padding goes under the footer, above that rule: a page shorter
+        than an earlier one has blank rows there that no ``rstrip`` can reach.
+        Returns ``lines`` unchanged when the last non-blank row is anything else,
+        so an idle input box (whose last rule is plain) is not touched.
+        """
+        last = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
+        if last is None or not _SESSION_NAME_RULE_PATTERN.match(lines[last]):
+            return lines
+        while last > 0 and not lines[last - 1].strip():
+            last -= 1
+        return lines[:last]
+
+    @staticmethod
+    def _review_answers_page_at_bottom(rows: List[str]) -> bool:
+        """Whether escape-free screen rows end in AskUserQuestion's "Review your answers" page.
+
+        Structure, blank rows dropped first:
+
+        - "1. Submit answers" directly followed by "2. Cancel", each alone on its
+          row, within the last ``_REVIEW_ANSWERS_CHOICES_BOTTOM_ROWS`` rows, and
+          exactly one of the two carrying the selection cursor. A numbered list an
+          agent wrote has no cursor; a live Select always has exactly one.
+        - the heading "Review your answers", alone on a row, above them, with no
+          rule and no tab row between: the search goes up from the choices and
+          stops at the dialog's own top, however many rows the answers take.
+        - below them no prompt row and no response marker: either means the screen
+          has moved on and the page is transcript, not a live dialog. The
+          session-name rule a named session draws under the page is neither.
+        """
+        region = [ln for ln in rows if ln.strip()]
+        floor = max(len(region) - _REVIEW_ANSWERS_CHOICES_BOTTOM_ROWS + 1, 1)
+        for i in range(len(region) - 1, floor - 1, -1):
+            submit = REVIEW_ANSWERS_SUBMIT_PATTERN.match(region[i - 1])
+            cancel = REVIEW_ANSWERS_CANCEL_PATTERN.match(region[i])
+            if submit and cancel:
+                break
+        else:
+            return False
+        if bool(submit.group("cursor")) == bool(cancel.group("cursor")):
+            return False
+        for row in reversed(region[: i - 1]):
+            if REVIEW_ANSWERS_HEADING_PATTERN.match(row):
+                break
+            if _ASK_TAB_ROW_PATTERN.match(row) or re.match(r"[ \t]*─{20,}", row):
+                return False
+        else:
+            return False
+        return not any(
+            _PROMPT_ROW_PATTERN.match(ln) or EXTRACTION_RESPONSE_PATTERN.search(ln)
+            for ln in region[i + 1 :]
+        )
+
+    @staticmethod
+    def _user_answer_dialog_at_bottom(output: str) -> bool:
+        """Whether escape-free pane text ends in a dialog only a user may answer.
+
+        The one definition of the AskUserQuestion / permission / plan-approval
+        detection, shared by ``get_status``'s buffer path and
+        ``shows_user_answer_dialog`` so the two cannot drift.
+        """
+        # Anchor dialog detection to the bottom region only. Dialog chrome is
+        # always rendered at the bottom; matching the full buffer false-positives
+        # on stale scrollback containing "↑/↓ to navigate" (issue #405).
+        # A named session's rule under the dialog, and the padding a shorter page
+        # leaves above it, would push the footer out of the windows below (#896).
+        lines = ClaudeCodeProvider._without_session_name_rule(output.split("\n"))
+        bottom_region = "\n".join(lines[-_DIALOG_BOTTOM_LINES:])
+        # AskUserQuestion footer can be pushed down by notes-hint, error banner,
+        # or IDE status line — use a 6-line anchor.
+        # Deliberately asymmetric window sizes (round-3 review, gutosantos82): the trust/bypass
+        # exclusion below reads the wider 15-line bottom_region while the WAITING match itself
+        # reads only the narrower 6-line bottom_chrome. This is fail-closed, not a bug -- the
+        # exclusion window being a strict superset of the match window means a trust/bypass dialog
+        # can only ever be excluded MORE often, never less, so it can't accidentally let a real
+        # trust/bypass dialog through as WAITING_USER_ANSWER.
+        bottom_chrome = "\n".join(lines[-6:])
+
+        if (
+            not re.search(TRUST_PROMPT_PATTERN, bottom_region)
+            and not re.search(BYPASS_PROMPT_PATTERN, bottom_region)
+            # Same reason as trust/bypass: _handle_startup_prompts declines this
+            # one itself, so surfacing it as WAITING_USER_ANSWER would ask an
+            # operator to answer a dialog that is about to answer itself. Its
+            # footer is "Enter to confirm · Esc to cancel", which the WAITING
+            # match below would otherwise hit.
+            and not re.search(MODEL_UPGRADE_PROMPT_PATTERN, bottom_region)
+        ):
+            # AskUserQuestion: "↑/↓ to navigate" in bottom chrome (last 6 lines).
+            # Known residual: agent prose containing this exact string in the
+            # 6-line footer window of an idle prompt will false-positive as
+            # WAITING. Full fix needs structural composer detection (out of scope).
+            if re.search(WAITING_USER_ANSWER_PATTERN, bottom_chrome):
+                return True
+            # Plan-approval: "Would you like to proceed?" with no nav footer.
+            # Guard against dismissed dialog in scrollback: only classify as
+            # WAITING if option markers appear AFTER the plan text AND neither
+            # a separator (────) nor a response marker (⏺/●) follows them —
+            # either indicates the agent proceeded past the dialog.
+            plan_match = re.search(PLAN_APPROVAL_PATTERN, bottom_region)
+            if plan_match:
+                after_plan = bottom_region[plan_match.end() :]
+                has_option_markers = re.search(r"^\s*(?:[❯>]\s*)?\d+\.", after_plan, re.MULTILINE)
+                sep_after_plan = re.search(r"─{20,}", after_plan)
+                response_after_options = False
+                if has_option_markers:
+                    last_option = None
+                    for m in re.finditer(r"^\s*(?:[❯>]\s*)?\d+\.", after_plan, re.MULTILINE):
+                        last_option = m
+                    if last_option:
+                        after_options = after_plan[last_option.end() :]
+                        # EXTRACTION_RESPONSE_PATTERN (not RESPONSE_PATTERN):
+                        # the newest TUI's response marker is ● which
+                        # RESPONSE_PATTERN deliberately excludes, and its
+                        # effort-footer lookahead keeps a "● high · /effort"
+                        # line from counting as dismissal evidence.
+                        response_after_options = bool(
+                            EXTRACTION_RESPONSE_PATTERN.search(after_options)
+                        )
+                if has_option_markers and not sep_after_plan and not response_after_options:
+                    return True
+            # AskUserQuestion "Review your answers": no footer either (#896).
+            if ClaudeCodeProvider._review_answers_page_at_bottom(lines):
+                return True
+        return False
+
     def get_status(self, output: str) -> TerminalStatus:
         """Get Claude Code status.
 
@@ -1531,64 +1720,8 @@ class ClaudeCodeProvider(BaseProvider):
             if last_idle is None or last_processing.start() > last_idle.start():
                 return TerminalStatus.PROCESSING
 
-        # Anchor dialog detection to the bottom region only. Dialog chrome is
-        # always rendered at the bottom; matching the full buffer false-positives
-        # on stale scrollback containing "↑/↓ to navigate" (issue #405).
-        lines = output.split("\n")
-        bottom_region = "\n".join(lines[-_DIALOG_BOTTOM_LINES:])
-        # AskUserQuestion footer can be pushed down by notes-hint, error banner,
-        # or IDE status line — use a 6-line anchor.
-        # Deliberately asymmetric window sizes (round-3 review, gutosantos82): the trust/bypass
-        # exclusion below reads the wider 15-line bottom_region while the WAITING match itself
-        # reads only the narrower 6-line bottom_chrome. This is fail-closed, not a bug -- the
-        # exclusion window being a strict superset of the match window means a trust/bypass dialog
-        # can only ever be excluded MORE often, never less, so it can't accidentally let a real
-        # trust/bypass dialog through as WAITING_USER_ANSWER.
-        bottom_chrome = "\n".join(lines[-6:])
-
-        if (
-            not re.search(TRUST_PROMPT_PATTERN, bottom_region)
-            and not re.search(BYPASS_PROMPT_PATTERN, bottom_region)
-            # Same reason as trust/bypass: _handle_startup_prompts declines this
-            # one itself, so surfacing it as WAITING_USER_ANSWER would ask an
-            # operator to answer a dialog that is about to answer itself. Its
-            # footer is "Enter to confirm · Esc to cancel", which the WAITING
-            # match below would otherwise hit.
-            and not re.search(MODEL_UPGRADE_PROMPT_PATTERN, bottom_region)
-        ):
-            # AskUserQuestion: "↑/↓ to navigate" in bottom chrome (last 6 lines).
-            # Known residual: agent prose containing this exact string in the
-            # 6-line footer window of an idle prompt will false-positive as
-            # WAITING. Full fix needs structural composer detection (out of scope).
-            if re.search(WAITING_USER_ANSWER_PATTERN, bottom_chrome):
-                return TerminalStatus.WAITING_USER_ANSWER
-            # Plan-approval: "Would you like to proceed?" with no nav footer.
-            # Guard against dismissed dialog in scrollback: only classify as
-            # WAITING if option markers appear AFTER the plan text AND neither
-            # a separator (────) nor a response marker (⏺/●) follows them —
-            # either indicates the agent proceeded past the dialog.
-            plan_match = re.search(PLAN_APPROVAL_PATTERN, bottom_region)
-            if plan_match:
-                after_plan = bottom_region[plan_match.end() :]
-                has_option_markers = re.search(r"^\s*(?:[❯>]\s*)?\d+\.", after_plan, re.MULTILINE)
-                sep_after_plan = re.search(r"─{20,}", after_plan)
-                response_after_options = False
-                if has_option_markers:
-                    last_option = None
-                    for m in re.finditer(r"^\s*(?:[❯>]\s*)?\d+\.", after_plan, re.MULTILINE):
-                        last_option = m
-                    if last_option:
-                        after_options = after_plan[last_option.end() :]
-                        # EXTRACTION_RESPONSE_PATTERN (not RESPONSE_PATTERN):
-                        # the newest TUI's response marker is ● which
-                        # RESPONSE_PATTERN deliberately excludes, and its
-                        # effort-footer lookahead keeps a "● high · /effort"
-                        # line from counting as dismissal evidence.
-                        response_after_options = bool(
-                            EXTRACTION_RESPONSE_PATTERN.search(after_options)
-                        )
-                if has_option_markers and not sep_after_plan and not response_after_options:
-                    return TerminalStatus.WAITING_USER_ANSWER
+        if self._user_answer_dialog_at_bottom(output):
+            return TerminalStatus.WAITING_USER_ANSWER
 
         # New Claude Code TUI PROCESSING: the input prompt is BOXED between two
         # separators, and the live spinner renders on the line DIRECTLY ABOVE the
@@ -1889,7 +2022,12 @@ class ClaudeCodeProvider(BaseProvider):
 
         bottom_joined = "\n".join(bottom)
         if (
-            re.search(WAITING_USER_ANSWER_PATTERN, bottom_joined)
+            (
+                re.search(WAITING_USER_ANSWER_PATTERN, bottom_joined)
+                # The "Review your answers" page has no footer (#896); the same
+                # structural check the raw path and the herdr pane check run.
+                or self._review_answers_page_at_bottom(rows)
+            )
             and not re.search(TRUST_PROMPT_PATTERN, joined)
             and not re.search(BYPASS_PROMPT_PATTERN, joined)
             and not re.search(MODEL_UPGRADE_PROMPT_PATTERN, joined)
@@ -1961,6 +2099,23 @@ class ClaudeCodeProvider(BaseProvider):
         worker alive for answer_user_prompt rather than auto-pasting into it.
         """
         return True
+
+    def shows_user_answer_dialog(self, pane_text: str) -> bool:
+        """Whether a fresh pane read ends in a dialog that would swallow a paste (#896).
+
+        Runs the buffer path's detection rather than ``get_status_from_screen``:
+        it is the only one that knows the plan-approval dialog (#405), and its
+        6-line footer window is the tighter of the two against agent prose that
+        merely quotes a footer. A rendered pane pads the rows under the TUI with
+        blanks, which the buffer path never sees, so they are dropped first to
+        keep the footer inside that window. The shared helper then drops a named
+        session's rule and the padding above it. Trust, bypass and model-upgrade
+        dialogs stay excluded, as in ``get_status``: ``initialize`` answers those.
+        """
+        clean = strip_terminal_escapes(pane_text).rstrip()
+        if not clean:
+            return False
+        return self._user_answer_dialog_at_bottom(clean)
 
     def mark_input_received(self) -> None:
         """Capture content-based snapshots for the staleness guard (issue #407).
