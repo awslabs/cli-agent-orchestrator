@@ -375,7 +375,20 @@ class TestKiroCliProviderInitialization:
         ] == ["Down", "Enter"]
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("variation", ["another_selector", "missing_cursor", "distant_body"])
+    @pytest.mark.parametrize(
+        "variation",
+        [
+            "another_selector",
+            "footer_between_body_and_cursor",
+            "missing_cursor",
+            "distant_body",
+            "stale_consent_no_footer_10",
+            "stale_consent_no_footer_20",
+            "stale_consent_no_footer_30",
+            "quoted_cursor",
+            "cursor_above_body",
+        ],
+    )
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
@@ -388,8 +401,35 @@ class TestKiroCliProviderInitialization:
                 "\nUpdate available!\n❯ Update now\n  Later\n"
                 "esc to cancel · ↑↓ to navigate · ↵ to select\n"
             )
+        elif variation == "footer_between_body_and_cursor":
+            pane += (
+                "\nUpdate available!\n❯ No, exit\n  Later\n"
+                "esc to cancel · ↑↓ to navigate · ↵ to select\n"
+            )
         elif variation == "missing_cursor":
             pane = pane.replace("❯ No, exit", "  No, exit")
+        elif variation.startswith("stale_consent_no_footer_"):
+            filler_count = int(variation.rsplit("_", 1)[-1])
+            pane = (
+                "Warning: Kiro is running in trust all tools mode\n"
+                "❯ No, exit\n"
+                + "filler\n" * filler_count
+                + "Update available!\n❯ Update now\n  Later\n"
+                "esc to cancel · ↑↓ to navigate · ↵ to select\n"
+            )
+        elif variation == "quoted_cursor":
+            pane = (
+                "Warning: Kiro is running in trust all tools mode\n"
+                "Update available!\n❯ Update now\n  Later\n"
+                "agent said: Kiro is running in trust all tools mode, pick '❯ No, exit'\n"
+                "esc to cancel · ↑↓ to navigate · ↵ to select\n"
+            )
+        elif variation == "cursor_above_body":
+            pane = (
+                "❯ No, exit\nWarning: Kiro is running in trust all tools mode\n"
+                "  No, exit\n  Yes, I accept\n"
+                "esc to cancel · ↑↓ to navigate · ↵ to select\n"
+            )
         else:
             pane = pane.replace(
                 "esc to cancel · ↑↓ to navigate · ↵ to select",

@@ -299,6 +299,7 @@ TUI_TRUST_ALL_TOOLS_CURSOR = r"❯\s*No, exit"
 
 # Bottom pane lines scanned for the current selector's footer and its wrapped body.
 STARTUP_PROMPT_BOTTOM_LINES = 15
+# Below ~49 columns the warning line wraps, so verification fails closed.
 TRUST_DIALOG_BODY_LINES = 40
 
 # Selection cursor of kiro's blocking list selectors (consent, update, login).
@@ -975,9 +976,16 @@ class KiroCliProvider(BaseProvider):
                     re.search(TUI_TRUST_ALL_TOOLS_FOOTER, lines[index])
                     for index in range(body_line + 1, footer_line)
                 )
-                and any(
-                    re.search(r"^\s*" + TUI_TRUST_ALL_TOOLS_CURSOR + r"\s*$", lines[index])
-                    for index in range(body_line + 1, footer_line)
+                and re.search(
+                    r"^\s*" + TUI_TRUST_ALL_TOOLS_CURSOR + r"\s*$",
+                    next(
+                        (
+                            lines[index]
+                            for index in range(footer_line - 1, body_line, -1)
+                            if "❯" in lines[index]
+                        ),
+                        "",
+                    ),
                 )
                 for body_line in body_lines
             )
