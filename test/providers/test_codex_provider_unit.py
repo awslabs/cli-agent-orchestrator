@@ -16,6 +16,7 @@ try:  # py3.11+; the project still supports 3.10 (pyproject requires-python)
 except ModuleNotFoundError:  # pragma: no cover - 3.10 only
     import tomli as tomllib  # type: ignore[no-redef]
 
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import (
@@ -496,6 +497,51 @@ class TestCodexBuildCommand:
         assert "HOME" in command
         assert "PATH" in command
         assert "CAO_TERMINAL_ID" in command
+
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    def test_worker_env_is_inherited_only_by_the_bundled_mcp_server(
+        self, mock_load_profile, monkeypatch
+    ):
+        monkeypatch.setenv("CAO_ELASTIC_RELEASE_TOKEN", "test-worker-token-value")
+        mock_load_profile.return_value = AgentProfile(
+            name="developer",
+            description="Test the MCP launch configuration",
+            mcpServers={
+                "orchestrator": {
+                    "command": "cao-mcp-server",
+                    "env_vars": ["EXISTING_VAR", "CAO_CALLBACK_URL"],
+                },
+                "cao-mcp-server": {"command": "third-party-server", "args": ["cao-mcp-server"]},
+                "replaced": {"command": "cao-mcp-server"},
+            },
+            codexConfig={"mcp_servers.replaced.command": "third-party-server"},
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0", "developer")
+        command = provider._build_codex_command()
+        overrides = tomllib.loads(
+            "\n".join(
+                arg
+                for arg in shlex.split(command)
+                if arg.startswith("mcp_servers.") and ".env_vars=" in arg
+            )
+        )["mcp_servers"]
+
+        assert overrides["orchestrator"]["env_vars"] == [
+            "EXISTING_VAR",
+            "CAO_CALLBACK_URL",
+            "CAO_TERMINAL_ID",
+            "CAO_CALLBACK_TERMINAL_ID",
+            "CAO_ELASTIC_BROKER_URL",
+            "CAO_ELASTIC_RELEASE_TOKEN",
+            "CAO_ELASTIC_WORKER_ID",
+            "CAO_MEMORY_API_URL",
+            "CAO_PROJECT_ID",
+            "CAO_MCP_REQUEST_TIMEOUT",
+        ]
+        assert overrides["cao-mcp-server"]["env_vars"] == ["CAO_TERMINAL_ID"]
+        assert overrides["replaced"]["env_vars"] == ["CAO_TERMINAL_ID"]
+        assert "test-worker-token-value" not in command
 
     @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_build_command_empty_system_prompt(self, mock_load_profile):

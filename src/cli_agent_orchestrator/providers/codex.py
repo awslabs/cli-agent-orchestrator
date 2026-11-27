@@ -15,13 +15,22 @@ from wcwidth import wcswidth
 from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.agent_plugins.mcp_mapping import CODEX_BARE_KEY
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.constants import (
+    CALLBACK_TERMINAL_ID_ENV,
+    CALLBACK_URL_ENV,
+    CAO_HOME_DIR,
+    ELASTIC_BROKER_URL_ENV,
+    ELASTIC_RELEASE_TOKEN_ENV,
+    ELASTIC_WORKER_ID_ENV,
+)
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider, ProviderExitedError
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils import agent_profiles
 from cli_agent_orchestrator.utils.mcp_resolution import (
+    CAO_MCP_SERVER_COMMAND,
+    CAO_TERMINAL_ID_ENV,
     forward_terminal_identity,
     is_bundled_cao_server,
     resolve_mcp_server_config,
@@ -30,6 +39,17 @@ from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_sta
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
+
+_CAO_WORKER_MCP_ENV_VARS = (
+    CALLBACK_TERMINAL_ID_ENV,
+    CALLBACK_URL_ENV,
+    ELASTIC_BROKER_URL_ENV,
+    ELASTIC_RELEASE_TOKEN_ENV,
+    ELASTIC_WORKER_ID_ENV,
+    "CAO_MEMORY_API_URL",
+    "CAO_PROJECT_ID",
+    "CAO_MCP_REQUEST_TIMEOUT",
+)
 
 # Regex patterns for Codex output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
@@ -1879,6 +1899,8 @@ class CodexProvider(BaseProvider):
                     f.write(_toml_scalar(system_prompt))
                 developer_instructions_fragment = f'-c "developer_instructions=$(cat {shlex.quote(str(developer_instructions_file))})"'
 
+            codex_config = dict(profile.codexConfig) if profile.codexConfig else {}
+
             # Add MCP servers via -c config overrides (per-session, no global config changes).
             # Each server field is set via dotted path: mcp_servers.<name>.<field>=<value>
             if profile.mcpServers:
@@ -1902,6 +1924,7 @@ class CodexProvider(BaseProvider):
                     # CAO tools out of Codex's deferred tool search, but one
                     # predicate for "is this our server" beats two.
                     is_cao_server = is_bundled_cao_server(cfg)
+                    uses_bundled_command = cfg.get("command") == CAO_MCP_SERVER_COMMAND
                     # Resolve the bundled cao-mcp-server console script to a
                     # PATH-independent invocation.
                     cfg = resolve_mcp_server_config(cfg, name=server_name)
@@ -1944,13 +1967,18 @@ class CodexProvider(BaseProvider):
                             for env_key, env_val in cfg["env"].items()
                         )
                         command_parts.extend(["-c", f"{prefix}.env={{ {pairs} }}"])
-                    # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
-                    # can identify the current session for handoff/assign operations.
-                    # Codex does not forward env vars to MCP subprocesses by default;
-                    # env_vars lists names to inherit from the parent shell environment.
-                    env_vars = cfg.get("env_vars", [])
-                    if "CAO_TERMINAL_ID" not in env_vars:
-                        env_vars = list(env_vars) + ["CAO_TERMINAL_ID"]
+                    # Codex inherits named variables from the worker's shell. Keep
+                    # values (including the release token) out of the launch command.
+                    required_env_vars: tuple[str, ...] = (CAO_TERMINAL_ID_ENV,)
+                    # Only the bare command is resolved by CAO. A name or args match
+                    # may be a custom process, and later overrides can replace it.
+                    if uses_bundled_command and not any(
+                        key in ("mcp_servers", prefix) or key.startswith(f"{prefix}.")
+                        for key in codex_config
+                    ):
+                        required_env_vars += _CAO_WORKER_MCP_ENV_VARS
+                    env_vars = list(cfg.get("env_vars", []))
+                    env_vars.extend(key for key in required_env_vars if key not in env_vars)
                     env_vars_toml = "[" + ", ".join(_toml_scalar(v) for v in env_vars) + "]"
                     command_parts.extend(["-c", f"{prefix}.env_vars={env_vars_toml}"])
                     # Set a generous tool timeout for MCP calls like handoff, which
@@ -1985,7 +2013,6 @@ class CodexProvider(BaseProvider):
             # into a copy of codexConfig, so it wins on a key conflict and is emitted even
             # when codexConfig is empty, giving exactly one model_reasoning_effort override.
             # It is never written back to the profile.
-            codex_config = dict(profile.codexConfig) if profile.codexConfig else {}
             if self._effort:
                 codex_config["model_reasoning_effort"] = self._effort
             for key, value in codex_config.items():

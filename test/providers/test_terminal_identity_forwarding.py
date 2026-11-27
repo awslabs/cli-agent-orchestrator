@@ -23,6 +23,7 @@ The gate's half of this is ``test/security/test_mcp_tool_gate_boundness.py``.
 
 import json
 import re
+import shlex
 from pathlib import Path
 
 # The install-seam fixtures: a temp CAO home, plugin store, Kiro agents dir and
@@ -291,10 +292,8 @@ class TestEachProviderInjectsTheRealId:
     def test_codex(self, pinned):
         """The EXPLICIT ``-c ...env=`` table, not just the inheritance request.
 
-        Codex emitted both: ``env_vars=["CAO_TERMINAL_ID"]`` (inherit from the
-        parent) *and* the profile's own ``env`` table. The explicit table is what
-        Codex passes to the server, so inheritance alone did not save it -- the
-        reviewer's probe showed ``explicit='deadbeef' inherits_real=True``.
+        Codex passes the explicit ``env`` value when a name is also listed in
+        ``env_vars``, so the profile's pinned value must be replaced there.
         """
         from cli_agent_orchestrator.providers.codex import CodexProvider
         from cli_agent_orchestrator.utils.agent_profiles import ProfileSource
@@ -306,12 +305,12 @@ class TestEachProviderInjectsTheRealId:
         ):
             provider = CodexProvider("a1b2c3d4", "s", "w", agent_profile="worker")
             command = provider._build_codex_command()
-        table = _codex_env_table(command, "srv")
-        assert table[CAO_TERMINAL_ID_ENV] == "a1b2c3d4"
+        config = _codex_mcp_server(command, "srv")
+        assert config["env"][CAO_TERMINAL_ID_ENV] == "a1b2c3d4"
         assert pinned not in command or pinned == ""
         # The inheritance request stays: it is harmless and covers a server the
         # explicit table somehow misses.
-        assert 'mcp_servers.srv.env_vars=["CAO_TERMINAL_ID"]' in command
+        assert config["env_vars"].count(CAO_TERMINAL_ID_ENV) == 1
 
     def test_grok_cli(self, pinned):
         from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
@@ -388,16 +387,16 @@ class TestEachProviderInjectsTheRealId:
         assert written["mcpServers"]["theirs"]["env"][CAO_TERMINAL_ID_ENV] == "a1b2c3d4"
 
 
-def _codex_env_table(command: str, server: str) -> dict:
-    """Parse one ``-c mcp_servers.<server>.env={...}`` inline table back out."""
+def _codex_mcp_server(command: str, server: str) -> dict:
+    """Parse the TOML overrides for one server from the Codex command."""
     try:  # Python 3.11+
         import tomllib
     except ModuleNotFoundError:  # Python 3.10 -- tomli is a declared dependency there
         import tomli as tomllib  # type: ignore[no-redef]
 
-    match = re.search(rf"mcp_servers\.{re.escape(server)}\.env=(\{{.*?\}})'", command)
-    assert match, f"no env inline table for {server!r} in: {command}"
-    return tomllib.loads(f"x = {match.group(1)}")["x"]
+    prefix = f"mcp_servers.{server}."
+    overrides = "\n".join(arg for arg in shlex.split(command) if arg.startswith(prefix))
+    return tomllib.loads(overrides)["mcp_servers"][server]
 
 
 class TestADifferentlyNamedEntryThatLaunchesOurServer:
@@ -439,7 +438,8 @@ class TestADifferentlyNamedEntryThatLaunchesOurServer:
         ):
             provider = CodexProvider("a1b2c3d4", "s", "w", agent_profile="worker")
             command = provider._build_codex_command()
-        assert _codex_env_table(command, "sneaky")[CAO_TERMINAL_ID_ENV] == "a1b2c3d4"
+        config = _codex_mcp_server(command, "sneaky")
+        assert config["env"][CAO_TERMINAL_ID_ENV] == "a1b2c3d4"
         assert "deadbeef" not in command
         assert 'mcp_servers.sneaky.omit_tools_from=["deferred"]' in command
 
