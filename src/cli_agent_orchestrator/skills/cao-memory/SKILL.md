@@ -13,8 +13,9 @@ available to a brand-new agent in a later session — even on a different provid
 the user never has to repeat themselves.
 
 These are CAO's cross-provider memory tools (`memory_store`, `memory_recall`,
-`memory_related`, `memory_forget`), exposed by the CAO MCP server. They are
-**distinct from any provider-native memory** the CLI tool may have.
+`memory_related`, `memory_forget`), exposed by the CAO MCP server.
+`memory_restore` is exposed only when `memory.supersede.auto` is on at server startup.
+They are **distinct from any provider-native memory** the CLI tool may have.
 
 ## Scopes and types
 
@@ -50,6 +51,9 @@ metadata, follows at most two hops, and does not surface proposed relationships.
 It shows existing human, compiler, and authored content-link edges; the
 opt-in `memory.relationships.content_links` setting only controls future
 authored-link edge production.
+
+A `memory_store` result may report same-key replacement in append mode when enabled.
+Use its version-pinned `memory_restore(key=..., scope=..., version=...)` hint.
 
 ## Store — save anything worth remembering, immediately
 

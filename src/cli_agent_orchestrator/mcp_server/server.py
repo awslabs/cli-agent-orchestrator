@@ -2042,20 +2042,25 @@ async def memory_store(
         if key is not None and MemoryService._key_was_truncated(key):
             result["key_truncated"] = True
             result["requested_key"] = key
+        if memory.superseded:
+            result["superseded"] = [item.model_dump(mode="json") for item in memory.superseded]
         return result
     except MemoryPartialWriteError as e:
+        partial_write: Dict[str, Any] = {
+            "key": e.key,
+            "scope": e.scope,
+            "scope_id": e.scope_id,
+            "file_path": e.file_path,
+            "completed_phases": e.completed_phases,
+            "repair_command": e.repair_command,
+        }
+        if e.superseded:
+            partial_write["superseded"] = [item.model_dump(mode="json") for item in e.superseded]
         return {
             "success": False,
             "error_kind": e.error_kind,
             "error": str(e),
-            "partial_write": {
-                "key": e.key,
-                "scope": e.scope,
-                "scope_id": e.scope_id,
-                "file_path": e.file_path,
-                "completed_phases": e.completed_phases,
-                "repair_command": e.repair_command,
-            },
+            "partial_write": partial_write,
         }
     except MemoryDisabledError as e:
         return {"success": False, "disabled": True, "error": str(e)}
@@ -2212,6 +2217,66 @@ async def memory_related(
             limit=limit,
             terminal_context=terminal_context,
         )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def _register_memory_restore(function):
+    from cli_agent_orchestrator.services.settings_service import is_memory_auto_supersede_enabled
+
+    return mcp.tool()(function) if is_memory_auto_supersede_enabled() else function
+
+
+@_register_memory_restore
+async def memory_restore(
+    key: str = Field(description="Key of the superseded memory to bring back"),
+    scope: str = Field(
+        default="project",
+        description=(
+            'Scope of the memory: "global", "project", "session", "agent", or "federated"'
+        ),
+    ),
+    version: Optional[str] = Field(
+        default=None, description="Exact version from the store undo hint"
+    ),
+) -> Dict[str, Any]:
+    """Undo an automatic supersede that a memory_store result reported.
+
+    Only a previous version of the same native key can be restored. Pass the
+    version from the store result; retries return already_restored without a
+    second write. A newer version makes the old hint stale.
+    """
+    from cli_agent_orchestrator.services.memory_gateway import remote_memory_url, restore_memory
+    from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    if not is_memory_enabled():
+        return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
+    try:
+        terminal_context = _get_terminal_context_from_env()
+        if remote_memory_url():
+            return await restore_memory(
+                key=key, scope=scope, terminal_context=terminal_context, version=version
+            )
+        return await MemoryService().restore(
+            key, scope=scope, terminal_context=terminal_context, version=version
+        )
+    except MemoryDisabledError as e:
+        return {"success": False, "disabled": True, "error": str(e)}
+    except MemoryPartialWriteError as e:
+        return {
+            "success": False,
+            "error_kind": e.error_kind,
+            "error": str(e),
+            "partial_write": {
+                "key": e.key,
+                "scope": e.scope,
+                "scope_id": e.scope_id,
+                "file_path": e.file_path,
+                "completed_phases": e.completed_phases,
+                "repair_command": e.repair_command,
+            },
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 

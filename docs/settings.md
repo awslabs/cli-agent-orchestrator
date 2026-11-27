@@ -19,4 +19,9 @@ file value. Disabling does not purge existing edges, and `memory_related`
 continues to show any existing human, compiler, or content-link edges; see
 [Typed relationships](memory.md#typed-relationships).
 
+`memory.supersede.auto` defaults to `false`; set it to `true` to report
+same-key replacements in append mode with version-pinned undo hints. Env override:
+`CAO_MEMORY_SUPERSEDE_AUTO`. See
+[Automatic supersede and undo](memory.md#automatic-supersede-and-undo).
+
 `memory.non_accessing_inspection` defaults to `true`; see [Operator inspection](memory.md#non-accessing-operator-inspection). `CAO_MEMORY_NON_ACCESSING_INSPECTION` overrides the file value.

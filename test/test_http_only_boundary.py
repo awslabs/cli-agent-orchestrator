@@ -210,6 +210,15 @@ DUAL_MODE_ALLOWLIST: Dict[PinKey, Pin] = {
     ),
     (
         "mcp_server/server.py",
+        "memory_restore",
+        "cli_agent_orchestrator.services.memory_service",
+    ): Pin(
+        ("MemoryService",),
+        "dual-mode: remote fallback is memory_gateway.restore_memory "
+        "(POST /internal/memory/restore)",
+    ),
+    (
+        "mcp_server/server.py",
         "memory_forget",
         "cli_agent_orchestrator.services.memory_service",
     ): Pin(

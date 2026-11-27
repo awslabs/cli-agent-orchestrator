@@ -145,6 +145,11 @@ memory_store(
 )
 ```
 
+A successful result may include `superseded`: the versions this store replaced,
+each as `{key, scope, reason, undo}`. See
+[Automatic supersede and undo](#automatic-supersede-and-undo) below. The field is
+absent when nothing was superseded.
+
 > **Storing is MCP-only.** There is no `cao memory store` command — the CLI can
 > `list`/`show`/`delete`/`clear`/`lint`/`compact`/`heal`/`export`/`import`, but *writing* a
 > memory always goes through the `memory_store` MCP tool (`import` is the one
@@ -309,6 +314,58 @@ memory_forget(
 )
 ```
 
+### `memory_restore`
+
+Undo an automatic supersede that a `memory_store` result reported.
+
+```
+memory_restore(
+  key="bridge-schedule",
+  scope="project",          # optional, default: "project"
+  version="2026-11-25T08:00:00Z#0:<digest>"  # exact hint from the store result
+)
+```
+
+The requested previous entry is appended under the same key with authored links
+intact. The version hint includes a timestamp, entry ordinal and digest of the
+topic ID and entry content,
+so hints cannot be used for another note. Unchanged repeated writes do not invalidate
+an earlier hint. Repeating the request returns `already_restored` without another
+write; a later different replacement makes an old hint return `stale_version`.
+Restore reinstates previous type and tags when their version metadata is present;
+otherwise it uses the current values and returns `metadata_restored: false`. It returns a
+`reverse_undo` hint for reversing the restoration. Per-version type and tags
+are recorded in bounded topic-file metadata comments while automatic supersede is on.
+An absent key returns `not_found`. The caller needs the same write access as
+`memory_store`; vault-mapped keys cannot be restored this way.
+
+### Automatic supersede and undo
+
+Automatic reporting is opt-in. In `append` mode, a changed write under an
+existing key in the same scope reports `reason: "same_key"` with a version-pinned
+undo hint. The previous entry remains in the topic file under its own heading.
+In `llm` compile mode, CAO does not report automatic supersede or offer an undo
+hint: compilation can merge away prior entries. `memory_restore` refuses in this
+mode with `error_kind: llm_mode`. Compaction ends undo for that topic. Links
+and similarity across keys never cause automatic supersede; content links
+remain normal relationships.
+Same-key writes already show their latest entry in recall, so no other key is
+hidden or resurrected by this feature.
+
+Every supersede and every undo writes one line to the memory audit log
+(`logs/memory/<date>.md`): `memory_superseded` or `memory_supersede_undone`,
+with the key, scope, reason and superseding key. The line never contains note
+content.
+
+`memory.supersede.auto` defaults to `false`. Set it to `true` to report same-key
+replacements in append mode. Env override: `CAO_MEMORY_SUPERSEDE_AUTO`.
+Off produces no supersede audit lines; `memory_restore` is unavailable as an
+MCP tool and the internal restore route refuses requests while off. Registration
+is read at MCP server startup; restart the server after enabling the setting.
+The setting doesn't change the opt-in
+`memory.lifecycle.enabled` rules below, which apply to every active `supersedes`
+edge.
+
 ### Injection eligibility sources
 
 The in-tree `services.memory_eligibility` registry provides batch lifecycle
@@ -369,7 +426,7 @@ memory, so the recorded block remains the one delivered with the step's first
 message. Another terminal creation does not invalidate that snapshot. A fresh
 workflow run resolves current memory.
 
-Explicit recall retains superseded memories. With lifecycle enabled, recency
+Explicit recall retains lifecycle-superseded memories. With lifecycle enabled, recency
 moves them last without changing membership; usage demotes them before the
 stable scope pass and slice. Score/relevance keep their existing always-on
 demotion; the flag adds annotation only in those modes. A transient

@@ -75,6 +75,7 @@ from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.mcp_server import server as cao_mcp
 from cli_agent_orchestrator.ops_mcp_server import server as ops_mcp
 from cli_agent_orchestrator.plugins import registry as plugin_registry
+from cli_agent_orchestrator.services.settings_service import is_memory_auto_supersede_enabled
 
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
@@ -260,6 +261,8 @@ _CAO_MCP_EXEMPT: Dict[str, str] = {
     # carry a name that is sometimes covered.
     "delete_terminal": "ownership-checked in-handler via _target_binding_denial",
 }
+if is_memory_auto_supersede_enabled():
+    _CAO_MCP_EXEMPT["memory_restore"] = _IDENTITY_LOCAL
 
 
 def _mcp_tool_registrations(mcp: FastMCP) -> Dict[str, bool]:

@@ -32,7 +32,12 @@ from cli_agent_orchestrator.constants import (
     MEMORY_MAX_PER_SCOPE,
     MEMORY_SCOPE_BUDGET_CHARS,
 )
-from cli_agent_orchestrator.models.memory import Memory, MemoryScope, MemoryType
+from cli_agent_orchestrator.models.memory import (
+    Memory,
+    MemoryScope,
+    MemoryType,
+    SupersededMemory,
+)
 from cli_agent_orchestrator.services import memory_eligibility
 from cli_agent_orchestrator.services.memory_archive.base import ExportReport, ImportReport
 from cli_agent_orchestrator.services.memory_format import (
@@ -78,6 +83,64 @@ _LEGACY_ENTRY_TIMESTAMP_RE = re.compile(r"## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2
 _COMPILED_MARKER_RE = re.compile(
     r"^<!-- cao-compiled: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z entries=\d+ -->$"
 )
+_VERSION_METADATA_RE = re.compile(r"^<!-- memory-version: (\{[^\n]*\}) -->\n?", re.MULTILINE)
+
+
+def _version_header_end(lines: list[str]) -> int:
+    header_end = 0
+    for index, line in enumerate(lines):
+        if line.startswith("# ") or line.startswith("<!-- id: ") or not line.strip():
+            header_end = index + 1
+            continue
+        break
+    return header_end
+
+
+def _version_header_metadata(preamble: str) -> list[tuple[int, re.Match[str]]]:
+    import json
+
+    lines = preamble.splitlines(keepends=True)
+    matches = []
+    for index in range(_version_header_end(lines), len(lines)):
+        line = lines[index]
+        match = _VERSION_METADATA_RE.fullmatch(line)
+        if match:
+            try:
+                metadata = json.loads(match.group(1))
+            except ValueError:
+                metadata = None
+            if (
+                isinstance(metadata, dict)
+                and isinstance(metadata.get("version"), str)
+                and metadata.get("type") in {"user", "feedback", "project", "reference"}
+                and isinstance(metadata.get("tags"), str)
+            ):
+                matches.append((index, match))
+                continue
+        if line.strip():
+            break
+    return matches
+
+
+def _strip_version_preamble(text: str) -> str:
+    """Remove CAO metadata only from the canonical header, not user-authored introductions."""
+    preamble, separator, entries = text.partition("\n## ")
+    if not separator:
+        return text
+    matches = _version_header_metadata(preamble)
+    if not matches:
+        return text
+    removed = {index for index, _ in matches}
+    return (
+        "".join(
+            line
+            for index, line in enumerate(preamble.splitlines(keepends=True))
+            if index not in removed
+        )
+        + separator
+        + entries
+    )
+
 
 # #861: cap hybrid score/usage widening at 200 per source, never below the requested limit.
 HYBRID_CANDIDATE_MIN = 50
@@ -168,6 +231,10 @@ class MemoryDisabledError(RuntimeError):
     """
 
 
+class MemoryRestoreConflict(RuntimeError):
+    """A concurrent write changed the topic before restore acquired its lock."""
+
+
 class MemoryPartialWriteError(RuntimeError):
     """Raised when durable wiki projections outlive a failed metadata write."""
 
@@ -186,6 +253,7 @@ class MemoryPartialWriteError(RuntimeError):
         self.scope = scope
         self.scope_id = scope_id
         self.file_path = file_path
+        self.superseded: list[SupersededMemory] = []
         self.completed_phases = ["wiki", "index"]
         super().__init__(
             "Memory content and index were saved, but SQLite metadata could not be updated. "
@@ -905,6 +973,9 @@ class MemoryService:
         tags: str = "",
         terminal_context: Optional[dict] = None,
         occurred_at: Optional[datetime] = None,
+        *,
+        auto_supersede: bool = True,
+        _restore_expected_content: Optional[str] = None,
     ) -> Memory:
         """Store or update a memory. Upserts wiki file + index.md.
 
@@ -925,6 +996,11 @@ class MemoryService:
 
         Raises ``MemoryDisabledError`` when ``memory.enabled`` is False
         (U5 / SC-6) — no filesystem or SQLite writes happen.
+
+        With ``memory.supersede.auto`` on in append mode, a changed entry under
+        the same key is reported with a version-pinned undo hint. Other keys
+        are never automatically superseded.
+        ``auto_supersede=False`` skips that step (``restore()`` itself).
         """
         if not _is_memory_enabled():
             raise MemoryDisabledError(MEMORY_DISABLED_MESSAGE)
@@ -1054,17 +1130,33 @@ class MemoryService:
         # .index.lock pattern in _update_index.
         topic_lock_path = wiki_path.parent / f".{wiki_path.stem}.lock"
         topic_lock_fd = open(topic_lock_path, "w")
+        replaced_version = False
         try:
             fcntl.flock(topic_lock_fd, fcntl.LOCK_EX)
 
             # Check if topic file already exists (upsert)
             is_update = wiki_path.exists()
+            if _restore_expected_content is not None and not is_update:
+                raise MemoryRestoreConflict("topic removed before restore")
             memory_id = str(uuid.uuid4())
             created_at = now
 
             if is_update:
                 # Read existing file to get original created_at and id from comment
                 existing_content = wiki_path.read_text(encoding="utf-8")
+                if (
+                    _restore_expected_content is not None
+                    and existing_content != _restore_expected_content
+                ):
+                    raise MemoryRestoreConflict("topic changed before restore")
+                old_header = next(
+                    (
+                        match
+                        for line in existing_content.splitlines()
+                        if (match := TOPIC_HEADER_RE.fullmatch(line))
+                    ),
+                    None,
+                )
                 # Try to extract original id
                 id_match = re.search(r"<!-- id: ([a-f0-9\-]+)", existing_content)
                 if id_match:
@@ -1102,6 +1194,83 @@ class MemoryService:
                 MemoryAppendEntry(content=content, occurred_at=occurred_at, now=now),
             )
             new_content = appended.content
+            from cli_agent_orchestrator.services.settings_service import (
+                get_compile_mode,
+                is_memory_auto_supersede_enabled,
+            )
+
+            compile_mode = "llm"
+            compile_mode_available = False
+            try:
+                compile_mode = get_compile_mode()
+                compile_mode_available = True
+            except Exception:
+                pass
+            if is_update and not is_memory_auto_supersede_enabled():
+                new_content = _strip_version_preamble(new_content)
+            if (
+                is_update
+                and old_header is not None
+                and compile_mode == "append"
+                and is_memory_auto_supersede_enabled()
+                and not any(
+                    _COMPILED_MARKER_RE.fullmatch(line) for line in existing_content.splitlines()
+                )
+            ):
+                old_sections = self._topic_sections(existing_content)
+                if old_sections:
+                    old_version = self._section_version(
+                        old_sections, len(old_sections) - 1, memory_id
+                    )
+                    import json
+
+                    preamble = existing_content.split("\n## ", 1)[0]
+                    retained = []
+                    if not self._latest_version_replaced(new_content):
+                        prior_index = len(old_sections) - 2
+                        while prior_index >= 0 and (
+                            self._strip_existing_see_also(old_sections[prior_index][1]).strip()
+                            == self._strip_existing_see_also(old_sections[-1][1]).strip()
+                        ):
+                            prior_index -= 1
+                        retained = [
+                            match.group(0).strip()
+                            for _, match in _version_header_metadata(preamble)
+                            if prior_index >= 0
+                            and self._metadata_for_version(
+                                match.group(1),
+                                self._section_version(old_sections, prior_index, memory_id),
+                            )
+                            is not None
+                        ]
+                    metadata = json.dumps(
+                        {
+                            "version": old_version,
+                            "type": old_header.group("type").strip(),
+                            "tags": old_header.group("tags"),
+                        },
+                        ensure_ascii=True,
+                    )
+                    preamble_end = new_content.find("\n## ")
+                    if preamble_end != -1:
+                        clean_content = _strip_version_preamble(new_content)
+                        clean_preamble, _, clean_entries = clean_content.partition("\n## ")
+                        marker = "\n".join([*retained, f"<!-- memory-version: {metadata} -->"])
+                        header_lines = clean_preamble.splitlines(keepends=True)
+                        header_end = sum(
+                            len(line) for line in header_lines[: _version_header_end(header_lines)]
+                        )
+                        head = clean_preamble[:header_end]
+                        if head and not head.endswith("\n"):
+                            head += "\n"
+                        new_content = (
+                            head
+                            + marker
+                            + "\n"
+                            + clean_preamble[header_end:]
+                            + "\n## "
+                            + clean_entries
+                        )
             entry_body = appended.entry_body
             timestamp = appended.section_at.strftime("%Y-%m-%dT%H:%M:%SZ")
             timestamp_clamped = appended.timestamp_clamped
@@ -1129,6 +1298,16 @@ class MemoryService:
             tmp_path = wiki_path.parent / f".{wiki_path.stem}.tmp"
             tmp_path.write_text(new_content, encoding="utf-8")
             os.replace(str(tmp_path), str(wiki_path))
+            replaced_version = is_update and self._latest_version_replaced(new_content)
+            sections = self._topic_sections(new_content) if replaced_version else []
+            replaced_at = (
+                self._section_version(sections, len(sections) - 2, memory_id) if sections else None
+            )
+            superseded = (
+                await self._auto_supersede(key, scope, scope_id, replaced_at, compile_mode)
+                if auto_supersede
+                else []
+            )
 
             # LLM wiki compilation, deferred. A coding-agent CLI cold-starts in
             # tens of seconds — far too slow to block store() — so on an "llm"
@@ -1140,9 +1319,7 @@ class MemoryService:
             # would only regurgitate the canonical ``# {key}`` header.
             last_compiled_at: Optional[datetime] = None
             try:
-                from cli_agent_orchestrator.services.settings_service import get_compile_mode
-
-                if is_update and get_compile_mode() == "llm":
+                if is_update and compile_mode_available and compile_mode == "llm":
                     self._schedule_background_compile(
                         scope=scope,
                         scope_id=scope_id,
@@ -1199,12 +1376,14 @@ class MemoryService:
                     scope,
                     scope_id,
                 )
-                raise MemoryPartialWriteError(
+                partial_error = MemoryPartialWriteError(
                     key=key,
                     scope=scope,
                     scope_id=scope_id,
                     file_path=str(wiki_path),
-                ) from e
+                )
+                partial_error.superseded = superseded
+                raise partial_error from e
             try:
                 self._sync_content_link_edges(key, scope, scope_id, new_content)
             except Exception:  # noqa: BLE001 — derived edges are repairable
@@ -1226,7 +1405,7 @@ class MemoryService:
             source_provider = terminal_context.get("provider")
             source_terminal_id = terminal_context.get("terminal_id")
 
-        return Memory(
+        memory = Memory(
             id=memory_id,
             key=key,
             memory_type=memory_type,
@@ -1242,6 +1421,306 @@ class MemoryService:
             action=action,
             timestamp_clamped=timestamp_clamped,
         )
+        memory.superseded = superseded
+        return memory
+
+    # -------------------------------------------------------------------------
+    # Automatic supersede with undo (#1335 change 5)
+    # -------------------------------------------------------------------------
+
+    def _topic_sections(self, text: str) -> list[tuple[str, str]]:
+        """Raw ``(timestamp, body)`` per entry heading, in file order."""
+        from cli_agent_orchestrator.services.settings_service import is_memory_parser_lenient
+
+        matches = list(_CANONICAL_ENTRY_HEADING_RE.finditer(text))
+        if not matches and is_memory_parser_lenient():
+            matches = list(_LENIENT_ENTRY_HEADING_RE.finditer(text))
+        sections: list[tuple[str, str]] = []
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            body = text[match.end() : end].strip()
+            sections.append((match.group(1), body))
+        return sections
+
+    @staticmethod
+    def _section_version(sections: list[tuple[str, str]], index: int, note_id: str) -> str:
+        stamp, body = sections[index]
+        return f"{stamp}#{index}:{hashlib.sha256(f'{note_id}:{body}'.encode()).hexdigest()[:12]}"
+
+    @staticmethod
+    def _metadata_for_version(raw: str, version: str) -> Optional[dict[str, str]]:
+        import json
+
+        try:
+            candidate = json.loads(raw)
+        except ValueError:
+            return None
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("version") == version
+            and candidate.get("type") in {"user", "feedback", "project", "reference"}
+            and isinstance(candidate.get("tags"), str)
+        ):
+            return candidate
+        return None
+
+    def _latest_version_replaced(self, text: str) -> bool:
+        """True when the newest entry hides a different previous entry from recall."""
+        if any(_COMPILED_MARKER_RE.fullmatch(line) for line in text.splitlines()):
+            return False  # recall shows a compiled topic's whole body
+        sections = self._topic_sections(text)
+        return len(sections) >= 2 and (
+            self._strip_existing_see_also(sections[-1][1]).strip()
+            != self._strip_existing_see_also(sections[-2][1]).strip()
+        )
+
+    @staticmethod
+    def _undo_hint(key: str, scope: str, version: str) -> str:
+        return f"memory_restore(key={key!r}, scope={scope!r}, version={version!r})"
+
+    async def _record_supersede_history(
+        self,
+        event: str,
+        *,
+        key: str,
+        scope: str,
+        scope_id: Optional[str],
+        reason: str,
+        superseded_by: str,
+    ) -> None:
+        """One content-free history line per supersede or undo (audit log)."""
+        from cli_agent_orchestrator.services.audit_log import write_audit
+
+        await write_audit(
+            event,
+            f"{reason} {event.removeprefix('memory_')}",
+            key=key,
+            scope=scope,
+            scope_id=scope_id or "",
+            reason=reason,
+            superseded_by=superseded_by,
+        )
+
+    async def _auto_supersede(
+        self,
+        key: str,
+        scope: str,
+        scope_id: Optional[str],
+        replaced_at: Optional[str],
+        compile_mode: str,
+    ) -> list[SupersededMemory]:
+        """Report a changed native entry, only while its history remains append-only."""
+        from cli_agent_orchestrator.services.settings_service import (
+            is_memory_auto_supersede_enabled,
+        )
+
+        if not is_memory_auto_supersede_enabled() or compile_mode != "append":
+            return []
+        superseded: list[SupersededMemory] = []
+        if replaced_at:
+            superseded.append(
+                SupersededMemory(
+                    key=key,
+                    scope=scope,
+                    reason="same_key",
+                    undo=self._undo_hint(key, scope, replaced_at),
+                )
+            )
+            await self._record_supersede_history(
+                "memory_superseded",
+                key=key,
+                scope=scope,
+                scope_id=scope_id,
+                reason="same_key",
+                superseded_by=key,
+            )
+        return superseded
+
+    async def restore(
+        self,
+        key: str,
+        scope: str = "project",
+        terminal_context: Optional[dict] = None,
+        version: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Undo an automatic supersede of a native note (#1335 change 5).
+
+        Restore the requested prior version under the same native key. A version
+        can only replace its immediate successor, and repeated requests are no-ops.
+        """
+        if not _is_memory_enabled():
+            raise MemoryDisabledError(MEMORY_DISABLED_MESSAGE)
+        from cli_agent_orchestrator.services.settings_service import (
+            is_memory_auto_supersede_enabled,
+        )
+
+        if not is_memory_auto_supersede_enabled():
+            return {
+                "success": False,
+                "error_kind": "disabled",
+                "error": "automatic supersede is off",
+            }
+        from cli_agent_orchestrator.services.settings_service import get_compile_mode
+
+        if get_compile_mode() != "append":
+            return {
+                "success": False,
+                "error_kind": "llm_mode",
+                "error": "restore requires append mode",
+            }
+        MemoryScope(scope)
+        from cli_agent_orchestrator.services.memory_scoring import scope_write_allowed
+
+        caller_scope = self.resolve_caller_scope(terminal_context)
+        if not scope_write_allowed(caller_scope, scope):
+            raise PermissionError(
+                f"caller scope {caller_scope!r} may not write target scope {scope!r}"
+            )
+        canonical = self._sanitize_key(key)
+        scope_id = self.resolve_scope_id(scope, terminal_context)
+        from cli_agent_orchestrator.services.settings_service import get_vault_config
+        from cli_agent_orchestrator.services.vault.binding import resolve
+
+        binding = resolve(scope, scope_id, vault_config=get_vault_config())
+        if isinstance(binding, VaultBinding):
+            return {
+                "success": False,
+                "error_kind": "vault_mapped",
+                "error": "restore requires a native memory",
+            }
+        scope_id = binding.scope_id
+        not_found = {
+            "success": False,
+            "error_kind": "not_found",
+            "error": f"memory not found: {canonical}",
+        }
+        if scope_id is None and scope not in {"global", "federated"}:
+            return not_found
+        wiki_path = self.get_wiki_path(scope, scope_id, canonical)
+        if not wiki_path.is_file():
+            return not_found
+        if version is None:
+            return {
+                "success": False,
+                "error_kind": "version_required",
+                "error": "restore requires the exact version from the store undo hint",
+            }
+
+        text = wiki_path.read_text(encoding="utf-8")
+        sections = self._topic_sections(text)
+        id_match = re.search(r"<!-- id: ([a-f0-9\-]+)", text)
+        ordinal = version.partition("#")[2].partition(":")[0]
+        if (
+            id_match is None
+            or not ordinal.isdecimal()
+            or int(ordinal) >= len(sections)
+            or self._section_version(sections, int(ordinal), id_match.group(1)) != version
+        ):
+            return {
+                "success": False,
+                "error_kind": "version_not_found",
+                "error": f"version not found: {version}",
+            }
+        index = int(ordinal)
+        restored_body = re.sub(r"^_Originally recorded: [^\n]+_\n?", "", sections[index][1]).strip()
+        if index < len(sections) - 1 and sections[-1][1] == restored_body:
+            return {
+                "success": True,
+                "key": canonical,
+                "scope": scope,
+                "restored": "already_restored",
+                "restored_from": version,
+            }
+        if index >= len(sections) - 1 or any(
+            self._strip_existing_see_also(body).strip()
+            != self._strip_existing_see_also(sections[index + 1][1]).strip()
+            for _, body in sections[index + 1 :]
+        ):
+            return {
+                "success": False,
+                "error_kind": "stale_version",
+                "error": f"version is not the immediately previous entry: {version}",
+            }
+        if any(_COMPILED_MARKER_RE.fullmatch(line) for line in text.splitlines()) or (
+            self._strip_existing_see_also(sections[index][1]).strip()
+            == self._strip_existing_see_also(sections[index + 1][1]).strip()
+        ):
+            return {
+                "success": False,
+                "error_kind": "nothing_to_restore",
+                "error": f"memory has no superseded version to restore: {canonical}",
+            }
+        _, previous = sections[index]
+        previous = re.sub(r"^_Originally recorded: [^\n]+_\n?", "", previous).strip()
+        metadata = None
+        preamble = text.split("\n## ", 1)[0]
+        for _, metadata_match in _version_header_metadata(preamble):
+            metadata = metadata or self._metadata_for_version(metadata_match.group(1), version)
+        header = next(
+            (match for line in text.splitlines() if (match := TOPIC_HEADER_RE.fullmatch(line))),
+            None,
+        )
+        try:
+            await self.store(
+                previous,
+                scope=scope,
+                memory_type=(
+                    metadata["type"]
+                    if metadata
+                    else (header.group("type").strip() if header else "project")
+                ),
+                key=canonical,
+                tags=metadata["tags"] if metadata else (header.group("tags") if header else ""),
+                terminal_context=terminal_context,
+                auto_supersede=False,
+                _restore_expected_content=text,
+            )
+        except MemoryRestoreConflict:
+            current = self._topic_sections(wiki_path.read_text(encoding="utf-8"))
+            if current and current[-1][1] == previous:
+                return {
+                    "success": True,
+                    "key": canonical,
+                    "scope": scope,
+                    "restored": "already_restored",
+                    "restored_from": version,
+                }
+            return {
+                "success": False,
+                "error_kind": "stale_version",
+                "error": "topic changed before restore",
+            }
+        except MemoryPartialWriteError:
+            await self._record_supersede_history(
+                "memory_supersede_undone",
+                key=canonical,
+                scope=scope,
+                scope_id=scope_id,
+                reason="same_key",
+                superseded_by=canonical,
+            )
+            raise
+        await self._record_supersede_history(
+            "memory_supersede_undone",
+            key=canonical,
+            scope=scope,
+            scope_id=scope_id,
+            reason="same_key",
+            superseded_by=canonical,
+        )
+        return {
+            "success": True,
+            "key": canonical,
+            "scope": scope,
+            "restored": "previous_version",
+            "restored_from": version,
+            "metadata_restored": metadata is not None,
+            "reverse_undo": self._undo_hint(
+                canonical,
+                scope,
+                self._section_version(sections, len(sections) - 1, id_match.group(1)),
+            ),
+        }
 
     def _store_vault_memory(
         self,
@@ -1683,6 +2162,7 @@ class MemoryService:
             if content_links_enabled
             else pre_append_content
         )
+        model_existing = _strip_version_preamble(model_existing)
         model_entry = (
             self._strip_existing_see_also(new_entry) if content_links_enabled else new_entry
         )

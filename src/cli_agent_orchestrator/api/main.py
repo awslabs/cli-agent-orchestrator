@@ -11467,18 +11467,21 @@ def _get_memory_service():
 
 def _memory_partial_write_response(error: Any) -> JSONResponse:
     """Preserve the typed partial-write contract across the HTTP boundary."""
+    partial_write = {
+        "key": error.key,
+        "scope": error.scope,
+        "scope_id": error.scope_id,
+        "file_path": error.file_path,
+        "completed_phases": error.completed_phases,
+        "repair_command": error.repair_command,
+    }
+    if error.superseded:
+        partial_write["superseded"] = [item.model_dump(mode="json") for item in error.superseded]
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
             "error_kind": error.error_kind,
-            "partial_write": {
-                "key": error.key,
-                "scope": error.scope,
-                "scope_id": error.scope_id,
-                "file_path": error.file_path,
-                "completed_phases": error.completed_phases,
-                "repair_command": error.repair_command,
-            },
+            "partial_write": partial_write,
         },
     )
 
@@ -11518,6 +11521,13 @@ class InternalMemoryRecallRequest(BaseModel):
     sort_by: Optional[str] = None
     include_related: bool = False
     record_access: bool = True
+
+
+class InternalMemoryRestoreRequest(BaseModel):
+    key: LenientMemoryKey  # see InternalMemoryStoreRequest.key
+    scope: MemoryScope = MemoryScope.PROJECT
+    version: Optional[str] = None
+    terminal_context: Optional[InternalMemoryContext] = None
 
 
 class InternalMemoryRelatedRequest(BaseModel):
@@ -11565,10 +11575,13 @@ async def internal_memory_store(
         )
     except MemoryPartialWriteError as error:
         return _memory_partial_write_response(error)
-    return {
+    result: Dict[str, Any] = {
         "memory": memory.model_dump(mode="json"),
         "action": memory.action,
     }
+    if memory.superseded:
+        result["superseded"] = [item.model_dump(mode="json") for item in memory.superseded]
+    return result
 
 
 @app.post("/internal/memory/recall")
@@ -11646,6 +11659,35 @@ async def internal_memory_related(
     if result.get("error_kind") == "ambiguous_scope":
         return JSONResponse(status_code=409, content=result)
     return result
+
+
+@app.post("/internal/memory/restore")
+async def internal_memory_restore(
+    body: InternalMemoryRestoreRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Any:
+    """Undo an automatic supersede for a remote CAO worker (#1335)."""
+    _require_memory_enabled()
+    from cli_agent_orchestrator.services.memory_service import MemoryPartialWriteError
+
+    try:
+        return cast(
+            Dict[str, Any],
+            await _get_memory_service().restore(
+                body.key,
+                scope=body.scope.value,
+                version=body.version,
+                terminal_context=(
+                    body.terminal_context.model_dump(exclude_none=True)
+                    if body.terminal_context
+                    else None
+                ),
+            ),
+        )
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
+    except MemoryPartialWriteError as error:
+        return _memory_partial_write_response(error)
 
 
 @app.post("/internal/memory/forget")

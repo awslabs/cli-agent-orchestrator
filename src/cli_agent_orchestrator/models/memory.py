@@ -109,6 +109,19 @@ class MemoryType(str, Enum):
     REFERENCE = "reference"
 
 
+class SupersededMemory(BaseModel):
+    """One note version that a successful store superseded (#1335 change 5).
+
+    ``reason`` is ``same_key`` (a changed entry under the exact same key).
+    ``undo`` is the version-pinned ``memory_restore`` call that reverses it.
+    """
+
+    key: str
+    scope: str
+    reason: str
+    undo: str
+
+
 class Memory(BaseModel):
     """Memory model — represents a stored memory entry."""
 
@@ -142,6 +155,14 @@ class Memory(BaseModel):
         default=None,
         exclude=True,
         description="Transient lifecycle label (e.g. superseded); never persisted or serialized by model_dump.",
+    )
+    superseded: list[SupersededMemory] = Field(
+        default_factory=list,
+        exclude=True,
+        description=(
+            "Transient store-result list of the versions this store superseded; "
+            "never persisted or serialized by model_dump."
+        ),
     )
     is_related: bool = Field(
         default=False,

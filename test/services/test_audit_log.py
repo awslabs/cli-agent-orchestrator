@@ -395,6 +395,9 @@ class TestT9SyncVsNowait:
                 "poison_access_zeroed",
                 "heal_run_completed",
                 "heal_partial_mutation",
+                # #1335 change 5 — supersede history, awaited.
+                "memory_superseded",
+                "memory_supersede_undone",
             }
         )
 

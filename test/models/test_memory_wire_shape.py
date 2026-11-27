@@ -66,6 +66,7 @@ NEVER_SERIALIZED = (
     "is_related",
     "lifecycle_status",
     "redacted_patterns",
+    "superseded",
     "timestamp_clamped",
 )
 
