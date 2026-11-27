@@ -689,24 +689,26 @@ class TestStatusWithCompletionFooter:
             "  Daybreak is currently off. Turn on Daybreak to continue with authorized security work.",
         ]
 
-        # 1. Resized stale frame wrapping tool output and refusal text must NOT complete
+        # 1. Resized stale frame wrapping tool output and splitting a long URL mid-word must NOT complete
         baseline_wide = screen(
             *TASK,
-            "• Ran pytest test/auth.py",
+            "• Ran pytest test/auth/session_revocation_guard_test.py",
             "  └ 4 passed in auth verification suite",
             "",
             *apply_refusal,
         )
         stale_narrow = screen(
             *TASK,
-            "• Ran pytest test/auth.py",
+            "• Ran pytest test/auth/session_",
+            "  revocation_guard_test.py",
             "  └ 4 passed in auth",
             "    verification suite",
             "",
             "ⓘ This content can’t be shown",
             "  We take extra care with some",
             "  cybersecurity requests.",
-            "  Apply for Daybreak: https://chatgpt.com/admin/status-and-access",
+            "  Apply for Daybreak: https://chatgpt.com/admin/",
+            "  status-and-access",
         )
         provider_resize = footer_provider()
         with patch("cli_agent_orchestrator.providers.codex.get_backend") as get_backend:
@@ -715,6 +717,18 @@ class TestStatusWithCompletionFooter:
             provider_resize.mark_input_received()
             provider_resize.record_dispatched_message("Run the next suite.")
         assert provider_resize.get_status_from_screen(stale_narrow) == TerminalStatus.PROCESSING
+
+        # 1b. Expanding the viewport above a clipped baseline (`└ 4 passed`) reveals old header
+        #     without adding new output and must NOT complete
+        clipped_baseline = screen("  └ 4 passed", "", *apply_refusal)
+        expanded_stale = screen("• Ran pytest test/a.py", "  └ 4 passed", "", *apply_refusal)
+        provider_expand = footer_provider()
+        with patch("cli_agent_orchestrator.providers.codex.get_backend") as get_backend:
+            get_backend.return_value.get_history.return_value = "\n".join(clipped_baseline)
+            provider_expand.notify_status_buffer_reset(1)
+            provider_expand.mark_input_received()
+            provider_expand.record_dispatched_message("Run the next suite.")
+        assert provider_expand.get_status_from_screen(expanded_stale) == TerminalStatus.PROCESSING
 
         # 2. Different tool call ending in the exact same `└ 4 passed` row completes
         baseline_tool = screen(
@@ -750,6 +764,23 @@ class TestStatusWithCompletionFooter:
             provider_body.record_dispatched_message("Check security config.")
         assert provider_body.get_status_from_screen(baseline_body) == TerminalStatus.PROCESSING
         assert provider_body.get_status_from_screen(changed_body) == TerminalStatus.COMPLETED
+
+        # 4. Scrolled-off empty retry after an old refusal completes with empty extraction
+        prompt = "Review the security patch."
+        baseline_refused = screen(f"› {prompt}", *apply_refusal)
+        scrolled_empty_retry = screen(f"› {prompt}", "  Worked for 1s • 4:22 PM")
+        provider_empty = footer_provider()
+        with patch("cli_agent_orchestrator.providers.codex.get_backend") as get_backend:
+            get_backend.return_value.get_history.return_value = "\n".join(baseline_refused)
+            provider_empty.notify_status_buffer_reset(1)
+            provider_empty.mark_input_received()
+            provider_empty.record_dispatched_message(prompt)
+        assert (
+            provider_empty.get_status_from_screen(scrolled_empty_retry) == TerminalStatus.COMPLETED
+        )
+        assert (
+            provider_empty.extract_last_message_from_script("\n".join(scrolled_empty_retry)) == ""
+        )
 
     def test_raw_stream_keeps_the_older_rules(self):
         """With CAO_PYTE_STATUS=false the raw stream is parsed. It keeps every

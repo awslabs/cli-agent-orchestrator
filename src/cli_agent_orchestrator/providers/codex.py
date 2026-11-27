@@ -803,38 +803,55 @@ def _extract_content_refusal_cell(text: str, refusal_match: re.Match[str]) -> st
     return tail[:end_pos].strip()
 
 
-def _refusal_cell_tokens(rows: Sequence[str], refusal_idx: int) -> tuple[str, ...]:
-    """Return whitespace-normalized tokens for the refusal cell starting at ``refusal_idx``."""
+def _compact_cell_text(cell_rows: Sequence[str]) -> str:
+    """Collapse all whitespace so soft wraps (including mid-word URL wraps) compare equal."""
+    return "".join("".join(cell_rows).split())
+
+
+def _refusal_cell_compact(rows: Sequence[str], refusal_idx: int) -> str:
+    """Return whitespace-stripped text for the refusal cell starting at ``refusal_idx``."""
     if refusal_idx < 0 or refusal_idx >= len(rows):
-        return ()
+        return ""
     cell = [rows[refusal_idx]]
     for row in rows[refusal_idx + 1 :]:
         if not row.strip() or not row[0].isspace():
             break
         cell.append(row)
-    return tuple(" ".join(cell).split())
+    return _compact_cell_text(cell)
 
 
-def _preceding_cell_tokens(rows: Sequence[str], boundary_idx: int) -> tuple[str, ...]:
-    """Return whitespace-normalized tokens for the cell immediately above ``boundary_idx``."""
+def _preceding_cell_compact(rows: Sequence[str], boundary_idx: int) -> tuple[str, bool]:
+    """Return ``(compact_text, clipped_top)`` for the cell immediately above ``boundary_idx``.
+
+    ``clipped_top`` is True when the cell starts with an indented continuation row
+    at the top of the viewport (its column-0 header was scrolled out of view).
+    """
     idx = boundary_idx - 1
     while idx >= 0 and not rows[idx].strip():
         idx -= 1
     if idx < 0:
-        return ()
+        return "", False
     cell: list[str] = []
+    found_header = False
     while idx >= 0 and rows[idx].strip():
         cell.append(rows[idx])
         if not rows[idx][0].isspace():
+            found_header = True
             break
         idx -= 1
     cell.reverse()
-    return tuple(" ".join(cell).split())
+    return _compact_cell_text(cell), not found_header
 
 
-def _is_token_suffix(shorter: tuple[str, ...], longer: tuple[str, ...]) -> bool:
-    """Return True when ``shorter`` is a non-empty suffix of ``longer``."""
-    return bool(shorter) and len(shorter) <= len(longer) and longer[-len(shorter) :] == shorter
+def _preceding_cell_matches(curr_text: str, base_text: str, base_clipped: bool) -> bool:
+    """Return True when ``curr_text`` is consistent with ``base_text`` across scroll or resize."""
+    if not curr_text:
+        return True
+    if not base_text:
+        return False
+    if base_text.endswith(curr_text):
+        return True
+    return base_clipped and curr_text.endswith(base_text)
 
 
 def _body_rows(text: str) -> list[str]:
@@ -1737,16 +1754,22 @@ class CodexProvider(BaseProvider):
             )
             if mapped_footer is None:
                 # Unlike timestamped completion footers, content-refusal cells are
-                # identical across turns. When the same prompt is retried and refused
-                # again after earlier unique history scrolls off, every context radius
-                # ties in _map_baseline_row. Attribute the newly added echo when the
-                # visible count increased by one and it ends with a terminal refusal
-                # or completion footer.
-                if (
-                    prior_footer is not None
-                    and re.match(CONTENT_REFUSAL_CELL_PATTERN, baseline[prior_footer])
-                    and len(echoes) == len(baseline_echoes) + 1
-                    and (
+                # identical across turns. When the same prompt is retried after a
+                # refusal, _map_baseline_row can return None either because identical
+                # blocks tie after unique history scrolls off or because the prior
+                # refusal scrolled completely out of view. Attribute the newest echo
+                # when the visible count grew by one and ended, or when it ends with
+                # a fresh completion footer not present in the baseline.
+                if prior_footer is not None and re.match(
+                    CONTENT_REFUSAL_CELL_PATTERN, baseline[prior_footer]
+                ):
+                    last_echo_tail = [row for row in rows[echoes[-1][1] :] if row.strip()]
+                    fresh_completion_footer = bool(
+                        last_echo_tail
+                        and _is_completion_footer(last_echo_tail[-1], self._codex_version)
+                        and last_echo_tail[-1] not in baseline
+                    )
+                    repeated_count_ended = len(echoes) == len(baseline_echoes) + 1 and (
                         _find_terminal_content_refusal("\n".join(rows[echoes[-1][1] :])) is not None
                         or _turn_ended_with_footer(
                             "\n".join(rows[echoes[-1][0] :]),
@@ -1754,8 +1777,10 @@ class CodexProvider(BaseProvider):
                             from_user_message=True,
                         )
                     )
-                ):
-                    current_echoes = [echoes[-1]]
+                    if repeated_count_ended or fresh_completion_footer:
+                        current_echoes = [echoes[-1]]
+                    else:
+                        return None
                 else:
                     return None
             else:
@@ -2774,23 +2799,24 @@ class CodexProvider(BaseProvider):
             return False
         base_seq = baseline or ()
         base_refusal_cells = {
-            _refusal_cell_tokens(base_seq, index)
+            _refusal_cell_compact(base_seq, index)
             for index, row in enumerate(base_seq)
             if re.match(CONTENT_REFUSAL_CELL_PATTERN, row)
         }
-        curr_refusal_tokens = _refusal_cell_tokens(rows, last_refusal)
-        if curr_refusal_tokens not in base_refusal_cells:
+        curr_refusal_compact = _refusal_cell_compact(rows, last_refusal)
+        if curr_refusal_compact not in base_refusal_cells:
             return True
-        curr_prev_tokens = _preceding_cell_tokens(rows, last_refusal)
-        if not curr_prev_tokens:
+        curr_prev_compact, _ = _preceding_cell_compact(rows, last_refusal)
+        if not curr_prev_compact:
             return False
         base_prev_cells = [
-            _preceding_cell_tokens(base_seq, index)
+            _preceding_cell_compact(base_seq, index)
             for index, row in enumerate(base_seq)
             if re.match(CONTENT_REFUSAL_CELL_PATTERN, row)
         ]
         return not any(
-            _is_token_suffix(curr_prev_tokens, base_prev) for base_prev in base_prev_cells
+            _preceding_cell_matches(curr_prev_compact, base_prev, base_clipped)
+            for base_prev, base_clipped in base_prev_cells
         )
 
     def _has_current_turn_activity(self, frame: str) -> bool:
@@ -2831,23 +2857,24 @@ class CodexProvider(BaseProvider):
         )
         # A content-refusal heading is constant across turns (unlike a timestamped
         # completion footer), so a radius-0 match can misalign a new refusal onto
-        # an old scrolled-off refusal. Compare whitespace-normalized tokens of the
-        # full refusal cell and its preceding cell so terminal reflow preserves the
-        # historical boundary while changed tool calls, changed refusal bodies, or
-        # fresh activity above a row-0 baseline refusal clear the stale mapping.
+        # an old scrolled-off refusal. Compare compact (whitespace-stripped) text
+        # of the full refusal cell and its preceding cell so both mid-word reflow
+        # and viewport expansion preserve the historical boundary, while changed
+        # tool calls, changed refusal bodies, or fresh activity above a row-0
+        # baseline refusal clear the stale mapping.
         if (
             mapped_boundary is not None
             and baseline is not None
             and prior_boundary is not None
             and re.match(CONTENT_REFUSAL_CELL_PATTERN, baseline[prior_boundary])
         ):
-            base_refusal_tokens = _refusal_cell_tokens(baseline, prior_boundary)
-            curr_refusal_tokens = _refusal_cell_tokens(current_rows, mapped_boundary)
-            base_prev_tokens = _preceding_cell_tokens(baseline, prior_boundary)
-            curr_prev_tokens = _preceding_cell_tokens(current_rows, mapped_boundary)
-            refusal_changed = curr_refusal_tokens != base_refusal_tokens
-            prev_changed = bool(curr_prev_tokens) and not _is_token_suffix(
-                curr_prev_tokens, base_prev_tokens
+            base_refusal_compact = _refusal_cell_compact(baseline, prior_boundary)
+            curr_refusal_compact = _refusal_cell_compact(current_rows, mapped_boundary)
+            base_prev_compact, base_prev_clipped = _preceding_cell_compact(baseline, prior_boundary)
+            curr_prev_compact, _ = _preceding_cell_compact(current_rows, mapped_boundary)
+            refusal_changed = curr_refusal_compact != base_refusal_compact
+            prev_changed = not _preceding_cell_matches(
+                curr_prev_compact, base_prev_compact, base_prev_clipped
             )
             if refusal_changed or prev_changed:
                 mapped_boundary = None
