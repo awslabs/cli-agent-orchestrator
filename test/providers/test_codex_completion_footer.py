@@ -488,6 +488,182 @@ class TestStatusWithCompletionFooter:
         assert provider.get_status_from_screen(retry_frame) == TerminalStatus.COMPLETED
         assert provider.extract_last_message_from_script("\n".join(retry_frame)) == ""
 
+    def test_second_daybreak_refusal_when_baseline_starts_at_refusal_completes(self):
+        """A baseline starting at the previous refusal heading (base_prev is None) must not
+        discard fresh activity when a later identical refusal scrolls the prompt off-screen."""
+        refusal = [
+            "ⓘ This content can’t be shown",
+            "  Apply for Daybreak: https://chatgpt.com/admin/status-and-access",
+        ]
+        baseline_frame = screen(*refusal)
+        provider = footer_provider()
+        with patch("cli_agent_orchestrator.providers.codex.get_backend") as get_backend:
+            get_backend.return_value.get_history.return_value = "\n".join(baseline_frame)
+            provider.notify_status_buffer_reset(1)
+            provider.mark_input_received()
+            provider.record_dispatched_message("Run the auth tests.")
+
+        # Unchanged stale baseline still must not complete
+        assert provider.get_status_from_screen(baseline_frame) == TerminalStatus.PROCESSING
+
+        # Fresh tool output + identical refusal heading completes
+        new_frame = screen("• Ran pytest test/auth.py", "  └ 4 passed", "", *refusal)
+        assert provider.get_status_from_screen(new_frame) == TerminalStatus.COMPLETED
+
+        # Even if the `•` bullet scrolled off and only a fresh continuation row remains
+        scrolled_tool_frame = screen("  └ 4 passed", "", *refusal)
+        assert provider.get_status_from_screen(scrolled_tool_frame) == TerminalStatus.COMPLETED
+
+    def test_repeated_identical_prompt_daybreak_refusal_completes(self):
+        """Retrying the same prompt and getting refused again completes even when only
+        identical prompt+refusal blocks fit in the viewport."""
+        prompt = "Review the security patch."
+        block = [
+            f"› {prompt}",
+            "ⓘ This content can’t be shown",
+            "  We take extra care with some cybersecurity requests.",
+            "  Apply for Daybreak: https://chatgpt.com/admin/status-and-access",
+        ]
+
+        # Case A: viewport starts at old identical turn (1 -> 2 blocks)
+        baseline_a = screen(*block)
+        frame_a = screen(*block, *block)
+        provider_a = footer_provider()
+        with patch("cli_agent_orchestrator.providers.codex.get_backend") as get_backend:
+            get_backend.return_value.get_history.return_value = "\n".join(baseline_a)
+            provider_a.notify_status_buffer_reset(1)
+            provider_a.mark_input_received()
+            provider_a.record_dispatched_message(prompt)
+        assert provider_a.get_status_from_screen(baseline_a) == TerminalStatus.UNKNOWN
+        assert provider_a.get_status_from_screen(frame_a) == TerminalStatus.COMPLETED
+
+        # Case G: third identical attempt with viewport holding only repeats (2 -> 3 blocks)
+        baseline_g = screen(*block, *block)
+        frame_g = screen(*block, *block, *block)
+        provider_g = footer_provider()
+        with patch("cli_agent_orchestrator.providers.codex.get_backend") as get_backend:
+            get_backend.return_value.get_history.return_value = "\n".join(baseline_g)
+            provider_g.notify_status_buffer_reset(1)
+            provider_g.mark_input_received()
+            provider_g.record_dispatched_message(prompt)
+        assert provider_g.get_status_from_screen(frame_g) == TerminalStatus.COMPLETED
+
+        # Case I: third identical attempt after earlier unique history scrolled off
+        baseline_i = screen(
+            "› earlier task", "• earlier answer", "  Worked for 2s • 4:10 PM", *block, *block
+        )
+        frame_i = screen(*block, *block, *block)
+        provider_i = footer_provider()
+        with patch("cli_agent_orchestrator.providers.codex.get_backend") as get_backend:
+            get_backend.return_value.get_history.return_value = "\n".join(baseline_i)
+            provider_i.notify_status_buffer_reset(1)
+            provider_i.mark_input_received()
+            provider_i.record_dispatched_message(prompt)
+        assert provider_i.get_status_from_screen(frame_i) == TerminalStatus.COMPLETED
+
+    def test_daybreak_disabled_picker_is_waiting_user_answer(self):
+        """Notice::Disabled renders the refusal cell and opens an interactive enable picker;
+        CAO must report WAITING_USER_ANSWER so queued inbox text is never typed into it."""
+        disabled_refusal = [
+            "ⓘ This content can’t be shown",
+            "  Daybreak is currently off. Turn on Daybreak to continue with authorized security work.",
+        ]
+        picker = [
+            "  Turn on Daybreak for your next request?",
+            "",
+            "",
+            "› 1. Enable Daybreak",
+            "  2. Not now",
+            "",
+            "  enter select · esc back",
+        ]
+
+        # Picker without status bar
+        no_bar = [*TASK, *disabled_refusal, "", *picker]
+        assert (
+            footer_provider().get_status_from_screen(no_bar) == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+        # Picker with status bar drawn underneath
+        with_bar = [*TASK, *disabled_refusal, "", *picker, STATUS_BAR]
+        assert (
+            footer_provider().get_status_from_screen(with_bar) == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+        # Tool output + refusal + picker
+        after_tool = [
+            *TASK,
+            "• Ran git diff --stat",
+            "  └ 3 files changed",
+            "",
+            *disabled_refusal,
+            "",
+            *picker,
+        ]
+        assert (
+            footer_provider().get_status_from_screen(after_tool)
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+        # With dispatch attribution active
+        provider = footer_provider()
+        with patch("cli_agent_orchestrator.providers.codex.get_backend") as get_backend:
+            get_backend.return_value.get_history.return_value = "\n".join(
+                screen("› prev", "• ok", "  Worked for 1s • 4:18 PM")
+            )
+            provider.notify_status_buffer_reset(1)
+            provider.mark_input_received()
+            provider.record_dispatched_message("Explain the bug")
+        assert provider.get_status_from_screen(with_bar) == TerminalStatus.WAITING_USER_ANSWER
+
+        # Once dismissed back to idle composer, Disabled refusal still completes cleanly
+        dismissed = screen(*TASK, *disabled_refusal)
+        assert footer_provider().get_status_from_screen(dismissed) == TerminalStatus.COMPLETED
+
+    def test_clipped_status_bar_daybreak_extraction_and_trailing_notice_cutoff(self):
+        """With the status bar clipped, extraction excludes the trailing idle composer
+        while preserving genuine submitted prompts, and stops before trailing notices."""
+        daybreak = [
+            "ⓘ This content can’t be shown",
+            "  We take extra care with some cybersecurity requests.",
+            "  Apply for Daybreak: https://chatgpt.com/admin/status-and-access",
+        ]
+        provider = footer_provider()
+
+        # Bare refusal + clipped composer (no status bar)
+        bare_clipped = "\n".join([*TASK, *daybreak, COMPOSER])
+        assert provider.extract_last_message_from_script(bare_clipped) == "\n".join(daybreak)
+
+        # Tool call + refusal + clipped composer (must return refusal, not earlier tool output)
+        tool_clipped = "\n".join(
+            [*TASK, "• Ran git diff --stat", "  └ 10 files changed", "", *daybreak, COMPOSER]
+        )
+        assert provider.extract_last_message_from_script(tool_clipped) == "\n".join(daybreak)
+
+        # Scrolled refusal (no user prompt) + clipped composer (fallback branch)
+        scrolled_clipped = "\n".join([*daybreak, COMPOSER])
+        assert provider.extract_last_message_from_script(scrolled_clipped) == "\n".join(daybreak)
+
+        # Trailing column-0 notices (e.g. usage warnings) after the refusal are not swallowed
+        with_trailing_notices = "\n".join(
+            screen(
+                *TASK,
+                *daybreak,
+                "",
+                "⚠ Approaching weekly usage limit (85% used).",
+                "ⓘ Context compacted.",
+            )
+        )
+        extracted = provider.extract_last_message_from_script(with_trailing_notices)
+        assert extracted == "\n".join(daybreak)
+        assert "Approaching weekly usage limit" not in extracted
+        assert "Context compacted" not in extracted
+
+        # Genuine submitted prompt after an earlier refusal must NOT be stripped as an idle composer
+        pending_next_turn = "\n".join([*TASK, *daybreak, "› Follow-up question"])
+        with pytest.raises(ValueError):
+            provider.extract_last_message_from_script(pending_next_turn)
+
     def test_raw_stream_keeps_the_older_rules(self):
         """With CAO_PYTE_STATUS=false the raw stream is parsed. It keeps every
         redraw, so a stale status bar or footer can follow the live rows."""

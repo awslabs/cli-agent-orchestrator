@@ -494,3 +494,66 @@ def test_codex_stream_error_retries_exhausted_is_a_refusal():
     )
     extracted = CodexProvider("terminal", "session", "window").extract_last_message_from_script(raw)
     assert classify_provider_error("codex", extracted, script_output=raw) is not None
+
+
+def test_codex_clipped_bar_and_trailing_warning_daybreak_classify():
+    """Clipped-status-bar frames, Disabled copy, and trailing column-0 warnings all extract
+    only the refusal cell and classify as ``content_filtered``."""
+    from cli_agent_orchestrator.providers.codex import CodexProvider
+
+    codex = CodexProvider("terminal", "session", "window")
+    daybreak_apply = (
+        "ⓘ This content can’t be shown\n"
+        "  We take extra care with some cybersecurity requests. If you’re doing authorized security work, apply for Daybreak to get\n"
+        "  broader access.\n"
+        "  Learn more: https://help.openai.com/en/articles/20001326\n"
+        "  Apply for Daybreak: https://chatgpt.com/admin/status-and-access"
+    )
+    # 1. Bare refusal with clipped status bar (trailing idle composer only)
+    bare_clipped = f"› Audit auth\n{daybreak_apply}\n› Ask Codex to do anything\n"
+    extracted_bare = codex.extract_last_message_from_script(bare_clipped)
+    assert extracted_bare == daybreak_apply
+    match_bare = classify_provider_error("codex", extracted_bare, script_output=bare_clipped)
+    assert match_bare is not None
+    assert match_bare.slug == "content_filtered"
+
+    # 2. Tool output + refusal with clipped status bar
+    tool_clipped = (
+        f"› Audit auth\n• Ran git diff --stat\n  └ 4 files changed\n\n"
+        f"{daybreak_apply}\n› Ask Codex to do anything\n"
+    )
+    extracted_tool = codex.extract_last_message_from_script(tool_clipped)
+    assert extracted_tool == daybreak_apply
+    match_tool = classify_provider_error("codex", extracted_tool, script_output=tool_clipped)
+    assert match_tool is not None
+    assert match_tool.slug == "content_filtered"
+
+    # 3. Trailing column-0 warnings must not push refusal text over PROVIDER_ERROR_MAX_CHARS
+    with_warnings = (
+        f"› Audit auth\n{daybreak_apply}\n\n"
+        "⚠ Approaching usage limit: 90% of your 5-hour window is used; consider switching models.\n"
+        "⚠ Weekly quota notice: 85% of your weekly quota is used across active Codex sessions.\n"
+        "⚠ Third warning banner that would exceed 512 characters if swallowed into extraction.\n"
+        "› Ask Codex to do anything\n"
+        "  gpt-5.6-codex · ~/project\n"
+    )
+    extracted_clean = codex.extract_last_message_from_script(with_warnings)
+    assert extracted_clean == daybreak_apply
+    assert "⚠" not in extracted_clean
+    match_warn = classify_provider_error("codex", extracted_clean, script_output=with_warnings)
+    assert match_warn is not None
+    assert match_warn.slug == "content_filtered"
+
+    # 4. Notice::Disabled copy (after picker dismissal)
+    disabled = (
+        "› Audit auth\n"
+        "ⓘ This content can’t be shown\n"
+        "  Daybreak is currently off. Turn on Daybreak to continue with authorized security work.\n"
+        "› Ask Codex to do anything\n"
+        "  gpt-5.6-codex · ~/project\n"
+    )
+    extracted_disabled = codex.extract_last_message_from_script(disabled)
+    assert "Daybreak is currently off." in extracted_disabled
+    match_disabled = classify_provider_error("codex", extracted_disabled, script_output=disabled)
+    assert match_disabled is not None
+    assert match_disabled.slug == "content_filtered"

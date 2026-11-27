@@ -397,8 +397,12 @@ APPROVAL_PROMPT_PATTERN = (
 # ctrl+shift+alt: 7 tokens per stroke, 14 in total, so a label is matched as
 # 1-15 whitespace-separated tokens. The bound keeps a same-line prose sentence
 # from bridging an unrelated "Press" to a distant "to confirm".
+# Selection popups rendered by Codex's bottom pane (such as the Daybreak
+# "Turn on Daybreak for your next request?" picker) use a compact dot-separated
+# hint ("enter select · esc back") instead of the "Press ... to ..." sentence.
 APPROVAL_PROMPT_FOOTER = (
-    r"Press \S+(?:[^\S\n]+\S+){0,14} to (?:confirm|cancel|go back|open thread)\b"
+    r"(?:Press \S+(?:[^\S\n]+\S+){0,14} to (?:confirm|cancel|go back|open thread)\b"
+    r"|enter[^\S\n]+select[^\S\n]+·[^\S\n]+esc[^\S\n]+(?:back|cancel|quit)\b)"
 )
 # One numbered menu option: "› 1. Yes, proceed (y)", "  2. No, ... (esc)". The
 # selection cursor is optional here because it sits on exactly one option at a
@@ -774,6 +778,29 @@ def _find_terminal_content_refusal(turn_text: str) -> Optional[re.Match[str]]:
     if re.search(TURN_ACTIVITY_PATTERN, turn_text[last.end() :], re.MULTILINE):
         return None
     return last
+
+
+def _extract_content_refusal_cell(text: str, refusal_match: re.Match[str]) -> str:
+    """Extract only the column-0 refusal cell and its indented body lines.
+
+    Codex renders ``SafetyAccessBlockCell`` with ``ⓘ <title>`` at column 0 and
+    its body/link lines indented by two spaces. Stopping at the first subsequent
+    column-0 non-blank line (or idle prompt) prevents trailing ``⚠``/``ⓘ``
+    notices or a clipped composer row from being concatenated onto the refusal.
+    """
+    tail = text[refusal_match.start() :]
+    idle_after = _strict_idle_prompt_start(tail)
+    end_pos = idle_after if idle_after is not None else len(tail)
+    first_nl = tail.find("\n", 0, end_pos)
+    if first_nl != -1:
+        next_cell = re.search(
+            rf"^(?:[^\s]|[^\S\n]*+{IDLE_PROMPT_PATTERN})",
+            tail[first_nl + 1 : end_pos],
+            re.MULTILINE,
+        )
+        if next_cell is not None:
+            end_pos = first_nl + 1 + next_cell.start()
+    return tail[:end_pos].strip()
 
 
 def _body_rows(text: str) -> list[str]:
@@ -1675,8 +1702,30 @@ class CodexProvider(BaseProvider):
                 else None
             )
             if mapped_footer is None:
-                return None
-            current_echoes = [item for item in echoes if item[0] > mapped_footer]
+                # Unlike timestamped completion footers, content-refusal cells are
+                # identical across turns. When the same prompt is retried and refused
+                # again after earlier unique history scrolls off, every context radius
+                # ties in _map_baseline_row. Attribute the newly added echo when the
+                # visible count increased by one and it ends with a terminal refusal
+                # or completion footer.
+                if (
+                    prior_footer is not None
+                    and re.match(CONTENT_REFUSAL_CELL_PATTERN, baseline[prior_footer])
+                    and len(echoes) == len(baseline_echoes) + 1
+                    and (
+                        _find_terminal_content_refusal("\n".join(rows[echoes[-1][1] :])) is not None
+                        or _turn_ended_with_footer(
+                            "\n".join(rows[echoes[-1][0] :]),
+                            self._codex_version,
+                            from_user_message=True,
+                        )
+                    )
+                ):
+                    current_echoes = [echoes[-1]]
+                else:
+                    return None
+            else:
+                current_echoes = [item for item in echoes if item[0] > mapped_footer]
         else:
             current_echoes = echoes
         if len(current_echoes) != 1:
@@ -2679,8 +2728,18 @@ class CodexProvider(BaseProvider):
             return rows[-1] not in baseline_rows and any(
                 row.strip() and row not in baseline_rows for row in rows[:-1]
             )
-        return any(
-            re.match(CONTENT_REFUSAL_CELL_PATTERN, row) and row not in baseline_rows for row in rows
+        last_refusal = next(
+            (
+                index
+                for index in range(len(rows) - 1, -1, -1)
+                if re.match(CONTENT_REFUSAL_CELL_PATTERN, rows[index])
+            ),
+            None,
+        )
+        if last_refusal is None:
+            return False
+        return rows[last_refusal] not in baseline_rows or any(
+            row.strip() and row not in baseline_rows for row in rows[:last_refusal]
         )
 
     def _has_current_turn_activity(self, frame: str) -> bool:
@@ -2721,8 +2780,10 @@ class CodexProvider(BaseProvider):
         )
         # A content-refusal heading is constant across turns (unlike a timestamped
         # completion footer), so a radius-0 match can misalign a new refusal after
-        # new tool output onto an old scrolled-off refusal. Require matching prior
-        # context when both frames have a non-empty row above the refusal.
+        # new tool output onto an old scrolled-off refusal. If any non-blank row
+        # above the mapped refusal differs from the baseline's preceding row
+        # (including when the baseline started at the refusal so base_prev is
+        # None), it is not the same historical boundary.
         if (
             mapped_boundary is not None
             and baseline is not None
@@ -2737,7 +2798,7 @@ class CodexProvider(BaseProvider):
                 (r for r in reversed(current_rows[:mapped_boundary]) if r.strip()),
                 None,
             )
-            if base_prev is not None and curr_prev is not None and curr_prev != base_prev:
+            if curr_prev is not None and curr_prev != base_prev:
                 mapped_boundary = None
         if mapped_boundary is not None:
             has_activity = any(
@@ -3088,6 +3149,9 @@ class CodexProvider(BaseProvider):
 
         # Primary: find last user message, extract response between it and idle prompt.
         # Exclude the Codex TUI footer from user-message matching when detected.
+        # When the status bar is clipped from a small viewport, also exclude a
+        # trailing idle composer row (empty prompt or built-in placeholder hint)
+        # while keeping genuine submitted prompts intact.
         all_lines = clean_output.splitlines()
         tui_footer_detected = any(
             re.search(TUI_FOOTER_PATTERN, line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]
@@ -3096,6 +3160,21 @@ class CodexProvider(BaseProvider):
             cutoff_pos = _compute_tui_footer_cutoff(all_lines)
         else:
             cutoff_pos = len(clean_output)
+            lines_with_ends = clean_output.splitlines(keepends=True)
+            last_non_blank_idx = next(
+                (
+                    idx
+                    for idx in range(len(lines_with_ends) - 1, -1, -1)
+                    if lines_with_ends[idx].strip()
+                ),
+                None,
+            )
+            if last_non_blank_idx is not None:
+                last_line = lines_with_ends[last_non_blank_idx].rstrip("\r\n")
+                if re.match(STARTUP_IDLE_PLACEHOLDER_PATTERN, last_line) or re.match(
+                    IDLE_PROMPT_STRICT_PATTERN, last_line
+                ):
+                    cutoff_pos = sum(len(line) for line in lines_with_ends[:last_non_blank_idx])
 
         user_matches = [
             m
@@ -3109,38 +3188,31 @@ class CodexProvider(BaseProvider):
             refusal_match = _find_terminal_content_refusal(turn_slice)
 
             if refusal_match is not None:
-                response_start = last_user.start() + refusal_match.start()
+                refusal_text = _extract_content_refusal_cell(turn_slice, refusal_match)
+                if refusal_text:
+                    return refusal_text
+
+            # Extraction uses a stricter anchor than status detection: skip MCP
+            # calls and at least two complete native activity cells before the
+            # model's actual reply, while preserving ambiguous compact groups.
+            asst_after_user = _find_response_marker(clean_output[last_user.start() :])
+
+            if asst_after_user:
+                response_start = last_user.start() + asst_after_user.start()
             else:
-                # Extraction uses a stricter anchor than status detection: skip MCP
-                # calls and at least two complete native activity cells before the
-                # model's actual reply, while preserving ambiguous compact groups.
-                asst_after_user = _find_response_marker(clean_output[last_user.start() :])
+                # No assistant marker found; fall back to skipping one line
+                user_line_end = clean_output.find("\n", last_user.start())
+                if user_line_end == -1:
+                    user_line_end = len(clean_output)
+                response_start = user_line_end + 1
 
-                if asst_after_user:
-                    response_start = last_user.start() + asst_after_user.start()
-                else:
-                    # No assistant marker found; fall back to skipping one line
-                    user_line_end = clean_output.find("\n", last_user.start())
-                    if user_line_end == -1:
-                        user_line_end = len(clean_output)
-                    response_start = user_line_end + 1
-
-            # Find extraction boundary: empty idle prompt, next prompt/composer row,
-            # or TUI footer area. With --no-alt-screen, the TUI footer (› hint +
-            # status bar) has no empty idle prompt; when the status bar is clipped,
-            # stop before any trailing composer prompt row as well.
+            # Find extraction boundary: empty idle prompt or TUI footer area.
+            # With --no-alt-screen, the TUI footer (› hint + status bar) has no
+            # empty idle prompt. Use cutoff_pos as the boundary when TUI is present.
             idle_after = _strict_idle_prompt_start(clean_output[response_start:])
             end_pos = cutoff_pos
             if idle_after is not None:
                 end_pos = min(end_pos, response_start + idle_after)
-            if refusal_match is not None:
-                next_prompt = re.search(
-                    rf"^\s*{IDLE_PROMPT_PATTERN}",
-                    clean_output[response_start:end_pos],
-                    re.MULTILINE,
-                )
-                if next_prompt is not None:
-                    end_pos = min(end_pos, response_start + next_prompt.start())
 
             response_text = clean_output[response_start:end_pos].strip()
 
@@ -3163,17 +3235,7 @@ class CodexProvider(BaseProvider):
         if refusal_match is not None and not re.search(
             USER_PREFIX_PATTERN, clean_output[refusal_match.end() :], re.IGNORECASE | re.MULTILINE
         ):
-            start_pos = refusal_match.start()
-            idle_after = _strict_idle_prompt_start(clean_output[start_pos:])
-            end_pos = start_pos + idle_after if idle_after is not None else len(clean_output)
-            next_prompt = re.search(
-                rf"^\s*{IDLE_PROMPT_PATTERN}",
-                clean_output[start_pos:end_pos],
-                re.MULTILINE,
-            )
-            if next_prompt is not None:
-                end_pos = min(end_pos, start_pos + next_prompt.start())
-            refusal_text = clean_output[start_pos:end_pos].strip()
+            refusal_text = _extract_content_refusal_cell(clean_output, refusal_match)
             if refusal_text:
                 return refusal_text
         all_matches = list(
