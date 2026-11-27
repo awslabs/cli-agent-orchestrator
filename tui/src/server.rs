@@ -625,6 +625,7 @@ fn route(id: CommandId) -> Option<Route> {
         // Experimental Remote CAO is hidden and deliberately has no local API mapping.
         CommandId::RemoteAdd => None,
         CommandId::RemoteCheck => None,
+        CommandId::RemoteConnect => None,
         CommandId::RemoteList => None,
         CommandId::RemoteRemove => None,
 
