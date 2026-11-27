@@ -148,13 +148,15 @@ After the check run, `publish` does three actions. It never approves a PR.
    does not request changes again at a head where an earlier run did. A later
    run dismisses these change requests only when its review is complete, accepts
    no P1 or P2, and the head did not move during the review. Otherwise they stay
-   until a maintainer dismisses them. `publish` changes only the reviews that
-   this workflow wrote.
+   until a maintainer dismisses them. Before each dismissal, `publish` reads the
+   head again, so a push during `publish` keeps the change requests that remain.
+   `publish` changes only the reviews that this workflow wrote.
 2. **CI runs.** A CI run of a PR from a fork waits until a maintainer approves
-   it. `publish` approves the waiting `pull_request` runs of each commit of the
-   PR, oldest first, when the run comes from the head repository of the PR. If
-   the PR head moved during the review, it approves no run, because no review
-   read the new commits.
+   it. `publish` approves the waiting `pull_request` runs of the reviewed head
+   and of the PR commits before it, oldest first, when the run comes from the
+   head repository of the PR. It approves no run of a commit that a push added
+   during the review, because no review read that commit. If the PR head moved
+   during the review, it approves no run.
 3. **Review request.** `publish` requests a review from the maintainer team,
    `REVIEW_TEAM` in the workflow. GitHub cannot assign a team to a PR.
 
@@ -392,9 +394,10 @@ profiles and the PR, and all three come from the dispatched ref.
 - CAO always allows its callback tools, such as `send_message`. A seat can send
   text to another seat of the same run.
 - The PR content goes to the model provider of the selected engine.
-- `publish` approves the waiting CI runs of every commit of the PR, but the
-  review reads only the head. An earlier commit can hold a workflow change that
-  no review read. A run from a fork gets a read-only job token and no secrets.
+- `publish` approves the waiting CI runs of the reviewed head and of the PR
+  commits before it, but the review reads only the head. An earlier commit can
+  hold a workflow change that no review read. A run from a fork gets a read-only
+  job token and no secrets.
 - GitHub does not document whether a change request from `github-actions[bot]`
   blocks a merge under a ruleset. If it does, the PR stays blocked until a later
   complete review or a maintainer dismisses the request.

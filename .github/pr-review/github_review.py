@@ -874,6 +874,35 @@ def change_request_plan(states: list[str], moved: bool) -> tuple[str, str]:
     return "dismiss", "the review accepted no P1 or P2 finding"
 
 
+def _live_head(repo: str, number: int) -> dict[str, Any]:
+    """The head of the PR as GitHub gives it now."""
+    return _dict(_dict(_gh_api(f"repos/{repo}/pulls/{number}")).get("head"))
+
+
+def _reviewed_commits(commits: list[Any], head_sha: str) -> set[str]:
+    """The reviewed head and the commits before it in ``commits``, the PR's commit list.
+
+    A commit that a push added during the review is not an ancestor of the
+    reviewed head, so it is not in the set. The set is empty if the list does not
+    have the reviewed head.
+    """
+    parents: dict[str, list[Any]] = {}
+    for item in commits:
+        entry = _dict(item)
+        sha, links = entry.get("sha"), entry.get("parents")
+        if isinstance(sha, str):
+            links = links if isinstance(links, list) else []
+            parents[sha] = [_dict(link).get("sha") for link in links]
+    found: set[str] = set()
+    todo: list[Any] = [head_sha]
+    while todo:
+        sha = todo.pop()
+        if sha in parents and sha not in found:
+            found.add(sha)
+            todo.extend(parents[sha])
+    return found
+
+
 def _change_request(
     repo: str,
     number: int,
@@ -919,6 +948,13 @@ def _change_request(
     for done, item in enumerate(ours):
         path = f"repos/{repo}/pulls/{number}/reviews/{item['id']}/dismissals"
         try:
+            # The plan comes from an earlier read, and a push since then leaves
+            # the new head unreviewed.
+            if _live_head(repo, number).get("sha") != head_sha:
+                kept = (
+                    f"dismissed {done} of {count} and kept the others" if done else f"kept {count}"
+                )
+                return True, f"{kept}, because the PR head moved after the review started"
             answer = _gh_api(path, method="PUT", payload={"message": message, "event": "DISMISS"})
         except GhError as exc:
             return False, f"dismissed {done} of {count}. {exc}"
@@ -928,19 +964,27 @@ def _change_request(
 
 
 def _approve_ci_runs(repo: str, number: int, head_sha: str) -> tuple[bool, str]:
-    """Approve the waiting runs of the PR's commits, oldest first.
+    """Approve the waiting runs of the reviewed head and the PR commits before it, oldest first.
 
     A run from a fork waits for a maintainer. If the head moved after the review
     started, no review read the new commits, so no run is approved.
     """
-    head = _dict(_dict(_gh_api(f"repos/{repo}/pulls/{number}")).get("head"))
+    head = _live_head(repo, number)
     if head.get("sha") != head_sha:
         return True, "approved none, because the PR head moved after the review started"
     head_repo = _dict(head.get("repo")).get("full_name")
     if not isinstance(head_repo, str) or not REPO_RE.fullmatch(head_repo):
         return True, "approved none, because GitHub gives no head repository for the PR"
     commits, _ = _paged(f"repos/{repo}/pulls/{number}/commits", 3)
-    shas = {_dict(item).get("sha") for item in commits}
+    # A push after the head check adds commits that no review read.
+    reviewed = _reviewed_commits(commits, head_sha)
+    if not reviewed:
+        if len(commits) >= PR_COMMITS_CAP:
+            return False, (
+                f"approved none, because the reviewed head is not in the first {PR_COMMITS_CAP} "
+                "commits that GitHub lists for the PR"
+            )
+        return True, "approved none, because the PR head moved after the review started"
     runs, truncated = _paged(f"repos/{repo}/{WAITING_RUNS}", RUN_PAGE_LIMIT, key="workflow_runs")
     waiting = sorted(
         run["id"]
@@ -948,7 +992,7 @@ def _approve_ci_runs(repo: str, number: int, head_sha: str) -> tuple[bool, str]:
         if type(_dict(run).get("id")) is int
         and run.get("event") == "pull_request"
         and "action_required" in (run.get("status"), run.get("conclusion"))
-        and run.get("head_sha") in shas
+        and run.get("head_sha") in reviewed
         and _dict(run.get("head_repository")).get("full_name") == head_repo
     )
     refused = []

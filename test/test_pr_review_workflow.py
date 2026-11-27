@@ -3643,6 +3643,73 @@ def test_publish_dismisses_its_change_requests_only_after_a_complete_review_of_t
     assert all((write[2] or {}).get("event") != "APPROVE" for write in process.writes())
 
 
+@pytest.mark.parametrize(
+    ("rechecks", "line", "dismissed", "code"),
+    [
+        pytest.param(
+            [NEW_HEAD],
+            "- Change request: kept 2 earlier change requests, because the PR head moved after "
+            "the review started.",
+            [],
+            0,
+            id="moved-before-the-first",
+        ),
+        pytest.param(
+            [HEAD, NEW_HEAD],
+            "- Change request: dismissed 1 of 2 earlier change requests and kept the others, "
+            "because the PR head moved after the review started.",
+            [301],
+            0,
+            id="moved-after-the-first",
+        ),
+        pytest.param(
+            ["error"],
+            "- Change request failed: dismissed 0 of 2 earlier change requests. "
+            f"gh api {PULL} failed: gh: Request failed (HTTP 502).",
+            [],
+            1,
+            id="read-fails",
+        ),
+    ],
+)
+def test_publish_reads_the_head_again_before_each_dismissal(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    rechecks: list[str],
+    line: str,
+    dismissed: list[int],
+    code: int,
+) -> None:
+    _github(process)
+    # The first read finds the reviewed head, so the plan is to dismiss. A push
+    # can land before each dismissal. The last read is the one of the CI runs.
+    process.routes[("GET", PULL)] = [
+        (
+            _http_error(502)
+            if sha == "error"
+            else _ok(_live_pr(head={"sha": sha, "repo": {"full_name": "fork/widgets"}}))
+        )
+        for sha in [HEAD, *rechecks, NEW_HEAD]
+    ]
+    process.routes[("GET", REVIEWS_PAGE)] = _ok(
+        [
+            _change_request_review(github_review, 301, OLD_HEAD),
+            _change_request_review(github_review, 302, OLD_HEAD),
+        ]
+    )
+    # Review 302 has no route, so its dismissal fails the test.
+    process.routes[("PUT", f"{REVIEWS}/301/dismissals")] = _ok({"id": 301, "state": "DISMISSED"})
+
+    assert _publish(github_review, tmp_path, _review(**NOTHING_BLOCKS)) == code
+
+    assert f"{line}\n" in capsys.readouterr().out
+    assert [path for _, path, _ in process.writes() if path.endswith("/dismissals")] == [
+        f"{REVIEWS}/{review_id}/dismissals" for review_id in dismissed
+    ]
+
+
 @pytest.mark.parametrize("case", ["too-many-reviews", "not-dismissed"])
 def test_publish_fails_the_change_request_when_github_cannot_confirm_it(
     github_review: ModuleType,
@@ -3672,14 +3739,21 @@ def test_publish_fails_the_change_request_when_github_cannot_confirm_it(
     assert f"- Change request failed: {text}.\n" in capsys.readouterr().out
 
 
-def test_publish_approves_the_waiting_runs_of_the_pr_commits_oldest_first(
+def test_publish_approves_the_waiting_runs_of_the_reviewed_commits_oldest_first(
     github_review: ModuleType,
     process: FakeProcess,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _github(process)
-    process.routes[("GET", _commits_page(1))] = _ok([{"sha": OLD_HEAD}, {"sha": HEAD}])
+    # NEW_HEAD is a push after the head check, so no review read it.
+    process.routes[("GET", _commits_page(1))] = _ok(
+        [
+            {"sha": OLD_HEAD, "parents": [{"sha": MERGE_BASE}]},
+            {"sha": HEAD, "parents": [{"sha": OLD_HEAD}]},
+            {"sha": NEW_HEAD, "parents": [{"sha": HEAD}]},
+        ]
+    )
     runs = [
         _waiting_run(903),
         _waiting_run(901, OLD_HEAD),
@@ -3687,8 +3761,9 @@ def test_publish_approves_the_waiting_runs_of_the_pr_commits_oldest_first(
         _waiting_run(904, OTHER_COMMIT),
         _waiting_run(905, conclusion="success"),
         _waiting_run(906, event="pull_request_target"),
+        _waiting_run(907, NEW_HEAD),
     ]
-    process.routes[("GET", WAITING_RUNS_PAGE)] = _ok({"total_count": 6, "workflow_runs": runs})
+    process.routes[("GET", WAITING_RUNS_PAGE)] = _ok({"total_count": 7, "workflow_runs": runs})
     # Only runs 901 and 903 have a route, so an approval of another run fails the test.
     for run_id in (901, 903):
         process.routes[("POST", _approve_path(run_id))] = _ok({})
@@ -3720,6 +3795,51 @@ def test_publish_approves_no_run_when_the_pr_has_no_head_repository(
         "- CI runs: approved none, because GitHub gives no head repository for the PR.\n"
         in capsys.readouterr().out
     )
+    assert not [path for _, path, _ in process.writes() if path.endswith("/approve")]
+
+
+@pytest.mark.parametrize(
+    ("listed", "line", "code"),
+    [
+        pytest.param(
+            1,
+            "- CI runs: approved none, because the PR head moved after the review started.",
+            0,
+            id="force-push",
+        ),
+        pytest.param(
+            250,
+            "- CI runs failed: approved none, because the reviewed head is not in the first 250 "
+            "commits that GitHub lists for the PR.",
+            1,
+            id="commit-cap",
+        ),
+    ],
+)
+def test_publish_approves_no_run_when_the_pr_commits_do_not_have_the_reviewed_head(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    listed: int,
+    line: str,
+    code: int,
+) -> None:
+    _github(process)
+    # A force push after the head check replaced the reviewed head.
+    commits = [{"sha": f"{n:040x}", "parents": []} for n in range(1, listed + 1)]
+    for page in range(3):
+        process.routes[("GET", _commits_page(page + 1))] = _ok(
+            commits[page * 100 : page * 100 + 100]
+        )
+    # Run 901 has no approval route, so an approval fails the test.
+    process.routes[("GET", WAITING_RUNS_PAGE)] = _ok(
+        {"workflow_runs": [_waiting_run(901, commits[-1]["sha"])]}
+    )
+
+    assert _publish(github_review, tmp_path, _review()) == code
+
+    assert f"{line}\n" in capsys.readouterr().out
     assert not [path for _, path, _ in process.writes() if path.endswith("/approve")]
 
 
