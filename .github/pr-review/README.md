@@ -189,7 +189,9 @@ failed action does not remove the comment or the check run.
 3. Optional: to spread the reviews over more than one key, add more keys as
    `KIRO_API_KEY_1` to `KIRO_API_KEY_10`. Each run uses one of the keys that are
    set, picked at random. The workflow reads only these names. The log of the
-   "Start cao-server" step names the secret of the run.
+   "Start cao-server" step names the secret of the run. A run does not try
+   another key. So if one key does not work, only the runs that pick it fail.
+   Fix or remove that secret.
 
 Kiro documents API keys for its non-interactive mode. CAO runs Kiro in its
 terminal UI, which also reads `KIRO_API_KEY` at startup. The governance rules of a
