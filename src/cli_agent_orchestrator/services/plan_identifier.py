@@ -94,7 +94,7 @@ slot.
 # Separates a component's byte length from its bytes. The LENGTH PREFIX is what makes the encoding
 # injective, and it is the one place this scheme deliberately DIVERGES from ``v2``.
 #
-# ``step_fingerprint.compute`` joins its ten components with a single ``\x00`` and records the
+# ``step_fingerprint.compute`` joins its components with a single ``\x00`` and records the
 # consequence honestly: safe for ordinary field boundaries — ("a","b") cannot collide with ("ab","") —
 # but NOT injective when a component itself contains ``\x00``, and closing it "means length-prefixed
 # framing, which is a scheme change and therefore a ``v3:`` decision". ``v2`` already had rows on disk,

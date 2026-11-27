@@ -26,6 +26,8 @@ def build_envelope(
     last_message: str,
     status: str,
     terminal_id: Optional[str] = None,
+    *,
+    waited_seconds: Optional[float] = None,
 ) -> StepResultEnvelope:
     """Build the durable envelope for a settled step. TOTAL — never raises (INV-2).
 
@@ -80,6 +82,7 @@ def build_envelope(
         terminal_id=terminal_id,
         truncated=truncated,
         redacted=redacted,
+        waited_seconds=waited_seconds,
     )
 
 
@@ -93,7 +96,8 @@ def serialise_envelope(envelope: StepResultEnvelope) -> str:
     Bounding already happened in ``build_envelope``, so the serialised string is bounded by
     the ``last_message`` limit plus a short status, an id and two booleans.
     """
-    return json.dumps(envelope.model_dump(), separators=(",", ":"))
+    exclude = {"waited_seconds"} if envelope.waited_seconds is None else None
+    return json.dumps(envelope.model_dump(exclude=exclude), separators=(",", ":"))
 
 
 def parse_envelope(result_json: Optional[str]) -> Optional[StepResultEnvelope]:

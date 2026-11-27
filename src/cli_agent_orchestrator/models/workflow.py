@@ -545,6 +545,7 @@ class StepResultEnvelope(BaseModel):
     terminal_id: Optional[str] = None
     truncated: bool = False
     redacted: bool = False
+    waited_seconds: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------

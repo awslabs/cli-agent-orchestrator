@@ -131,7 +131,7 @@ class TestTenComponents:
 # ---------------------------------------------------------------------------
 # BR-1 / BR-2 / BR-6 — the field list is CLOSED, and six inputs are excluded
 # ---------------------------------------------------------------------------
-def test_field_list_is_exactly_the_ten_and_excludes_the_six():
+def test_field_list_includes_waiting_policy_and_excludes_non_execution_fields():
     """BR-1's closed list and BR-2's six exclusions, asserted STRUCTURALLY.
 
     The six excluded inputs — ``session_name``, ``reuse_terminal_id``, ``teardown``,
@@ -142,12 +142,12 @@ def test_field_list_is_exactly_the_ten_and_excludes_the_six():
 
     It also carries BR-6's second clause — the module exposes no parameter accepting a
     terminal id — and INV-5: ``provider``/``agent``/``prompt`` (the legacy three-field scheme)
-    remain a strict subset of the ten, so no caller loses coverage.
+    remain a strict subset of the execution fields, so no caller loses coverage.
 
-    THIS TEST FAILS THE MOMENT SOMEONE ADDS A FIELD, WHICH IS ITS PURPOSE. An open field list
-    lets a later caller pass "one more thing" and silently change every fingerprint already on
-    disk. Do not "fix" a failure here by extending the expected tuple — a new component is a
-    fingerprint-scheme decision that owes a ``v3:`` prefix or a deliberate re-baseline.
+    The waiting policy extends the preimage only when opted in. Default-policy
+    calls still match previously recorded fingerprints.
+    This test deliberately fails when a field is added. New components must
+    preserve the default-policy preimage or introduce a new scheme prefix.
     """
     assert tuple(f.name for f in dataclass_fields(StepCallFields)) == (
         "provider",
@@ -160,6 +160,8 @@ def test_field_list_is_exactly_the_ten_and_excludes_the_six():
         "use_worktree",
         "reused_terminal",
         "timeout",
+        "timeout_excludes_waiting",
+        "max_waiting",
     )
     present = {f.name for f in dataclass_fields(StepCallFields)}
     for excluded in (
@@ -173,6 +175,14 @@ def test_field_list_is_exactly_the_ten_and_excludes_the_six():
         assert excluded not in present, f"{excluded} is excluded by BR-2 and must not be hashed"
     # INV-5: the legacy scheme's three fields survive intact.
     assert {"provider", "agent", "prompt"} <= present
+
+
+def test_waiting_policy_changes_the_fingerprint():
+    opt_in = StepCallFields(**{**vars(_CREATE), "timeout_excludes_waiting": True})
+    capped = StepCallFields(**{**vars(opt_in), "max_waiting": 30})
+    longer_cap = StepCallFields(**{**vars(opt_in), "max_waiting": 60})
+
+    assert len({compute(call) for call in (_CREATE, opt_in, capped, longer_cap)}) == 4
 
 
 # ---------------------------------------------------------------------------

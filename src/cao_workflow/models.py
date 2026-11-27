@@ -29,3 +29,5 @@ class StepHandle:
     exactly, including the ``False`` default — so a hand-constructed
     ``StepHandle`` (an author's own test) keeps working unchanged (BR-10).
     """
+    waited_seconds: float | None = None
+    """Seconds awaiting user answers, when reported by the server."""

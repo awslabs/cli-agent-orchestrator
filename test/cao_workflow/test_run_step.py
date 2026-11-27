@@ -215,6 +215,7 @@ class TestSuccessPath:
         assert handle.terminal_id == "term-42"
         assert handle.output == "done"
         assert handle.status == "COMPLETED"
+        assert handle.waited_seconds is None
         assert captured_body["env_vars"] == {
             "CAO_WORKFLOW_RUN_ID": "run-1",
             "CAO_WORKFLOW_GENERATION": "1",

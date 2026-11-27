@@ -93,6 +93,38 @@ class TestRunStepEndpoint:
         assert resp.status_code == 200
         assert m_run.await_args.kwargs["model"] == "fable-5"
 
+    def test_waiting_options_forwarded_and_reported(self, client):
+        result = AgentStepResult(
+            terminal_id="abc12345",
+            last_message="all done",
+            status=TerminalStatus.COMPLETED,
+            waited_seconds=12.5,
+        )
+        with patch(_RUN_STEP, new=AsyncMock(return_value=result)) as run_step:
+            response = client.post(
+                TERMINALS_RUN_STEP_ROUTE,
+                json=_body(timeout_excludes_waiting=True, max_waiting=30),
+            )
+
+        assert response.status_code == 200
+        assert response.json()["waited_seconds"] == 12.5
+        assert run_step.await_args.kwargs["timeout_excludes_waiting"] is True
+        assert run_step.await_args.kwargs["max_waiting"] == 30
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"max_waiting": 30},
+            {"timeout_excludes_waiting": True, "max_waiting": 0},
+        ],
+    )
+    def test_invalid_waiting_options_return_422(self, client, overrides):
+        with patch(_RUN_STEP, new=AsyncMock()) as run_step:
+            response = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(**overrides))
+
+        assert response.status_code == 422
+        run_step.assert_not_awaited()
+
     def test_successful_one_shot_schedules_elastic_terminal_ended_signal(self):
         from cli_agent_orchestrator.api import main
 

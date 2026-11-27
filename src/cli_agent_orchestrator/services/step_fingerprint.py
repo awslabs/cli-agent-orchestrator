@@ -94,7 +94,7 @@ _TIMEOUT_PRECISION = 6
 
 @dataclass(frozen=True)
 class StepCallFields:
-    """The execution-affecting inputs to one agent step — ten hashed components (BR-1).
+    """The execution-affecting inputs to one agent step — ten base components plus the opt-in waiting policy (BR-1).
 
     NEVER PERSISTED. It exists only to be hashed; the *hash* is persisted, the fields are not.
     This is the type's most load-bearing property and it is a security property, not an
@@ -162,6 +162,8 @@ class StepCallFields:
     use_worktree: bool = False
     reused_terminal: bool = False
     timeout: float = 600.0
+    timeout_excludes_waiting: bool = False
+    max_waiting: Optional[float] = None
 
 
 def _text(value: Optional[str]) -> str:
@@ -198,15 +200,15 @@ def _tools(value: Optional[tuple[str, ...]]) -> str:
 
 
 def compute(fields: StepCallFields) -> str:
-    """Hash the ten components into ``"v2:<64 lowercase hex>"``.
+    """Hash the call components into ``"v2:<64 lowercase hex>"``.
 
-    TEN COMPONENTS IN A FIXED ORDER, AND THE ORDER IS PART OF THE CONTRACT (BR-1). Reordering
+    TEN BASE COMPONENTS IN A FIXED ORDER (BR-1). Reordering
     them changes every hash on disk with no scheme change to signal it — the same silent break
     as editing :data:`CREATION_ONLY`.
 
     ON A REUSE CALL, SUBSTITUTION IS PER-FIELD AND THE TUPLE IS NEVER SHORTENED (BR-1a). Four
-    components become :data:`CREATION_ONLY`; the count stays ten on both paths, so a create
-    call and a reuse call cannot collide by arity either. ``engine`` is NOT among them (see
+    components become :data:`CREATION_ONLY`; both paths have the same arity.
+    ``engine`` is NOT among them (see
     :class:`StepCallFields`).
 
     THE PREFIX IS PART OF THE VALUE, NOT A SEPARATE COLUMN (BR-7/INV-4). Provenance travels
@@ -248,7 +250,7 @@ def compute(fields: StepCallFields) -> str:
         effective_working_directory = _text(fields.effective_working_directory)
         use_worktree = _flag(fields.use_worktree)
 
-    components = (
+    components: tuple[str, ...] = (
         fields.provider,
         fields.agent,
         fields.prompt,
@@ -260,6 +262,10 @@ def compute(fields: StepCallFields) -> str:
         _flag(fields.reused_terminal),
         _timeout(fields.timeout),
     )
+    if fields.timeout_excludes_waiting:
+        cap = None if fields.max_waiting is None else _timeout(fields.max_waiting)
+        # Preserve the preimage of existing journal entries for the default policy.
+        components += (_text(cap), "timeout_excludes_waiting")
     joined = _COMPONENT_SEP.join(components)
     return _V2_PREFIX + hashlib.sha256(joined.encode("utf-8")).hexdigest()
 

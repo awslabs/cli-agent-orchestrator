@@ -45,8 +45,13 @@ Its public surface:
   the same call, **declaring no policy**. That is the only difference between the two. A
   `recovery=` passed to `run_step` lands in `**opts`; the server validates it, the shim does
   not — see below.
-- `StepHandle` has **five** fields: `.step_id`, `.terminal_id`, `.output`, `.status`, and
-  `.replayed`. **`.replayed` qualifies `.terminal_id`.** When it is `True` the server returned
+- Both step calls accept `timeout_excludes_waiting=True` through `**opts` to pause the
+  completion timeout while awaiting user answers. Set `max_waiting` in seconds to bound
+  cumulative waiting. The client adds that cap to its socket budget. Without a cap,
+  user waiting and the socket read have no time limit.
+- `StepHandle` has six fields: `.step_id`, `.terminal_id`, `.output`, `.status`,
+  `.replayed`, and `.waited_seconds`. The last is `None` when the server omits it.
+  **`.replayed` qualifies `.terminal_id`.** When it is `True` the server returned
   a stored result and ran nothing, and `.terminal_id` is the ORIGINAL id — it names a terminal
   that **no longer exists**. That flag is the only thing standing between you and reading,
   writing to, or waiting on a dead id, so check it before you touch `.terminal_id`.
