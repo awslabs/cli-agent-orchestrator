@@ -105,8 +105,12 @@ def load(name: str) -> RemoteBox:
         return RemoteBox(**data)
     except FileNotFoundError as exc:
         raise RemoteConfigError(f"remote box '{name}' is not registered") from exc
-    except (KeyError, OSError, TypeError, ValueError) as exc:
+    except (KeyError, IsADirectoryError, NotADirectoryError, TypeError, ValueError) as exc:
         raise RemoteConfigError(f"remote box '{name}' has invalid configuration") from exc
+    except OSError as exc:
+        raise RemoteConfigError(
+            f"could not load remote box '{name}': {exc.strerror or str(exc)}"
+        ) from exc
 
 
 def list_boxes() -> list[RemoteBox]:
@@ -123,9 +127,20 @@ def list_boxes() -> list[RemoteBox]:
 
 
 def remove(name: str) -> None:
+    target = path_for(name)
     try:
-        path_for(name).unlink()
+        target.unlink()
     except FileNotFoundError as exc:
         raise RemoteConfigError(f"remote box '{name}' is not registered") from exc
-    except OSError as exc:
+    except (IsADirectoryError, NotADirectoryError) as exc:
         raise RemoteConfigError(f"remote box '{name}' has invalid configuration") from exc
+    except PermissionError as exc:
+        if os.path.isdir(target):
+            raise RemoteConfigError(f"remote box '{name}' has invalid configuration") from exc
+        raise RemoteConfigError(
+            f"could not remove remote box '{name}': {exc.strerror or str(exc)}"
+        ) from exc
+    except OSError as exc:
+        raise RemoteConfigError(
+            f"could not remove remote box '{name}': {exc.strerror or str(exc)}"
+        ) from exc
