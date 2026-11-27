@@ -263,6 +263,7 @@ def launch(
         from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
         from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
         from cli_agent_orchestrator.utils.tool_mapping import (
+            copilot_tool_rules,
             format_tool_summary,
             get_disallowed_tools,
             resolve_allowed_tools,
@@ -370,6 +371,13 @@ def launch(
                 # Normal launch: show tool summary and confirm
                 tool_summary = format_tool_summary(resolved_allowed_tools)
                 blocked = get_disallowed_tools(provider, resolved_allowed_tools)
+                if provider == "copilot_cli":
+                    # The names that the provider's flags block: a shell grant
+                    # keeps `url` and hides the web_fetch tool instead.
+                    denied, excluded, builtin_mcps_off = copilot_tool_rules(resolved_allowed_tools)
+                    blocked = sorted(denied + excluded)
+                    if builtin_mcps_off:
+                        blocked.append("built-in MCP servers")
                 blocked_summary = ", ".join(blocked) if blocked else "(none)"
                 level = enforcement_for(provider)
                 if is_install_time(provider):

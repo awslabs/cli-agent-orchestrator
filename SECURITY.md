@@ -148,6 +148,7 @@ from the `dependencies` / `devDependencies` labels in `package.json`:
 | `tui/Cargo.lock` | `cargo tree --locked -e normal --target all` (the release build, `cargo build --release --locked`, uses default features and the package has none) |
 | `examples/**` | nothing: examples ship nothing (one list, `NO_SHIP_PREFIXES`), except the named exceptions in `SHIPPED_EXAMPLES` |
 | `examples/decision-model-host/aws/cdk/package-lock.json` | the lockfile's non-dev packages: a deployable CDK app, whose runtime dependencies run in the deployed stack |
+| `.github/pr-review/copilot/package-lock.json` | the lockfile's non-dev packages: CAO does not ship this Copilot CLI, but the [PR Review workflow](.github/workflows/pr-review.yml) runs it with a credential on untrusted PR text (`PR_REVIEW_TOOL_LOCKFILE`) |
 
 Membership is by package **name**, at any version: a lockfile can hold several versions of
 one package, and a version match would let a bundled vulnerable copy look unbundled.

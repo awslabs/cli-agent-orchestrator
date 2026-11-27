@@ -53,6 +53,8 @@ EXPECTED_PATHS = {
     "/src/cli_agent_orchestrator/services/secret_gate.py",
     "/src/cli_agent_orchestrator/services/vault/",
     "/src/cli_agent_orchestrator/decisions/",
+    "/REVIEW.md",
+    "/.github/pr-review/",
     "/.gitleaksignore",
     "/.trivyignore",
     "/trivy.yaml",
@@ -97,7 +99,7 @@ def test_ruff_gate_uses_root_config():
     ruff_steps = [step for step in steps if "ruff check" in step.get("run", "")]
     assert len(ruff_steps) == 1
     assert ruff_steps[0]["run"] == (
-        "uv run ruff check --config pyproject.toml --no-respect-gitignore src/ test/ examples/"
+        "uv run ruff check --config pyproject.toml --no-respect-gitignore src/ test/ examples/ .github/pr-review/"
     )
 
 

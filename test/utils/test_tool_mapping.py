@@ -292,9 +292,11 @@ class TestClaudeCodeWebFetch:
         assert "web_fetch" not in granted
         assert "google_web_search" not in granted
 
-    def test_web_fetch_noop_for_unmapped_provider(self):
-        """For a provider with no network entry (copilot), web_fetch is a
-        harmless no-op — it maps to nothing and blocks nothing extra."""
+    def test_copilot_web_fetch_gates_url_access(self):
+        """Copilot keeps URL access only with web_fetch, like the other providers."""
+        assert get_disallowed_tools(
+            "copilot_cli", ["@builtin", "fs_read", "fs_list", "@cao-mcp-server"]
+        ) == sorted({"shell", "write", "url"})
         assert get_disallowed_tools("copilot_cli", ["web_fetch", "fs_read"]) == sorted(
             {"shell", "write", "list", "grep"}
         )
@@ -455,6 +457,7 @@ _OTHER_PROVIDER_MAPPINGS_BEFORE = {
         "fs_write": ["write"],
         "fs_list": ["list", "grep"],
         "fs_*": ["read", "write", "list", "grep"],
+        "web_fetch": ["url"],
     },
     "grok_cli": {
         "execute_bash": ["Bash"],

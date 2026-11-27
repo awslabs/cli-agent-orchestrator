@@ -1751,6 +1751,25 @@ def test_launch_gate_blocked_line_matches_the_docs_example(tools):
     assert _blocked_line(result.output) == _docs_blocked_line("  Allowed:  " + ", ".join(tools))
 
 
+@pytest.mark.parametrize(
+    ("tools", "blocked"),
+    [
+        # A shell grant keeps URL access from the shell, so only web_fetch is hidden.
+        (
+            ["@cao-mcp-server", "fs_read", "execute_bash"],
+            "grep, list, web_fetch, write, built-in MCP servers",
+        ),
+        (["@cao-mcp-server", "fs_read"], "grep, list, shell, url, write, built-in MCP servers"),
+        (["@cao-mcp-server", "fs_read", "execute_bash", "web_fetch"], "grep, list, write"),
+    ],
+)
+def test_launch_gate_blocked_line_names_the_copilot_rules_that_apply(tools, blocked):
+    """The Copilot summary names what the provider's flags block, not the raw mapping."""
+    result = _launch_with_tools("copilot_cli", tools)
+    assert result.exit_code == 0, result.output
+    assert _blocked_line(result.output) == f"  Blocked:  {blocked}"
+
+
 def test_launch_gate_warns_when_the_provider_cannot_enforce():
     """A restricted profile on cursor_cli runs unrestricted; the gate must say so
     instead of showing a Blocked list that looks real."""
