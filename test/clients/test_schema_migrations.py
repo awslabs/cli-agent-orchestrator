@@ -167,6 +167,136 @@ def test_insufficient_backup_space_refuses_early(schema_db, monkeypatch):
     assert not (schema_db.parent / "backups").exists()
 
 
+def test_backup_space_requires_twice_file_size(schema_db, monkeypatch):
+    database_module.init_db()
+    with sqlite3.connect(schema_db) as connection:
+        connection.execute("DELETE FROM cao_schema_migrations")
+    size = schema_db.stat().st_size
+    disk = migrations.shutil.disk_usage(schema_db.parent)
+    monkeypatch.setattr(
+        migrations.shutil, "disk_usage", lambda path: disk._replace(free=2 * size - 1)
+    )
+    with pytest.raises(migrations.SchemaBackupError, match="Insufficient free space"):
+        database_module.init_db()
+    assert not (schema_db.parent / "backups").exists()
+    monkeypatch.setattr(migrations.shutil, "disk_usage", lambda path: disk._replace(free=2 * size))
+    database_module.init_db()
+    assert len(list((schema_db.parent / "backups").glob("*.db"))) == 1
+
+
+def test_existing_backup_directory_is_restricted(schema_db):
+    database_module.init_db()
+    with sqlite3.connect(schema_db) as connection:
+        connection.execute("DELETE FROM cao_schema_migrations")
+    directory = schema_db.parent / "backups"
+    directory.mkdir(mode=0o755)
+    directory.chmod(0o755)
+    database_module.init_db()
+    assert directory.stat().st_mode & 0o777 == 0o700
+    assert len(list(directory.glob("*.db"))) == 1
+
+
+def test_failed_backup_removes_partial_copy(schema_db, monkeypatch):
+    database_module.init_db()
+    with sqlite3.connect(schema_db) as connection:
+        connection.execute("DELETE FROM cao_schema_migrations")
+    original = migrations.sqlite3.connect
+
+    class BadCopy(sqlite3.Connection):
+        def execute(self, statement, *args):
+            if statement == "PRAGMA quick_check":
+                return super().execute("SELECT 'corrupt'")
+            return super().execute(statement, *args)
+
+    def connect(path, *args, **kwargs):
+        if path.parent.name == "backups":
+            kwargs["factory"] = BadCopy
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(migrations.sqlite3, "connect", connect)
+    for _ in range(2):
+        with pytest.raises(migrations.SchemaBackupError, match="integrity"):
+            database_module.init_db()
+        assert list((schema_db.parent / "backups").glob("*.db")) == []
+
+
+def test_unreadable_schema_raises_schema_error(schema_db):
+    schema_db.write_bytes(b"not a sqlite database")
+    with pytest.raises(migrations.UnrecognisedSchemaError, match="test.db"):
+        database_module.init_db()
+
+
+def test_invalid_record_shape_raises_schema_error(schema_db):
+    with sqlite3.connect(schema_db) as connection:
+        connection.execute("CREATE TABLE cao_schema_migrations (version INTEGER)")
+    with pytest.raises(migrations.UnrecognisedSchemaError, match="test.db"):
+        database_module.init_db()
+
+
+def test_server_entry_refuses_before_uvicorn(schema_db, monkeypatch, capsys):
+    from cli_agent_orchestrator.api import main
+
+    database_module.init_db()
+    with sqlite3.connect(schema_db) as connection:
+        connection.execute(
+            "INSERT INTO cao_schema_migrations VALUES "
+            "(2, 'future', 'applied', 'future-writer', 'now', 'now', NULL)"
+        )
+    monkeypatch.setattr("sys.argv", ["cao-server"])
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: pytest.fail("uvicorn started"))
+    with pytest.raises(SystemExit) as refusal:
+        main.main()
+    assert refusal.value.code == 1
+    output = capsys.readouterr().err
+    assert "cao-server:" in output
+    assert "Traceback" not in output
+
+
+def test_schema_lock_timeout_names_active_upgrader(schema_db, monkeypatch):
+    monkeypatch.setattr(migrations, "SCHEMA_MIGRATE_LOCK_TIMEOUT_S", 0)
+    monkeypatch.setattr(
+        migrations.fcntl, "flock", lambda *args: (_ for _ in ()).throw(BlockingIOError())
+    )
+    with pytest.raises(migrations.MigrationLockTimeout, match="retry when it finishes"):
+        database_module.init_db()
+
+
+def test_large_upgrade_allows_concurrent_starter():
+    from cli_agent_orchestrator import constants
+
+    assert constants.SCHEMA_MIGRATE_LOCK_TIMEOUT_S >= 60
+
+
+def test_server_probe_does_not_take_exclusive_lock(monkeypatch, tmp_path):
+    monkeypatch.setattr(migrations.server_lock, "SERVER_LOCK_FILE", tmp_path / "server.lock")
+    calls = []
+    monkeypatch.setattr(
+        migrations.fcntl, "flock", lambda descriptor, operation: calls.append(operation)
+    )
+    migrations._check_server()
+    assert calls == [migrations.fcntl.LOCK_SH | migrations.fcntl.LOCK_NB]
+
+
+def test_migration_and_backup_connections_close(schema_db, monkeypatch):
+    database_module.init_db()
+    with sqlite3.connect(schema_db) as connection:
+        connection.execute("DELETE FROM cao_schema_migrations")
+    original = migrations.sqlite3.connect
+    connections = []
+
+    def connect(*args, **kwargs):
+        connection = original(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(migrations.sqlite3, "connect", connect)
+    database_module.init_db()
+    assert len(connections) >= 2
+    for connection in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            connection.execute("SELECT 1")
+
+
 def test_schedule_and_decision_mcp_surface_schema_error(schema_db, monkeypatch):
     from cli_agent_orchestrator.cli.commands.init import init as init_command
     from cli_agent_orchestrator.cli.commands.schedule import schedule

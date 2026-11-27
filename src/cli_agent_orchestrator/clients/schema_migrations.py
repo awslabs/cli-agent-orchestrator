@@ -13,7 +13,7 @@ import os
 import shutil
 import sqlite3
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
@@ -106,7 +106,7 @@ def _writer_version() -> str:
 
 
 @contextmanager
-def _migration_lock(path: Path) -> Iterator[None]:
+def _migration_lock(path: Path) -> Iterator[int]:
     lock = path.parent / constants.SCHEMA_MIGRATE_LOCK_NAME
     descriptor = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
     deadline = time.monotonic() + SCHEMA_MIGRATE_LOCK_TIMEOUT_S
@@ -117,13 +117,23 @@ def _migration_lock(path: Path) -> Iterator[None]:
                 break
             except BlockingIOError as error:
                 if time.monotonic() >= deadline:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    holder = os.read(descriptor, 128).decode("ascii", errors="replace").strip()
                     raise MigrationLockTimeout(
-                        f"Timed out waiting for schema lock {lock}"
+                        f"Another CAO process ({holder or 'holder unknown'}) is upgrading "
+                        f"the database under schema lock {lock}; retry when it finishes"
                     ) from error
                 time.sleep(0.05)
-        yield
+        _lock_phase(descriptor, "checking")
+        yield descriptor
     finally:
         os.close(descriptor)
+
+
+def _lock_phase(descriptor: int, phase: str) -> None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    os.write(descriptor, f"pid {os.getpid()}, phase {phase}".encode("ascii"))
+    os.ftruncate(descriptor, os.lseek(descriptor, 0, os.SEEK_CUR))
 
 
 def _verify_manifest(connection: sqlite3.Connection) -> None:
@@ -143,7 +153,7 @@ def _verify_manifest(connection: sqlite3.Connection) -> None:
         for name in indexes:
             if name not in unique:
                 if name in TOLERATED_UNIQUE_INDEXES:
-                    logger.warning("Missing %s; run cao memory repair", name)
+                    logger.warning("Missing %s; run cao memory repair --apply", name)
                 else:
                     problems.append(f"{table}.{name}")
         for name in NONUNIQUE_INDEXES_V1.get(table, ()):
@@ -163,16 +173,26 @@ def _backup(source: sqlite3.Connection, path: Path, from_version: int) -> Path:
         size = path.stat().st_size
         if shutil.disk_usage(path.parent).free < 2 * size:
             raise SchemaBackupError(
-                f"Insufficient free space for schema backup: need at least {2 * size} bytes"
+                f"Insufficient free space for schema backup of {path}: need at least "
+                f"{2 * size} bytes; clear space, including old backups in {backup_dir}, and retry"
             )
         backup_dir.mkdir(mode=0o700, exist_ok=True)
         os.chmod(backup_dir, 0o700)
         descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.close(descriptor)
-        with sqlite3.connect(destination) as copy:
-            source.backup(copy)
-            if copy.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                raise SchemaBackupError(f"Schema backup failed quick_check: {destination}")
+        try:
+            with closing(sqlite3.connect(destination)) as copy:
+                with copy:
+                    source.backup(copy)
+                    if copy.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                        raise SchemaBackupError(
+                            f"Source database {path} failed backup integrity check; "
+                            "restore a known-good copy or recover with sqlite3 .recover "
+                            "(see docs/updating.md)"
+                        )
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
         return destination
     except (OSError, sqlite3.Error) as error:
         raise SchemaBackupError(f"Cannot back up database before upgrade: {error}") from error
@@ -183,7 +203,7 @@ def _check_server() -> None:
     descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
     try:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError as error:
             holder = server_lock.read_holder(lock_path)
             detail = f" (held by pid {holder.pid}, version {holder.version})" if holder else ""
@@ -203,7 +223,9 @@ def _classify(connection: sqlite3.Connection) -> tuple[int, bool, str | None]:
         return 0, True, None
     if RECORD_TABLE not in tables:
         if "terminals" not in tables:
-            raise UnrecognisedSchemaError("Unrecognised database schema; restore a CAO backup")
+            raise UnrecognisedSchemaError(
+                "Unrecognised database schema; restore a CAO backup (see docs/updating.md)"
+            )
         return 0, False, None
     rows = connection.execute(
         "SELECT version, name, state, cao_version, backup_path "
@@ -215,34 +237,71 @@ def _classify(connection: sqlite3.Connection) -> tuple[int, bool, str | None]:
             raise SchemaTooNewError(
                 f"Schema version {step_version} written by CAO {writer} exceeds or is unknown "
                 f"to this binary (HEAD {HEAD}); upgrade CAO, or restore the backup made "
-                "before that upgrade"
+                f"before that upgrade ({backup_path or 'no recorded backup'}); see docs/updating.md"
             )
         if state == "started" and not known[step_version].rerunnable:
             raise MigrationInterruptedError(
-                f"Migration {step_version} was interrupted; restore backup {backup_path}"
+                f"Migration {step_version} was interrupted; restore "
+                f"{backup_path or 'a known-good backup'} (see docs/updating.md)"
             )
     applied = max((row[0] for row in rows if row[2] == "applied"), default=0)
     if any(
         step not in {row[0] for row in rows if row[2] == "applied"}
         for step in range(1, applied + 1)
     ):
-        raise SchemaTooNewError("Unknown gap in schema history; restore a matching backup")
+        raise SchemaTooNewError(
+            "Unknown gap in schema history; restore a matching backup (see docs/updating.md)"
+        )
     pending_backup = next((row[4] for row in rows if row[2] == "started"), None)
     return applied, False, pending_backup
+
+
+def _classify_safe(connection: sqlite3.Connection, path: Path) -> tuple[int, bool, str | None]:
+    try:
+        return _classify(connection)
+    except sqlite3.DatabaseError as error:
+        raise UnrecognisedSchemaError(
+            f"Cannot read CAO schema in {path}: {error}; restore a known-good "
+            "backup (see docs/updating.md)"
+        ) from error
+    except SchemaError as error:
+        raise type(error)(f"{path}: {error}") from error
+
+
+def check() -> None:
+    """Read-only compatibility check before uvicorn owns the startup lifecycle."""
+    path = constants.DATABASE_FILE
+    if not path.exists():
+        return
+    with _migration_lock(path):
+        try:
+            with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as connection:
+                _classify_safe(connection, path)
+        except sqlite3.DatabaseError as error:
+            raise UnrecognisedSchemaError(
+                f"Cannot read CAO schema in {path}: {error}; see docs/updating.md"
+            ) from error
 
 
 def migrate(*, caller: str = "cli") -> None:
     """Refuse incompatible files before running any legacy schema operation."""
     path = constants.DATABASE_FILE
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with _migration_lock(path):
-        with sqlite3.connect(path, isolation_level=None) as connection:
-            current, fresh, pending_backup = _classify(connection)
+    with _migration_lock(path) as lock_descriptor:
+        try:
+            connection = sqlite3.connect(path, isolation_level=None)
+        except sqlite3.DatabaseError as error:
+            raise UnrecognisedSchemaError(
+                f"Cannot read CAO schema in {path}: {error}; see docs/updating.md"
+            ) from error
+        with closing(connection), connection:
+            current, fresh, pending_backup = _classify_safe(connection, path)
             steps = [step for step in MIGRATIONS if step.version > current]
             if caller != "server" and any(step.version > 1 for step in steps):
                 _check_server()
             backup_path = pending_backup
             if not fresh and steps and backup_path is None:
+                _lock_phase(lock_descriptor, "backing up")
                 try:
                     backup_path = str(_backup(connection, path, current))
                 except SchemaBackupError:
@@ -251,6 +310,7 @@ def migrate(*, caller: str = "cli") -> None:
                     raise SchemaBackupError(f"Cannot back up database: {error}") from error
             connection.execute(CREATE_RECORD)
             for step in steps:
+                _lock_phase(lock_descriptor, f"applying v{step.version}")
                 try:
                     if step.transactional:
                         connection.execute("BEGIN IMMEDIATE")
@@ -273,14 +333,17 @@ def migrate(*, caller: str = "cli") -> None:
                         connection.execute("ROLLBACK")
                     raise MigrationFailedError(
                         f"Migration {step.version} ({step.name}) failed: {error}; "
-                        f"backup: {backup_path}"
+                        f"restore {backup_path or 'a known-good backup'} "
+                        f"(see docs/updating.md); database: {path}"
                     ) from error
             if HEAD == 1 and current == 1:
                 try:
                     _apply_baseline(connection)
                 except Exception as error:
                     raise MigrationFailedError(
-                        f"Baseline verification failed: {error}; backup: {backup_path}"
+                        f"Baseline verification failed: {error}; restore "
+                        f"{backup_path or 'a known-good backup'} "
+                        f"(see docs/updating.md); database: {path}"
                     ) from error
             from cli_agent_orchestrator.clients.database import _restrict_db_file_permissions
 
