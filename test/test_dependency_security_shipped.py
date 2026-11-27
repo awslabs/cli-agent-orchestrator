@@ -645,35 +645,69 @@ def test_tracked_lockfile_without_a_producer_fails_closed(tmp_path, monkeypatch)
         audit.collect_shipped_sets(tmp_path, INPUTS + [Path("newproject/package-lock.json")])
 
 
-def test_the_pr_review_tool_lockfile_ships_nothing(tmp_path, monkeypatch):
-    # The pr-review workflow installs Copilot CLI from it on a runner; CAO does not ship it.
-    _all_producers(monkeypatch)
-    lockfile = Path(".github/pr-review/copilot/package-lock.json")
-    sets = audit.collect_shipped_sets(tmp_path, INPUTS + [lockfile])
-    assert lockfile.as_posix() not in sets
-
-
 @pytest.mark.parametrize(
-    "lockfile, prefix",
+    ("package", "version"),
     [
-        ("examples/demo/package-lock.json", "examples/"),
-        (".github/pr-review/copilot/package-lock.json", ".github/pr-review/"),
+        ("@github/copilot", "1.0.114"),
+        ("@github/copilot-linux-x64", "1.0.114"),
+        ("detect-libc", "2.1.2"),
     ],
 )
-def test_a_finding_that_ships_nothing_names_its_prefix(lockfile, prefix):
-    finding = {
-        "path": lockfile,
-        "advisory": "CVE-2099-20001",
-        "severity": "CRITICAL",
-        "package": "react",
-        "version": "18.3.1",
-        "fixed_version": "",
-        "malware": False,
-    }
-    inventory = [{"path": lockfile, "ecosystem": "npm", "_graph": []}]
-    [out] = audit.classify_findings([finding], inventory, shipped_set()["sets"], [])
-    assert out["classification"] == "toolchain"
-    assert out["reason"] == f"ships nothing ({prefix})"
+def test_a_finding_in_the_pr_review_tool_lockfile_blocks(tmp_path, monkeypatch, package, version):
+    # The PR Review workflow runs this Copilot CLI with a credential on untrusted PR text.
+    # A CRITICAL with no fix blocks on the package, its optional platform binary and its
+    # dependency, as for shipped code.
+    lockfile = audit.PR_REVIEW_TOOL_LOCKFILE
+    root = tmp_path / "repository"
+    (root / lockfile).parent.mkdir(parents=True)
+    (root / lockfile).write_text(
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"dependencies": {"@github/copilot": "1.0.114"}},
+                    "node_modules/@github/copilot": {"version": "1.0.114"},
+                    "node_modules/@github/copilot-linux-x64": {
+                        "version": "1.0.114",
+                        "optional": True,
+                    },
+                    "node_modules/detect-libc": {"version": "2.1.2"},
+                },
+            }
+        )
+    )
+    subprocess.run(["git", "init", "--quiet", str(root)], check=True)
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    monkeypatch.setattr(audit, "__file__", str(root / "scripts" / "dependency_security.py"))
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    packages = [
+        pkg("@github/copilot", "1.0.114"),
+        pkg("@github/copilot-linux-x64", "1.0.114"),
+        pkg("detect-libc", "2.1.2"),
+    ]
+    fake_trivy(
+        monkeypatch,
+        {
+            "SchemaVersion": 2,
+            "Results": [
+                {
+                    "Target": lockfile,
+                    "Type": "npm",
+                    "Packages": packages,
+                    "Vulnerabilities": [vuln(package, version, severity="CRITICAL")],
+                }
+            ],
+        },
+    )
+    out = tmp_path / "out"
+
+    code = audit.main(
+        ["--output-dir", str(out), "--today", TODAY, "--ignore-file", str(tmp_path / "none.yaml")]
+    )
+
+    report = json.loads((out / "report.json").read_text())
+    assert code == audit.EXIT_BLOCKED == 1, report.get("error")
+    assert [finding["classification"] for finding in report["findings"]] == ["shipped"]
 
 
 # ── #1398 box 5: ignore-file validation ──────────────────────────────────────

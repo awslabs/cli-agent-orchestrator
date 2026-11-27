@@ -11,8 +11,7 @@ advisories included). Each finding is then classified:
 * ``shipped``   - the (package, version) is in the shipped set measured from the build.
   A HIGH/CRITICAL shipped finding blocks, exactly as #884 does, unless a valid,
   unexpired ignore-file entry covers it.
-* ``toolchain`` - everything else (devDependencies, build tooling, ``examples/``,
-  ``.github/pr-review/``).
+* ``toolchain`` - everything else (devDependencies, build tooling, ``examples/``).
   Listed in the step summary, ``report.json`` and ``toolchain.sarif``; never blocks.
 
 CLI
@@ -32,11 +31,11 @@ CLI
 Exit codes: ``0`` passed (toolchain findings and warnings allowed); ``1`` blocked (a
 shipped HIGH/CRITICAL not covered by a valid unexpired ignore entry); ``2`` error, which
 fails closed: a producer failed or returned an empty set, a tracked lockfile has no
-producer (except under ``NO_SHIP_PREFIXES``), the scanner report is malformed, or the
-ignore file is invalid. ``report.status`` is ``passed`` / ``blocked`` / ``error``.
+producer (except ``examples/``), the scanner report is malformed, or the ignore file is
+invalid. ``report.status`` is ``passed`` / ``blocked`` / ``error``.
 
 shipped-set.json (written by ``collect_shipped_sets``; one entry per tracked lockfile
-that ships code; lockfiles under ``NO_SHIP_PREFIXES`` are deliberately absent)::
+that ships code; ``examples/**`` lockfiles are deliberately absent)::
 
     {"schema": 1,
      "sets": {
@@ -610,9 +609,7 @@ def scan(
 # --- #1398: shipped-set gate ----------------------------------------------------------
 
 #: Lockfiles under these prefixes ship nothing and are always ``toolchain``.
-#: ``.github/pr-review/`` holds the Copilot CLI that the pr-review workflow installs
-#: with ``npm ci``: CI tooling that CAO does not ship.
-NO_SHIP_PREFIXES = ("examples/", ".github/pr-review/")
+NO_SHIP_PREFIXES = ("examples/",)
 #: Named exceptions to NO_SHIP_PREFIXES: example lockfiles whose code is deployed, so their
 #: runtime (non-dev) packages are shipped. Owner ruling on #1400: the decision-model-host
 #: CDK app is a deployable stack, so what it installs at deploy time runs in an account.
@@ -621,6 +618,9 @@ SHIPPED_EXAMPLES = {
         "deployable CDK app: its runtime dependencies run in the deployed stack"
     ),
 }
+#: CAO does not ship this Copilot CLI, but the PR Review workflow runs it with a credential
+#: on untrusted PR text, so its runtime (non-dev) packages are gated like shipped ones.
+PR_REVIEW_TOOL_LOCKFILE = ".github/pr-review/copilot/package-lock.json"
 
 
 def ships_nothing(lockfile: str) -> bool:
@@ -1061,6 +1061,10 @@ def _producers(root: Path, policy: dict | None = None) -> dict[str, tuple[str, o
         "web/package-lock.json": ("bundled-packages.json", bundled("web")),
         "cao_mcp_apps/package-lock.json": ("bundled-packages.json", bundled("cao_mcp_apps")),
         "docusaurus/package-lock.json": ("bundled-packages.json", docusaurus),
+        PR_REVIEW_TOOL_LOCKFILE: (
+            "package-lock.json non-dev packages",
+            lambda: npm_runtime_packages(root, PR_REVIEW_TOOL_LOCKFILE),
+        ),
         **{
             lockfile: (
                 "package-lock.json non-dev packages",
@@ -1387,8 +1391,7 @@ def classify_findings(
         ecosystem = ecosystems.get(path, "")
         name = _canonical(ecosystem, finding["package"])
         if ships_nothing(path):
-            prefix = next(p for p in NO_SHIP_PREFIXES if path.startswith(p))
-            record["classification"], record["reason"] = "toolchain", f"ships nothing ({prefix})"
+            record["classification"], record["reason"] = "toolchain", "ships nothing (examples/)"
         elif path not in members:
             record["classification"] = "shipped"
             record["reason"] = "no shipped set for this lockfile; treated as shipped"

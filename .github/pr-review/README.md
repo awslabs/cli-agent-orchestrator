@@ -372,7 +372,10 @@ one run.
 - **Pinned tools.** Kiro CLI is a pinned release with a SHA-256 check. Copilot CLI
   comes from the committed lockfile in [`copilot/`](copilot/), installed with
   `npm ci --ignore-scripts`, which checks the integrity hash of each package and
-  runs no install script. The filtered environment has no `CI`, so
+  runs no install script. The
+  [dependency gate](../../SECURITY.md#shipped-set-and-toolchain-findings) blocks
+  a HIGH or CRITICAL advisory on its runtime packages, as for shipped code.
+  The filtered environment has no `CI`, so
   `COPILOT_AUTO_UPDATE=false` stops Copilot CLI from downloading a newer
   version. Each action is pinned to a commit SHA. `uv` installs the committed
   `uv.lock`. No cache is used.
