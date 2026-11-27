@@ -65,8 +65,7 @@ def write_ddl(name: str, commit: str, db: Path) -> None:
         ).fetchall()
     output = Path(__file__).parent / f"{name}.sql"
     statements = (
-        "\n".join(line.rstrip() for line in row[0].rstrip("; ").splitlines()) + ";"
-        for row in rows
+        "\n".join(line.rstrip() for line in row[0].rstrip("; ").splitlines()) + ";" for row in rows
     )
     output.write_text(
         f"-- Schema from {name}, commit {commit}; DDL only, no rows.\n"
