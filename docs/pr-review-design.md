@@ -290,7 +290,7 @@ reason given. "Later" means work after this design.
 | Cancel an older run of the same PR | #1350 step 10. The latest dispatch is the one that a maintainer wants. |
 | The driver waits until each seat ends | The step call can return before CAO ends the step. The driver reads the reports only after each step ends, or after a fixed wait. |
 | Copilot CLI from a lockfile, installed with `npm ci --ignore-scripts` | Pins each dependency of the CLI, not only the CLI version. The filtered environment has no `CI`, so `COPILOT_AUTO_UPDATE=false` keeps that version at run time. |
-| Use one Kiro key for each run, picked at random from the keys that are set | The owners chose this, to spread the reviews over more than one key. A step gets a secret only by its name, so the workflow names `KIRO_API_KEY` and `KIRO_API_KEY_2` to `KIRO_API_KEY_10`, and skips an empty one. Only the picked key reaches the agents. |
+| Use one Kiro key for each run, picked at random from the keys that are set | The owners chose this, to spread the reviews over more than one key. A step gets a secret only by its name, so the workflow names `KIRO_API_KEY` and `KIRO_API_KEY_1` to `KIRO_API_KEY_10`, and skips an empty one. Only the picked key reaches the agents. |
 
 ## Owner decisions
 

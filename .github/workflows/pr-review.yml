@@ -301,6 +301,7 @@ jobs:
           # Each engine gets only its own credential. A secret that is not set
           # is empty.
           KIRO_API_KEY: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY || '' }}
+          KIRO_API_KEY_1: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_1 || '' }}
           KIRO_API_KEY_2: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_2 || '' }}
           KIRO_API_KEY_3: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_3 || '' }}
           KIRO_API_KEY_4: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_4 || '' }}
@@ -319,8 +320,8 @@ jobs:
               # Use one of the Kiro keys that are set, picked at random. Only
               # the picked key goes on, as KIRO_API_KEY.
               keys=()
-              for name in KIRO_API_KEY KIRO_API_KEY_2 KIRO_API_KEY_3 KIRO_API_KEY_4 KIRO_API_KEY_5 \
-                KIRO_API_KEY_6 KIRO_API_KEY_7 KIRO_API_KEY_8 KIRO_API_KEY_9 KIRO_API_KEY_10; do
+              for name in KIRO_API_KEY KIRO_API_KEY_1 KIRO_API_KEY_2 KIRO_API_KEY_3 KIRO_API_KEY_4 \
+                KIRO_API_KEY_5 KIRO_API_KEY_6 KIRO_API_KEY_7 KIRO_API_KEY_8 KIRO_API_KEY_9 KIRO_API_KEY_10; do
                 if [ -n "$(printenv "$name")" ]; then
                   keys+=("$name")
                 fi
@@ -500,6 +501,7 @@ jobs:
         env:
           # Each engine gets only its own credentials, as in "Start cao-server".
           KIRO_API_KEY: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY || '' }}
+          KIRO_API_KEY_1: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_1 || '' }}
           KIRO_API_KEY_2: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_2 || '' }}
           KIRO_API_KEY_3: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_3 || '' }}
           KIRO_API_KEY_4: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_4 || '' }}
@@ -515,9 +517,10 @@ jobs:
           review="$RUNNER_TEMP/pr-review/evidence/review.json"
           # check-secrets does not check a variable that is empty.
           python3 trusted/.github/pr-review/github_review.py check-secrets --file "$review" \
-            --env KIRO_API_KEY --env KIRO_API_KEY_2 --env KIRO_API_KEY_3 --env KIRO_API_KEY_4 \
-            --env KIRO_API_KEY_5 --env KIRO_API_KEY_6 --env KIRO_API_KEY_7 --env KIRO_API_KEY_8 \
-            --env KIRO_API_KEY_9 --env KIRO_API_KEY_10 --env COPILOT_GITHUB_TOKEN --env GITHUB_TOKEN
+            --env KIRO_API_KEY --env KIRO_API_KEY_1 --env KIRO_API_KEY_2 --env KIRO_API_KEY_3 \
+            --env KIRO_API_KEY_4 --env KIRO_API_KEY_5 --env KIRO_API_KEY_6 --env KIRO_API_KEY_7 \
+            --env KIRO_API_KEY_8 --env KIRO_API_KEY_9 --env KIRO_API_KEY_10 \
+            --env COPILOT_GITHUB_TOKEN --env GITHUB_TOKEN
           if ! jq -e '.publishable == true' "$review" > /dev/null; then
             reason="$(jq -r '.blocked_reason // "unknown" | @json' "$review")"
             echo "::error::Blocked: the review is not publishable: $reason"

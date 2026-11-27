@@ -183,7 +183,7 @@ failed action does not remove the comment or the check run.
    ```
 
 3. Optional: to spread the reviews over more than one key, add more keys as
-   `KIRO_API_KEY_2` to `KIRO_API_KEY_10`. Each run uses one of the keys that are
+   `KIRO_API_KEY_1` to `KIRO_API_KEY_10`. Each run uses one of the keys that are
    set, picked at random. The workflow reads only these names. The log of the
    "Start cao-server" step names the secret of the run.
 
@@ -230,7 +230,7 @@ repository secret. After the workflow is on the default branch, do these steps:
    gh secret delete KIRO_API_KEY --repo OWNER/REPO
    ```
 
-   Do the same for `KIRO_API_KEY_2` to `KIRO_API_KEY_10`, and for
+   Do the same for `KIRO_API_KEY_1` to `KIRO_API_KEY_10`, and for
    `COPILOT_GITHUB_TOKEN`, if you use them.
 
 Then only a run from the default branch can start the `review` job. Do not add a
@@ -433,7 +433,7 @@ profiles and the PR, and all three come from the dispatched ref.
 
 | Message | Cause |
 | --- | --- |
-| `The kiro_cli engine needs a KIRO_API_KEY secret.` | No Kiro key is set: `KIRO_API_KEY` and `KIRO_API_KEY_2` to `KIRO_API_KEY_10` are all empty. |
+| `The kiro_cli engine needs a KIRO_API_KEY secret.` | No Kiro key is set: `KIRO_API_KEY` and `KIRO_API_KEY_1` to `KIRO_API_KEY_10` are all empty. |
 | `A model name is not valid.` | A model name has more than 100 characters, or a character that is not a letter, a digit, `.`, `_`, `:`, `/` or `-`. |
 | `Kiro CLI did not list the models of the … account.` | `kiro-cli chat --list-models` failed or returned no model list. Check the key that the message names, and its subscription. The step log shows the Kiro CLI messages. |
 | `The … account does not offer the model …` | The account of the key that the message names cannot use this model. For example, an administrator did not approve the model, or the model is not available in the geography of the account. Select a model from the list in the message. Then change `KIRO_MODEL_A` or `KIRO_MODEL_B`, or set the input. |

@@ -4326,7 +4326,7 @@ def test_summary_refuses_and_never_shows_the_review(
 WORKFLOW_FILE = REPO_ROOT / ".github" / "workflows" / "pr-review.yml"
 COPILOT_DIR = REVIEW_DIR / "copilot"
 JOB_TOKEN = "${{ github.token }}"
-KIRO_KEYS = ("KIRO_API_KEY", *(f"KIRO_API_KEY_{n}" for n in range(2, 11)))
+KIRO_KEYS = ("KIRO_API_KEY", *(f"KIRO_API_KEY_{n}" for n in range(1, 11)))
 # Each engine credential is empty unless the run uses that engine.
 ENGINE_CREDENTIALS = {
     **{
@@ -4541,6 +4541,10 @@ def _start_kiro_cli(
     "keys",
     [
         pytest.param({"KIRO_API_KEY": "set-first"}, id="only-the-first-key"),
+        pytest.param(
+            {"KIRO_API_KEY": "set-first", "KIRO_API_KEY_1": "set-one"},
+            id="the-first-key-and-key-1",
+        ),
         pytest.param(
             {"KIRO_API_KEY_2": "set-two", "KIRO_API_KEY_10": "set-ten"},
             id="two-keys-and-an-empty-first-key",
