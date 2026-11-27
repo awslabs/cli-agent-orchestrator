@@ -30,6 +30,23 @@ Kiro's header row (`<agent> · <model> · ◔ N% · <auth>`) differs between the
 captures and the 2.25 fixtures (`developer · auto · ◔ 11% · auth ok`), so the
 composer reader anchors on the last separator and the `›` row, not the header.
 
+## Antigravity CLI composer (issue #1494)
+
+The `agy_composer_*.txt` excerpts were captured on macOS on 2026-11-27 with
+`agy` 1.5.18 and `tmux capture-pane -p` at 100×35. Banner rows and blank viewport
+padding were omitted. Drafts were inserted with `tmux paste-buffer -p`.
+
+- `empty` and `draft` show the same fresh composer before and after a paste.
+- `transcript_only` and `transcript_and_draft` show a completed PONG exchange
+  with an empty composer and then with the same message pasted again.
+- `multiline` and `wrapped_with_blank` show the indentation of continuation
+  rows, a soft-wrapped line, and a blank line inside the composer.
+- `agy_workspace_trust_dialog.txt` shows the folder picker before the composer
+  is available, with the workspace path omitted.
+
+When text is in the composer, the shortcuts hint disappears. The footer can
+then be empty or show only the right-aligned model name.
+
 ## Status-area fixtures (PR #975, P2-1)
 
 Real `tmux capture-pane -p` snapshots (80x45) of Claude Code 2.1.308 (Bedrock)

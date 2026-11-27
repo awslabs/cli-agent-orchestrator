@@ -2230,7 +2230,7 @@ class TestInboxRecoveryNeverDuplicates:
 
 
 class TestSwallowedEnterRecoveryOnRealComposers:
-    """PR #1004 review, P2-1: the #78 pile-up for claude_code and kiro_cli.
+    """The #78 pile-up on providers with a live composer capture.
 
     Same real-code harness as TestInboxRecoveryNeverDuplicates, but the pane
     renders the REAL capture of each TUI holding the unsubmitted MSG1 (see
@@ -2255,22 +2255,30 @@ class TestSwallowedEnterRecoveryOnRealComposers:
             return self.msg1_screen if self.composer == self.msg1 else self.screen
 
     @pytest.mark.parametrize(
-        "provider_type, idle_fixture, composer_fixture",
+        "provider_type, idle_fixture, composer_fixture, msg1",
         [
             (
                 "claude_code",
                 "claude_code_865_startup_idle.txt",
                 "claude_code_composer_single_line.txt",
+                MSG1,
             ),
             (
                 "kiro_cli",
                 "kiro_cli_tui_2_25_idle_output.txt",
                 "kiro_cli_tui_composer_single_line.txt",
+                MSG1,
+            ),
+            (
+                "antigravity_cli",
+                "agy_composer_transcript_only.txt",
+                "agy_composer_transcript_and_draft.txt",
+                "Reply with exactly one word: PONG",
             ),
         ],
     )
     def test_two_messages_arrive_as_two_prompts_not_one_pile_up(
-        self, provider_type, idle_fixture, composer_fixture
+        self, provider_type, idle_fixture, composer_fixture, msg1
     ):
         import sys
 
@@ -2285,9 +2293,9 @@ class TestSwallowedEnterRecoveryOnRealComposers:
         pane = self._Pane(
             strip_terminal_escapes((self.FIXTURES / idle_fixture).read_text()),
             (self.FIXTURES / composer_fixture).read_text(),
-            self.MSG1,
+            msg1,
         )
-        queue = [_make_message(1, message=self.MSG1), _make_message(2, message=self.MSG2)]
+        queue = [_make_message(1, message=msg1), _make_message(2, message=self.MSG2)]
         sm = MagicMock()
         sm.get_status.return_value = TerminalStatus.IDLE
         sm.output_generation.return_value = 7
@@ -2345,7 +2353,7 @@ class TestSwallowedEnterRecoveryOnRealComposers:
             # MSG2's own Enter lands (only MSG1's frame is captured for real).
             svc.deliver_pending("term-1", registry=MagicMock())  # MSG2
 
-        assert pane.submitted == [self.MSG1, self.MSG2], "each message must reach the agent alone"
+        assert pane.submitted == [msg1, self.MSG2], "each message must reach the agent alone"
         assert pane.composer == ""
 
 
@@ -2505,7 +2513,6 @@ class TestInboxRecoveryCoverageByProvider:
     # provider gains extract_current_composer; the test fails if one is missing
     # or stale.
     NO_RECOVERY = {
-        "antigravity_cli",
         "copilot_cli",
         "cursor_cli",
         "grok_cli",
@@ -2564,9 +2571,9 @@ class TestDialogGuardCoversSubmitRecovery:
     #: they can read their own composer (so #1004's bare-Enter branch is
     #: reachable). Pinned because the guard below only matters for this set, and
     #: a provider joining it should come with that fact in view.
-    OVERLAP = {"claude_code", "codex"}
+    OVERLAP = {"antigravity_cli", "claude_code", "codex"}
 
-    def test_overlap_set_is_still_these_two_providers(self):
+    def test_overlap_matches_providers_with_dialog_block_and_reader(self):
         """Enumerated, not assumed: which providers both features apply to."""
         from cli_agent_orchestrator.providers.base import BaseProvider
         from cli_agent_orchestrator.providers.manager import ProviderManager
@@ -2594,15 +2601,16 @@ class TestDialogGuardCoversSubmitRecovery:
         replaces the composer box, so ``extract_current_composer`` returns None
         and the inbox path (``full_resend_requires_composer_evidence=True``)
         sends nothing at all. That is what keeps the unguarded bare Enter out of
-        reach -- a property of these two extractors, not an invariant, which is
-        exactly why the guard is checked explicitly rather than inherited.
+        reach on these captures. The separate guard tests also cover a dialog
+        that leaves the composer visible.
         """
         from cli_agent_orchestrator.providers.manager import ProviderManager
 
         provider = TestInboxRecoveryNeverDuplicates._make_provider(
             ProviderManager.provider_class(provider_type)
         )
-        fixtures = sorted(TestInboxRecoveryNeverDuplicates.FIXTURES.glob(f"{provider_type}*"))
+        prefix = "agy_" if provider_type == "antigravity_cli" else provider_type
+        fixtures = sorted(TestInboxRecoveryNeverDuplicates.FIXTURES.glob(f"{prefix}*"))
         dialogs = [
             path
             for path in fixtures

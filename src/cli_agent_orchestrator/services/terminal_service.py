@@ -5406,17 +5406,9 @@ def redeliver_dropped_message_with_boundary(
         # highlighted, answering a question reserved for a human, with no text
         # involved at all.
         #
-        # Today this branch happens to be unreachable with a prompt open: on
-        # every real capture in test/providers/fixtures the dialog replaces the
-        # composer box, so ``extract_current_composer`` returns None for the only
-        # two providers that both block dialogs and read a composer (claude_code
-        # and codex -- the overlap is enumerated in
-        # test/services/test_inbox_service.py's
-        # TestDialogGuardCoversSubmitRecovery). But that is a property of those
-        # two extractors, not an invariant: the moment one of them learns to read
-        # the composer under an overlaying permission prompt, this Enter starts
-        # answering dialogs. Check the guard here rather than inherit it by
-        # coincidence.
+        # On the recorded dialog captures the composer disappears. A dialog
+        # can also overlay a composer that remains readable, so guard the
+        # bare Enter even when a provider extracted the current draft.
         if _dialog_blocks_orchestrated_input(
             provider, orchestration_type, status_monitor.get_status(terminal_id)
         ):

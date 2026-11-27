@@ -6,6 +6,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.antigravity_cli import (
@@ -81,6 +83,50 @@ def make_provider(
         allowed_tools=allowed_tools,
         model=model,
         skill_prompt=skill_prompt,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Editable composer (against captured live agy panes)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("fixture", "expected"),
+    [
+        ("empty", ""),
+        ("draft", "Reply with exactly one word: PONG"),
+        ("transcript_only", ""),
+        ("transcript_and_draft", "Reply with exactly one word: PONG"),
+        ("multiline", "Line one of a test message.\nLine two of a test message."),
+        (
+            "wrapped_with_blank",
+            "First line. Repeat this test phrase. Repeat this test phrase. "
+            "Repeat this test phrase. Repeat\nthis test phrase. Repeat this test phrase."
+            "\n\nLast line of the draft.",
+        ),
+    ],
+)
+def test_extract_current_composer_fixture(fixture, expected):
+    pane = load_fixture(f"agy_composer_{fixture}.txt")
+    assert make_provider().extract_current_composer(pane) == expected
+
+
+def test_extract_current_composer_rejects_unavailable_box():
+    provider = make_provider()
+    assert provider.extract_current_composer(load_fixture("agy_processing.txt")) is None
+    draft = load_fixture("agy_composer_draft.txt")
+    assert provider.extract_current_composer("\n".join(draft.splitlines()[:-1])) is None
+    assert provider.extract_current_composer(draft + "↑/↓ Navigate · enter Confirm\n") is None
+
+
+@given(history=st.text(max_size=300))
+def test_extract_current_composer_ignores_history_above_the_live_box(history):
+    """Any extra rendered history above a captured pane leaves the draft unchanged."""
+    pane = load_fixture("agy_composer_transcript_and_draft.txt")
+    assert (
+        make_provider().extract_current_composer(f"{history}\n{pane}")
+        == "Reply with exactly one word: PONG"
     )
 
 
