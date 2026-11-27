@@ -477,7 +477,7 @@ carries nothing. Check your packages after an update; see
 cao update
 
 # If installed from git, it will fetch the latest commits:
-# $ uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main --upgrade --reinstall
+# $ uv tool upgrade cli-agent-orchestrator --reinstall
 ```
 
 ---

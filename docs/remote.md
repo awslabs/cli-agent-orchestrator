@@ -419,7 +419,7 @@ Run `ssh cao-box true`. The box may be stopped, your AWS login may have expired 
 
 ## Coming next
 
-These are **proposals** in issue [#1385](https://github.com/awslabs/cli-agent-orchestrator/issues/1385). They don't exist yet, and this guide doesn't depend on them:
+`cao remote add`, `list`, `check` and `remove` exist now; see the [Remote CLI reference](remote-cli.md). These are still **proposals** in issue [#1385](https://github.com/awslabs/cli-agent-orchestrator/issues/1385). They don't exist yet, and this guide doesn't depend on them:
 
 - `cao remote connect`: the AWS login, the SSH key, the pinned host key and the SSH config, done for you with your OK.
 - An optional CloudFormation template for step 2.
