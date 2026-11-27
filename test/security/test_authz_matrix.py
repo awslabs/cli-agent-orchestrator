@@ -175,7 +175,7 @@ _WS: Optional[Dict[str, object]] = None
 def auth_on(monkeypatch):
     """Enable the auth layer with an in-process scope oracle; open the feature gates.
 
-    The feature gates (agent plugins, ephemeral agents, AG-UI) answer 404 before
+    The feature gates (agent plugins, ephemeral agents, AG-UI, AG-UI post-3.0 previews) answer 404 before
     the scope dependency runs when their surface is off, which would read as
     "admitted" in the matrix. Overriding them lets the scope tier be observed on
     those routes too; the gates themselves are pinned by their own suites.
@@ -191,6 +191,7 @@ def auth_on(monkeypatch):
     overrides[api_main._require_plugins_enabled] = lambda: None
     overrides[api_main._require_agui_enabled] = lambda: None
     overrides[api_main._require_ephemeral_enabled] = lambda: {}
+    overrides[api_main._require_post3_preview] = lambda: None
     try:
         yield
     finally:
@@ -198,6 +199,7 @@ def auth_on(monkeypatch):
             api_main._require_plugins_enabled,
             api_main._require_agui_enabled,
             api_main._require_ephemeral_enabled,
+            api_main._require_post3_preview,
         ):
             overrides.pop(dep, None)
 
@@ -360,3 +362,20 @@ def test_terminal_websocket_requires_write_or_admin(ws_matrix):
     assert ws_matrix["read"] == WS_UNAUTHORIZED
     assert ws_matrix["write"] == ("accepted", WS_TERMINAL_NOT_FOUND)
     assert ws_matrix["admin"] == ("accepted", WS_TERMINAL_NOT_FOUND)
+
+
+PREVIEW_READS = {"/agui/v1/preview/team-composition", "/agui/v1/preview/approvals"}
+
+
+def test_post3_preview_routes_are_scope_gated_behind_their_feature_gate(matrix):
+    """The preview routes answer 404 when their flag is off, which the matrix would read as
+    "admitted". With the gate opened (``auth_on``) each cell must show its real tier: the two
+    reads deny no token and admit read; the render is a write-tier POST that refuses read."""
+    cells = {c.key: c for c in matrix}
+    for path in sorted(PREVIEW_READS):
+        cell = cells[("GET", path)]
+        assert cell.status["none"] == 401 and cell.admitted("read"), str(cell)
+    render = cells[("POST", "/agui/v1/preview/a2ui")]
+    assert render.status["none"] == 401, str(render)
+    assert render.status["read"] == 403, str(render)
+    assert render.admitted("write"), str(render)
