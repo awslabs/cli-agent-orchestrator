@@ -4,6 +4,8 @@ import fcntl
 import multiprocessing
 import os
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -90,3 +92,43 @@ def test_server_lock_blocks_post_baseline_cli(tmp_path, monkeypatch):
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
+
+
+def test_transactional_step_never_loses_concurrent_writer(tmp_path, monkeypatch):
+    path = tmp_path / "shared.db"
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
+    _initialize(path)
+    writer_result = []
+    writer = None
+
+    def insert_writer():
+        try:
+            with sqlite3.connect(path, timeout=0.1) as connection:
+                connection.execute(
+                    "INSERT INTO terminals (id, tmux_session, tmux_window, provider, "
+                    "agent_profile) VALUES ('writer', 'session', 'window', 'codex', 'developer')"
+                )
+            writer_result.append("committed")
+        except sqlite3.OperationalError as error:
+            writer_result.append(str(error))
+
+    def second(connection):
+        nonlocal writer
+        connection.execute("ALTER TABLE terminals ADD COLUMN test_v2 TEXT")
+        writer = threading.Thread(target=insert_writer)
+        writer.start()
+        time.sleep(0.2)
+
+    monkeypatch.setattr(
+        migrations,
+        "MIGRATIONS",
+        (*migrations.MIGRATIONS, migrations.Migration(2, "test", second, True, False)),
+    )
+    monkeypatch.setattr(migrations, "HEAD", 2)
+    database_module.init_db()
+    assert writer is not None
+    writer.join(timeout=5)
+    assert writer_result == ["committed"] or writer_result == ["database is locked"]
+    with sqlite3.connect(path) as connection:
+        ids = {row[0] for row in connection.execute("SELECT id FROM terminals")}
+    assert ("writer" in ids) == (writer_result == ["committed"])

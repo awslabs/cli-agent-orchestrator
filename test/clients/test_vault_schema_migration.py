@@ -25,6 +25,7 @@ from cli_agent_orchestrator.clients.database import (
 def isolated_db(tmp_path, monkeypatch):
     db_path = tmp_path / "vault-schema.db"
     engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    db_mod.Base.metadata.tables["terminals"].create(engine)
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
     monkeypatch.setattr(db_mod, "engine", engine)
     monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
@@ -595,7 +596,9 @@ def test_source_kind_migration_failure_propagates(isolated_db):
     with sqlite3.connect(db_path) as conn:
         conn.execute("CREATE TABLE memory_metadata_new (id TEXT)")
 
-    with pytest.raises(sqlite3.OperationalError, match="already exists"):
+    from cli_agent_orchestrator.clients.schema_migrations import MigrationFailedError
+
+    with pytest.raises(MigrationFailedError, match="already exists"):
         db_mod.init_db()
 
     with sqlite3.connect(db_path) as conn:

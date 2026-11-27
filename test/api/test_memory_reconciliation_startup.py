@@ -107,7 +107,7 @@ async def test_lifespan_repairs_replacement_database_and_second_startup_is_noop(
     monkeypatch.setattr(db_module, "SessionLocal", sessions)
     monkeypatch.setattr(memory_reconciliation, "MEMORY_BASE_DIR", base)
 
-    def initialize_replacement() -> None:
+    def initialize_replacement(*, caller: str = "cli") -> None:
         Base.metadata.create_all(bind=replacement_engine)
 
     forbidden = {

@@ -200,7 +200,7 @@ class TestMigrateAddHandoffResults:
         import inspect
         import textwrap
 
-        assert "_migrate_add_handoff_results()" in inspect.getsource(db_mod.init_db)
+        assert "_migrate_add_handoff_results()" in inspect.getsource(db_mod._apply_legacy_schema)
 
         tree = ast.parse(textwrap.dedent(inspect.getsource(db_mod._migrate_add_handoff_results)))
         # Drop the docstring, which legitimately discusses create_all and the ORM.

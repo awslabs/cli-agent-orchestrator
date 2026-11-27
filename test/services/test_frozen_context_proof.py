@@ -72,6 +72,9 @@ def isolated_state(tmp_path, monkeypatch):
     mid-process. The suite also runs with random ordering, so nothing here may depend on another test
     having left a clean process behind.
     """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
     from cli_agent_orchestrator import constants
     from cli_agent_orchestrator.clients import database as database_client
 
@@ -80,10 +83,14 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(database_client, "DATABASE_FILE", path, raising=False)
     monkeypatch.setattr(workflow_journal, "DATABASE_FILE", path, raising=False)
     monkeypatch.setattr(approval_store, "DATABASE_FILE", path, raising=False)
+    engine = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False})
+    monkeypatch.setattr(database_client, "engine", engine)
+    monkeypatch.setattr(database_client, "SessionLocal", sessionmaker(bind=engine))
     database_client.init_db()
 
     with terminal_service._memory_injected_lock:
         terminal_service._memory_injected_terminals.clear()
+    engine.dispose()
     yield
     with terminal_service._memory_injected_lock:
         terminal_service._memory_injected_terminals.clear()

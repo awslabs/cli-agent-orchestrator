@@ -3,7 +3,7 @@
 import hashlib
 import sqlite3
 from dataclasses import replace
-from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from click.testing import CliRunner
@@ -12,6 +12,7 @@ from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients import database as database_module
 from cli_agent_orchestrator.clients import schema_migrations as migrations
+from cli_agent_orchestrator.clients.schema_manifest import SCHEMA_MANIFEST_V1
 
 
 @pytest.fixture
@@ -43,6 +44,25 @@ def test_fresh_home_is_stamped_without_backup(schema_db):
     assert not (schema_db.parent / "backups").exists()
     database_module.init_db()
     assert records(schema_db) == [(1, "applied", None)]
+
+
+def test_manifest_matches_fresh_baseline(schema_db):
+    database_module.init_db()
+    with sqlite3.connect(schema_db) as connection:
+        actual = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' AND name != 'cao_schema_migrations'"
+            )
+        }
+        assert actual == set(SCHEMA_MANIFEST_V1)
+        for table, (columns, indexes) in SCHEMA_MANIFEST_V1.items():
+            assert {
+                row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')
+            } == columns
+            present = {row[1] for row in connection.execute(f'PRAGMA index_list("{table}")')}
+            assert indexes <= present
 
 
 def test_newer_version_is_read_only(schema_db):
@@ -116,6 +136,7 @@ def test_insufficient_backup_space_refuses_early(schema_db, monkeypatch):
 
 
 def test_schedule_and_decision_mcp_surface_schema_error(schema_db, monkeypatch):
+    from cli_agent_orchestrator.cli.commands.init import init as init_command
     from cli_agent_orchestrator.cli.commands.schedule import schedule
     from cli_agent_orchestrator.ops_mcp_server.decision_tools import _result
 
@@ -129,9 +150,32 @@ def test_schedule_and_decision_mcp_surface_schema_error(schema_db, monkeypatch):
     assert result.exit_code != 0
     assert "restore the backup" in result.output
     assert "Traceback" not in result.output
+    init_result = CliRunner().invoke(init_command)
+    assert init_result.exit_code != 0
+    assert "restore the backup" in init_result.output
+    assert "Traceback" not in init_result.output
     message = _result(database_module.init_db)
     assert message["success"] is False
     assert "restore the backup" in message["message"]
+
+
+@pytest.mark.asyncio
+async def test_server_lifespan_refuses_schema_error(monkeypatch, capsys):
+    from cli_agent_orchestrator.api import main
+
+    monkeypatch.setattr(main, "remote_auth_refusal", lambda: None)
+    monkeypatch.setattr(main, "setup_logging", lambda: None)
+    monkeypatch.setattr(main, "_prime_host_sampler_if_enabled", AsyncMock())
+    monkeypatch.setattr(main.server_lock, "acquire_server_lock", lambda **kwargs: MagicMock())
+    monkeypatch.setattr(main, "_runner_token_refusal", lambda: None)
+    monkeypatch.setattr(
+        main, "init_db", MagicMock(side_effect=migrations.SchemaTooNewError("restore the backup"))
+    )
+    with pytest.raises(SystemExit) as refusal:
+        async with main.lifespan(main.app):
+            pass
+    assert refusal.value.code == 1
+    assert "restore the backup" in capsys.readouterr().err
 
 
 def test_transaction_rolls_back_failed_step(schema_db, monkeypatch):

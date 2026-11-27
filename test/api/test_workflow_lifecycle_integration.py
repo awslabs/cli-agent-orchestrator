@@ -111,15 +111,17 @@ def journal_db(monkeypatch, tmp_path):
     ``_migrate_workflow_run*`` migrators). Clears the process-local registry / drive set
     on both sides so no run leaks between tests.
     """
-    from cli_agent_orchestrator.clients.database import (
-        _migrate_workflow_run,
-        _migrate_workflow_run_step,
-    )
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from cli_agent_orchestrator.clients import database
 
     db_path = tmp_path / "wf.db"
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
-    _migrate_workflow_run()
-    _migrate_workflow_run_step()
+    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
+    database.init_db()
     # issue #583 Bolt 3 (``approval-enforcement-default``): approval enforcement defaults ON, so an
     # unapproved script-tier plan is refused with 403 before any lifecycle behaviour happens. These
     # tests are about the LIFECYCLE -- compose, drive, cancel, detached observation -- so the gate is
@@ -137,6 +139,7 @@ def journal_db(monkeypatch, tmp_path):
     yield db_path
     workflow_service.run_registry.clear()
     workflow_service._active_drives.clear()
+    engine.dispose()
 
 
 @pytest.fixture

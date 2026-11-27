@@ -39,6 +39,12 @@ def journalled_run(tmp_path, monkeypatch):
     monkeypatch.setattr(constants, "DATABASE_FILE", path)
     monkeypatch.setattr(database_client, "DATABASE_FILE", path, raising=False)
     monkeypatch.setattr(workflow_journal, "DATABASE_FILE", path, raising=False)
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    engine = create_engine(f"sqlite:///{path}")
+    monkeypatch.setattr(database_client, "engine", engine)
+    monkeypatch.setattr(database_client, "SessionLocal", sessionmaker(bind=engine))
     database_client.init_db()
 
     envelope = execution_manifest.build(

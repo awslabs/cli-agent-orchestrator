@@ -94,7 +94,7 @@ def test_migrator_appended_last_in_registry():
     executing every migrator."""
     import inspect
 
-    src = inspect.getsource(db_mod.init_db)
+    src = inspect.getsource(db_mod._apply_legacy_schema)
     assert "_migrate_memory_relationships()" in src
     assert src.index("_migrate_workflow_run_step()") < src.index("_migrate_memory_relationships()")
     # Must not issue SQL against the workflow tables. Parse the two functions

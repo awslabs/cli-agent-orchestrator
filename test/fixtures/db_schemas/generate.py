@@ -1,6 +1,5 @@
 """Generate DDL-only fixtures with the actual released database initializers."""
 
-import os
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -32,13 +31,20 @@ def generate() -> None:
             for target in (home, chain) if tag in TAGS else (home,):
                 scratch_home = SCRATCH / "isolated-home"
                 scratch_home.mkdir(exist_ok=True)
-                environment = {
-                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                    "HOME": str(scratch_home),
-                    "CAO_HOME_DIR": str(target),
-                    "PYTHONPATH": str(checkout / "src"),
-                }
-                subprocess.run((str(PYTHON), "-c", INIT), env=environment, check=True)
+                subprocess.run(
+                    (
+                        "env",
+                        "-i",
+                        "PATH=/usr/bin:/bin",
+                        f"HOME={scratch_home}",
+                        f"CAO_HOME_DIR={target}",
+                        f"PYTHONPATH={checkout / 'src'}",
+                        str(PYTHON),
+                        "-c",
+                        INIT,
+                    ),
+                    check=True,
+                )
             db = home / "db/cli-agent-orchestrator.db"
             write_ddl(tag, commit, db)
             if tag == "v2.5.5":
