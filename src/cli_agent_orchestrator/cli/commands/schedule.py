@@ -5,6 +5,7 @@ import asyncio
 import click
 
 from cli_agent_orchestrator.clients.database import init_db
+from cli_agent_orchestrator.clients.schema_migrations import SchemaError
 from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.services import flow_service
 from cli_agent_orchestrator.utils import api_http
@@ -23,6 +24,13 @@ from cli_agent_orchestrator.utils.terminal import (
 _FLOW_RUN_REQUEST_TIMEOUT = 600.0
 
 
+def _init_schedule_db() -> None:
+    try:
+        init_db()
+    except SchemaError as error:
+        raise click.ClickException(str(error)) from error
+
+
 @click.group()
 def schedule():
     """Manage scheduled agent flows."""
@@ -32,7 +40,7 @@ def schedule():
 @click.argument("file_path", type=click.Path(exists=True))
 def add(file_path):
     """Add a flow from file."""
-    init_db()
+    _init_schedule_db()
     try:
         added = flow_service.add_flow(file_path)
         click.echo(f"Flow '{added.name}' added successfully")
@@ -46,7 +54,7 @@ def add(file_path):
 @schedule.command()
 def list():
     """List all flows."""
-    init_db()
+    _init_schedule_db()
     try:
         flows = flow_service.list_flows()
         if not flows:
@@ -77,7 +85,7 @@ def remove(name):
 
     Acts immediately; there is no confirmation prompt.
     """
-    init_db()
+    _init_schedule_db()
     try:
         flow_service.remove_flow(name)
         click.echo(f"Flow '{name}' removed successfully")
@@ -89,7 +97,7 @@ def remove(name):
 @click.argument("name")
 def disable(name):
     """Disable a flow."""
-    init_db()
+    _init_schedule_db()
     try:
         flow_service.disable_flow(name)
         click.echo(f"Flow '{name}' disabled")
@@ -101,7 +109,7 @@ def disable(name):
 @click.argument("name")
 def enable(name):
     """Enable a flow."""
-    init_db()
+    _init_schedule_db()
     try:
         flow_service.enable_flow(name)
         click.echo(f"Flow '{name}' enabled")
@@ -138,7 +146,7 @@ async def _run_flow_with_pipeline(name):
 @click.argument("name")
 def run(name):
     """Manually run a flow."""
-    init_db()
+    _init_schedule_db()
     try:
         server_backend = server_terminal_backend_or_absent()
     except ServerBackendUnknown as e:

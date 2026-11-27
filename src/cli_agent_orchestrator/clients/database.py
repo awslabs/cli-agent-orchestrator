@@ -1357,7 +1357,7 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
-def init_db() -> None:
+def _apply_legacy_schema() -> None:
     """Initialize database tables and apply schema migrations."""
     _migrate_project_aliases_schema()
     Base.metadata.create_all(bind=engine)
@@ -1405,6 +1405,13 @@ def init_db() -> None:
     _migrate_decision_records_provider_route()
     # Appended LAST (issue #1199). Eight nullable decision_records columns, no backfill.
     _migrate_decision_records_match()
+
+
+def init_db(*, caller: str = "cli") -> None:
+    """Check and migrate the database before any legacy schema changes."""
+    from cli_agent_orchestrator.clients.schema_migrations import migrate
+
+    migrate(caller=caller)
 
 
 def _restrict_db_file_permissions() -> None:

@@ -1832,7 +1832,14 @@ async def lifespan(app: FastAPI):
         init_telemetry(OTEL_SERVICE_NAME)
     except Exception:
         logger.warning("OTel telemetry init failed; continuing", exc_info=True)
-    init_db()
+    from cli_agent_orchestrator.clients.schema_migrations import SchemaError
+
+    try:
+        init_db(caller="server")
+    except SchemaError as error:
+        logger.error("refusing to start: %s", error)
+        print(f"cao-server: {error}", file=sys.stderr, flush=True)
+        raise SystemExit(1) from None
     from cli_agent_orchestrator.utils import agent_profiles
 
     agent_profiles.warn_reserved_installed_profiles()
@@ -12377,6 +12384,14 @@ def main():
         if refusal is not None:
             print(refusal, file=sys.stderr, flush=True)
             raise SystemExit(1)
+    from cli_agent_orchestrator.clients.schema_migrations import SchemaError, check
+
+    try:
+        check()
+    except SchemaError as error:
+        print(f"cao-server: {error}", file=sys.stderr, flush=True)
+        raise SystemExit(1) from None
+
     from cli_agent_orchestrator.services.agui.ambient_run import install_uvicorn_exit_hook
 
     install_uvicorn_exit_hook()

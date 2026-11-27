@@ -452,15 +452,21 @@ def test_target_kind_migration_creates_nothing_without_the_table(tmp_path, monke
 
 
 def test_init_db_adds_target_kind_to_an_existing_database(tmp_path, monkeypatch):
-    from unittest.mock import patch
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
 
     from cli_agent_orchestrator.clients import database
 
     path = tmp_path / "legacy.db"
-    _legacy_decision_table(path)
+    fixture = Path(__file__).resolve().parents[1] / "fixtures/db_schemas/3.0-beta1.sql"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(fixture.read_text())
+        connection.execute("ALTER TABLE decision_records DROP COLUMN target_kind")
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
-    with patch.object(database, "Base"):
-        database.init_db()
+    engine = create_engine(f"sqlite:///{path}")
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
+    database.init_db()
     with sqlite3.connect(path) as db:
         columns = {row[1] for row in db.execute("PRAGMA table_info(decision_records)")}
     assert "target_kind" in columns

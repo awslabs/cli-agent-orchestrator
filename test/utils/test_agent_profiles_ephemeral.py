@@ -239,7 +239,7 @@ async def test_startup_calls_warning(stores, monkeypatch, caplog):
     (stores[0] / f"{NAME}.md").write_text(DOCUMENT)
     monkeypatch.setattr(main, "setup_logging", lambda: None)
     monkeypatch.setattr(main, "init_telemetry", lambda _: None)
-    monkeypatch.setattr(main, "init_db", lambda: None)
+    monkeypatch.setattr(main, "init_db", lambda **kwargs: None)
     monkeypatch.setattr(
         main.terminal_service,
         "recover_interrupted_deferred_init_external_owners",
@@ -283,7 +283,7 @@ async def test_failed_reserved_scan_does_not_abort_startup(stores, monkeypatch, 
 
     monkeypatch.setattr(main, "setup_logging", lambda: None)
     monkeypatch.setattr(main, "init_telemetry", lambda _: None)
-    monkeypatch.setattr(main, "init_db", lambda: None)
+    monkeypatch.setattr(main, "init_db", lambda **kwargs: None)
     monkeypatch.setattr(
         profiles, "_list_installed_profiles", Mock(side_effect=scan_error("unreadable store"))
     )

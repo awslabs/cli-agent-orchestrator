@@ -482,6 +482,8 @@ OPENCODE_CONFIG_FILE = OPENCODE_CONFIG_DIR / "opencode.json"  # OpenCode MCP + t
 # =============================================================================
 # SQLite database file path and connection URL
 DATABASE_FILE = DB_DIR / "cli-agent-orchestrator.db"
+SCHEMA_MIGRATE_LOCK_NAME = ".schema-migrate.lock"
+SCHEMA_MIGRATE_LOCK_TIMEOUT_S = 120.0
 DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 
 # =============================================================================

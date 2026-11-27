@@ -728,15 +728,21 @@ def test_the_migration_creates_nothing_without_the_table(tmp_path, monkeypatch):
 
 def test_init_db_adds_the_columns_to_an_existing_database(tmp_path, monkeypatch):
     import sqlite3
-    from unittest.mock import patch
+    from pathlib import Path
 
     from cli_agent_orchestrator.clients import database
 
     path = tmp_path / "legacy.db"
-    _legacy_decision_table(path)
+    fixture = Path(__file__).resolve().parents[1] / "fixtures/db_schemas/3.0-beta1.sql"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(fixture.read_text())
+        for column in COLUMNS:
+            connection.execute(f"ALTER TABLE decision_records DROP COLUMN {column}")
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
-    with patch.object(database, "Base"):
-        database.init_db()
+    engine = create_engine(f"sqlite:///{path}")
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
+    database.init_db()
     with sqlite3.connect(path) as db:
         names = {row[1] for row in db.execute("PRAGMA table_info(decision_records)")}
     assert set(COLUMNS) <= names
