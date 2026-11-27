@@ -11,7 +11,7 @@ Well, I have to admit, it wasn't always like that. My agents running under CAO w
 
 {/* truncate */}
 
-:::tip TL;DR
+:::tip[TL;DR]
 I can follow three, maybe five (after some really good coffee), agent sessions at once. Instead of talking to multiple agents and trying to memorise what they are busy with (it got even harder when those agents used the handoff function to assign jobs to other agents), I choose to talk to one conductor agent and let CAO run a PR shepherd and short-lived workers behind it. A Kiro Crew bot reviews other people's pull requests on its own (and I ask it to take extra care and be humble with my own PRs). That makes it a lot easier. The rules that matter are small scripts instead of prompts, and the kit starts in observe mode. Seven reviews said NOT-READY before one said READY. The agents still run as one OS user, but publishing to GitHub now goes through a user of its own.
 
 :::

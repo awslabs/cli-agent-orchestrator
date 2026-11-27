@@ -36,7 +36,7 @@ This will:
 2. After you confirm, open a tmux window with the agent running
 3. The agent starts processing in its terminal
 
-:::info The `cao-` prefix
+:::info[The `cao-` prefix]
 CAO prefixes every session with `cao-`, so `--session-name my-session` creates a
 session named **`cao-my-session`**. Later commands (`cao session status`,
 `cao session send`, `cao shutdown --session`) take the full prefixed name — pass
@@ -44,7 +44,7 @@ session named **`cao-my-session`**. Later commands (`cao session status`,
 `cao session list` any time you need the exact name.
 :::
 
-:::tip Choosing a provider
+:::tip[Choosing a provider]
 The `--provider` flag tells CAO which AI CLI to use. If you omit `--provider`, CAO uses the profile's `provider:` field, falling back to `kiro_cli`. Otherwise, specify whichever CLI you have installed:
 - `--provider claude_code` — for Claude Code
 - `--provider codex` — for OpenAI Codex
