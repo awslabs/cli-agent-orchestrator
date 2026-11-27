@@ -794,4 +794,6 @@ class TestMessagePluginEvents:
             sender_id="supervisor-1",
             orchestration_type=OrchestrationType.SEND_MESSAGE,
         )
-        mock_update_message_status.assert_called_once_with(17, MessageStatus.DELIVERED)
+        mock_update_message_status.assert_called_once_with(
+            17, MessageStatus.DELIVERED, expected_status=MessageStatus.PENDING
+        )
