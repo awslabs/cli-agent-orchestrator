@@ -40,8 +40,8 @@ cao launch --agents ci_developer \
 
 START=$(date +%s)
 while true; do
-    STATUS_JSON=$(cao session status "${PREFIXED}" --workers 2>/dev/null || echo "")
-    STATUS=$(echo "${STATUS_JSON}" | grep -oE '"status":[[:space:]]*"[A-Z_]+"' | head -1 | sed -E 's/.*"([A-Z_]+)"/\1/')
+    STATUS_JSON=$(cao session status "${PREFIXED}" --workers --json 2>/dev/null || echo "")
+    STATUS=$(echo "${STATUS_JSON}" | grep -oE '"status":[[:space:]]*"[a-zA-Z_]+"' | head -1 | sed -E 's/.*"([a-zA-Z_]+)"/\1/' | tr '[:lower:]' '[:upper:]' || true)
 
     case "${STATUS}" in
         IDLE|COMPLETED)

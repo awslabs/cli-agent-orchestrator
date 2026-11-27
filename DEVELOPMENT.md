@@ -137,6 +137,18 @@ keeps it for any session and `CAO_TEST_REAL_HOME=0` forces isolation; a single
 test opts out with `@pytest.mark.real_home`. Under `pytest -n`, each worker takes
 the controller's decision, so `-n` with E2E keeps the real `HOME` too.
 
+### Keyless Orchestration E2E
+
+Install `tmux`, then run the same keyless `mock_cli` suite as CI:
+
+```bash
+env -u CAO_MUST_RUN -u PYTEST_ADDOPTS uv run pytest -p no:cacheprovider -q --no-cov -o 'addopts=' -m e2e test/e2e/test_mock_cli_orchestration.py
+```
+
+The tests start an isolated `cao-server` and use a real tmux session with the
+deterministic `mock_cli` fixture; no provider account or secrets are needed. If
+you run pytest inside tmux, follow the private-`TMUX_TMPDIR` instructions above.
+
 ### Unit Tests
 
 Most tests mock external dependencies, but the default invocation is not unit-only: its

@@ -85,6 +85,13 @@ def test_changes_to_detector_or_ci_trigger_every_filtered_job():
     assert all(matching_filters([".github/workflows/ci.yml"]).values())
 
 
+def test_keyless_e2e_is_unfiltered_even_for_unrelated_changes():
+    workflow = yaml.safe_load((WORKFLOWS / "ci.yml").read_text())
+    job = workflow["jobs"]["e2e-mock"]
+    assert "if" not in job and "needs" not in job
+    assert "e2e-mock" not in FILTERS
+
+
 def test_changed_paths_detector_requires_workflow_code_owner_review():
     entries = [
         line.split("#", 1)[0].split()
