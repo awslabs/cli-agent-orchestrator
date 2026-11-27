@@ -3327,6 +3327,29 @@ def test_publish_dry_run_writes_the_requests_and_posts_nothing(
     assert process.writes() == []
 
 
+def test_publish_dry_run_plans_no_run_approval_after_a_move_and_no_bot_assignee(
+    github_review: ModuleType, process: FakeProcess, tmp_path: Path
+) -> None:
+    _github(process, live=_live_pr(head={"sha": NEW_HEAD}))
+    process.routes[("GET", _commits_page(1))] = _ok([{"sha": HEAD}, {"sha": NEW_HEAD}])
+    request = tmp_path / "request.json"
+
+    code = _publish(
+        github_review,
+        tmp_path,
+        _review(**NOTHING_BLOCKS),
+        *("--dry-run", str(request), "--actor", "dependabot[bot]"),
+    )
+
+    assert code == 0
+    assert json.loads(request.read_text(encoding="utf-8"))["actions"] == {
+        "change_request": "keep",
+        "approve_ci_runs": False,
+        "assign": None,
+    }
+    assert process.writes() == []
+
+
 def test_the_check_run_is_neutral_and_holds_no_agent_text(
     github_review: ModuleType, process: FakeProcess, tmp_path: Path
 ) -> None:
@@ -3450,6 +3473,29 @@ def test_publish_requests_changes_once_for_each_head(
     assert (("POST", REVIEWS) in [write[:2] for write in process.writes()]) is requested
 
 
+@pytest.mark.parametrize("live_head", [HEAD, NEW_HEAD], ids=["same-head", "head-moved"])
+def test_publish_requests_changes_for_an_accepted_p1_or_p2_also_in_an_incomplete_review(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    live_head: str,
+) -> None:
+    _github(process, live=_live_pr(head={"sha": live_head, "repo": {"full_name": "fork/widgets"}}))
+    process.routes[("GET", _commits_page(1))] = _ok([{"sha": HEAD}, {"sha": NEW_HEAD}])
+    review = _review(
+        result_states=["changes_required", "incomplete"],
+        review_complete=False,
+        not_checked_ids=["A2"],
+    )
+
+    assert _publish(github_review, tmp_path, review) == 0
+
+    assert (
+        f"- Change request: requested changes at {HEAD} in review 777.\n" in capsys.readouterr().out
+    )
+
+
 @pytest.mark.parametrize(
     ("changes", "live_head", "line", "dismissed"),
     [
@@ -3533,6 +3579,35 @@ def test_publish_dismisses_its_change_requests_only_after_a_complete_review_of_t
     assert all((write[2] or {}).get("event") != "APPROVE" for write in process.writes())
 
 
+@pytest.mark.parametrize("case", ["too-many-reviews", "not-dismissed"])
+def test_publish_fails_the_change_request_when_github_cannot_confirm_it(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+) -> None:
+    _github(process)
+    if case == "too-many-reviews":
+        # An unread page can hold a change request of this workflow.
+        for page in range(1, github_review.REVIEW_PAGE_LIMIT + 1):
+            others = [{"id": page * 1000 + n, "state": "COMMENTED"} for n in range(100)]
+            process.routes[("GET", f"{REVIEWS}?per_page=100&page={page}")] = _ok(others)
+        text = "the PR has too many reviews to find the change requests of this workflow"
+    else:
+        process.routes[("GET", REVIEWS_PAGE)] = _ok(
+            [_change_request_review(github_review, 301, OLD_HEAD)]
+        )
+        process.routes[("PUT", f"{REVIEWS}/301/dismissals")] = _ok(
+            {"id": 301, "state": "CHANGES_REQUESTED"}
+        )
+        text = "dismissed 0 of 1 earlier change request. GitHub did not dismiss review 301"
+
+    assert _publish(github_review, tmp_path, _review(**NOTHING_BLOCKS)) == 1
+
+    assert f"- Change request failed: {text}.\n" in capsys.readouterr().out
+
+
 def test_publish_approves_the_waiting_runs_of_the_pr_commits_oldest_first(
     github_review: ModuleType,
     process: FakeProcess,
@@ -3547,8 +3622,9 @@ def test_publish_approves_the_waiting_runs_of_the_pr_commits_oldest_first(
         _waiting_run(902, head_repository={"full_name": "other/widgets"}),
         _waiting_run(904, OTHER_COMMIT),
         _waiting_run(905, conclusion="success"),
+        _waiting_run(906, event="pull_request_target"),
     ]
-    process.routes[("GET", WAITING_RUNS_PAGE)] = _ok({"total_count": 5, "workflow_runs": runs})
+    process.routes[("GET", WAITING_RUNS_PAGE)] = _ok({"total_count": 6, "workflow_runs": runs})
     # Only runs 901 and 903 have a route, so an approval of another run fails the test.
     for run_id in (901, 903):
         process.routes[("POST", _approve_path(run_id))] = _ok({})
@@ -3560,6 +3636,27 @@ def test_publish_approves_the_waiting_runs_of_the_pr_commits_oldest_first(
         _approve_path(901),
         _approve_path(903),
     ]
+
+
+def test_publish_approves_no_run_when_the_pr_has_no_head_repository(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # GitHub gives no head repository when the fork is deleted.
+    _github(process, live=_live_pr(head={"sha": HEAD, "repo": None}))
+    process.routes[("GET", WAITING_RUNS_PAGE)] = _ok(
+        {"workflow_runs": [_waiting_run(901, head_repository=None)]}
+    )
+
+    assert _publish(github_review, tmp_path, _review()) == 0
+
+    assert (
+        "- CI runs: approved none, because GitHub gives no head repository for the PR.\n"
+        in capsys.readouterr().out
+    )
+    assert not [path for _, path, _ in process.writes() if path.endswith("/approve")]
 
 
 @pytest.mark.parametrize("cut", ["commits", "runs"])
@@ -4256,6 +4353,9 @@ def test_publish_reports_a_review_that_is_not_published_with_a_neutral_check(
         "${{ needs.review.result == 'success' && 'publish_failure' || needs.review.result }}"
     )
     assert '--reviewers "$REVIEWERS"' in publish["run"]
+    # A re-run assigns the person who started the re-run.
+    assert publish["env"]["ACTOR"] == "${{ github.triggering_actor }}"
+    assert '--actor "$ACTOR"' in publish["run"]
     assert '--job-result "$JOB_RESULT"' in failure["run"]
 
 
