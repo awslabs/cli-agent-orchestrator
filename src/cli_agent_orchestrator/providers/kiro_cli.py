@@ -297,8 +297,9 @@ TUI_TRUST_ALL_TOOLS_FOOTER = r"esc to cancel · ↑↓ to navigate · ↵ to sel
 TUI_TRUST_ALL_TOOLS_BODY = r"Kiro is running in trust all tools mode"
 TUI_TRUST_ALL_TOOLS_CURSOR = r"❯\s*No, exit"
 
-# Bottom pane lines scanned for the consent dialog (mirrors codex's window).
+# Bottom pane lines scanned for the current selector's footer and its wrapped body.
 STARTUP_PROMPT_BOTTOM_LINES = 15
+TRUST_DIALOG_BODY_LINES = 40
 
 # Selection cursor of kiro's blocking list selectors (consent, update, login).
 # The "/" command menu draws the same footer as TUI_TRUST_ALL_TOOLS_FOOTER but
@@ -954,11 +955,33 @@ class KiroCliProvider(BaseProvider):
         pane = strip_terminal_escapes(
             re.sub(ANSI_CODE_PATTERN, "", backend.get_history(self.session_name, self.window_name))
         )
-        bottom = "\n".join(pane.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
-        if not (
-            re.search(TUI_TRUST_ALL_TOOLS_BODY, bottom)
-            and re.search(TUI_TRUST_ALL_TOOLS_CURSOR, bottom)
-        ):
+        lines = pane.splitlines()
+        footer_lines = [
+            index
+            for index in range(max(0, len(lines) - STARTUP_PROMPT_BOTTOM_LINES), len(lines))
+            if re.search(TUI_TRUST_ALL_TOOLS_FOOTER, lines[index])
+        ]
+        verified = False
+        if footer_lines:
+            footer_line = footer_lines[-1]
+            body_start = max(0, footer_line - TRUST_DIALOG_BODY_LINES)
+            body_lines = [
+                index
+                for index in range(body_start, footer_line)
+                if re.search(TUI_TRUST_ALL_TOOLS_BODY, lines[index])
+            ]
+            verified = any(
+                not any(
+                    re.search(TUI_TRUST_ALL_TOOLS_FOOTER, lines[index])
+                    for index in range(body_line + 1, footer_line)
+                )
+                and any(
+                    re.search(r"^\s*" + TUI_TRUST_ALL_TOOLS_CURSOR + r"\s*$", lines[index])
+                    for index in range(body_line + 1, footer_line)
+                )
+                for body_line in body_lines
+            )
+        if not verified:
             logger.warning(
                 "kiro_cli: WAITING_USER_ANSWER but the trust-all-tools consent "
                 "dialog (body + '❯ No, exit') was not verified; not answering"
