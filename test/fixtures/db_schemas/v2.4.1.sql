@@ -1,20 +1,4 @@
 -- Schema from v2.4.1, commit 752be53f19c15b328a67a4e64c3d3c87c38b2d23; DDL only, no rows.
-CREATE INDEX idx_memory_rel_lookup ON memory_relationships (scope, scope_id, source_key);
-
-CREATE INDEX idx_memory_scope ON memory_metadata (scope, scope_id);
-
-CREATE INDEX idx_memory_type ON memory_metadata (memory_type);
-
-CREATE INDEX idx_memory_updated ON memory_metadata (updated_at);
-
-CREATE INDEX idx_outcome_agent ON workflow_outcomes (agent_profile, created_at);
-
-CREATE INDEX idx_outcome_session ON workflow_outcomes (session_name, created_at);
-
-CREATE INDEX ix_project_aliases_project_id ON project_aliases (project_id);
-
-CREATE UNIQUE INDEX uq_memory_rel ON memory_relationships (scope, scope_id, source_key, target_key, type, origin);
-
 CREATE TABLE flows (
 	name VARCHAR NOT NULL, 
 	file_path VARCHAR NOT NULL, 
@@ -122,3 +106,19 @@ CREATE TABLE workflow_outcomes (
 CREATE TABLE workflow_run (run_id TEXT PRIMARY KEY, workflow_name TEXT NOT NULL, spec_snapshot TEXT NOT NULL, inputs_json TEXT NOT NULL, state TEXT NOT NULL, current_step_id TEXT, started_at TEXT NOT NULL, finished_at TEXT, tier TEXT NOT NULL DEFAULT 'yaml', generation TEXT NOT NULL DEFAULT '1');
 
 CREATE TABLE workflow_run_step (run_id TEXT NOT NULL, step_id TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL, output_json TEXT, error TEXT, updated_at TEXT NOT NULL, call_fingerprint TEXT DEFAULT NULL, PRIMARY KEY (run_id, step_id));
+
+CREATE INDEX idx_memory_rel_lookup ON memory_relationships (scope, scope_id, source_key);
+
+CREATE INDEX idx_memory_scope ON memory_metadata (scope, scope_id);
+
+CREATE INDEX idx_memory_type ON memory_metadata (memory_type);
+
+CREATE INDEX idx_memory_updated ON memory_metadata (updated_at);
+
+CREATE INDEX idx_outcome_agent ON workflow_outcomes (agent_profile, created_at);
+
+CREATE INDEX idx_outcome_session ON workflow_outcomes (session_name, created_at);
+
+CREATE INDEX ix_project_aliases_project_id ON project_aliases (project_id);
+
+CREATE UNIQUE INDEX uq_memory_rel ON memory_relationships (scope, scope_id, source_key, target_key, type, origin);

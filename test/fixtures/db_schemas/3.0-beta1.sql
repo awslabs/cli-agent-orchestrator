@@ -1,50 +1,4 @@
 -- Schema from 3.0-beta1, commit cd9d69330d5977719b8b0a620211ac62b727d561; DDL only, no rows.
-CREATE INDEX idx_memory_rel_lookup ON memory_relationships (scope, scope_id, source_key);
-
-CREATE INDEX idx_memory_scope ON memory_metadata (scope, scope_id);
-
-CREATE INDEX idx_memory_type ON memory_metadata (memory_type);
-
-CREATE INDEX idx_memory_updated ON memory_metadata (updated_at);
-
-CREATE INDEX idx_outcome_agent ON workflow_outcomes (agent_profile, created_at);
-
-CREATE INDEX idx_outcome_session ON workflow_outcomes (session_name, created_at);
-
-CREATE INDEX idx_workflow_run_started_at ON workflow_run (started_at);
-
-CREATE INDEX idx_workflow_run_state ON workflow_run (state);
-
-CREATE INDEX ix_decision_records_created_at ON decision_records (created_at);
-
-CREATE INDEX ix_decision_records_point_created_at ON decision_records (point, created_at);
-
-CREATE INDEX ix_decision_records_terminal_id ON decision_records (terminal_id);
-
-CREATE INDEX ix_delegation_edges_caller_id ON delegation_edges (caller_id);
-
-CREATE INDEX ix_delegation_edges_state ON delegation_edges (state);
-
-CREATE INDEX ix_delegation_edges_worker_id ON delegation_edges (worker_id);
-
-CREATE INDEX ix_ephemeral_agents_launched_terminal_id ON ephemeral_agents (launched_terminal_id);
-
-CREATE INDEX ix_kept_terminals_session_name ON kept_terminals (session_name);
-
-CREATE INDEX ix_launch_records_created_at ON launch_records (created_at);
-
-CREATE INDEX ix_launch_records_ended_at ON launch_records (ended_at);
-
-CREATE INDEX ix_launch_records_terminal_id ON launch_records (terminal_id);
-
-CREATE INDEX ix_launch_status_events_terminal_created ON launch_status_events (terminal_id, created_at);
-
-CREATE INDEX ix_project_aliases_project_id ON project_aliases (project_id);
-
-CREATE UNIQUE INDEX uq_memory_key_scope_null ON memory_metadata ("key", scope, source_kind) WHERE scope_id IS NULL;
-
-CREATE UNIQUE INDEX uq_memory_rel ON memory_relationships (scope, scope_id, source_key, target_key, type, origin);
-
 CREATE TABLE decision_records (
 	id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, 
 	created_at DATETIME NOT NULL, 
@@ -399,3 +353,49 @@ CREATE TABLE workflow_run_event (run_id TEXT NOT NULL, seq INTEGER NOT NULL, eve
 CREATE TABLE workflow_run_seq (run_id TEXT PRIMARY KEY, high_water INTEGER NOT NULL);
 
 CREATE TABLE workflow_run_step (run_id TEXT NOT NULL, step_id TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL, output_json TEXT, error TEXT, updated_at TEXT NOT NULL, call_fingerprint TEXT DEFAULT NULL, terminal_id TEXT DEFAULT NULL, reprompted INTEGER DEFAULT NULL, error_kind TEXT DEFAULT NULL, result_json TEXT DEFAULT NULL, PRIMARY KEY (run_id, step_id));
+
+CREATE INDEX idx_memory_rel_lookup ON memory_relationships (scope, scope_id, source_key);
+
+CREATE INDEX idx_memory_scope ON memory_metadata (scope, scope_id);
+
+CREATE INDEX idx_memory_type ON memory_metadata (memory_type);
+
+CREATE INDEX idx_memory_updated ON memory_metadata (updated_at);
+
+CREATE INDEX idx_outcome_agent ON workflow_outcomes (agent_profile, created_at);
+
+CREATE INDEX idx_outcome_session ON workflow_outcomes (session_name, created_at);
+
+CREATE INDEX idx_workflow_run_started_at ON workflow_run (started_at);
+
+CREATE INDEX idx_workflow_run_state ON workflow_run (state);
+
+CREATE INDEX ix_decision_records_created_at ON decision_records (created_at);
+
+CREATE INDEX ix_decision_records_point_created_at ON decision_records (point, created_at);
+
+CREATE INDEX ix_decision_records_terminal_id ON decision_records (terminal_id);
+
+CREATE INDEX ix_delegation_edges_caller_id ON delegation_edges (caller_id);
+
+CREATE INDEX ix_delegation_edges_state ON delegation_edges (state);
+
+CREATE INDEX ix_delegation_edges_worker_id ON delegation_edges (worker_id);
+
+CREATE INDEX ix_ephemeral_agents_launched_terminal_id ON ephemeral_agents (launched_terminal_id);
+
+CREATE INDEX ix_kept_terminals_session_name ON kept_terminals (session_name);
+
+CREATE INDEX ix_launch_records_created_at ON launch_records (created_at);
+
+CREATE INDEX ix_launch_records_ended_at ON launch_records (ended_at);
+
+CREATE INDEX ix_launch_records_terminal_id ON launch_records (terminal_id);
+
+CREATE INDEX ix_launch_status_events_terminal_created ON launch_status_events (terminal_id, created_at);
+
+CREATE INDEX ix_project_aliases_project_id ON project_aliases (project_id);
+
+CREATE UNIQUE INDEX uq_memory_key_scope_null ON memory_metadata ("key", scope, source_kind) WHERE scope_id IS NULL;
+
+CREATE UNIQUE INDEX uq_memory_rel ON memory_relationships (scope, scope_id, source_key, target_key, type, origin);

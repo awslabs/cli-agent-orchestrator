@@ -1,24 +1,4 @@
 -- Schema from v2.5.0, commit a5ccbe2624aabadfbdf64642c5f1e364db299ec3; DDL only, no rows.
-CREATE INDEX idx_memory_rel_lookup ON memory_relationships (scope, scope_id, source_key);
-
-CREATE INDEX idx_memory_scope ON memory_metadata (scope, scope_id);
-
-CREATE INDEX idx_memory_type ON memory_metadata (memory_type);
-
-CREATE INDEX idx_memory_updated ON memory_metadata (updated_at);
-
-CREATE INDEX idx_outcome_agent ON workflow_outcomes (agent_profile, created_at);
-
-CREATE INDEX idx_outcome_session ON workflow_outcomes (session_name, created_at);
-
-CREATE INDEX idx_workflow_run_started_at ON workflow_run (started_at);
-
-CREATE INDEX idx_workflow_run_state ON workflow_run (state);
-
-CREATE INDEX ix_project_aliases_project_id ON project_aliases (project_id);
-
-CREATE UNIQUE INDEX uq_memory_rel ON memory_relationships (scope, scope_id, source_key, target_key, type, origin);
-
 CREATE TABLE flows (
 	name VARCHAR NOT NULL, 
 	file_path VARCHAR NOT NULL, 
@@ -135,3 +115,23 @@ CREATE TABLE workflow_run_event (run_id TEXT NOT NULL, seq INTEGER NOT NULL, eve
 CREATE TABLE workflow_run_seq (run_id TEXT PRIMARY KEY, high_water INTEGER NOT NULL);
 
 CREATE TABLE workflow_run_step (run_id TEXT NOT NULL, step_id TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL, output_json TEXT, error TEXT, updated_at TEXT NOT NULL, call_fingerprint TEXT DEFAULT NULL, terminal_id TEXT DEFAULT NULL, reprompted INTEGER DEFAULT NULL, error_kind TEXT DEFAULT NULL, result_json TEXT DEFAULT NULL, PRIMARY KEY (run_id, step_id));
+
+CREATE INDEX idx_memory_rel_lookup ON memory_relationships (scope, scope_id, source_key);
+
+CREATE INDEX idx_memory_scope ON memory_metadata (scope, scope_id);
+
+CREATE INDEX idx_memory_type ON memory_metadata (memory_type);
+
+CREATE INDEX idx_memory_updated ON memory_metadata (updated_at);
+
+CREATE INDEX idx_outcome_agent ON workflow_outcomes (agent_profile, created_at);
+
+CREATE INDEX idx_outcome_session ON workflow_outcomes (session_name, created_at);
+
+CREATE INDEX idx_workflow_run_started_at ON workflow_run (started_at);
+
+CREATE INDEX idx_workflow_run_state ON workflow_run (state);
+
+CREATE INDEX ix_project_aliases_project_id ON project_aliases (project_id);
+
+CREATE UNIQUE INDEX uq_memory_rel ON memory_relationships (scope, scope_id, source_key, target_key, type, origin);
