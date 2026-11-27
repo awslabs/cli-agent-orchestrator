@@ -49,6 +49,28 @@ update the local source, then reinstall: uv tool install /path --reinstall
 
 ## After updating
 
+### Database upgrades, backups and recovery
+
+On startup, CAO checks its numbered schema-migration record before modifying
+the database. An unrecorded existing database is backed up before the 2.5
+baseline is verified and stamped; future pending upgrades are backed up before
+their first migration. Backups are consistent SQLite snapshots in
+`CAO_HOME_DIR/db/backups/`, one per upgrade, with no automatic rotation. CAO
+refuses an upgrade if it cannot make and verify a backup, or if available space
+is less than twice the database file's size. Never use a live file copy as a
+backup: it can omit transactions or WAL data.
+
+If startup refuses a newer, unknown or interrupted migration, stop **every**
+CAO process first. Move `CAO_HOME_DIR/db/cli-agent-orchestrator.db` and any
+matching `-wal` and `-shm` files aside, then copy the indicated backup into
+the original database path and reinstall the older CAO release that wrote it.
+Inspect the recorded `cao_version` and the error's backup path before choosing
+the release. Do not open a migrated database with an older CAO binary; it is
+unsupported. A CLI process cannot apply a post-baseline upgrade while the
+server is running: restart `cao-server` to let it complete the upgrade.
+
+## Restarting the server
+
 Restart any running `cao-server` so it picks up the new version:
 
 ```bash

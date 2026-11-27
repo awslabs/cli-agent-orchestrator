@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Schema migration safety (#775):** startup records and verifies the 2.5
+  baseline, refuses unknown or newer schema versions, serializes upgrades and
+  snapshots an existing database before applying a pending upgrade. See
+  `docs/updating.md` for backup and recovery instructions.
+
 - **Breaking: execution runtimes from the first #745 slice (#834) are removed, before any
   release shipped them.** `3.0-beta1` replaces them with the remote terminal backend, where
   `cao-server` keeps providers, status detection and the inbox and execution-only runners drive
