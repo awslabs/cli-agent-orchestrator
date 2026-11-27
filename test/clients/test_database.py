@@ -1,6 +1,7 @@
 """Tests for the database client."""
 
 import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1500,6 +1501,113 @@ class TestInboxOperations:
         update_message_status(1, MessageStatus.DELIVERED)
 
         mock_session.commit.assert_called_once()
+
+    @staticmethod
+    def _seed_pending(count=1):
+        with db_mod.SessionLocal() as seed:
+            rows = [
+                InboxModel(
+                    sender_id="s",
+                    receiver_id="term-1",
+                    message="m",
+                    status=MessageStatus.PENDING.value,
+                    created_at=datetime.now(),
+                )
+                for _ in range(count)
+            ]
+            seed.add_all(rows)
+            seed.commit()
+            return sorted(row.id for row in rows)
+
+    @staticmethod
+    def _claim(message_id):
+        """The claim deliver_pending makes: PENDING to DELIVERED, or nothing."""
+        return update_message_status(
+            message_id, MessageStatus.DELIVERED, expected_status=MessageStatus.PENDING
+        )
+
+    def test_get_pending_messages_lets_two_independent_callers_both_see_the_same_row(
+        self, isolated_memory_db
+    ):
+        """Documents the race #406 reports: a plain read does not claim anything,
+        so two deliver_pending() callers that do not share a lock both decide,
+        independently, that the same PENDING row is theirs to deliver.
+        """
+        self._seed_pending()
+
+        caller_a = get_pending_messages("term-1", limit=1)
+        caller_b = get_pending_messages("term-1", limit=1)
+
+        assert len(caller_a) == 1
+        assert [m.id for m in caller_a] == [m.id for m in caller_b]
+
+    def test_claim_pending_message_only_one_caller_wins(self, isolated_memory_db):
+        """The answer to the race above: the second caller's
+        UPDATE ... WHERE status = 'pending' matches zero rows once the first
+        caller's UPDATE has flipped the row to DELIVERED."""
+        [message_id] = self._seed_pending()
+
+        caller_a = self._claim(message_id)
+        caller_b = self._claim(message_id)
+
+        assert caller_a is True
+        assert caller_b is False
+        [stored] = get_inbox_messages("term-1")
+        assert stored.status == MessageStatus.DELIVERED
+
+    def test_claim_pending_message_concurrent_threads_never_double_claim(self, isolated_memory_db):
+        """Two OS threads, each on its own connection to the on-disk SQLite file
+        isolated_memory_db sets up, contest every row head to head: a barrier
+        per row releases both claims on that row together. Every seeded row is
+        claimed exactly once across both threads, never twice and never by
+        neither. An exception in a thread fails the test.
+        """
+        seeded_ids = self._seed_pending(25)
+        row_barriers = {message_id: threading.Barrier(2) for message_id in seeded_ids}
+        wins: list[list[int]] = [[], []]
+        errors: list[BaseException] = []
+
+        def worker(mine: list[int]) -> None:
+            try:
+                for message_id in seeded_ids:
+                    row_barriers[message_id].wait(timeout=10)
+                    if self._claim(message_id):
+                        mine.append(message_id)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the test thread
+                errors.append(exc)
+                for barrier in row_barriers.values():
+                    barrier.abort()
+
+        threads = [threading.Thread(target=worker, args=(mine,)) for mine in wins]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+
+        assert not any(t.is_alive() for t in threads)
+        if errors:
+            raise errors[0]
+        assert sorted(wins[0] + wins[1]) == seeded_ids
+
+    def test_claim_fails_on_a_row_that_is_not_pending_and_leaves_it_alone(self, isolated_memory_db):
+        [message_id] = self._seed_pending()
+        update_message_status(message_id, MessageStatus.FAILED)
+
+        assert self._claim(message_id) is False
+        assert self._claim(message_id + 1) is False, "no such row"
+        [stored] = get_inbox_messages("term-1")
+        assert stored.status == MessageStatus.FAILED
+
+    def test_message_reset_to_pending_can_be_claimed_again(self, isolated_memory_db):
+        """A delivery that could not type its message puts it back with an
+        unconditional write; the next attempt must be able to claim it."""
+        [message_id] = self._seed_pending()
+        assert self._claim(message_id) is True
+
+        assert update_message_status(message_id, MessageStatus.PENDING) is True
+
+        assert self._claim(message_id) is True
+        assert self._claim(message_id) is False
 
 
 class TestFlowOperations:

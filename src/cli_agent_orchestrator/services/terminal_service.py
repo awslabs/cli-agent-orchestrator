@@ -7532,7 +7532,7 @@ def delete_terminal_row(
     *,
     end_reason: str,
 ) -> bool:
-    """Drop a terminal's registry row and emit ``post_kill_terminal``.
+    """Drop a terminal's registry row; emit ``post_kill_terminal`` only when a registry is passed.
 
     The final third of terminal teardown, split out so session teardown can
     defer it past its kill-confirmation point (#498) -- deleting a row for a
@@ -7541,11 +7541,14 @@ def delete_terminal_row(
     it is needed for the event payload because the row is gone by the time the
     event is built.
 
-    ``registry=None`` drops the row WITHOUT emitting. Session teardown and the
-    single-terminal ``delete_terminal`` both pass None while they hold the
-    lifecycle lock and emit the event themselves once it is released, so that no
-    third-party plugin ever runs inside the critical section. Callers that hold no
-    lock (keep_service, retention cleanup) pass their registry straight through.
+    ``registry=None`` drops the row (and its sidecars, open delegation edges and
+    ephemeral binding) WITHOUT emitting ``post_kill_terminal``. Every caller but
+    one passes None: session teardown and the single-terminal ``delete_terminal``
+    hold the lifecycle lock and emit the event themselves once it is released, so
+    that no third-party plugin ever runs inside the critical section; the retention
+    sweep (``cleanup_service``) and the stale-row purge for a reused session name
+    emit nothing. Only keep's cleanup (``keep_service``) passes its registry
+    straight through, and that event is dispatched from here.
 
     ``end_reason`` (one of ``database.LAUNCH_END_REASONS``) is stamped on the
     terminal's launch record (issue #1082); the caller names why it ended.
