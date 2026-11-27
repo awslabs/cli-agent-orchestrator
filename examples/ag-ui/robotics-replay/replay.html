@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<!--
+  ABOUTME: Zero-dependency replay of a recorded robotics run as an AG-UI session timeline.
+  ABOUTME: Reads two same-origin files (the trace and its factory command log). Opens no stream, writes nothing.
+
+  Replay of a MOCK run of the hierarchical-factory example (#1166). The trace is a
+  cao-dojo-trace/1 recording of CAO's own AG-UI events: the supervisor's three assigns and one
+  handoff, and the approval card for robot motion. The factory commands (form_team,
+  start_line, start_shipping, set_pace) are not AG-UI events; they come from the side log and
+  are placed after the tool call they followed, and the page labels them as such.
+
+  What it is not: a client of /agui/v1. It opens no stream, sends no request body and holds no token, so it
+  needs no cao-server and no CAO_AGUI_ENABLED, and it cannot change anything. Rows are built
+  with textContent only, never by parsing markup or evaluating text.
+
+  A page opened from file:// cannot fetch, so serve this directory:
+    cd examples/ag-ui/robotics-replay && python3 -m http.server 8791 --bind 127.0.0.1
+    open http://127.0.0.1:8791/replay.html
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CAO robotics replay: a mock factory run as an AG-UI timeline</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a21; --panel-2: #1e222b; --border: #2a2f3a;
+    --text: #e6e9ef; --muted: #9aa4b2; --agent: #6ea8fe; --call: #4ec9a5;
+    --approval: #e6b450; --factory: #c792ea;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 10px 16px;
+    background: var(--panel); border-bottom: 1px solid var(--border); }
+  h1 { margin: 0; font-size: 16px; }
+  button { background: var(--agent); color: #07101f; border: 0; border-radius: 6px; padding: 5px 12px; cursor: pointer; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  main { padding: 16px; }
+  #banner, #meta, #summary { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
+  #banner { color: var(--approval); }
+  #error { color: #f07178; margin: 8px 0; }
+  .legend span { margin-right: 14px; font-size: 12px; }
+  ol { list-style: none; margin: 8px 0 0; padding: 0; background: var(--panel); border: 1px solid var(--border); }
+  li { display: grid; grid-template-columns: 56px 100px 1fr 1fr; gap: 8px; padding: 4px 8px;
+    border-bottom: 1px solid var(--border); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  li[data-kind="agent"] .kind, .k-agent { color: var(--agent); }
+  li[data-kind="call"] .kind, .k-call { color: var(--call); }
+  li[data-kind="approval"] .kind, .k-approval { color: var(--approval); }
+  li[data-kind="factory"] .kind, .k-factory { color: var(--factory); }
+  .seq, .detail { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Robotics replay</h1>
+  <button id="play" type="button">Play</button>
+  <button id="step" type="button">Step</button>
+  <button id="all" type="button">Show all</button>
+  <button id="reset" type="button">Reset</button>
+</header>
+<main>
+  <p id="banner">MOCK run: the agents are mock_cli seats and their decisions are scripted. The CAO events and the MuJoCo factory floor are real.</p>
+  <p id="meta">No trace loaded.</p>
+  <p class="legend">
+    <span class="k-agent">agent: seat lifecycle</span>
+    <span class="k-call">call: assign / handoff</span>
+    <span class="k-approval">approval: card and resume</span>
+    <span class="k-factory">factory: side log, not an AG-UI event</span>
+  </p>
+  <p id="summary"></p>
+  <p id="error" role="alert"></p>
+  <ol id="rows"></ol>
+</main>
+<script src="replay-rows.js"></script>
+<script>
+(function () {
+  "use strict";
+  var TRACE = "trace/robotics-mock-trace.ndjson";
+  var LOG = "trace/factory-command-log.json";
+  var DELAY_MS = 450;
+  var els = {
+    meta: document.getElementById("meta"), summary: document.getElementById("summary"),
+    error: document.getElementById("error"), rows: document.getElementById("rows"),
+    play: document.getElementById("play"), step: document.getElementById("step"),
+    all: document.getElementById("all"), reset: document.getElementById("reset"),
+  };
+  var rows = [];
+  var shown = 0;
+  var timer = null;
+
+  function cell(cls, text) {
+    var d = document.createElement("span");
+    d.className = cls;
+    d.textContent = text;
+    return d;
+  }
+  function addRow(row) {
+    var li = document.createElement("li");
+    li.setAttribute("data-kind", row.kind);
+    li.appendChild(cell("seq", row.seq === null ? "log" : "#" + row.seq));
+    li.appendChild(cell("kind", row.kind));
+    li.appendChild(cell("label", row.label));
+    li.appendChild(cell("detail", row.detail));
+    els.rows.appendChild(li);
+  }
+  function render() {
+    els.rows.textContent = "";
+    rows.slice(0, shown).forEach(addRow);
+    els.summary.textContent = shown + " of " + rows.length + " rows";
+    var done = shown >= rows.length;
+    els.step.disabled = done;
+    els.play.disabled = done;
+    if (done) stop();
+  }
+  function stop() {
+    if (timer !== null) { clearInterval(timer); timer = null; }
+    els.play.textContent = "Play";
+  }
+  function advance() { if (shown < rows.length) { shown += 1; render(); } }
+
+  els.play.addEventListener("click", function () {
+    if (timer !== null) { stop(); return; }
+    els.play.textContent = "Pause";
+    timer = setInterval(advance, DELAY_MS);
+  });
+  els.step.addEventListener("click", advance);
+  els.all.addEventListener("click", function () { stop(); shown = rows.length; render(); });
+  els.reset.addEventListener("click", function () { stop(); shown = 0; render(); });
+
+  function getText(path) {
+    return fetch(path, { credentials: "omit" }).then(function (r) {
+      if (!r.ok) throw new Error(path + ": HTTP " + r.status);
+      return r.text();
+    });
+  }
+  Promise.all([getText(TRACE), getText(LOG)])
+    .then(function (texts) {
+      var trace = RoboticsReplayRows.parseNdjson(texts[0]);
+      var log = JSON.parse(texts[1]);
+      rows = RoboticsReplayRows.buildRows(trace.records, log.commands);
+      els.meta.textContent = "schema " + trace.meta.schema + ", " + trace.meta.mode + " run, CAO "
+        + trace.meta.cao_version + ", AG-UI protocol " + trace.meta.ag_ui_protocol
+        + ". Final team status: " + Object.keys(log.final_team_status).map(function (z) {
+            return z + " " + log.final_team_status[z];
+          }).join(", ") + ".";
+      shown = 0;
+      render();
+    })
+    .catch(function (e) { els.error.textContent = String(e && e.message || e); });
+})();
+</script>
+</body>
+</html>

@@ -43,6 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delegation ceiling treats them as granting nothing new. Reinstall such profiles to pick
   this up.
 
+- **Replay a recorded robotics run as an AG-UI timeline** (#1166). `examples/ag-ui/robotics-replay/` holds a scrubbed trace of a mock hierarchical-factory run (assigns, a handoff, one approval), the factory command log, a zero-dependency replay page and the recorder. `test/examples/test_robotics_replay_trace.py` runs the CAO Dojo leak rule over the trace and refuses a deliberately leaky copy. No change to CAO's code.
+
 - Add the Qwen Code (`qwen_cli`) provider with profile, skill, MCP and model support.
 
 - **kiro_cli (v2 TUI): an open permission dialog reads `waiting_user_answer` in the cases #1426 missed**.
