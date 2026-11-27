@@ -160,6 +160,18 @@ STALE_PROCESSING_CAPTURE_INTERVAL_S = 3.0
 # only attempt a capture once no new chunk has been appended for this long. A terminal
 # mid-burst never reaches the fallback at all.
 STALE_PROCESSING_BUFFER_QUIET_S = 3.0
+#
+# "No new chunk" means no chunk that changed the composited screen when the provider is read
+# through the pyte screen (#1367). A TUI that is idle can still write on a timer without
+# touching a cell: agy repeats one 39-byte block of terminal-mode sequences about every 2.1 s
+# (measured; test/providers/fixtures/agy_idle_mode_block_timed.json). Counted as output, it
+# held this gate shut forever, and its arrival also dropped the pending capture candidate each
+# time, so the capture-pane fallback above never ran and a wrong composite was never corrected.
+# A chunk that leaves every row's text as it was is not activity: it is still appended to the
+# rolling buffer and still advances the output generation, but it does not reset the gate,
+# advance the capture generation or drop a candidate. Colour or attribute changes on unchanged
+# text count as no change, because status detection reads text only. Without a screen (raw
+# detection), every chunk counts as before.
 
 # A ready verdict from a single capture is never honored on its own — it must repeat on the
 # next eligible read (see _fresh_capture_pane_status). This bounds how far apart those two
@@ -308,6 +320,10 @@ class StatusMonitor:
         # stopped for PYTE_QUIESCENCE_DELAY_S) — never mid-burst, which is what
         # keeps status flap-free.
         self._screens: Dict[str, Tuple["pyte.Screen", "pyte.Stream"]] = {}
+        # Per-terminal rendered text of each screen row the screen has marked dirty, so a
+        # chunk that rewrites the screen to what it already showed (or touches no row) can be
+        # told from one that changes it (#1367). An absent row reads as blank.
+        self._screen_rows: Dict[str, Dict[int, Dict[int, str]]] = {}
         self._bursting: Dict[str, bool] = {}
         # The last screen re-check of a poller, per terminal: (output generation,
         # verdict). A poll on the same output reuses the verdict instead of
@@ -397,21 +413,32 @@ class StatusMonitor:
             if len(buffer) > state_buffer_max:
                 buffer = buffer[-state_buffer_max:]
             self._buffers[terminal_id] = buffer
-            # Real new output just landed — the stale-PROCESSING quiet gate keys off this
-            # (see STALE_PROCESSING_BUFFER_QUIET_S). It also advances the capture
-            # generation and kills any pending capture candidate: output arriving
-            # means the terminal is demonstrably alive, so a ready verdict sampled
-            # before this chunk no longer describes it and must not be confirmable
-            # by a later read.
-            self._buffer_changed_at[terminal_id] = time.monotonic()
-            capture_generation = self._capture_generation.get(terminal_id, 0) + 1
-            self._capture_generation[terminal_id] = capture_generation
+            # The chunk is always in the buffer, and the output generation always advances,
+            # so a cached re-check on the old buffer is never reused.
             self._output_generation[terminal_id] = self._output_generation.get(terminal_id, 0) + 1
-            self._pending_stale_capture.pop(terminal_id, None)
-            self._confirmed_stale_capture_commit.pop(terminal_id, None)
-            capture_handle = self._stale_capture_handle.pop(terminal_id, None)
+            # With a screen, learn whether the chunk changed any cell. Without one (raw
+            # detection) every chunk is activity, as before.
+            screen_changed = True
             if use_screen:
-                self._feed_screen_locked(terminal_id, chunk)
+                screen_changed = self._feed_screen_locked(terminal_id, chunk)
+            capture_handle = None
+            if screen_changed or self._buffer_changed_at.get(terminal_id) is None:
+                # Real new output just landed — the stale-PROCESSING quiet gate keys off
+                # this (see STALE_PROCESSING_BUFFER_QUIET_S). It also advances the capture
+                # generation and kills any pending capture candidate: output arriving
+                # means the terminal is demonstrably alive, so a ready verdict sampled
+                # before this chunk no longer describes it and must not be confirmable
+                # by a later read. A chunk that changed no cell is none of that (#1367);
+                # the very first chunk of a terminal still starts the gate's clock.
+                self._buffer_changed_at[terminal_id] = time.monotonic()
+            if screen_changed:
+                capture_generation = self._capture_generation.get(terminal_id, 0) + 1
+                self._capture_generation[terminal_id] = capture_generation
+                self._pending_stale_capture.pop(terminal_id, None)
+                self._confirmed_stale_capture_commit.pop(terminal_id, None)
+                capture_handle = self._stale_capture_handle.pop(terminal_id, None)
+            else:
+                capture_generation = self._capture_generation.get(terminal_id, 0)
 
         self._cancel_quiesce_handle(capture_handle)
         if not use_screen:
@@ -601,11 +628,16 @@ class StatusMonitor:
 
     # ----- pyte rendered-screen detection (edge-debounced) -------------------
 
-    def _feed_screen_locked(self, terminal_id: str, chunk: str) -> None:
+    def _feed_screen_locked(self, terminal_id: str, chunk: str) -> bool:
         """Feed a chunk into the terminal's pyte screen. Caller holds the lock.
 
         Lazily creates the Screen+Stream so pyte is only imported/used when the
         screen path is active for this terminal.
+
+        Returns whether the chunk changed the text of any screen row (#1367). Only the
+        rows pyte marked dirty are rendered and compared with their last rendered text, so
+        a chunk of mode sequences costs nothing. Any failure to compare reports a change,
+        which keeps the old behaviour of counting the chunk as activity.
         """
         scr = self._screens.get(terminal_id)
         if scr is None:
@@ -706,6 +738,25 @@ class StatusMonitor:
             scr = (screen, stream)
             self._screens[terminal_id] = scr
         scr[1].feed(chunk)
+        try:
+            rendered = scr[0]
+            rows = self._screen_rows.setdefault(terminal_id, {})
+            dirty = sorted(rendered.dirty)
+            rendered.dirty.clear()
+            changed = False
+            for y in dirty:
+                # The row's text: its written cells, keyed by column. pyte stores only
+                # written cells, so this costs what the row holds, not the screen width.
+                # Blank cells are left out so that "erased" and "never written" agree.
+                text = {x: c.data for x, c in rendered.buffer[y].items() if c.data != " "}
+                if text != rows.get(y, {}):
+                    rows[y] = text
+                    changed = True
+            return changed
+        except Exception:
+            logger.debug("screen change check failed for %s", terminal_id, exc_info=True)
+            self._screen_rows.pop(terminal_id, None)
+            return True
 
     def _screen_lines(self, terminal_id: str) -> Tuple[Optional[List[str]], str]:
         """Render the terminal's composited pyte screen under the lock.
@@ -1383,6 +1434,7 @@ class StatusMonitor:
             self._input_sent_at.pop(terminal_id, None)
             self._native_activity_at.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
+            self._screen_rows.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
             self._recheck_cache.pop(terminal_id, None)
             self._last_stale_capture_check.pop(terminal_id, None)
@@ -1421,6 +1473,7 @@ class StatusMonitor:
             # Drop the rendered screen too so the relaunched CLI mode is
             # detected against a fresh viewport, not the failed attempt's.
             self._screens.pop(terminal_id, None)
+            self._screen_rows.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
             self._recheck_cache.pop(terminal_id, None)
             self._last_stale_capture_check.pop(terminal_id, None)
