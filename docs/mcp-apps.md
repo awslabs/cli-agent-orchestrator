@@ -34,7 +34,9 @@ view bundles** inside an MCP-host iframe with live host data over the same
 postMessage/SSE contract a host uses — drives an operator flow, and records it.
 Regenerate with `cd cao_mcp_apps && npm run build:all && node scripts/record-demo.mjs`
 (the recorder also emits an optimized `mcp-apps-demo.gif` when a gif-capable
-ffmpeg/gifski is on the machine). A true in-host render (Claude Desktop / Cursor /
+ffmpeg/gifski is on the machine). The recorder picks a free port, so it never
+sits on `9889`; set `DEMO_PORT` to choose one. It refuses to start while anything
+answers on `9889`, so a live `cao-server` cannot end up in a recording. A true in-host render (Claude Desktop / Cursor /
 Goose) can't be captured headlessly, so this harness is a faithful stand-in.
 
 ## Enabling
@@ -66,7 +68,11 @@ build or a missing frontend build degrades gracefully (logged, never fatal).
   the matching `ui://cao/*` view.
 - `cao_fetch_history` — replays normalized events from the ring buffer (app-only;
   used for iframe re-hydration after a re-mount).
-- `subscribe_events` — returns the live SSE endpoint descriptor.
+- `subscribe_events` — returns the live SSE endpoint descriptor. Its `base_url` is
+  the server's address; a wildcard bind (`CAO_API_HOST=0.0.0.0`) is reported as
+  `127.0.0.1`. The view's CSP allows only `127.0.0.1:9889` and `localhost:9889`
+  (`connectDomains` in `ext_apps/apps.py`), so the stream is reachable only on port
+  9889: with any other `CAO_API_PORT` a CSP-enforcing host blocks it.
 - `submit_command` — the **single mutation choke point**: classifies the command
   kind, applies a scope pre-check, and routes to a real Backplane HTTP endpoint.
 

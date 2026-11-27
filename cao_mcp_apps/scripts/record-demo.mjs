@@ -17,7 +17,8 @@
 // event-stream}.png, and mcp-apps-demo.gif when a gif-capable encoder is found.
 //
 // Usage:  npm run build:all && node scripts/record-demo.mjs
-// Env overrides: CHROMIUM_BIN, FFMPEG_BIN, DEMO_PORT.
+// Env overrides: CHROMIUM_BIN, FFMPEG_BIN, DEMO_PORT (default: a free port;
+// 9889 is refused, and so is any run while something answers on 9889).
 
 import { spawn, spawnSync } from "node:child_process";
 import {
@@ -32,11 +33,14 @@ import { fileURLToPath } from "node:url";
 
 import { chromium } from "@playwright/test";
 
+import { resolveDemoPort } from "./demo-port.mjs";
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, "..");
 const REPO = resolve(ROOT, "..");
-const PORT = Number(process.env.DEMO_PORT ?? 9889);
-const BASE = `http://127.0.0.1:${PORT}`;
+// Resolved in main(): a free port by default, never the cao-server port.
+let PORT;
+let BASE;
 const OUT_DIR = resolve(REPO, "docs/media");
 const TMP_DIR = resolve(ROOT, ".demo-tmp");
 const CHROMIUM_BIN = process.env.CHROMIUM_BIN || "/opt/pw-browsers/chromium";
@@ -89,6 +93,8 @@ function run(bin, args) {
 }
 
 async function main() {
+  PORT = await resolveDemoPort();
+  BASE = `http://127.0.0.1:${PORT}`;
   if (!existsSync(CHROMIUM_BIN))
     throw new Error(`chromium not found at ${CHROMIUM_BIN}`);
   rmSync(TMP_DIR, { recursive: true, force: true });

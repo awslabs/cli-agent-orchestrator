@@ -171,6 +171,16 @@ packages = ["src/cli_agent_orchestrator", "src/cao_workflow"]
 [tool.hatch.build.targets.wheel.hooks.custom]
 path = "scripts/hatch_build_tui_tag.py"
 
+# Keep npm dependency trees out of the sdist. The release `build-sdist` job runs
+# `npm ci` in web/ and cao_mcp_apps/ before `uv build --sdist`, and the published 2.5.5
+# sdist carried web/node_modules (74 MB). With cao_mcp_apps/node_modules as well the
+# sdist passed PyPI's 100 MB per-file limit, so the upload would fail (#1509 review).
+# Both trees are gitignored, which is not enough on its own: the release sdist included
+# web/node_modules anyway. `scripts/assert_mcp_app_views.py` fails the release on any
+# `node_modules/` member and on an artifact over the limit.
+[tool.hatch.build.targets.sdist]
+exclude = ["node_modules/"]
+
 # ---------------------------------------------------------------------------------------
 # cibuildwheel — per-platform wheels for the bundled Rust TUI binary (issue #321).
 #

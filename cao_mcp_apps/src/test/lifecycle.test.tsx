@@ -107,8 +107,8 @@ describe("EventStreamView — live SSE subscription", () => {
     let push: ((ev: { data: string }) => void) | undefined;
     let closed = false;
     const factory = (url: string): EventSourceLike => {
-      // The view builds the SSE URL from base + descriptor.sse_url.
-      expect(url).toBe("http://127.0.0.1:9889/events");
+      // The view builds the SSE URL from the descriptor's base_url + sse_url.
+      expect(url).toBe("http://127.0.0.1:54321/events");
       return {
         addEventListener: (_type, listener) => {
           push = listener;
@@ -122,7 +122,10 @@ describe("EventStreamView — live SSE subscription", () => {
     const host = buildHost({
       tools: {
         cao_fetch_history: () => ({ events: [] }),
-        subscribe_events: () => ({ sse_url: "/events" }),
+        subscribe_events: () => ({
+          sse_url: "/events",
+          base_url: "http://127.0.0.1:54321",
+        }),
       },
     });
     const app = makeApp(host);
@@ -146,6 +149,50 @@ describe("EventStreamView — live SSE subscription", () => {
     view.unmount();
     // Unmount closes the SSE source (listener release).
     expect(closed).toBe(true);
+  });
+
+  it("does not stream when the host gives no address (no built-in default)", async () => {
+    const factory = vi.fn();
+    const host = buildHost({
+      tools: {
+        cao_fetch_history: () => ({ events: [] }),
+        subscribe_events: () => ({ sse_url: "/events" }),
+      },
+    });
+    const app = makeApp(host);
+    const view = render(
+      <EventStreamView app={app} eventSourceFactory={factory} />,
+    );
+    await screen.findByText("No fleet events yet");
+    await waitFor(() =>
+      expect(host.toolCalls.map((c) => c.name)).toContain("subscribe_events"),
+    );
+    expect(factory).not.toHaveBeenCalled();
+    app.disconnect();
+    view.unmount();
+  });
+
+  it("takes an absolute stream URL from the host as given", async () => {
+    const urls: string[] = [];
+    const factory = (url: string): EventSourceLike => {
+      urls.push(url);
+      return { addEventListener: () => {}, close: () => {} };
+    };
+    const host = buildHost({
+      tools: {
+        cao_fetch_history: () => ({ events: [] }),
+        subscribe_events: () => ({ sse_url: "http://127.0.0.1:54322/events" }),
+      },
+    });
+    const app = makeApp(host);
+    const view = render(
+      <EventStreamView app={app} eventSourceFactory={factory} />,
+    );
+    await waitFor(() =>
+      expect(urls).toEqual(["http://127.0.0.1:54322/events"]),
+    );
+    app.disconnect();
+    view.unmount();
   });
 });
 
