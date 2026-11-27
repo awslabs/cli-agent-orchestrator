@@ -290,6 +290,7 @@ reason given. "Later" means work after this design.
 | Cancel an older run of the same PR | #1350 step 10. The latest dispatch is the one that a maintainer wants. |
 | The driver waits until each seat ends | The step call can return before CAO ends the step. The driver reads the reports only after each step ends, or after a fixed wait. |
 | Copilot CLI from a lockfile, installed with `npm ci --ignore-scripts` | Pins each dependency of the CLI, not only the CLI version. The filtered environment has no `CI`, so `COPILOT_AUTO_UPDATE=false` keeps that version at run time. |
+| Use one Kiro key for each run, picked at random from the keys that are set | The owners chose this, to spread the reviews over more than one key. A step gets a secret only by its name, so the workflow names `KIRO_API_KEY` and `KIRO_API_KEY_2` to `KIRO_API_KEY_10`, and skips an empty one. Only the picked key reaches the agents. |
 
 ## Owner decisions
 
@@ -299,7 +300,7 @@ them.
 | Decision | Risk until the owners decide | Mitigation |
 | --- | --- | --- |
 | Set a deployment branch rule on the `ai-review` environment that allows only `main`. GitHub creates the environment, with no rule, at the first run that names it. Set the rule after the workflow is on `main`, because a run from another branch then cannot use the environment. Do not add a custom deployment protection rule: with `deployment: false`, it fails the job. | A workflow on any branch can use the environment. | Only a user with write access can dispatch the workflow. |
-| Move `KIRO_API_KEY`, and `COPILOT_GITHUB_TOKEN` if you use it, into the environment. Then delete the repository secret. | Any workflow of the repository can read a repository secret. | No other workflow reads `KIRO_API_KEY`. |
+| Move each Kiro key secret, and `COPILOT_GITHUB_TOKEN` if you use it, into the environment. Then delete the repository secrets. | Any workflow of the repository can read a repository secret. | No other workflow reads a Kiro key secret. |
 | Who owns the key and its budget (#1350 Q6). The comments prefer GitHub OIDC to Amazon Bedrock, with the Kiro key as the fallback. | A long-lived key. `check-secrets` does not find an obfuscated copy. | Rotate the key if a review shows unexpected text. |
 | Keep `single` as the default, or use the panel (#1350 step 11). | A single agent has no second check of its findings. | The comment says so. |
 

@@ -14,6 +14,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -4325,9 +4326,13 @@ def test_summary_refuses_and_never_shows_the_review(
 WORKFLOW_FILE = REPO_ROOT / ".github" / "workflows" / "pr-review.yml"
 COPILOT_DIR = REVIEW_DIR / "copilot"
 JOB_TOKEN = "${{ github.token }}"
+KIRO_KEYS = ("KIRO_API_KEY", *(f"KIRO_API_KEY_{n}" for n in range(2, 11)))
 # Each engine credential is empty unless the run uses that engine.
 ENGINE_CREDENTIALS = {
-    "KIRO_API_KEY": "${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY || '' }}",
+    **{
+        name: "${{ inputs.engine == 'kiro_cli' && secrets." + name + " || '' }}"
+        for name in KIRO_KEYS
+    },
     "COPILOT_GITHUB_TOKEN": (
         "${{ inputs.engine == 'copilot_cli' && secrets.COPILOT_GITHUB_TOKEN || '' }}"
     ),
@@ -4461,6 +4466,120 @@ def test_the_agents_get_only_the_kept_variables(workflow: dict[Any, Any]) -> Non
         ("filter_env", "kiro-cli chat --list-models --format json"),
         ("filter_env", "setsid cao-server"),
     ]
+
+
+def test_each_step_reads_the_same_kiro_key_secrets(workflow: dict[Any, Any]) -> None:
+    job = workflow["jobs"]["review"]
+    start = _step(job, "Start cao-server")["run"]
+    check = _step(job, CREDENTIAL_CHECK)["run"]
+
+    # The env of both steps is checked against ENGINE_CREDENTIALS above.
+    loop = re.search(r"for name in (KIRO_API_KEY[^;]*);", start)
+    assert loop is not None
+    assert tuple(loop.group(1).replace("\\\n", " ").split()) == KIRO_KEYS
+    assert tuple(re.findall(r"--env (KIRO_API_KEY\w*)", check)) == KIRO_KEYS
+
+
+def _start_kiro_cli(
+    workflow: dict[Any, Any], tmp_path: Path, keys: dict[str, str]
+) -> tuple[subprocess.CompletedProcess[str], Optional[dict[str, str]]]:
+    """Run the "Start cao-server" script for kiro_cli with stub tools.
+
+    Return the result and the environment that kiro-cli got, or None if it did not run.
+    """
+    base = tmp_path / "runner" / "pr-review"
+    workspace = tmp_path / "workspace"
+    stubs = {
+        base
+        / "kiro"
+        / "kirocli"
+        / "bin"
+        / "kiro-cli": (
+            'env > "$HOME/../kiro-env"\n'
+            'echo \'{"models": [{"model_id": "model-a"}, {"model_id": "model-b"}]}\'\n'
+        ),
+        workspace / "trusted" / ".venv" / "bin" / "setsid": 'exec "$@"\n',
+        workspace / "trusted" / ".venv" / "bin" / "cao-server": "exit 0\n",
+        tmp_path / "stubs" / "curl": "exit 0\n",
+    }
+    for path, body in stubs.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+        path.chmod(0o755)
+    (base / "home").mkdir(exist_ok=True)
+    dump = base / "kiro-env"
+    dump.unlink(missing_ok=True)
+    script = tmp_path / "start.sh"
+    script.write_text(
+        _step(workflow["jobs"]["review"], "Start cao-server")["run"], encoding="utf-8"
+    )
+    env = {
+        "PATH": f"{tmp_path / 'stubs'}{os.pathsep}{os.environ['PATH']}",
+        "RUNNER_TEMP": str(base.parent),
+        "GITHUB_WORKSPACE": str(workspace),
+        "ENGINE": "kiro_cli",
+        "MODEL_A": "model-a",
+        "MODEL_B": "model-b",
+        **dict.fromkeys(ENGINE_CREDENTIALS, ""),
+        **keys,
+    }
+    # Actions runs a step script with `bash -e`.
+    result = subprocess.run(
+        ["bash", "-e", str(script)], env=env, capture_output=True, text=True, timeout=60
+    )
+    if not dump.exists():
+        return result, None
+    lines = dump.read_text(encoding="utf-8").splitlines()
+    return result, dict(line.split("=", 1) for line in lines)
+
+
+# must_run("unit"): the runners of the Unit Tests job have jq, so these tests
+# must run there and must not skip.
+@pytest.mark.must_run("unit")
+@pytest.mark.skipif(shutil.which("jq") is None, reason="the step script needs jq")
+@pytest.mark.parametrize(
+    "keys",
+    [
+        pytest.param({"KIRO_API_KEY": "set-first"}, id="only-the-first-key"),
+        pytest.param(
+            {"KIRO_API_KEY_2": "set-two", "KIRO_API_KEY_10": "set-ten"},
+            id="two-keys-and-an-empty-first-key",
+        ),
+    ],
+)
+def test_kiro_cli_uses_one_set_key_picked_at_random(
+    workflow: dict[Any, Any], tmp_path: Path, keys: dict[str, str]
+) -> None:
+    picked: set[str] = set()
+    # Run until each set key is picked. With two keys, 64 runs leave a chance
+    # of 2**-63 that one key is never picked.
+    for _ in range(64):
+        result, seen = _start_kiro_cli(workflow, tmp_path, keys)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert seen is not None and seen["KIRO_API_KEY"] in keys.values()
+        name = next(name for name, value in keys.items() if value == seen["KIRO_API_KEY"])
+        # Only the picked key reaches Kiro, and the log names it without its value.
+        assert [key for key in seen if key.startswith("KIRO_API_KEY_")] == []
+        assert f"This run uses {name}, picked at random." in result.stdout
+        assert not any(value in result.stdout + result.stderr for value in keys.values())
+        picked.add(name)
+        if picked == set(keys):
+            break
+
+    assert picked == set(keys)
+
+
+@pytest.mark.must_run("unit")
+@pytest.mark.skipif(shutil.which("jq") is None, reason="the step script needs jq")
+def test_kiro_cli_without_a_set_key_stops_before_kiro_starts(
+    workflow: dict[Any, Any], tmp_path: Path
+) -> None:
+    result, seen = _start_kiro_cli(workflow, tmp_path, {})
+
+    assert result.returncode == 1
+    assert "::error::The kiro_cli engine needs a KIRO_API_KEY secret." in result.stdout
+    assert seen is None
 
 
 def test_only_the_review_job_uses_the_ai_review_environment(workflow: dict[Any, Any]) -> None:

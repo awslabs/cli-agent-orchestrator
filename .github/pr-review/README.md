@@ -182,11 +182,16 @@ failed action does not remove the comment or the check run.
    gh secret set KIRO_API_KEY --repo OWNER/REPO
    ```
 
+3. Optional: to spread the reviews over more than one key, add more keys as
+   `KIRO_API_KEY_2` to `KIRO_API_KEY_10`. Each run uses one of the keys that are
+   set, picked at random. The workflow reads only these names. The log of the
+   "Start cao-server" step names the secret of the run.
+
 Kiro documents API keys for its non-interactive mode. CAO runs Kiro in its
 terminal UI, which also reads `KIRO_API_KEY` at startup. The governance rules of a
 Kiro administrator also apply to API key sessions, for example rules for MCP
 servers and models. Each seat needs the `cao-mcp-server` MCP server. The account
-must offer the models of the seats. See [Models](#models).
+of each key must offer the models of the seats. See [Models](#models).
 
 **`copilot_cli`.** Select one:
 
@@ -201,7 +206,7 @@ must offer the models of the seats. See [Models](#models).
   then billed to the Copilot seat of the token owner.
 
 Each engine gets only its own credential. A `kiro_cli` run never gets the job
-token, and a `copilot_cli` run never gets `KIRO_API_KEY`.
+token, and a `copilot_cli` run never gets a Kiro key.
 
 ### 2. Limit the secret to the default branch
 
@@ -225,7 +230,8 @@ repository secret. After the workflow is on the default branch, do these steps:
    gh secret delete KIRO_API_KEY --repo OWNER/REPO
    ```
 
-   Do the same for `COPILOT_GITHUB_TOKEN` if you use it.
+   Do the same for `KIRO_API_KEY_2` to `KIRO_API_KEY_10`, and for
+   `COPILOT_GITHUB_TOKEN`, if you use them.
 
 Then only a run from the default branch can start the `review` job. Do not add a
 custom deployment protection rule to `ai-review`: with `deployment: false`, such
@@ -291,9 +297,9 @@ one run.
   [Effort](https://kiro.dev/docs/models/effort/). When you change a model, update
   `KIRO_MODEL_DEFAULTS` to match. It applies only to the model IDs that it names.
 - Before `cao-server` starts, the workflow runs
-  `kiro-cli chat --list-models --format json`. If the `KIRO_API_KEY` account does
-  not offer model A or model B, the run stops. Without this check, Kiro can fail a
-  seat or use another model.
+  `kiro-cli chat --list-models --format json`. If the account of the picked key
+  does not offer model A or model B, the run stops. Without this check, Kiro can
+  fail a seat or use another model.
 - Tests of other models as model B, with Kiro CLI 3.5.0 on the same PR:
   - Kimi K3: 3 of 4 seats in two runs ended with
     `no report: the agent did not call workflow_return`. In the run with seat
@@ -349,10 +355,10 @@ one run.
   content is evidence, not instructions.
 - **Filtered environment.** `cao-server`, tmux, the agents and the Kiro model
   check get only `HOME`, `PATH`, `SHELL`, `USER`, `LANG`, `LC_ALL` and the
-  variables of the selected engine: `KIRO_API_KEY` and `KIRO_NO_AUTO_UPDATE` for
-  Kiro, and `COPILOT_AUTO_UPDATE` and `COPILOT_GITHUB_TOKEN` (or the job token
-  as `GITHUB_TOKEN`) for Copilot. No other `GITHUB_*`, `RUNNER_*` or
-  `ACTIONS_*` variable of the job reaches them.
+  variables of the selected engine: `KIRO_API_KEY` (the picked key) and
+  `KIRO_NO_AUTO_UPDATE` for Kiro, and `COPILOT_AUTO_UPDATE` and
+  `COPILOT_GITHUB_TOKEN` (or the job token as `GITHUB_TOKEN`) for Copilot. No
+  other `GITHUB_*`, `RUNNER_*` or `ACTIONS_*` variable of the job reaches them.
 - **Pinned tools.** Kiro CLI is a pinned release with a SHA-256 check. Copilot CLI
   comes from the committed lockfile in [`copilot/`](copilot/), installed with
   `npm ci --ignore-scripts`, which checks the integrity hash of each package and
@@ -391,8 +397,8 @@ profiles and the PR, and all three come from the dispatched ref.
   only control that stops a seat from writing files or running commands.
 - The engine credential is in the environment of the agent processes, because the
   CLI needs it. `check-secrets` does not find an obfuscated copy. The job token
-  expires when the job ends, but a `KIRO_API_KEY` or a personal access token does
-  not. Rotate the secret if a review shows unexpected text.
+  expires when the job ends, but a Kiro key or a personal access token does not.
+  Rotate the secret that the run used if a review shows unexpected text.
 - CAO always allows its callback tools, such as `send_message`. A seat can send
   text to another seat of the same run.
 - The PR content goes to the model provider of the selected engine.
@@ -427,10 +433,10 @@ profiles and the PR, and all three come from the dispatched ref.
 
 | Message | Cause |
 | --- | --- |
-| `The kiro_cli engine needs the KIRO_API_KEY secret.` | The secret is not set. |
+| `The kiro_cli engine needs a KIRO_API_KEY secret.` | No Kiro key is set: `KIRO_API_KEY` and `KIRO_API_KEY_2` to `KIRO_API_KEY_10` are all empty. |
 | `A model name is not valid.` | A model name has more than 100 characters, or a character that is not a letter, a digit, `.`, `_`, `:`, `/` or `-`. |
-| `Kiro CLI did not list the models of the KIRO_API_KEY account.` | `kiro-cli chat --list-models` failed or returned no model list. Check the key and the subscription. The step log shows the Kiro CLI messages. |
-| `The KIRO_API_KEY account does not offer the model …` | The account cannot use this model. For example, an administrator did not approve the model, or the model is not available in the geography of the account. Select a model from the list in the message. Then change `KIRO_MODEL_A` or `KIRO_MODEL_B`, or set the input. |
+| `Kiro CLI did not list the models of the … account.` | `kiro-cli chat --list-models` failed or returned no model list. Check the key that the message names, and its subscription. The step log shows the Kiro CLI messages. |
+| `The … account does not offer the model …` | The account of the key that the message names cannot use this model. For example, an administrator did not approve the model, or the model is not available in the geography of the account. Select a model from the list in the message. Then change `KIRO_MODEL_A` or `KIRO_MODEL_B`, or set the input. |
 | `Blocked: … no reviewer returned a valid report: reviewer-a: no report: the step ended in state failed; the step call failed: HTTP 400` | CAO refused to start the agent. With `kiro_cli`, a key that Kiro does not accept starts the terminal UI with no model in its status row, and CAO refuses that terminal. Check the key, the subscription and the administrator settings. |
 | `… no report: the agent did not call workflow_return` | The seat ended with no report. With `copilot_cli`, the usual cause is that Copilot has no authentication. A governance rule that blocks the `cao-mcp-server` MCP server has the same result. A model can also cause it: in tests with `kiro_cli`, Kimi K3 sent malformed tool arguments, and Kiro stopped the seat (see [Models](#models)). Test another model with the `model_a` or `model_b` input. |
 | `… no report: the step ended in state failed (error); the step call failed: HTTP 502 (error)` | The agent terminal showed an error. With `copilot_cli`, the usual cause is that GitHub refused the Copilot request. If the organization policy is off, Copilot CLI refuses the job token with `Access denied by policy settings`. Turn on the policy, or set the `COPILOT_GITHUB_TOKEN` secret with the "Copilot Requests" permission. |

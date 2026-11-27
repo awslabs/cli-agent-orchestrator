@@ -298,18 +298,41 @@ jobs:
           ENGINE: ${{ inputs.engine }}
           MODEL_A: ${{ steps.models.outputs.a }}
           MODEL_B: ${{ steps.models.outputs.b }}
-          # Each engine gets only its own credential.
+          # Each engine gets only its own credential. A secret that is not set
+          # is empty.
           KIRO_API_KEY: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY || '' }}
+          KIRO_API_KEY_2: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_2 || '' }}
+          KIRO_API_KEY_3: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_3 || '' }}
+          KIRO_API_KEY_4: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_4 || '' }}
+          KIRO_API_KEY_5: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_5 || '' }}
+          KIRO_API_KEY_6: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_6 || '' }}
+          KIRO_API_KEY_7: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_7 || '' }}
+          KIRO_API_KEY_8: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_8 || '' }}
+          KIRO_API_KEY_9: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_9 || '' }}
+          KIRO_API_KEY_10: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_10 || '' }}
           COPILOT_GITHUB_TOKEN: ${{ inputs.engine == 'copilot_cli' && secrets.COPILOT_GITHUB_TOKEN || '' }}
           GITHUB_TOKEN: ${{ inputs.engine == 'copilot_cli' && github.token || '' }}
         run: |
           base="$RUNNER_TEMP/pr-review"
           case "$ENGINE" in
             kiro_cli)
-              if [ -z "$KIRO_API_KEY" ]; then
-                echo "::error::The kiro_cli engine needs the KIRO_API_KEY secret. See .github/pr-review/README.md."
+              # Use one of the Kiro keys that are set, picked at random. Only
+              # the picked key goes on, as KIRO_API_KEY.
+              keys=()
+              for name in KIRO_API_KEY KIRO_API_KEY_2 KIRO_API_KEY_3 KIRO_API_KEY_4 KIRO_API_KEY_5 \
+                KIRO_API_KEY_6 KIRO_API_KEY_7 KIRO_API_KEY_8 KIRO_API_KEY_9 KIRO_API_KEY_10; do
+                if [ -n "$(printenv "$name")" ]; then
+                  keys+=("$name")
+                fi
+              done
+              if [ "${#keys[@]}" -eq 0 ]; then
+                echo "::error::The kiro_cli engine needs a KIRO_API_KEY secret. See .github/pr-review/README.md."
                 exit 1
               fi
+              picked="${keys[RANDOM % ${#keys[@]}]}"
+              KIRO_API_KEY="$(printenv "$picked")"
+              export KIRO_API_KEY
+              echo "Kiro key secrets that are set: ${keys[*]}. This run uses $picked, picked at random."
               engine_bin="$base/kiro/kirocli/bin"
               export KIRO_NO_AUTO_UPDATE=1
               keep="KIRO_API_KEY KIRO_NO_AUTO_UPDATE"
@@ -356,18 +379,18 @@ jobs:
             models="$base/kiro-models.json"
             if ! (filter_env; exec kiro-cli chat --list-models --format json) < /dev/null > "$models" \
               || ! jq -e '.models | type == "array"' "$models" > /dev/null; then
-              echo "::error::Kiro CLI did not list the models of the KIRO_API_KEY account."
+              echo "::error::Kiro CLI did not list the models of the $picked account."
               exit 1
             fi
             for model in "$MODEL_A" "$MODEL_B"; do
               if [ -n "$model" ] \
                 && ! jq -e --arg model "$model" 'any(.models[] | objects; .model_id == $model)' "$models" > /dev/null; then
                 offered="$(jq -r '[.models[] | objects | .model_id | strings | select(test("^[A-Za-z0-9._:/-]{1,100}$"))] | join(", ")' "$models")"
-                echo "::error::The KIRO_API_KEY account does not offer the model $model. It offers: ${offered:-no model}."
+                echo "::error::The $picked account does not offer the model $model. It offers: ${offered:-no model}."
                 exit 1
               fi
             done
-            echo "The KIRO_API_KEY account offers the chosen models."
+            echo "The $picked account offers the chosen models."
           fi
           (filter_env; exec setsid cao-server) > "$base/cao-server.log" 2>&1 &
           echo "$!" > "$base/cao-server.pid"
@@ -475,15 +498,26 @@ jobs:
 
       - name: Check the review for credentials, then require a publishable result
         env:
-          # Each engine gets only its own credential, as in "Start cao-server".
+          # Each engine gets only its own credentials, as in "Start cao-server".
           KIRO_API_KEY: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY || '' }}
+          KIRO_API_KEY_2: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_2 || '' }}
+          KIRO_API_KEY_3: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_3 || '' }}
+          KIRO_API_KEY_4: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_4 || '' }}
+          KIRO_API_KEY_5: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_5 || '' }}
+          KIRO_API_KEY_6: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_6 || '' }}
+          KIRO_API_KEY_7: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_7 || '' }}
+          KIRO_API_KEY_8: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_8 || '' }}
+          KIRO_API_KEY_9: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_9 || '' }}
+          KIRO_API_KEY_10: ${{ inputs.engine == 'kiro_cli' && secrets.KIRO_API_KEY_10 || '' }}
           COPILOT_GITHUB_TOKEN: ${{ inputs.engine == 'copilot_cli' && secrets.COPILOT_GITHUB_TOKEN || '' }}
           GITHUB_TOKEN: ${{ inputs.engine == 'copilot_cli' && github.token || '' }}
         run: |
           review="$RUNNER_TEMP/pr-review/evidence/review.json"
           # check-secrets does not check a variable that is empty.
-          python3 trusted/.github/pr-review/github_review.py check-secrets \
-            --file "$review" --env KIRO_API_KEY --env COPILOT_GITHUB_TOKEN --env GITHUB_TOKEN
+          python3 trusted/.github/pr-review/github_review.py check-secrets --file "$review" \
+            --env KIRO_API_KEY --env KIRO_API_KEY_2 --env KIRO_API_KEY_3 --env KIRO_API_KEY_4 \
+            --env KIRO_API_KEY_5 --env KIRO_API_KEY_6 --env KIRO_API_KEY_7 --env KIRO_API_KEY_8 \
+            --env KIRO_API_KEY_9 --env KIRO_API_KEY_10 --env COPILOT_GITHUB_TOKEN --env GITHUB_TOKEN
           if ! jq -e '.publishable == true' "$review" > /dev/null; then
             reason="$(jq -r '.blocked_reason // "unknown" | @json' "$review")"
             echo "::error::Blocked: the review is not publishable: $reason"
