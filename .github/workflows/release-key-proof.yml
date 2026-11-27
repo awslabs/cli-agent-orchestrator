@@ -1,0 +1,63 @@
+name: Release key proof
+
+# Proves that the `release-deploy` environment hands a job a working
+# RELEASE_DEPLOY_KEY, without cutting a release.
+#
+# Why it exists: release.yml and publish-to-pypi.yml are moving to read the key
+# from that environment (#1460). In publish-to-pypi.yml the key is first used
+# after the PyPI upload, so a wrong environment secret would be found only once
+# a release is already out. This job finds it with nothing at stake.
+#
+# It reads the remote and does a dry-run push. It changes nothing.
+#
+# Dispatch it from `main` (or a `v*` tag). The environment's deployment policy
+# refuses any other ref, and that refusal is itself the policy working.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    name: Check out with the release key
+    if: github.repository == 'awslabs/cli-agent-orchestrator'
+    runs-on: ubuntu-latest
+    environment: release-deploy
+    steps:
+      # Without this, an empty secret makes the checkout fall back to the
+      # workflow token over HTTPS, and every later step would pass without
+      # the key being used at all.
+      - name: The environment provides the key
+        env:
+          KEY_PRESENT: ${{ secrets.RELEASE_DEPLOY_KEY != '' }}
+        run: |
+          if [ "$KEY_PRESENT" != "true" ]; then
+            echo "::error::RELEASE_DEPLOY_KEY is empty in the release-deploy environment"
+            exit 1
+          fi
+
+      # The key stays configured for the steps below (the default,
+      # persist-credentials: true): they are what uses it. No step here prints
+      # git config or uploads the workspace, and none should be added.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
+
+      - name: The checkout used SSH
+        run: |
+          url="$(git remote get-url origin)"
+          case "$url" in
+            git@github.com:*) echo "origin is $url" ;;
+            *) echo "::error::origin is $url, not an SSH remote; the key was not used"; exit 1 ;;
+          esac
+
+      - name: The key can read the repository
+        run: git ls-remote --exit-code origin refs/heads/main
+
+      # A push opens the remote's receive side, which GitHub refuses for a
+      # read-only deploy key. --dry-run stops before anything is sent, and the
+      # branch named here is never created.
+      - name: The key can write (dry run, nothing is pushed)
+        run: git push --dry-run origin HEAD:refs/heads/release-key-proof-dry-run

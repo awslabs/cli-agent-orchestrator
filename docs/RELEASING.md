@@ -86,6 +86,23 @@ and copies `web/dist/` into `src/cli_agent_orchestrator/web_ui/` before `uv buil
 The wheel artifact includes this per `[tool.hatch.build].artifacts` in
 `pyproject.toml`.
 
+### 4. Check the release deploy key
+
+`release.yml` and the repin job in `publish-to-pypi.yml` push to `main` with the
+deploy key in `RELEASE_DEPLOY_KEY`. The repin job first uses it after the PyPI
+upload, so a wrong key would be found only once a release is out.
+
+To check the key with nothing at stake, run **Release key proof**
+(`release-key-proof.yml`) from `main`: `gh workflow run release-key-proof.yml --ref main`.
+It declares the `release-deploy` environment, checks out with the key, reads the
+remote, and does a dry-run push. It changes nothing. Run it after the key or the
+environment is created or changed.
+
+A green run means the `release-deploy` environment gave the job a key that can
+read and write this repository. It cannot tell an environment secret from a
+repository secret of the same name; GitHub gives the environment secret
+precedence when both exist.
+
 ---
 
 ## The weekly release
