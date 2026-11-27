@@ -501,8 +501,8 @@ tmux -S "/abs/review-home/tmux-$(id -u)/default" kill-server
 
 ## Files
 
-- [`REVIEW.md`](../../REVIEW.md): the review policy. Its checks hold the lessons
-  of this repository.
+- [`REVIEW.md`](../../REVIEW.md): the review policy. Its rules and checks hold
+  the lessons of this repository.
 - [`docs/pr-review-design.md`](../../docs/pr-review-design.md): the design and the
   ticket contract.
 - [`pr_review.py`](pr_review.py): the CAO workflow. It runs the reviewers, applies

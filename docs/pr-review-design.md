@@ -46,7 +46,7 @@ Where the two issues differ, the design follows #1350, the later plan.
 
 ## Repository structure
 
-`REVIEW.md` owns the policy: the evidence rules, the severity scale, the risk
+`REVIEW.md` owns the policy: the review rules, the severity scale, the risk
 levels and the checks. The agent profiles own the roles and the tools. The
 driver owns the procedure, the report schemas and the verdict rules. The
 publisher owns every GitHub call. The workflow owns the jobs, the permissions,
@@ -55,7 +55,7 @@ of a rule. It does not copy the rule.
 
 ```text
 cli-agent-orchestrator/
-|-- REVIEW.md                     Review policy: evidence rules, severity, risk, checks
+|-- REVIEW.md                     Review policy: rules, severity, risk, checks
 |-- docs/
 |   `-- pr-review-design.md       This design
 |-- test/
