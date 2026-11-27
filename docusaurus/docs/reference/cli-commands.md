@@ -107,7 +107,7 @@ cao launch "Research this codebase" --agents explorer --memory
 
 Manage active CAO sessions.
 
-:::note Session names include the `cao-` prefix
+:::note[Session names include the `cao-` prefix]
 `cao launch --session-name my-session` creates a session named `cao-my-session`.
 The subcommands below take the full prefixed name; `cao session list` shows the
 exact values.
@@ -455,17 +455,19 @@ cao update
 | Install source | What `cao update` does |
 |----------------|------------------------|
 | PyPI (`uv tool install cli-agent-orchestrator`) | Runs `uv tool upgrade cli-agent-orchestrator` |
-| PyPI with version pin (`==2.3.0`, `<3.0`) | Runs `uv tool install cli-agent-orchestrator@latest --upgrade` (unpins) |
-| Git (`uv tool install git+...`) | Runs `uv tool upgrade cli-agent-orchestrator --reinstall` (reuses the recorded Git ref and requirements) |
+| PyPI with version pin (`==2.3.0`, `<3.0`) | Runs `uv tool install 'cli-agent-orchestrator[<extras>]@latest' --upgrade --with …` (unpins, and passes CAO's extras and each `--with` package back), or stops before uv runs when it cannot carry one |
+| Git (`uv tool install git+...`) | Runs `uv tool upgrade cli-agent-orchestrator --reinstall` |
 | Local directory / editable | Prints guidance (cannot auto-update a local install) |
 
 After updating, restart any running `cao-server` to pick up the new version.
 
-Packages you added to CAO's tool environment with `--with`, such as a decider, and extras such as
-`[otel]`, are kept by the Git and unpinned PyPI paths, which both run `uv tool upgrade` and reuse
-uv's receipt. The version-pinned path runs without `--with` and drops those packages, and can
-drop the extras too. Check and reinstall
-them after an update; see
+Packages you added to CAO's tool environment with `--with`, such as a decider, are kept by the
+unpinned PyPI path and the git path, where uv reuses its install receipt. The version-pinned
+path writes a new receipt, so `cao update` passes CAO's extras and each recorded package back.
+It exits non-zero before uv runs, and prints the receipt path with a command to finish by hand,
+when it cannot do that: a git, URL, editable or marker entry, a wheel or directory that is gone,
+or index settings recorded while any package is carried. A local install prints guidance and
+carries nothing. Check your packages after an update; see
 [the setup runbook](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/ephemeral-agents-agent-setup.md#3-install-the-decider-into-the-servers-python).
 
 ### Examples
@@ -597,7 +599,7 @@ Without both, every subcommand exits with `No fleet configured.` — neither gro
 ever falls back to the `cao-server` on this machine. See
 [Environment Variables](environment-variables.md#remote-fleets-env-var-only).
 
-:::warning `cao shutdown` and `cao fleet shutdown` are different commands
+:::warning[`cao shutdown` and `cao fleet shutdown` are different commands]
 `cao shutdown` stops tmux sessions on **this machine**. `cao fleet shutdown`
 releases workers in a **remote cluster**, and the agent sessions inside them go
 with the workers.

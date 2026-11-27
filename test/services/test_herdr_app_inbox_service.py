@@ -665,6 +665,37 @@ class TestReconcile:
         svc._reconcile()
         assert ghosts == [] and not backend.kill_address.called
 
+    @pytest.mark.parametrize(
+        "role_labels",
+        [
+            {},
+            {"cao.profile": "developer"},
+            {"cao.profile": "reviewer", "cao.caller": "aaaa0001"},
+            {"cao.caller": "gone0000"},
+        ],
+        ids=["none", "root", "worker", "caller-only"],
+    )
+    def test_role_labels_do_not_change_what_is_kept_or_pruned(self, env, monkeypatch, role_labels):
+        """herdr-app-role-labels, "Reconcile ignores the new labels"."""
+        svc, backend, *_ = env
+        core_with(
+            backend,
+            rec("t1", "aaaa0001", **role_labels),  # live with a row: kept
+            rec("t5", "orphan01", **role_labels),  # live without a row: killed
+            finished("t6", "ghost001", **role_labels),  # finished with a row: dropped
+        )
+        rows = [
+            {"id": "aaaa0001", "tmux_session": "cao-a"},
+            {"id": "ghost001", "tmux_session": "cao-a"},
+        ]
+        monkeypatch.setattr(mod, "_rows_by_session", lambda: {"cao-a": rows})
+        monkeypatch.setattr(mod, "_rows_for", lambda s: rows)
+        ghosts = []
+        monkeypatch.setattr(mod, "_drop_ghost_row", lambda tid: ghosts.append(tid))
+        svc._reconcile()
+        assert ghosts == ["ghost001"]
+        backend.kill_address.assert_called_once_with("t5")
+
     def test_holds_the_session_lock(self, env, monkeypatch):
         svc, backend, *_ = env
         held = []
@@ -738,7 +769,9 @@ class TestTeardown:
             entry = session_lock._session_locks.get("cao-a")
             deleted.append((tid, kwargs, entry is not None and entry[0].locked()))
 
-        monkeypatch.setattr(terminal_service, "delete_terminal", delete_terminal)
+        # _teardown holds the session lock, so it calls the unlocked inner
+        # teardown (#1468); the locked public delete_terminal would self-deadlock.
+        monkeypatch.setattr(terminal_service, "_delete_terminal_locked", delete_terminal)
         return rows, retained, deleted
 
     def test_retains_deferred_tombstone(self, db):
@@ -777,3 +810,55 @@ class TestTeardown:
             rows.clear()  # the session teardown drops its rows, then releases
         worker.join(5)
         assert done.is_set() and deleted == []
+
+
+class TestTeardownUnderTheLockDoesNotDeadlock:
+    """#1468: delete_terminal now takes the session lifecycle lock, and the lock is
+    not reentrant. _teardown already holds it, so it must reach the teardown
+    without taking it again. This drives the REAL terminal_service functions
+    (only the store-touching steps are recorded) and fails by timeout if
+    _teardown deadlocks on its own lock."""
+
+    def test_the_real_inner_teardown_runs_under_the_held_lock(self, monkeypatch):
+        import threading
+
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.services import (
+            delegation_callback_service,
+            herdr_inbox_service,
+            session_lock,
+            terminal_service,
+        )
+
+        rows = {"aaaa0002": {"id": "aaaa0002", "tmux_session": "cao-b"}}
+        monkeypatch.setattr(database, "terminal_exists", lambda tid: tid in rows)
+        monkeypatch.setattr(database, "get_terminal_metadata", lambda tid: rows.get(tid))
+        monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda tid: rows.get(tid))
+        monkeypatch.setattr(
+            herdr_inbox_service, "_retain_deferred_failure_tombstone", lambda tid: False
+        )
+        monkeypatch.setattr(
+            delegation_callback_service, "handle_worker_ended", lambda *a, **k: None
+        )
+        monkeypatch.setattr(terminal_service, "capture_terminal_snapshot", lambda tid: {})
+        monkeypatch.setattr(terminal_service, "dismantle_terminal_runtime", lambda tid, m: True)
+        held_during_row_delete = []
+
+        def _delete_row(tid, metadata, registry=None, end_reason=None):
+            entry = session_lock._session_locks.get("cao-b")
+            held_during_row_delete.append(entry is not None and entry[0].locked())
+            rows.pop(tid, None)
+            return True
+
+        monkeypatch.setattr(terminal_service, "delete_terminal_row", _delete_row)
+
+        worker = threading.Thread(
+            target=mod._teardown, args=("aaaa0002", "terminal_finished"), daemon=True
+        )
+        worker.start()
+        worker.join(5)
+
+        assert not worker.is_alive(), "_teardown deadlocked on its own lifecycle lock"
+        assert held_during_row_delete == [True]
+        assert "aaaa0002" not in rows
+        assert session_lock._session_locks == {}

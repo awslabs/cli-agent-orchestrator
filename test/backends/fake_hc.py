@@ -94,6 +94,14 @@ class FakeHc:
             if t["address"] not in self.unkillable:
                 t["state"] = "finished"
             return copy.deepcopy(t)
+        if method == "terminal.label":
+            t = self._find(params["terminal"])
+            for key, value in params["labels"].items():
+                if value == "":  # `key=` removes the label
+                    t["labels"].pop(key, None)
+                else:
+                    t["labels"][key] = value
+            return copy.deepcopy(t)
         if method == "terminal.rm":
             t = self._find(params["terminal"])
             if t["address"] not in self.unkillable:

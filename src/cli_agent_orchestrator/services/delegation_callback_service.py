@@ -10,10 +10,13 @@ it still applies on backends that do not publish status events.
 import asyncio
 import functools
 import logging
+import threading
 import time
 from datetime import datetime, timezone
-from typing import Collection, List, Optional, Set
+from typing import Callable, Collection, Iterable, List, Mapping, Optional, Set
 
+from cli_agent_orchestrator.backends.base import TerminalBackend
+from cli_agent_orchestrator.backends.registry import peek_backend
 from cli_agent_orchestrator.clients.database import (
     clear_reply_in_flight,
     close_delegation_edge,
@@ -21,6 +24,7 @@ from cli_agent_orchestrator.clients.database import (
     close_edges_replied_by,
     close_edges_with_delivered_reply,
     close_open_edges_for_terminal,
+    count_open_edges_by_caller,
     create_delegation_edge,
     create_inbox_message,
     find_open_edge,
@@ -213,13 +217,154 @@ def build_task_not_delivered_message(worker_id: str, profile: Optional[str]) -> 
     )
 
 
+def _publishes_waiting(backend: TerminalBackend) -> bool:
+    """True if ``backend`` overrides the no-op ``set_waiting_counts``.
+
+    tmux and the herdr TUI keep the default, so for them the count queries
+    that feed it are skipped.
+    """
+    return getattr(type(backend), "set_waiting_counts", None) is not (
+        TerminalBackend.set_waiting_counts
+    )
+
+
+class _WaitingLabelPublisher:
+    """Writes ``cao.waiting`` on one background thread, never on a request path.
+
+    A write is an RPC to herdr-core and can take as long as the core takes to
+    answer. Callers only name the terminals whose count may have changed
+    (``request``); the thread reads each count from the database when it writes,
+    so a request that arrives while a write is in flight is folded into the
+    next one and the last write always reflects the latest database state.
+    ``repair`` takes the same lock for its read and write, so the sweep cannot
+    interleave with a refresh either.
+
+    Thread Safety:
+        All methods are thread-safe. ``request`` holds a lock only to add to a
+        set; it never waits for a write.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._pending: Set[str] = set()
+        self._busy = False
+        self._stopped = False
+        self._thread: Optional[threading.Thread] = None
+        self._write_lock = threading.Lock()
+        self._failing = False  # guarded by _write_lock
+
+    def request(self, caller_ids: Set[str]) -> None:
+        """Queue ``caller_ids`` for a write. Returns at once."""
+        with self._cond:
+            if self._stopped:
+                return
+            self._pending.update(caller_ids)
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="cao-waiting-labels", daemon=True
+                )
+                self._thread.start()
+            self._cond.notify_all()
+
+    def flush(self, timeout: float) -> bool:
+        """Wait until nothing is queued or being written. False if ``timeout`` ran out."""
+        with self._cond:
+            return self._cond.wait_for(lambda: not self._pending and not self._busy, timeout)
+
+    def stop(self, timeout: float = 1.0) -> None:
+        """Stop the thread; queued requests are dropped (the next sweep repairs them)."""
+        with self._cond:
+            self._stopped = True
+            self._pending.clear()
+            self._cond.notify_all()
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
+
+    def repair(self) -> None:
+        """Write every managed terminal's count from the database (``complete=True``)."""
+        self._write(count_open_edges_by_caller, complete=True)
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                self._cond.wait_for(lambda: self._pending or self._stopped)
+                if self._stopped:
+                    return
+                caller_ids = set(self._pending)
+                self._pending.clear()
+                self._busy = True
+            try:
+                self._write(
+                    lambda: {c: len(list_open_edges_out_of(c)) for c in caller_ids},
+                    complete=False,
+                )
+            finally:
+                with self._cond:
+                    self._busy = False
+                    self._cond.notify_all()
+
+    def _write(self, read_counts: Callable[[], Mapping[str, int]], *, complete: bool) -> None:
+        """Read the counts and hand them to the backend, under one lock. Never raises."""
+        backend = peek_backend()
+        if backend is None or not _publishes_waiting(backend):
+            return
+        with self._write_lock:
+            try:
+                backend.set_waiting_counts(read_counts(), complete=complete)
+            except Exception as exc:  # noqa: BLE001 - a label must never break the service
+                # One warning when the failures start; the sweep retries every 30 s.
+                log = logger.debug if self._failing else logger.warning
+                log("delegation: could not publish cao.waiting: %s", exc)
+                self._failing = True
+            else:
+                self._failing = False
+
+
+_publisher = _WaitingLabelPublisher()
+
+
+def refresh_waiting_labels(caller_ids: Iterable[str]) -> None:
+    """Publish how many terminals each of ``caller_ids`` waits on, as ``cao.waiting``.
+
+    Call it after an edge opens or closes. It returns at once: the count is
+    read from the database, and the label written through the backend, on a
+    background thread (``_WaitingLabelPublisher``), because the write is an RPC
+    that must never hold up the assign, send_message, delete or failed delivery
+    that caused it. Only the herdr-app backend shows the label; for any other
+    backend, or none, it does nothing. A failure is logged once per episode
+    and never reaches the caller; the next ``sweep`` repairs a label that a
+    failed or dropped write left behind.
+    """
+    ids = {caller_id for caller_id in caller_ids if caller_id}
+    backend = peek_backend()
+    if not ids or backend is None or not _publishes_waiting(backend):
+        return
+    _publisher.request(ids)
+
+
+def flush_waiting_labels(timeout: float = 5.0) -> bool:
+    """Wait for the queued ``cao.waiting`` writes to finish; False if ``timeout`` ran out.
+
+    For tests and orderly shutdown; request paths never call it.
+    """
+    return _publisher.flush(timeout)
+
+
+def _repair_waiting_labels() -> None:
+    """Recompute every managed terminal's ``cao.waiting`` from the database."""
+    _publisher.repair()
+
+
 def on_send_message(sender_id: str, receiver_id: str, message_id: int, expect_reply: bool) -> None:
     """Apply the edge rules for one send_message. Best-effort.
 
     Rules, first match wins: a reply to a terminal that is waiting on the
     sender marks that edge's reply in flight, and the edge closes as replied
     once the reply is delivered; a message to a terminal this sender created opens
-    an edge; ``expect_reply`` opens an edge for any other terminal.
+    an edge; ``expect_reply`` opens an edge for any other terminal. The caller
+    whose edge opened or closed has its ``cao.waiting`` label refreshed; marking
+    a reply changes no count, so only a reply already delivered refreshes it.
     """
     owed = [e for e in list_open_edges_into(sender_id) if e.caller_id == receiver_id]
     if owed:
@@ -241,6 +386,7 @@ def on_send_message(sender_id: str, receiver_id: str, message_id: int, expect_re
         create_delegation_edge(
             sender_id, receiver_id, EdgeSource.SEND_MESSAGE, message_id=message_id
         )
+        refresh_waiting_labels([sender_id])
 
 
 def _last_response(terminal_id: str) -> Optional[str]:
@@ -397,6 +543,7 @@ def evaluate_completion(terminal_id: str, registry: PluginRegistry | None = None
     # delivery takes the caller's lock and can wait out a submit confirmation.
     for edge in forwarded:
         _deliver(edge.caller_id, terminal_id, registry)
+    refresh_waiting_labels(edge.caller_id for edge in forwarded)
     if forwarded:
         logger.info("delegation: auto-forwarded %s to %d caller(s)", terminal_id, len(forwarded))
     return len(forwarded)
@@ -428,9 +575,13 @@ def handle_worker_ended(
         ]
     # Outbound edges, and any inbound edge opened since the listing, close
     # without a notice: their replies have no live receiver.
-    close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
+    closed_silently = close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
     for edge in notified:
         _deliver(edge.caller_id, terminal_id, registry)
+    # The callers' counts fall. A terminal that is kept (ERROR) closed its own
+    # outbound edges, so its own count is 0; a deleted one takes its label along.
+    own = [terminal_id] if may_be_running else []
+    refresh_waiting_labels([*own, *(edge.caller_id for edge in [*notified, *closed_silently])])
 
 
 def handle_delivery_failed(
@@ -469,6 +620,7 @@ def handle_delivery_failed(
     ]
     for edge in notified:
         _deliver(edge.caller_id, worker_id, registry)
+    refresh_waiting_labels(edge.caller_id for edge in notified)
 
 
 def handle_messages_failed(
@@ -508,8 +660,12 @@ def handle_messages_failed(
     told = {e.message_id for e in list_open_message_edges(unreported)}
     if unreported:
         handle_delivery_failed(receiver_id, unreported, reason, registry, uncertain=uncertain)
-    for edge in list_open_message_edges([i for i in ids if i in reported]):
-        close_delegation_edge(edge.id, EdgeState.WORKER_ENDED, exclude_reply_in_flight=True)
+    closed_quietly = [
+        edge
+        for edge in list_open_message_edges([i for i in ids if i in reported])
+        if close_delegation_edge(edge.id, EdgeState.WORKER_ENDED, exclude_reply_in_flight=True)
+    ]
+    refresh_waiting_labels(edge.caller_id for edge in closed_quietly)
 
     by_id = {m.id: m for m in messages}
     for edge in clear_reply_in_flight(ids):
@@ -556,6 +712,7 @@ def _tell_caller_if_replier_ended(
     text = build_reply_lost_message(edge.worker_id, reason, reply, uncertain=uncertain)
     if _close_and_notify(edge, EdgeState.WORKER_ENDED, edge.worker_id, text):
         _deliver(edge.caller_id, edge.worker_id, registry)
+        refresh_waiting_labels([edge.caller_id])
 
 
 def _settle_reply_mark(
@@ -581,12 +738,14 @@ def _settle_reply_mark(
         # A delivered message from the worker already answered the caller, even
         # when the mark now names a later reply that is still pending or failed.
         if close_edges_with_delivered_reply(caller_id, message_id):
+            refresh_waiting_labels([caller_id])
             return
         message = get_inbox_message(message_id)
         if message is not None and message.status == MessageStatus.PENDING:
             return
         if message is not None and message.status == MessageStatus.DELIVERED:
-            close_edges_replied_by([message_id])
+            if close_edges_replied_by([message_id]):
+                refresh_waiting_labels([caller_id])
             return
         if delivered_only:
             return
@@ -632,7 +791,9 @@ def handle_task_never_delivered(worker_id: str) -> int:
         return 0
     profile = (get_terminal_metadata(worker_id) or {}).get("agent_profile")
     text = build_task_not_delivered_message(worker_id, profile)
-    return sum(1 for e in edges if _close_and_notify(e, EdgeState.WORKER_ENDED, worker_id, text))
+    told = [e for e in edges if _close_and_notify(e, EdgeState.WORKER_ENDED, worker_id, text)]
+    refresh_waiting_labels(edge.caller_id for edge in told)
+    return len(told)
 
 
 def _log_cycles(worker_ids: List[str]) -> None:
@@ -656,17 +817,29 @@ def _log_cycles(worker_ids: List[str]) -> None:
 
 
 def sweep(registry: PluginRegistry | None = None) -> None:
-    """Settle stale reply marks, then evaluate every armed worker.
+    """Settle stale reply marks, evaluate every armed worker, then repair every ``cao.waiting`` label.
 
-    Covers missed events, herdr, and restarts.
+    Covers missed events, herdr, and restarts. Each step runs on its own: the
+    label repair is what heals a missed update, so no other step's failure may
+    skip it.
     """
-    settle_stale_reply_marks(registry)
-    for worker_id in list_armed_worker_ids():
-        try:
-            evaluate_completion(worker_id, registry)
-        except Exception as exc:  # noqa: BLE001 - one worker must not stop the sweep
-            logger.debug("delegation sweep failed for %s: %s", worker_id, exc)
-    _log_cycles(list_armed_worker_ids())
+    try:
+        settle_stale_reply_marks(registry)
+    except Exception as exc:  # noqa: BLE001 - the steps below still run
+        logger.warning("delegation sweep could not settle reply marks: %s", exc)
+    try:
+        for worker_id in list_armed_worker_ids():
+            try:
+                evaluate_completion(worker_id, registry)
+            except Exception as exc:  # noqa: BLE001 - one worker must not stop the sweep
+                logger.debug("delegation sweep failed for %s: %s", worker_id, exc)
+    except Exception as exc:  # noqa: BLE001 - the label repair below still runs
+        logger.warning("delegation sweep could not list armed workers: %s", exc)
+    try:
+        _log_cycles(list_armed_worker_ids())
+    except Exception as exc:  # noqa: BLE001 - the label repair below still runs
+        logger.warning("delegation sweep could not check for cycles: %s", exc)
+    _repair_waiting_labels()
 
 
 async def run(registry: PluginRegistry | None = None) -> None:

@@ -70,6 +70,11 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         "fs_write": ["write"],
         "fs_list": ["list", "grep"],
         "fs_*": ["read", "write", "list", "grep"],
+        # Copilot's `url` permission kind covers URL access by its web-fetch
+        # tool and by shell commands, and a deny rule wins over --allow-all
+        # (`copilot help permissions`, Copilot CLI 1.0.114). For a grant that
+        # keeps the shell, the provider hides only the fetch tool instead.
+        "web_fetch": ["url"],
     },
     # Official xAI Grok Build CLI permission-rule prefixes. These rules work
     # in the interactive TUI and remain enforced under --always-approve.
@@ -779,6 +784,25 @@ def get_disallowed_tools(provider: str, allowed: List[str]) -> List[str]:
     all_tools = ALL_NATIVE_TOOLS.get(provider, set())
     disallowed = (all_tools - allowed_native) | set(ALWAYS_DISALLOWED.get(provider, ()))
     return sorted(disallowed)
+
+
+def copilot_tool_rules(allowed: List[str]) -> Tuple[List[str], List[str], bool]:
+    """Copilot CLI's ``--deny-tool`` kinds and ``--excluded-tools`` names for a grant,
+    and whether the grant turns off Copilot's built-in MCP servers.
+
+    The provider's command and the ``cao launch`` summary both use this, so the
+    summary names what the launch blocks. Copilot's ``url`` kind also covers URL
+    access by shell commands. On the other providers a shell grant keeps URL
+    access, so a grant that keeps ``shell`` hides only the ``web_fetch`` tool.
+    Neither rule reaches MCP tools, so a grant without ``web_fetch`` also turns
+    off the built-in MCP servers.
+    """
+    denied = get_disallowed_tools("copilot_cli", allowed)
+    if "url" not in denied:
+        return denied, [], False
+    if "shell" not in denied:
+        return [tool for tool in denied if tool != "url"], ["web_fetch"], True
+    return denied, [], True
 
 
 def get_launch_disallowed_tools(

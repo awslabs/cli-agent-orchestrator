@@ -53,6 +53,7 @@ updates:
       - "/examples/ag-ui/ag-ui-stock-client-live"
       - "/examples/ag-ui/cao-dojo/tools"
       - "/examples/agent-plugins/agent-plugins-dogfood/tools"
+      - "/.github/pr-review/copilot"
     schedule:
       interval: "weekly"
     cooldown:

@@ -76,6 +76,7 @@ def test_term_during_the_interval_sleep_exits_without_waiting_for_the_interval(t
             if children.returncode == 0: break
             time.sleep(.02)
         assert children.returncode == 0
+        assert (tmp_path/'state/tick_loop.clean').is_file()
         p.terminate()
         p.wait(timeout=3)
     finally:

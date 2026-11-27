@@ -1,0 +1,29 @@
+          ⣀⣤⣤⣶⣶⣤⣤⣄⡀
+        ⢠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣄
+        ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡄
+       ⢸⣿⣿⣿⣿⣿⣿⠁⢹⣿⠁⢹⣿⣿⣧
+       ⢸⣿⣿⣿⣿⣿⣿⣄⣼⣿⣄⣼⣿⣿⣿        Kiro CLI V3 is here. This version will no longer receive feature updates.
+       ⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿        To upgrade, run: kiro-cli --v3
+      ⢰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿        Learn more: https://kiro.dev/docs/cli/v3/
+      ⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠃
+        ⠸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠁
+         ⠙⠛⠛⠛⠋⠁⠙⠛⠛⠉
+
+
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Warning: Kiro is running in trust all tools mode
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ In this mode, Kiro will execute all tool calls — including shell commands, file operations, and MCP tools — without asking for
+ your approval.
+
+ This mode is intended for sandboxed or disposable environments only. Do not use it on a machine with access to sensitive data or
+ production systems.
+
+ By proceeding, you confirm that you understand the risks and accept responsibility for all actions taken during this session.
+
+ ❯ No, exit
+   Yes, I accept
+   Yes, and don't ask again
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  esc to cancel · ↑↓ to navigate · ↵ to select

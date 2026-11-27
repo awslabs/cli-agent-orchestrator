@@ -618,6 +618,9 @@ SHIPPED_EXAMPLES = {
         "deployable CDK app: its runtime dependencies run in the deployed stack"
     ),
 }
+#: CAO does not ship this Copilot CLI, but the PR Review workflow runs it with a credential
+#: on untrusted PR text, so its runtime (non-dev) packages are gated like shipped ones.
+PR_REVIEW_TOOL_LOCKFILE = ".github/pr-review/copilot/package-lock.json"
 
 
 def ships_nothing(lockfile: str) -> bool:
@@ -1058,6 +1061,10 @@ def _producers(root: Path, policy: dict | None = None) -> dict[str, tuple[str, o
         "web/package-lock.json": ("bundled-packages.json", bundled("web")),
         "cao_mcp_apps/package-lock.json": ("bundled-packages.json", bundled("cao_mcp_apps")),
         "docusaurus/package-lock.json": ("bundled-packages.json", docusaurus),
+        PR_REVIEW_TOOL_LOCKFILE: (
+            "package-lock.json non-dev packages",
+            lambda: npm_runtime_packages(root, PR_REVIEW_TOOL_LOCKFILE),
+        ),
         **{
             lockfile: (
                 "package-lock.json non-dev packages",

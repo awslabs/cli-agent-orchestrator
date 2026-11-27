@@ -470,6 +470,63 @@ def _decide_at_import() -> None:
         _isolate_memory_home()
 
 
+# Variables that bind a git command to one repository, or redirect where it writes. A hook
+# run (a push from a linked worktree exports GIT_DIR) or a developer's shell can have them
+# set, and then every `git init` / `git config` / `git commit` a test runs in a temp
+# directory acts on that repository (or config file) instead. Dropped once, at import, so
+# the suite is safe however it is launched (also in xdist workers, which import this module
+# too). Same source as cao_mcp_apps/.husky/pre-push: `git rev-parse --local-env-vars`,
+# with this tuple as the fallback when git is missing or fails.
+GIT_REPO_ENV_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+)
+
+
+def _git_repo_env_names() -> frozenset:
+    import shutil
+    import subprocess
+    import tempfile
+
+    names = set(GIT_REPO_ENV_VARS)
+    git = shutil.which("git")
+    if git is None:
+        return frozenset(names)
+    try:
+        # Outside any repository and without GIT_* so a bad GIT_DIR cannot make it fail.
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        out = subprocess.run(
+            [git, "rev-parse", "--local-env-vars"],
+            cwd=tempfile.gettempdir(),
+            env=clean,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return frozenset(names)
+    names.update(line.strip() for line in out.splitlines() if line.strip().startswith("GIT_"))
+    return frozenset(names)
+
+
+def _strip_git_repo_env() -> None:
+    # This also drops GIT_CONFIG_COUNT / GIT_CONFIG_PARAMETERS config that a developer
+    # injects on purpose when running pytest; a test that needs such config sets it with
+    # monkeypatch after import.
+    for name in _git_repo_env_names():
+        os.environ.pop(name, None)
+
+
+_strip_git_repo_env()
 _decide_at_import()
 
 
@@ -1095,3 +1152,33 @@ def isolated_memory_db(tmp_path, monkeypatch):
         # Land this test's queued status-event writes in its own database.
         _drain_launch_status_writes()
         engine.dispose()
+
+
+@pytest.fixture
+def fire_time_scans(monkeypatch):
+    """Record the work ``flow_service`` asks of the cron scheduler, instead of timing it.
+
+    ``parsed`` lists every expression handed to ``CronTrigger.from_crontab``; ``spans`` holds,
+    for each ``get_next_fire_time``, how far past its start the scan may look. A schedule that
+    never fires costs time in proportion to that span, so asserting on it guards against a
+    runaway scan without a wall-clock limit that a slow runner could trip.
+    """
+    from types import SimpleNamespace
+
+    from cli_agent_orchestrator.services import flow_service
+
+    scans = SimpleNamespace(parsed=[], spans=[])
+    real_parse = flow_service.CronTrigger.from_crontab
+    real_next = flow_service.CronTrigger.get_next_fire_time
+
+    def parse(expression, *args, **kwargs):
+        scans.parsed.append(expression)
+        return real_parse(expression, *args, **kwargs)
+
+    def next_fire_time(self, previous_fire_time, now):
+        scans.spans.append(self.end_date - now.astimezone(self.timezone))
+        return real_next(self, previous_fire_time, now)
+
+    monkeypatch.setattr(flow_service.CronTrigger, "from_crontab", parse)
+    monkeypatch.setattr(flow_service.CronTrigger, "get_next_fire_time", next_fire_time)
+    return scans

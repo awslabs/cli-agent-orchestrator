@@ -1,0 +1,10 @@
+{
+  "name": "cao-pr-review-copilot",
+  "private": true,
+  "version": "0.0.0",
+  "description": "The Copilot CLI that the pr-review workflow installs with npm ci. Not shipped.",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@github/copilot": "1.0.114"
+  }
+}

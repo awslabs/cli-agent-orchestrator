@@ -1,6 +1,7 @@
 """Unit tests for Kiro CLI provider."""
 
 import re
+import textwrap
 from pathlib import Path
 from typing import Optional
 from unittest.mock import Mock, patch
@@ -344,6 +345,103 @@ class TestKiroCliProviderInitialization:
         assert special_keys == ["Down", "Enter"]
         # The PROCESSING latch must be armed before answering the dialog.
         mock_status_monitor.notify_input_sent.assert_called_with("test1234")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("width", [130, 80])
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_wrapped_trust_dialog_is_verified(
+        self, mock_tmux, mock_wait_status, mock_status_monitor, width
+    ):
+        pane = load_fixture("kiro_trust_all_tools_dialog_wrapped.txt")
+        if width == 80:
+            pane = "\n".join(
+                (
+                    textwrap.fill(line, width=80, subsequent_indent=" ", break_long_words=False)
+                    if line.lstrip().startswith(("In this mode,", "This mode is", "By proceeding,"))
+                    else line
+                )
+                for line in pane.splitlines()
+            )
+        mock_wait_status.side_effect = [True, True]
+        mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        mock_tmux.return_value.get_history.side_effect = _screens(pane)
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+
+        assert await provider._wait_ready_accepting_trust_dialog() is True
+        assert [
+            call.args[2] for call in mock_tmux.return_value.send_special_key.call_args_list
+        ] == ["Down", "Enter"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "variation",
+        [
+            "another_selector",
+            "footer_between_body_and_cursor",
+            "missing_cursor",
+            "distant_body",
+            "stale_consent_no_footer_10",
+            "stale_consent_no_footer_20",
+            "stale_consent_no_footer_30",
+            "quoted_cursor",
+            "cursor_above_body",
+        ],
+    )
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_old_consent_above_current_selector_is_not_answered(
+        self, mock_tmux, mock_wait_status, mock_status_monitor, variation
+    ):
+        pane = load_fixture("kiro_trust_all_tools_dialog_active.txt")
+        if variation == "another_selector":
+            pane += (
+                "\nUpdate available!\n❯ Update now\n  Later\n"
+                "esc to cancel · ↑↓ to navigate · ↵ to select\n"
+            )
+        elif variation == "footer_between_body_and_cursor":
+            pane += (
+                "\nUpdate available!\n❯ No, exit\n  Later\n"
+                "esc to cancel · ↑↓ to navigate · ↵ to select\n"
+            )
+        elif variation == "missing_cursor":
+            pane = pane.replace("❯ No, exit", "  No, exit")
+        elif variation.startswith("stale_consent_no_footer_"):
+            filler_count = int(variation.rsplit("_", 1)[-1])
+            pane = (
+                "Warning: Kiro is running in trust all tools mode\n"
+                "❯ No, exit\n"
+                + "filler\n" * filler_count
+                + "Update available!\n❯ Update now\n  Later\n"
+                "esc to cancel · ↑↓ to navigate · ↵ to select\n"
+            )
+        elif variation == "quoted_cursor":
+            pane = (
+                "Warning: Kiro is running in trust all tools mode\n"
+                "Update available!\n❯ Update now\n  Later\n"
+                "agent said: Kiro is running in trust all tools mode, pick '❯ No, exit'\n"
+                "esc to cancel · ↑↓ to navigate · ↵ to select\n"
+            )
+        elif variation == "cursor_above_body":
+            pane = (
+                "❯ No, exit\nWarning: Kiro is running in trust all tools mode\n"
+                "  No, exit\n  Yes, I accept\n"
+                "esc to cancel · ↑↓ to navigate · ↵ to select\n"
+            )
+        else:
+            pane = pane.replace(
+                "esc to cancel · ↑↓ to navigate · ↵ to select",
+                "\n" * 45 + "esc to cancel · ↑↓ to navigate · ↵ to select",
+            )
+        mock_wait_status.return_value = True
+        mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        mock_tmux.return_value.get_history.return_value = pane
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+
+        assert await provider._wait_ready_accepting_trust_dialog() is False
+        mock_tmux.return_value.send_special_key.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")

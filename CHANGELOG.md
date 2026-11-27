@@ -7,11 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Approve & run no longer comes back after a run starts**. In the Workflows tab, a started run
+  opens its page, and the launcher closed before it saved its cleared state. Going back to
+  Workflows then showed the same, already approved plan again, and each click on Approve & run
+  started another run. The launcher now clears the approval as soon as the plan is approved, and
+  saves its state before the run's page opens. If the resubmit is refused again, it shows the new
+  plan.
+- **Remote worker status polling no longer overruns `--timeout` by up to 60s** (#1059).
+  `FleetClient.terminal_status` now reads with a 5s timeout (the same ceiling the local
+  status poll in `wait_until_terminal_status` uses) instead of the module-wide 60s read
+  timeout. Each status read stops after 5s to connect and 5s without data, so a stalled
+  broker can overrun `cao worker send --timeout` by about 6s instead of about 60s.
 - **Workspace split panes fill themselves**. Picking 2 or 4 panes in the Workspace tab now
   shows the session's other agents in the empty panes, in tab order, instead of leaving them
   blank. Panes already showing an agent keep it, and clicking the current layout again refills
   any pane you emptied. Shift+click splits and status polling never fill panes, so a pane you
   close stays empty, and going down to fewer panes (or picking 1 pane) never fills.
+
+- **Code-owner review protects CI policy, release scripts, and trust-boundary code** (#1350).
+  Tests pin the owned paths, the active `mypy.ini` settings, and the full ruff
+  configuration; root gate configuration files are owned before they exist, and
+  the ruff gate reads only `pyproject.toml` and ignores `.gitignore` and `.ignore`
+  files; nested ruff configs are owned and ignored.
 
 - **Workflow specs open in a large, readable viewer**. The Workflows page now shows
   Python syntax colouring, line numbers and lint findings in a near-window-size dialog,
@@ -62,6 +79,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   update, and `cao workflow run` all refuse such a script before any step starts. A stored workflow
   written that way needs its ids changed. The fan-out example in the `cao-workflow` skill and in
   `docs/workflows.md` used this shape and now builds a valid id from each file name.
+- **`cao update` keeps CAO's extras and its `--with` packages when it unpins a version-pinned install** (#1260).
+  `uv tool install cli-agent-orchestrator@latest --upgrade` rewrote the receipt with only a bare CAO in it,
+  so CAO's own extras (`[agui]`, `[otel]`) and extra packages such as a decider were uninstalled. Both are
+  now passed back. If the receipt holds something `cao update` can't pass back (a git, URL, editable or
+  marker entry, or index settings under `[tool.options]` alongside any carried package, whose dependencies
+  would be resolved without them), it stops before uv runs and prints the receipt path and a command to
+  finish by hand.
 - **Memory inspection and fixture hygiene are safer by default** (#1329).
   This resolves #861 Q3: CLI list/show and REST list/show no longer increment
   `access_count` unless `memory.non_accessing_inspection=false`; MCP recall
@@ -87,9 +111,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Synthetic memory-evaluation arms run with their own CAO settings homes**, so
   future memory phases can measure their setting without changing the legacy baseline (#1329).
 - **Synthetic memory retrieval evaluation fixtures and baseline harness** measure
-  BM25 current-first strictly: a tied current/stale pair counts only when the
-  current note ranks first in both fixed wiki-listing orders, so the measure no
-  longer depends on filesystem listing order. Tokens per recall can still vary
+  current-first strictly in every arm: a current note counts only when it
+  ranks first in both fixed wiki-listing orders. Tokens per recall can still vary
   slightly by filesystem (#1329).
 - **Provider memory file writes now default off** (#1335). CAO delivers each terminal's
   memory without writing it into project files that can be committed. Interactive

@@ -101,7 +101,22 @@ CAO injects `cao-mcp-server` at runtime via:
 Implementation:
 
 - Add `cao-mcp-server` with `CAO_TERMINAL_ID`
+- Forward the workflow step identity, `CAO_WORKFLOW_RUN_ID` and
+  `CAO_WORKFLOW_STEP_ID`, as `${VAR:-}` placeholders. Copilot gives a stdio
+  MCP server only `PATH` and a few platform variables, and it expands these
+  placeholders from its own environment. Without them, `workflow_return`
+  cannot find the step of a structured workflow step.
 - Pass the merged MCP payload inline as JSON
+
+A grant without `web_fetch` also adds `--disable-builtin-mcps` and
+`--disable-mcp-server computer-use`. Copilot's `url` rule and the
+`--excluded-tools web_fetch` flag (which a grant with `execute_bash` gets instead
+of the `url` rule, so that its shell keeps URL access) do not reach MCP tools,
+and Copilot's built-in MCP servers reach GitHub, hosted services, a browser or
+the desktop. The servers go off also when the grant names one, such as
+`@github-mcp-server`; add `web_fetch` to keep them. `--disable-builtin-mcps` does
+not cover `computer-use`. `cao-mcp-server` is not a built-in server, so it stays
+on.
 
 
 ### Agent-plugin MCP working directory
@@ -119,14 +134,19 @@ Provider expects these flags in your Copilot CLI:
 - `--additional-mcp-config`
 - `--allow-all`
 - `--autopilot`
+- `--deny-tool`, `--excluded-tools`, `--disable-builtin-mcps` and `--disable-mcp-server`, for a restricted grant
 
 When `--additional-mcp-config` is missing from your `copilot --help`, CAO skips MCP config injection.
+An unknown restriction flag stops the launch.
 
 ### Command Shape
 
 ```bash
 copilot --allow-all [--agent <name>] --config-dir ~/.copilot \
-  --add-dir <cwd> --additional-mcp-config '{"mcpServers":{...}}' --autopilot
+  --add-dir <cwd> --additional-mcp-config '{"mcpServers":{...}}' \
+  [--excluded-tools web_fetch] [--deny-tool <tool> ...] \
+  [--disable-builtin-mcps --disable-mcp-server computer-use] \
+  --autopilot
 ```
 
 ### Environment Variables

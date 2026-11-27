@@ -35,7 +35,8 @@ before the WAKE is printed can't turn into a quiet tick. A crash after the WAKE 
 The loop has handed the WAKE over once it prints it, so the supervisor makes the delivery safe.
 It writes the WAKE line to `state/tick_supervisor.pending` (fsync'd) **before** the first delivery
 attempt, then delivers that file oldest line first, with a short doubling backoff, and removes each
-line only after a 2xx. No new loop starts while a line is left. A TERM is taken between steps, so a
+line only after a 2xx response with `success: true`; unsuccessful or non-JSON answers keep it.
+No new loop starts while a line is left. A TERM is taken between steps, so a
 stop, a kill or a cao-server restart during the retries delays a wake but can't lose it: the next
 cycle, or the next supervisor, delivers it. A crash right after a 2xx, before the line is removed,
 repeats that WAKE at most once. Blank lines in the file are skipped. If the path isn't a usable
@@ -43,9 +44,12 @@ regular file (a directory, a symlink, unreadable), the supervisor logs one `STOP
 unusable` line, exits 4 and leaves it as it is. On `not_writer` it stops with exit 3 and writes one
 `NOT_WRITER …` line to its log and to `state/tick_supervisor.stopped`; if the inbox was down, that
 line says the notice is waiting in the pending file.
-After five consecutive error exits, the supervisor stops with exit 2, writes one `LOOP_ERROR …`
+On a new start, an old stop reason moves to `state/tick_supervisor.stopped.prev`.
+After five error exits without a clean poll or clean exit between them, the supervisor stops with
+exit 2, writes one `LOOP_ERROR …`
 line to the same stop file and sends the conductor a stop notice. Error pauses double from 5 seconds
-to the poll interval, resetting after a clean exit. A final error wake tells the shepherd to report
+to the poll interval, resetting after a clean exit; a quiet tick resets the error count. A final
+error wake tells the shepherd to report
 BLOCKED instead of claiming the loop will restart.
 
 ## The digest

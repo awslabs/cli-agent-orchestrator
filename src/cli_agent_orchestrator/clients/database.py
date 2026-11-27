@@ -4315,9 +4315,40 @@ def delete_old_handoff_results(cutoff: datetime) -> int:
         return deleted
 
 
-def update_message_status(message_id: int, status: MessageStatus) -> bool:
-    """Update message status to MessageStatus.DELIVERED or MessageStatus.FAILED."""
+def update_message_status(
+    message_id: int,
+    status: MessageStatus,
+    *,
+    expected_status: Optional[MessageStatus] = None,
+) -> bool:
+    """Set a message's status; with ``expected_status``, only if it still has that status.
+
+    Without ``expected_status`` the write is unconditional, and False means
+    the row does not exist.
+
+    With it, the write is one ``UPDATE ... WHERE id = ? AND status = ?``, and
+    the result is True only for the caller whose statement changed the row.
+    False then means the row does not exist or no longer has the expected
+    status; the two are not told apart.
+
+    SQLite runs that statement under its write lock, so of several callers
+    claiming one PENDING row (#406, #709) one gets True and the others, after
+    waiting on the lock for up to the connection's busy timeout, get False.
+    The claim is a single statement in its own transaction and uses no
+    ``RETURNING``, so it does not depend on the SQLite version.
+    """
     with SessionLocal() as db:
+        if expected_status is not None:
+            changed = (
+                db.query(InboxModel)
+                .filter(
+                    InboxModel.id == message_id,
+                    InboxModel.status == expected_status.value,
+                )
+                .update({InboxModel.status: status.value}, synchronize_session=False)
+            )
+            db.commit()
+            return bool(changed == 1)
         message = db.query(InboxModel).filter(InboxModel.id == message_id).first()
         if message:
             message.status = status.value
@@ -4765,6 +4796,21 @@ def list_open_edges_out_of(caller_id: str) -> List[DelegationEdge]:
         return [_edge_from_row(r) for r in rows]
 
 
+def count_open_edges_by_caller() -> Dict[str, int]:
+    """Open outbound edges per caller: how many terminals each caller waits on.
+
+    A caller with no open edge is absent. This is what ``cao.waiting`` holds.
+    """
+    with SessionLocal() as db:
+        rows = (
+            db.query(DelegationEdgeModel.caller_id, func.count(DelegationEdgeModel.id))
+            .filter(DelegationEdgeModel.state == EdgeState.OPEN.value)
+            .group_by(DelegationEdgeModel.caller_id)
+            .all()
+        )
+        return {caller_id: int(count) for caller_id, count in rows}
+
+
 def find_any_edge(caller_id: str, worker_id: str) -> Optional[DelegationEdge]:
     """The oldest edge caller -> worker in any state, open or closed."""
     with SessionLocal() as db:
@@ -4838,6 +4884,7 @@ def create_flow(
     provider: str,
     script: str,
     next_run: datetime,
+    enabled: bool = True,
 ) -> Flow:
     """Create flow record."""
     with SessionLocal() as db:
@@ -4849,6 +4896,7 @@ def create_flow(
             provider=provider,
             script=script,
             next_run=next_run,
+            enabled=enabled,
         )
         db.add(flow)
         db.commit()
@@ -4931,6 +4979,27 @@ def update_flow_enabled(name: str, enabled: bool, next_run: Optional[datetime] =
             db.commit()
             return True
         return False
+
+
+def update_flow_definition(
+    name: str,
+    schedule: str,
+    agent_profile: str,
+    provider: str,
+    next_run: Optional[datetime] = None,
+) -> bool:
+    """Update an edited flow's definition columns; ``next_run`` only when given."""
+    with SessionLocal() as db:
+        flow = db.query(FlowModel).filter(FlowModel.name == name).first()
+        if not flow:
+            return False
+        flow.schedule = schedule
+        flow.agent_profile = agent_profile
+        flow.provider = provider
+        if next_run is not None:
+            flow.next_run = next_run
+        db.commit()
+        return True
 
 
 def delete_flow(name: str) -> bool:
