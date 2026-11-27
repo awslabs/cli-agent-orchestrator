@@ -54,7 +54,7 @@ Apply these rules with the general rules.
 - **Review against the contract, not the CI result.** The contract is the
   linked issue, the docs and the existing interfaces. Green CI does not prove
   it: trace the changed data through the success and failure paths. Do not
-  invent requirements; lint owns style.
+  invent requirements; lint owns code style.
 - **Review one head and the whole PR.** Evidence from another commit does not
   prove this head. CI on a head behind `main` tested an older merge, and a
   retarget starts no CI run. Each review covers the full PR, not only the new
@@ -203,7 +203,8 @@ Docs, changelog text, the names of new concepts, and duplicate code.
   explained at its first use. No AI style, such as filler, hype, jargon,
   strings of dashes or repeated bold headings. A blog post first says what CAO
   is, who uses it and what the change does, and names who did the work.
-  Report a writing problem as P3.
+  Report serious AI style as P2, for example AI style that runs through a
+  section or hides what the text means. Report another writing problem as P3.
 
 ## Severity
 
@@ -211,7 +212,7 @@ Docs, changelog text, the names of new concepts, and duplicate code.
 | --- | --- | --- | --- |
 | P1 | Must Fix | Breaks security, authorization, data integrity or the approved architecture; loses or corrupts data; or presents wrong results as correct. | Yes |
 | P2 | Should Fix | A defect on a supported path; a missing failure, empty or partial state; or a missing coupled test, document, prompt or schema. | Yes |
-| P3 | Good To Fix | A real problem that does not need a fix before the merge, such as a weak low-risk test or a writing note. | No |
+| P3 | Good To Fix | A real problem that does not need a fix before the merge, such as a weak low-risk test or a minor writing problem. | No |
 
 Severity follows the control and the impact, not the audience size or known
 exploits. An old defect counts only if this PR introduces it, newly exposes it
