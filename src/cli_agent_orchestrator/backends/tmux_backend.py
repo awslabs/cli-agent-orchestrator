@@ -6,7 +6,7 @@ no alternative is configured.
 """
 
 import logging
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 from cli_agent_orchestrator.backends.base import (
     TerminalBackend,
@@ -176,6 +176,7 @@ class TmuxBackend(TerminalBackend):
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
+        pre_write_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         self._client.send_keys(
             session_name,
@@ -184,6 +185,7 @@ class TmuxBackend(TerminalBackend):
             enter_count=enter_count,
             force_bracketed_paste=force_bracketed_paste,
             submit_delay=submit_delay,
+            pre_write_hook=pre_write_hook,
         )
 
     def send_special_key(self, session_name: str, window_name: str, key: str) -> None:

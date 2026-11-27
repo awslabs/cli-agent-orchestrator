@@ -192,6 +192,39 @@ class TestInput:
         with pytest.raises(TerminalNotFoundError):
             backend.send_keys("cao-a", "nope", "x")
 
+    @pytest.mark.parametrize(
+        "text,enter_count,method",
+        [("hello", 1, "terminal.send"), ("hello", 2, "terminal.send"), ("3", 0, "terminal.keys")],
+    )
+    def test_pre_write_hook_fires_once_before_the_first_write(
+        self, backend, hc, two_windows, text, enter_count, method
+    ):
+        """hc types inside one call, so the hook runs immediately before it (#709)."""
+        writes_at_hook_time = []
+
+        def hook():
+            writes_at_hook_time.append(
+                len(hc.calls_to("terminal.send")) + len(hc.calls_to("terminal.keys"))
+            )
+
+        backend.send_keys("cao-a", "w1", text, enter_count=enter_count, pre_write_hook=hook)
+
+        assert writes_at_hook_time == [0]
+        assert len(hc.calls_to(method)) >= 1
+
+    def test_pre_write_hook_not_called_when_nothing_is_written(self, backend, hc, two_windows):
+        fired = []
+
+        def hook():
+            fired.append(True)
+
+        backend.send_keys("cao-a", "w1", "", enter_count=0, pre_write_hook=hook)
+        with pytest.raises(TerminalNotFoundError):
+            backend.send_keys("cao-a", "nope", "x", pre_write_hook=hook)
+
+        assert fired == []
+        assert hc.calls_to("terminal.send") == [] and hc.calls_to("terminal.keys") == []
+
 
 def _fail_send_with(hc, monkeypatch, error):
     """Make herdr-core answer terminal.send with ``error``; other calls are unchanged."""

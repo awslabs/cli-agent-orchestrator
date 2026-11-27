@@ -1932,6 +1932,7 @@ class TmuxClient:
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
+        pre_write_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         """Send keys to window using tmux paste-buffer for instant delivery.
 
@@ -1985,6 +1986,13 @@ class TmuxClient:
                 into a receiving TUI). Do NOT set for shell commands sent
                 to bash during initialization (bash 4.x would receive the
                 literal escape sequences on tmux < 3.7).
+            pre_write_hook: If given, called exactly once, after load-buffer
+                has returned and immediately before paste-buffer. load-buffer
+                only stores bytes in a tmux buffer and the leading cancel
+                delivers nothing to the application, so this is the last
+                point before the pane is written to (#709). It is not called
+                when an earlier step raises. It must not raise: an exception
+                propagates like any other failure here and nothing is pasted.
         """
         # Defence-in-depth: re-validate at the sink even though callers
         # validate at the API/MCP boundary. Both halves flow into a
@@ -2065,6 +2073,11 @@ class TmuxClient:
                 input=buf_content,
                 check=True,
             )
+            # After load-buffer, not before it: load-buffer is a subprocess
+            # round trip during which the pane can still emit, and a caller
+            # sampling a boundary here must not leave that output outside it.
+            if pre_write_hook is not None:
+                pre_write_hook()
             subprocess.run(
                 ["tmux", "paste-buffer", *paste_args, "-b", buf_name, "-t", target],
                 check=True,

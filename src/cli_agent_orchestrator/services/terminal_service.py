@@ -5537,6 +5537,36 @@ async def _wait_for_post_dispatch_start(
     distinguish, and it fails toward resubmission rather than toward a false
     confirmation.
     """
+    started, _ = await _observe_post_dispatch_start(
+        terminal_id,
+        dispatch_generation,
+        timeout,
+        polling_interval,
+        pre_dispatch_status=pre_dispatch_status,
+    )
+    return started
+
+
+async def _observe_post_dispatch_start(
+    terminal_id: str,
+    dispatch_generation: Optional[int],
+    timeout: float,
+    polling_interval: float = 0.5,
+    *,
+    pre_dispatch_status: Optional[TerminalStatus] = None,
+    earlier_generation: Optional[int] = None,
+) -> tuple[bool, bool]:
+    """``_wait_for_post_dispatch_start``, also reporting evidence it had to refuse.
+
+    Returns ``(started, refused_earlier_evidence)``. The second value is True
+    when ``started`` is False and some poll saw a started status stamped above
+    ``earlier_generation`` (and so not above ``dispatch_generation``). That is a
+    status earned from output that landed between ``dispatch_input``'s two
+    boundary samples (#709): it would have confirmed this send before the
+    boundary moved to the pane write. It is always False when
+    ``earlier_generation`` is ``None``.
+    """
+    refused_earlier_evidence = False
     deadline = time.monotonic() + timeout
     while True:
         observation = status_monitor.status_observation(terminal_id)
@@ -5544,14 +5574,17 @@ async def _wait_for_post_dispatch_start(
         if status in _DEFERRED_STARTED_STATUSES:
             if dispatch_generation is None:
                 if status == TerminalStatus.PROCESSING or status != pre_dispatch_status:
-                    return True
-            elif (
-                observation.output_generation is not None
-                and observation.output_generation > dispatch_generation
-            ):
-                return True
+                    return True, False
+            elif observation.output_generation is not None:
+                if observation.output_generation > dispatch_generation:
+                    return True, False
+                if (
+                    earlier_generation is not None
+                    and observation.output_generation > earlier_generation
+                ):
+                    refused_earlier_evidence = True
         if time.monotonic() >= deadline:
-            return False
+            return False, refused_earlier_evidence
         await asyncio.sleep(polling_interval)
 
 
@@ -5564,6 +5597,7 @@ async def _confirm_worker_started_or_resubmit(
     provider=None,
     dispatch_generation: Optional[int] = None,
     pre_dispatch_status: Optional[TerminalStatus] = None,
+    earlier_dispatch_generation: Optional[int] = None,
 ) -> bool:
     """Confirm a deferred-init worker began processing; re-submit if not.
 
@@ -5571,6 +5605,24 @@ async def _confirm_worker_started_or_resubmit(
     (see ``_wait_for_post_dispatch_start``), False if it never does after all
     resubmit attempts. Blocking tmux/DB I/O runs off the loop via to_thread so
     concurrent deferred inits aren't frozen.
+
+    ``earlier_dispatch_generation`` is ``dispatch_input``'s first boundary
+    sample (``DispatchBoundarySamples.before_preparation``), given when the
+    backend took a later one at the pane write. It covers one case (#1498
+    review, haofeif and Kiro Crew, P2-1). Old output lands between the two
+    samples and stamps a started status. The worker then takes the task and
+    finishes so fast that no PROCESSING frame is detected: it ends on the status
+    it already had, which is not stamped again. Nothing is ever stamped above
+    the later boundary, so the first wait fails although the task ran. Both
+    duplicate gates are off on this path, so the recovery would type the whole
+    task again, up to ``_DEFERRED_SUBMIT_MAX_RESUBMITS`` times.
+
+    So when the first wait saw only that in-between status, the composer
+    decides. If it shows the task, the Enter was swallowed and the recovery
+    below submits it: that is the case #709 fixed. If it does not show the task
+    (empty, or unreadable), the task is counted as started, which is what the
+    earlier boundary alone concluded before #709. Only the first wait does
+    this; a redelivery takes one sample and has no in-between window.
     """
     if provider is None:
         try:
@@ -5578,26 +5630,57 @@ async def _confirm_worker_started_or_resubmit(
         except Exception:
             provider = None
 
-    async def wait_for_start(boundary: Optional[int]) -> bool:
+    async def wait_for_start(
+        boundary: Optional[int], earlier: Optional[int] = None
+    ) -> tuple[bool, bool]:
         if getattr(provider, "requires_execution_evidence", False) is True:
             # Cached PROCESSING/COMPLETED may be dispatch-derived too. Poll
             # independent evidence for the full grace period before resending.
             deadline = time.monotonic() + _DEFERRED_SUBMIT_CONFIRM_TIMEOUT
             while True:
                 if await asyncio.to_thread(_worker_is_started_direct, terminal_id, provider):
-                    return True
+                    return True, False
                 if time.monotonic() >= deadline:
-                    return False
+                    return False, False
                 await asyncio.sleep(0.5)
-        return await _wait_for_post_dispatch_start(
+        if earlier is None:
+            started = await _wait_for_post_dispatch_start(
+                terminal_id,
+                boundary,
+                timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
+                pre_dispatch_status=pre_dispatch_status,
+            )
+            return started, False
+        return await _observe_post_dispatch_start(
             terminal_id,
             boundary,
             timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
             pre_dispatch_status=pre_dispatch_status,
+            earlier_generation=earlier,
         )
 
-    if await wait_for_start(dispatch_generation):
+    if (
+        dispatch_generation is None
+        or earlier_dispatch_generation is None
+        or earlier_dispatch_generation >= dispatch_generation
+    ):
+        earlier_dispatch_generation = None
+    started, refused_earlier_evidence = await wait_for_start(
+        dispatch_generation, earlier_dispatch_generation
+    )
+    if started:
         return True
+    if refused_earlier_evidence:
+        in_composer = await asyncio.to_thread(_message_in_composer, terminal_id, message)
+        if in_composer is not True:
+            logger.info(
+                "First task to %s: the only started status was earned from output that "
+                "landed while the send was being prepared, and the composer does not show "
+                "the task (%s); counting it as started rather than typing it again",
+                terminal_id,
+                "empty" if in_composer is False else "unreadable",
+            )
+            return True
 
     for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
         # The redelivery decision (box check + #496's direct-probe guard for
@@ -5625,7 +5708,8 @@ async def _confirm_worker_started_or_resubmit(
         # returns no boundary and the current one is kept.
         if redelivery_boundary is not None and dispatch_generation is not None:
             dispatch_generation = redelivery_boundary
-        if await wait_for_start(dispatch_generation):
+        started, _ = await wait_for_start(dispatch_generation)
+        if started:
             return True
 
     return False
@@ -5732,6 +5816,7 @@ def _schedule_deferred_init(
                     pre_dispatch_status = await asyncio.to_thread(
                         status_monitor.get_status, terminal_id
                     )
+                boundary_samples = DispatchBoundarySamples()
                 dispatch_boundary = await asyncio.to_thread(
                     dispatch_input,
                     terminal_id,
@@ -5739,6 +5824,7 @@ def _schedule_deferred_init(
                     registry=registry,
                     sender_id=caller_id,
                     orchestration_type=effective_orchestration_type,
+                    boundary_samples=boundary_samples,
                 )
                 task_dispatched = True
                 # The pending mark is deliberately NOT released here.
@@ -5807,6 +5893,13 @@ def _schedule_deferred_init(
                     provider=provider_instance,
                     dispatch_generation=dispatch_generation,
                     pre_dispatch_status=pre_dispatch_status,
+                    # The sample from before the send was prepared, when the
+                    # backend also took one at the pane write. See the docstring.
+                    earlier_dispatch_generation=(
+                        boundary_samples.earlier_if_resampled()
+                        if dispatch_generation is not None
+                        else None
+                    ),
                 )
                 # Strict execution-evidence providers (currently Kimi) do not
                 # accept cached PROCESSING/COMPLETED as pickup proof. Their
@@ -6549,6 +6642,36 @@ class TerminalRowMissingError(InputNotSentError, ValueError):
     """
 
 
+class DispatchBoundarySamples:
+    """Both output-generation samples one ``dispatch_input`` call takes.
+
+    ``dispatch_input`` returns the later sample. A caller that also needs the
+    earlier one passes an instance and reads it afterwards.
+
+    - ``before_preparation``: armed, buffer cleared, before the provider
+      bookkeeping and the backend's own preparation. This was the boundary
+      before #709.
+    - ``before_write``: taken from the backend's ``pre_write_hook``, at the last
+      point before the pane write. ``None`` when the backend never called the
+      hook or the sample failed, in which case the earlier one was returned.
+
+    A status stamped above the first and not above the second was earned from
+    output that landed between them: old output, not evidence of this send. The
+    first-task confirmation uses that to tell this case from "no output at all"
+    (see ``_confirm_worker_started_or_resubmit``).
+    """
+
+    __slots__ = ("before_preparation", "before_write")
+
+    def __init__(self) -> None:
+        self.before_preparation: Optional[int] = None
+        self.before_write: Optional[int] = None
+
+    def earlier_if_resampled(self) -> Optional[int]:
+        """The earlier sample, but only when a later one was taken at the pane write."""
+        return self.before_preparation if self.before_write is not None else None
+
+
 def dispatch_input(
     terminal_id: str,
     message: str,
@@ -6557,6 +6680,7 @@ def dispatch_input(
     orchestration_type: OrchestrationType | None = None,
     redelivery: bool = False,
     frozen_memory: str | None = None,
+    boundary_samples: DispatchBoundarySamples | None = None,
 ) -> int:
     """Send input to terminal via tmux paste buffer and return its dispatch boundary.
 
@@ -6569,6 +6693,11 @@ def dispatch_input(
     includes the provider's submit delay, during which a fast worker can already
     emit and complete; sampled afterwards, those chunks would be inside the
     baseline and a genuine completion would read as pre-dispatch.
+
+    The sample is taken again from the backend's ``pre_write_hook``, at the last
+    point before the pane write, and that later value is the one returned
+    (#709); see the comment at the ``send_keys`` call.
+    ``boundary_samples``, when given, receives both samples.
 
     Uses bracketed paste mode (-p) to bypass TUI hotkey handling. The number
     of Enter keys sent after pasting is determined by the provider's
@@ -6719,10 +6848,13 @@ def dispatch_input(
         # THE DISPATCH BOUNDARY. Sampled here -- armed, buffer cleared, no key
         # sent yet -- and returned to the caller. Output that lands from this
         # point on is output produced after this send; output that landed before
-        # it is already inside the value and can never count as evidence. This
-        # is the only place the sample is correct: one line later send_keys
+        # it is already inside the value and can never count as evidence. It
+        # must not be taken any later in THIS function: one line later send_keys
         # starts, and its submit delay is exactly the window in which a fast
-        # worker emits and completes (reviewer-reproduced on PR #566).
+        # worker emits and completes (reviewer-reproduced on PR #566). The
+        # backend re-takes it from inside send_keys, just before the pane write
+        # (see ``_resample_dispatch_boundary`` below); this sample is what is
+        # returned when a backend never gets that far or never calls the hook.
         #
         # Deliberately a separate lock acquisition AFTER the clear, not atomic
         # with it. A chunk that lands between the two is pre-dispatch output (no
@@ -6731,6 +6863,8 @@ def dispatch_input(
         # leave that chunk outside the baseline and count it -- the false
         # confirmation this gate exists to prevent.
         dispatch_boundary = status_monitor.output_generation(terminal_id)
+        if boundary_samples is not None:
+            boundary_samples.before_preparation = dispatch_boundary
 
         # Mark the provider before send_keys rather than after it.  send_keys
         # includes the provider-specific submit delay, during which a fast CLI
@@ -6748,6 +6882,34 @@ def dispatch_input(
                 provider.mark_input_received()
             provider.record_dispatched_message(message)
 
+        def _resample_dispatch_boundary() -> None:
+            # The provider bookkeeping above and the backend's own preparation
+            # (on tmux a cancel, a foreground-command probe and load-buffer,
+            # each a subprocess) all run after the sample above and before any
+            # key reaches the pane. A receiver that is still emitting while it
+            # reads as ready advances the generation in that window, and a
+            # status earned from that old output then sat above the boundary
+            # and confirmed a send whose Enter was swallowed, so the recovery
+            # was skipped (#709). The backend calls this at its last point
+            # before the write, which folds that output into the baseline for
+            # the same reason the sample above follows the clear.
+            #
+            # Never raises: the backend calls it between its preparation and
+            # the write, and a failed sample must cost only the later boundary,
+            # not the send. The earlier sample then stands.
+            nonlocal dispatch_boundary
+            try:
+                dispatch_boundary = status_monitor.output_generation(terminal_id)
+                if boundary_samples is not None:
+                    boundary_samples.before_write = dispatch_boundary
+            except Exception as exc:  # noqa: BLE001 - see above
+                logger.warning(
+                    "Could not re-sample the dispatch boundary for %s before the pane "
+                    "write (%r); keeping the earlier sample",
+                    terminal_id,
+                    exc,
+                )
+
         backend = get_backend()
         submit_delay = provider.paste_submit_delay if provider else 0.3
         sending = True
@@ -6758,6 +6920,7 @@ def dispatch_input(
             enter_count=enter_count,
             force_bracketed_paste=True,
             submit_delay=submit_delay,
+            pre_write_hook=_resample_dispatch_boundary,
         )
 
         update_last_active(terminal_id)
