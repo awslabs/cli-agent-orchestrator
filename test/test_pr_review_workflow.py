@@ -393,6 +393,7 @@ def _context(pr_review: ModuleType, source_dir: Path, settled: list[Any]) -> dic
         "severity_counts": {"P1": 0, "P2": 0, "P3": 0},
         "risk": pr_review.overall_risk(reports, REVIEWERS),
         "not_checked_ids": [],
+        "idle": [],
         "dropped": [],
         "coverage": pr_review.coverage(reports, len(FILES), REVIEWERS),
         "reports": reports,
@@ -1156,6 +1157,29 @@ def test_not_checked_ids_lists_the_checks_that_no_reviewer_covered(pr_review: Mo
     ) == ["A1", "A2"]
 
 
+def test_idle_reviewers_lists_each_report_that_shows_no_review(pr_review: ModuleType) -> None:
+    no_check = dict.fromkeys(CHECK_IDS, "not_applicable")
+    reports = {
+        "reviewer-a": _reviewer_report(reviewed=(), skipped=(1, 2, 3, 4, 5, 6), statuses=no_check),
+        "reviewer-b": _reviewer_report(statuses={"A1": "not_checked", "A2": "not_applicable"}),
+    }
+
+    assert pr_review.idle_reviewers(reports, REVIEWERS) == [
+        "reviewer-a read no changed file in full",
+        "reviewer-a marked no check checked",
+        "reviewer-b marked no check checked",
+    ]
+    assert pr_review.idle_reviewers(reports, ("reviewer-b",)) == [
+        "reviewer-b marked no check checked"
+    ]
+    # One file read in full and one check checked is enough. A missing report is
+    # a coverage gap, not an idle reviewer.
+    one = _reviewer_report(
+        reviewed=(1,), skipped=(2, 3, 4, 5, 6), statuses={**no_check, "A2": "checked"}
+    )
+    assert pr_review.idle_reviewers({"reviewer-a": one, "reviewer-b": None}, REVIEWERS) == []
+
+
 def test_overall_risk_takes_the_highest_level_and_its_reasons(pr_review: ModuleType) -> None:
     def report(level: str, *reasons: str) -> dict[str, Any]:
         return {**_reviewer_report(), "risk": {"level": level, "reasons": list(reasons)}}
@@ -1416,6 +1440,19 @@ def test_render_sections_shows_the_checks_the_risk_and_single_mode(
     assert checked_note in text and not_checked_note in text
     # The compact body keeps only the notes that say why a check was not done.
     assert not_checked_note in compact and checked_note not in compact
+
+
+def test_render_sections_names_an_idle_reviewer_in_the_full_and_compact_body(
+    pr_review: ModuleType, workspace: dict[str, Path]
+) -> None:
+    context = _context(pr_review, workspace["source"], [])
+    context["reports"]["reviewer-a"] = _reviewer_report(reviewed=(), skipped=(1, 2, 3, 4, 5, 6))
+    context["coverage"] = pr_review.coverage(context["reports"], len(FILES), REVIEWERS)
+    context["idle"] = pr_review.idle_reviewers(context["reports"], REVIEWERS)
+    line = "- reviewer-a read no changed file in full, so the review is incomplete.\n"
+
+    assert line in pr_review.render_sections(context, False)
+    assert line in pr_review.render_sections(context, True)
 
 
 # --------------------------------------------------------------------------
@@ -1803,6 +1840,32 @@ def test_run_review_is_incomplete_when_no_reviewer_checked_a_check(
     assert review["not_checked_ids"] == ["A2"]
     assert (review["result_states"], review["review_complete"]) == (["incomplete"], False)
     assert "Not covered: A2." in review["sections"]
+    _assert_publishable(github_review, review)
+
+
+def test_run_review_is_incomplete_when_the_reviewer_read_no_file_and_checked_no_check(
+    pr_review: ModuleType,
+    github_review: ModuleType,
+    workspace: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The report accounts for each file and check, so the coverage rules pass.
+    report = _reviewer_report(
+        reviewed=(),
+        skipped=(1, 2, 3, 4, 5, 6),
+        statuses=dict.fromkeys(CHECK_IDS, "not_applicable"),
+    )
+    cao = FakeCao({"reviewer-a": report})
+
+    review = _run_review(pr_review, workspace, monkeypatch, cao, reviewers="single")
+
+    assert review["not_checked_ids"] == []
+    assert (review["result_states"], review["review_complete"]) == (["incomplete"], False)
+    assert (
+        "| reviewer-a | 0 | 6 | 0 |\n\n"
+        "- reviewer-a read no changed file in full, so the review is incomplete.\n"
+        "- reviewer-a marked no check checked, so the review is incomplete.\n"
+    ) in review["sections"]
     _assert_publishable(github_review, review)
 
 

@@ -24,7 +24,9 @@ checked them.
 
 With no candidates, the voters and the adjudicator do not run. In both modes, a
 check that no reviewer covered, a dropped finding or a changed file that a reviewer
-did not list makes the review Incomplete.
+did not list makes the review Incomplete. So does a reviewer that read no changed
+file in full or marked no check checked: its report can account for each file and
+check, but it shows no review.
 
 The agents run in an empty working directory with read and search tools only.
 Each agent returns its report with CAO's ``workflow_return`` tool. This script
@@ -1177,6 +1179,26 @@ def not_checked_ids(
     return [check_id for check_id in check_ids if check_id not in covered]
 
 
+def idle_reviewers(
+    reports: dict[str, Optional[dict[str, Any]]], seats: tuple[str, ...]
+) -> list[str]:
+    """The valid reviewer reports that read no changed file in full or marked no check checked.
+
+    Skipped files and not_applicable checks count as accounted for, so such a
+    report passes the coverage rules without a review.
+    """
+    gaps = []
+    for seat in seats:
+        report = reports.get(seat)
+        if report is None:
+            continue
+        if not report["files_reviewed"]:
+            gaps.append(f"{seat} read no changed file in full")
+        if all(item["status"] != "checked" for item in report["checks"].values()):
+            gaps.append(f"{seat} marked no check checked")
+    return gaps
+
+
 def overall_risk(
     reports: dict[str, Optional[dict[str, Any]]], seats: tuple[str, ...]
 ) -> dict[str, Any]:
@@ -1430,6 +1452,9 @@ def render_sections(context: dict[str, Any], compact: bool) -> str:
                 f"{len(cover['missing'])} |"
             )
     lines.append("")
+    if context["idle"]:
+        lines += [f"- {gap}, so the review is incomplete." for gap in context["idle"]]
+        lines.append("")
     if not compact:
         for seat in reviewers:
             cover = context["coverage"][seat]
@@ -1615,6 +1640,7 @@ def run_review(
     groups = group_ids(settled)
     cover = coverage(reports, file_count, reviewers)
     unchecked = not_checked_ids(reports, reviewers, check_ids)
+    idle = idle_reviewers(reports, reviewers)
     votes_complete = (
         mode == "single"
         or not candidates
@@ -1623,6 +1649,7 @@ def run_review(
     complete = (
         all(item is not None and not item["missing"] for item in (cover[s] for s in reviewers))
         and not unchecked
+        and not idle
         and not dropped
         and votes_complete
     )
@@ -1644,6 +1671,7 @@ def run_review(
         "severity_counts": counts,
         "risk": risk,
         "not_checked_ids": unchecked,
+        "idle": idle,
         "dropped": dropped,
         "coverage": cover,
         "reports": reports,

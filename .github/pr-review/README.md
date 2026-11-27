@@ -105,7 +105,7 @@ is the result.
 | --- | --- |
 | `changes_required` | The review accepted a P1 or P2 finding. |
 | `owner_decision_required` | A P1 or P2 candidate needs a decision from the PR owner. |
-| `incomplete` | A reviewer did not account for every changed file, no reviewer checked a check of `REVIEW.md`, the script dropped a finding with a bad location, or a voter or the adjudicator returned no valid report. |
+| `incomplete` | A reviewer did not account for every changed file, read no changed file in full, or marked no check `checked`. Or no reviewer checked a check of `REVIEW.md`, the script dropped a finding with a bad location, or a voter or the adjudicator returned no valid report. |
 | `no_blocking_findings` | None of the above. Accepted P3 findings can still be listed. |
 
 If the run cannot make a review, `review.json` is Blocked: `publishable` is
@@ -404,7 +404,8 @@ profiles and the PR, and all three come from the dispatched ref.
 - A PR with more than 1,000 changed files is Blocked.
 - Each reviewer reports at most 8 findings and 5 unknowns. A reviewer can skip
   at most 50 files, each with a reason. If a reviewer does not account for each
-  changed file, the review is incomplete.
+  changed file, or reads none in full, the review is incomplete. So a PR that
+  changes only files that a reviewer skips, such as binary files, is incomplete.
 - `REVIEW.md` can have at most 40 checks.
 - The report of each seat must fit the CAO limit of a step result, 32 KiB. CAO
   drops a larger report, so the seat has no report.

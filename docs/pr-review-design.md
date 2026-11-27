@@ -96,7 +96,10 @@ the publisher. The tests keep the two copies equal.
   reviewer reports each check as `checked`, `not_checked` or `not_applicable`,
   with a short note. Each finding names its check. If no valid report covers a
   check, the review is Incomplete. So the review records which review angles
-  ran, and it marks a partial review as partial (#1350, step 10).
+  ran, and it marks a partial review as partial (#1350, step 10). A reviewer
+  that reads no changed file in full, or marks no check `checked`, also makes
+  the review Incomplete. Its report can account for each file and check, but
+  it shows no review.
 - **Record.** The comment names the policy file, shows the first 12 characters
   of its SHA-256 and shows the coverage of each check. `review.json` keeps the
   full SHA-256 and the check IDs.
@@ -229,7 +232,7 @@ exact rules.
 | Blocked | A prerequisite failed, for example a closed PR or an invalid policy file. No comment is posted. If the `review` job is Blocked, a neutral check says that the review did not finish. |
 | Skipped | The PR is a draft, so no agent runs. `publish` also skips when the PR became a draft during the run, or when a newer run posted the comment. A skip posts no comment and no check. |
 | Stale | The reviewed head is no longer a commit of the PR. No comment is posted, and a neutral check says that the review is not published. |
-| Incomplete | A seat returned no valid report, a reviewer did not list a changed file, no reviewer covered a check, or a finding was dropped. The comment lists the gaps. |
+| Incomplete | A seat returned no valid report, or a reviewer did not list a changed file, read none in full or marked no check `checked`. Or no reviewer covered a check, or a finding was dropped. The comment lists the gaps. |
 | Owner decision required | In panel mode, the agents disagree in a way that the verdict rules leave to a person. |
 | Changes required | At least one accepted P1 or P2 finding. The workflow requests changes on the PR. |
 | No blocking findings | Coverage is complete, and no accepted P1 or P2 finding and no owner question remain. It is still not an approval. |
