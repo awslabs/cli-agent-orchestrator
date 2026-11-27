@@ -1533,9 +1533,26 @@ class TestAsyncLaunchWaitsForADurableDeliveryOutcome:
         }
         result, _, _ = self._invoke([_pending_response(), failed])
         assert result.exit_code != 0
-        assert "not delivered" in result.output
-        assert "provider_init_error" in result.output
+        # The handler that writes provider_init_error also covers a failure after
+        # the send, so the CLI does not claim the message was not delivered (#882).
+        assert "was not confirmed (provider_init_error)" in result.output
+        assert "failed to initialize: boom" in result.output
         assert "Running in background" not in result.output
+
+    def test_async_provider_exit_before_the_send_says_not_delivered(self):
+        """``provider_exited`` is the one kind written only when nothing was typed."""
+        result, _, _ = self._invoke(
+            [
+                _pending_response(),
+                _failed_delivery_response(
+                    "provider_exited", "provider process exited; nothing was typed into the pane."
+                ),
+            ]
+        )
+        assert result.exit_code != 0
+        assert "Initial message was not delivered" in result.output
+        assert "(provider_exited)" in result.output
+        assert "was not confirmed" not in result.output
 
     def test_async_startup_prompt_surfaces_instead_of_dropping_the_message(self):
         result, _, _ = self._invoke(

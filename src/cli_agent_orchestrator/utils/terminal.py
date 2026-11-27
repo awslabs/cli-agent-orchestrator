@@ -607,8 +607,16 @@ def wait_for_initial_delivery(
         if state == "failed":
             kind = delivery.get("kind") or "failed"
             detail = delivery.get("message") or "no detail recorded"
+            if kind in _KINDS_WRITTEN_BEFORE_THE_TASK_IS_TYPED:
+                raise click.ClickException(
+                    f"Initial message was not delivered to terminal {terminal_id} "
+                    f"({kind}): {detail}"
+                )
+            # Every other kind, and any kind added later: the task may have been
+            # typed, so do not say it was not delivered (#882).
             raise click.ClickException(
-                f"Initial message was not delivered to terminal {terminal_id} ({kind}): {detail}"
+                f"Delivery of the initial message to terminal {terminal_id} was not "
+                f"confirmed ({kind}): {detail}"
             )
         if payload.get("status") == TerminalStatus.ERROR.value:
             failure = payload.get("deferred_init_failure")
@@ -622,6 +630,24 @@ def wait_for_initial_delivery(
                 + (f": {detail}" if detail else "")
             )
         time.sleep(polling_interval)
+
+
+# Failed ``initial_delivery`` kinds the server writes only when nothing was typed
+# into the pane. For these the CLI may say "was not delivered". For every other
+# kind the task may have reached the agent, and a new kind is treated that way
+# until it is listed here.
+#
+# - ``provider_exited``: the delivery guard refused the first send because the
+#   provider process was gone (terminal_service, the ``task_dispatched`` False
+#   branch; its text says "nothing was typed into the pane").
+#
+# Not listed, on purpose: ``provider_init_error`` and ``waiting_user_answer``
+# are usually written before the send, but the handlers that write them also
+# cover a failure after it. ``interrupted``, ``interrupted_init``,
+# ``task_not_started``, ``provider_exited_after_dispatch`` and
+# ``provider_error_after_delivery`` all describe a task that was or may have
+# been typed.
+_KINDS_WRITTEN_BEFORE_THE_TASK_IS_TYPED = frozenset({"provider_exited"})
 
 
 def wait_until_terminal_status(
