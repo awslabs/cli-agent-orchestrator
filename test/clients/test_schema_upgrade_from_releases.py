@@ -9,7 +9,6 @@ from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients import database as database_module
 
-
 SCHEMAS = Path(__file__).resolve().parents[1] / "fixtures/db_schemas"
 RELEASES = (
     "v2.5.0",

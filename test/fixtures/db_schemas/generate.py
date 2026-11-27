@@ -5,7 +5,6 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[3]
 SCRATCH = Path.home() / ".cache/cao-scratch/cao3-775-gen"
 TAGS = ("v2.4.1", "v2.5.0", "v2.5.1", "v2.5.2", "v2.5.4", "v2.5.5")

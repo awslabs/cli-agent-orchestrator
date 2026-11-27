@@ -2,6 +2,7 @@
 
 from typing import Any, Callable
 
+from cli_agent_orchestrator.clients.schema_migrations import SchemaError
 from cli_agent_orchestrator.decisions import operator, settings
 
 
@@ -9,6 +10,8 @@ def _result(action: Callable[[], Any]) -> dict[str, Any]:
     try:
         return {"success": True, "data": action()}
     except ValueError as error:
+        return {"success": False, "message": str(error)}
+    except SchemaError as error:
         return {"success": False, "message": str(error)}
     except Exception:
         return {

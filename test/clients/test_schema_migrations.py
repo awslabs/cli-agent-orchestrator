@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -32,9 +33,7 @@ def records(path):
 
 
 def test_registry_contiguous_and_unique():
-    assert [step.version for step in migrations.MIGRATIONS] == list(
-        range(1, migrations.HEAD + 1)
-    )
+    assert [step.version for step in migrations.MIGRATIONS] == list(range(1, migrations.HEAD + 1))
     assert len({step.name for step in migrations.MIGRATIONS}) == len(migrations.MIGRATIONS)
 
 
@@ -68,6 +67,7 @@ def test_foreign_schema_refused(schema_db):
 
 def test_manifest_missing_column_refuses_stamp(schema_db, monkeypatch):
     baseline = migrations.MIGRATIONS[0]
+    original_migrator = database_module._migrate_terminals_schema
     database_module.init_db()
     with sqlite3.connect(schema_db) as connection:
         connection.execute("DELETE FROM cao_schema_migrations")
@@ -76,8 +76,62 @@ def test_manifest_missing_column_refuses_stamp(schema_db, monkeypatch):
     with pytest.raises(migrations.MigrationFailedError, match="terminals.runner_id"):
         database_module.init_db()
     assert records(schema_db)[0][1] == "started"
-    monkeypatch.undo()
+    monkeypatch.setattr(database_module, "_migrate_terminals_schema", original_migrator)
+    database_module.init_db()
+    assert records(schema_db)[0][1] == "applied"
     assert baseline.rerunnable
+
+
+def test_started_nonrerunnable_step_is_refused(schema_db, monkeypatch):
+    database_module.init_db()
+    second = migrations.Migration(2, "unfinished", lambda connection: None, True, False)
+    monkeypatch.setattr(migrations, "MIGRATIONS", (*migrations.MIGRATIONS, second))
+    monkeypatch.setattr(migrations, "HEAD", 2)
+    with sqlite3.connect(schema_db) as connection:
+        connection.execute(
+            "INSERT INTO cao_schema_migrations VALUES "
+            "(2, 'unfinished', 'started', 'future', 'now', NULL, 'backup.db')"
+        )
+    with pytest.raises(migrations.MigrationInterruptedError, match="backup.db"):
+        database_module.init_db()
+
+
+def test_unknown_registry_version_is_refused(schema_db):
+    database_module.init_db()
+    with sqlite3.connect(schema_db) as connection:
+        connection.execute("UPDATE cao_schema_migrations SET version=0, cao_version='strange'")
+    with pytest.raises(migrations.SchemaTooNewError, match="strange"):
+        database_module.init_db()
+
+
+def test_insufficient_backup_space_refuses_early(schema_db, monkeypatch):
+    database_module.init_db()
+    with sqlite3.connect(schema_db) as connection:
+        connection.execute("DELETE FROM cao_schema_migrations")
+    disk = migrations.shutil.disk_usage(schema_db.parent)
+    monkeypatch.setattr(migrations.shutil, "disk_usage", lambda path: disk._replace(free=0))
+    with pytest.raises(migrations.SchemaBackupError, match="Insufficient free space"):
+        database_module.init_db()
+    assert not (schema_db.parent / "backups").exists()
+
+
+def test_schedule_and_decision_mcp_surface_schema_error(schema_db, monkeypatch):
+    from cli_agent_orchestrator.cli.commands.schedule import schedule
+    from cli_agent_orchestrator.ops_mcp_server.decision_tools import _result
+
+    database_module.init_db()
+    with sqlite3.connect(schema_db) as connection:
+        connection.execute(
+            "INSERT INTO cao_schema_migrations VALUES "
+            "(2, 'future', 'applied', 'future-writer', 'now', 'now', NULL)"
+        )
+    result = CliRunner().invoke(schedule, ["list"])
+    assert result.exit_code != 0
+    assert "restore the backup" in result.output
+    assert "Traceback" not in result.output
+    message = _result(database_module.init_db)
+    assert message["success"] is False
+    assert "restore the backup" in message["message"]
 
 
 def test_transaction_rolls_back_failed_step(schema_db, monkeypatch):
@@ -103,7 +157,9 @@ def test_transaction_rolls_back_failed_step(schema_db, monkeypatch):
     with sqlite3.connect(schema_db) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(terminals)")}
     assert "test_v2" in columns and "test_v3" not in columns
-    monkeypatch.setattr(migrations, "MIGRATIONS", (*steps[:2], replace(steps[2], apply=lambda c: None)))
+    monkeypatch.setattr(
+        migrations, "MIGRATIONS", (*steps[:2], replace(steps[2], apply=lambda c: None))
+    )
     database_module.init_db()
     assert records(schema_db)[-1][0:2] == (3, "applied")
 
