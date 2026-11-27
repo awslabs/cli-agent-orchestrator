@@ -43,6 +43,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'guides/building-with-claude-code',
         'guides/building-with-kiro',
+        'guides/remote-cao',
       ],
     },
     {
