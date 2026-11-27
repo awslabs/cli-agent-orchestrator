@@ -35,6 +35,7 @@ const sidebars: SidebarsConfig = {
         'features/profiles',
         'features/scheduled-flows',
         'features/web-ui',
+        'features/herdr-app',
       ],
     },
     {
