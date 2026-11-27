@@ -664,6 +664,93 @@ class TestStatusWithCompletionFooter:
         with pytest.raises(ValueError):
             provider.extract_last_message_from_script(pending_next_turn)
 
+        # Even if the user literally submitted text matching a built-in suggestion placeholder,
+        # dispatch attribution preserves it as a submitted prompt rather than returning the stale refusal
+        dispatched_suggestion = footer_provider()
+        with patch("cli_agent_orchestrator.providers.codex.get_backend") as get_backend:
+            get_backend.return_value.get_history.return_value = "\n".join(screen(*TASK, *daybreak))
+            dispatched_suggestion.notify_status_buffer_reset(1)
+            dispatched_suggestion.mark_input_received()
+            dispatched_suggestion.record_dispatched_message("Explain this codebase")
+        clipped_submitted = "\n".join([*TASK, *daybreak, "› Explain this codebase"])
+        with pytest.raises(ValueError):
+            dispatched_suggestion.extract_last_message_from_script(clipped_submitted)
+
+    def test_refusal_boundary_preserves_reflow_and_detects_cell_changes(self):
+        """Reflowing a stale refused frame keeps attribution, while different tool calls
+        sharing a tail row or a changed refusal body complete the new turn."""
+        apply_refusal = [
+            "ⓘ This content can’t be shown",
+            "  We take extra care with some cybersecurity requests.",
+            "  Apply for Daybreak: https://chatgpt.com/admin/status-and-access",
+        ]
+        disabled_refusal = [
+            "ⓘ This content can’t be shown",
+            "  Daybreak is currently off. Turn on Daybreak to continue with authorized security work.",
+        ]
+
+        # 1. Resized stale frame wrapping tool output and refusal text must NOT complete
+        baseline_wide = screen(
+            *TASK,
+            "• Ran pytest test/auth.py",
+            "  └ 4 passed in auth verification suite",
+            "",
+            *apply_refusal,
+        )
+        stale_narrow = screen(
+            *TASK,
+            "• Ran pytest test/auth.py",
+            "  └ 4 passed in auth",
+            "    verification suite",
+            "",
+            "ⓘ This content can’t be shown",
+            "  We take extra care with some",
+            "  cybersecurity requests.",
+            "  Apply for Daybreak: https://chatgpt.com/admin/status-and-access",
+        )
+        provider_resize = footer_provider()
+        with patch("cli_agent_orchestrator.providers.codex.get_backend") as get_backend:
+            get_backend.return_value.get_history.return_value = "\n".join(baseline_wide)
+            provider_resize.notify_status_buffer_reset(1)
+            provider_resize.mark_input_received()
+            provider_resize.record_dispatched_message("Run the next suite.")
+        assert provider_resize.get_status_from_screen(stale_narrow) == TerminalStatus.PROCESSING
+
+        # 2. Different tool call ending in the exact same `└ 4 passed` row completes
+        baseline_tool = screen(
+            *TASK,
+            "• Ran pytest test/a.py",
+            "  └ 4 passed",
+            "",
+            *apply_refusal,
+        )
+        new_tool_same_tail = screen(
+            "• Ran pytest test/b.py",
+            "  └ 4 passed",
+            "",
+            *apply_refusal,
+        )
+        provider_tool = footer_provider()
+        with patch("cli_agent_orchestrator.providers.codex.get_backend") as get_backend:
+            get_backend.return_value.get_history.return_value = "\n".join(baseline_tool)
+            provider_tool.notify_status_buffer_reset(1)
+            provider_tool.mark_input_received()
+            provider_tool.record_dispatched_message("Run suite b.")
+        assert provider_tool.get_status_from_screen(baseline_tool) == TerminalStatus.PROCESSING
+        assert provider_tool.get_status_from_screen(new_tool_same_tail) == TerminalStatus.COMPLETED
+
+        # 3. No-tool refusal with same heading but changed Apply -> Disabled body completes
+        baseline_body = screen(*apply_refusal)
+        changed_body = screen(*disabled_refusal)
+        provider_body = footer_provider()
+        with patch("cli_agent_orchestrator.providers.codex.get_backend") as get_backend:
+            get_backend.return_value.get_history.return_value = "\n".join(baseline_body)
+            provider_body.notify_status_buffer_reset(1)
+            provider_body.mark_input_received()
+            provider_body.record_dispatched_message("Check security config.")
+        assert provider_body.get_status_from_screen(baseline_body) == TerminalStatus.PROCESSING
+        assert provider_body.get_status_from_screen(changed_body) == TerminalStatus.COMPLETED
+
     def test_raw_stream_keeps_the_older_rules(self):
         """With CAO_PYTE_STATUS=false the raw stream is parsed. It keeps every
         redraw, so a stale status bar or footer can follow the live rows."""

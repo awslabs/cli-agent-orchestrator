@@ -8,7 +8,7 @@ import shlex
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 from wcwidth import wcswidth
 
@@ -801,6 +801,40 @@ def _extract_content_refusal_cell(text: str, refusal_match: re.Match[str]) -> st
         if next_cell is not None:
             end_pos = first_nl + 1 + next_cell.start()
     return tail[:end_pos].strip()
+
+
+def _refusal_cell_tokens(rows: Sequence[str], refusal_idx: int) -> tuple[str, ...]:
+    """Return whitespace-normalized tokens for the refusal cell starting at ``refusal_idx``."""
+    if refusal_idx < 0 or refusal_idx >= len(rows):
+        return ()
+    cell = [rows[refusal_idx]]
+    for row in rows[refusal_idx + 1 :]:
+        if not row.strip() or not row[0].isspace():
+            break
+        cell.append(row)
+    return tuple(" ".join(cell).split())
+
+
+def _preceding_cell_tokens(rows: Sequence[str], boundary_idx: int) -> tuple[str, ...]:
+    """Return whitespace-normalized tokens for the cell immediately above ``boundary_idx``."""
+    idx = boundary_idx - 1
+    while idx >= 0 and not rows[idx].strip():
+        idx -= 1
+    if idx < 0:
+        return ()
+    cell: list[str] = []
+    while idx >= 0 and rows[idx].strip():
+        cell.append(rows[idx])
+        if not rows[idx][0].isspace():
+            break
+        idx -= 1
+    cell.reverse()
+    return tuple(" ".join(cell).split())
+
+
+def _is_token_suffix(shorter: tuple[str, ...], longer: tuple[str, ...]) -> bool:
+    """Return True when ``shorter`` is a non-empty suffix of ``longer``."""
+    return bool(shorter) and len(shorter) <= len(longer) and longer[-len(shorter) :] == shorter
 
 
 def _body_rows(text: str) -> list[str]:
@@ -2738,8 +2772,25 @@ class CodexProvider(BaseProvider):
         )
         if last_refusal is None:
             return False
-        return rows[last_refusal] not in baseline_rows or any(
-            row.strip() and row not in baseline_rows for row in rows[:last_refusal]
+        base_seq = baseline or ()
+        base_refusal_cells = {
+            _refusal_cell_tokens(base_seq, index)
+            for index, row in enumerate(base_seq)
+            if re.match(CONTENT_REFUSAL_CELL_PATTERN, row)
+        }
+        curr_refusal_tokens = _refusal_cell_tokens(rows, last_refusal)
+        if curr_refusal_tokens not in base_refusal_cells:
+            return True
+        curr_prev_tokens = _preceding_cell_tokens(rows, last_refusal)
+        if not curr_prev_tokens:
+            return False
+        base_prev_cells = [
+            _preceding_cell_tokens(base_seq, index)
+            for index, row in enumerate(base_seq)
+            if re.match(CONTENT_REFUSAL_CELL_PATTERN, row)
+        ]
+        return not any(
+            _is_token_suffix(curr_prev_tokens, base_prev) for base_prev in base_prev_cells
         )
 
     def _has_current_turn_activity(self, frame: str) -> bool:
@@ -2779,26 +2830,26 @@ class CodexProvider(BaseProvider):
             else None
         )
         # A content-refusal heading is constant across turns (unlike a timestamped
-        # completion footer), so a radius-0 match can misalign a new refusal after
-        # new tool output onto an old scrolled-off refusal. If any non-blank row
-        # above the mapped refusal differs from the baseline's preceding row
-        # (including when the baseline started at the refusal so base_prev is
-        # None), it is not the same historical boundary.
+        # completion footer), so a radius-0 match can misalign a new refusal onto
+        # an old scrolled-off refusal. Compare whitespace-normalized tokens of the
+        # full refusal cell and its preceding cell so terminal reflow preserves the
+        # historical boundary while changed tool calls, changed refusal bodies, or
+        # fresh activity above a row-0 baseline refusal clear the stale mapping.
         if (
             mapped_boundary is not None
             and baseline is not None
             and prior_boundary is not None
             and re.match(CONTENT_REFUSAL_CELL_PATTERN, baseline[prior_boundary])
         ):
-            base_prev = next(
-                (r for r in reversed(baseline[:prior_boundary]) if r.strip()),
-                None,
+            base_refusal_tokens = _refusal_cell_tokens(baseline, prior_boundary)
+            curr_refusal_tokens = _refusal_cell_tokens(current_rows, mapped_boundary)
+            base_prev_tokens = _preceding_cell_tokens(baseline, prior_boundary)
+            curr_prev_tokens = _preceding_cell_tokens(current_rows, mapped_boundary)
+            refusal_changed = curr_refusal_tokens != base_refusal_tokens
+            prev_changed = bool(curr_prev_tokens) and not _is_token_suffix(
+                curr_prev_tokens, base_prev_tokens
             )
-            curr_prev = next(
-                (r for r in reversed(current_rows[:mapped_boundary]) if r.strip()),
-                None,
-            )
-            if curr_prev is not None and curr_prev != base_prev:
+            if refusal_changed or prev_changed:
                 mapped_boundary = None
         if mapped_boundary is not None:
             has_activity = any(
@@ -3171,9 +3222,17 @@ class CodexProvider(BaseProvider):
             )
             if last_non_blank_idx is not None:
                 last_line = lines_with_ends[last_non_blank_idx].rstrip("\r\n")
-                if re.match(STARTUP_IDLE_PLACEHOLDER_PATTERN, last_line) or re.match(
-                    IDLE_PROMPT_STRICT_PATTERN, last_line
-                ):
+                with self._dispatch_lock:
+                    dispatched_message = self._dispatch_message
+                matches_dispatched = bool(
+                    dispatched_message and _dispatched_echoes([last_line], dispatched_message)
+                )
+                is_strict_idle = re.match(IDLE_PROMPT_STRICT_PATTERN, last_line) is not None
+                is_idle_placeholder = (
+                    not matches_dispatched
+                    and re.match(STARTUP_IDLE_PLACEHOLDER_PATTERN, last_line) is not None
+                )
+                if is_strict_idle or is_idle_placeholder:
                     cutoff_pos = sum(len(line) for line in lines_with_ends[:last_non_blank_idx])
 
         user_matches = [
