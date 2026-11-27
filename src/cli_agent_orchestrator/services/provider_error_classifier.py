@@ -15,7 +15,7 @@ independent guards: only the FIRST non-empty line is tested; any output longer t
 provider adapters that emit that chrome; the pattern must consume the WHOLE line;
 and raw adapter context, when available, must show a provider-NATIVE error signal
 rather than an ordinary marker-owned answer. That signal is the CLI's own error
-chrome where it has one (Codex's ``■`` / ``⚠️ stream error``), and — for the ONE
+chrome where it has one (Codex's ``■`` / ``⚠️ stream error`` / ``ⓘ`` notice cell), and — for the ONE
 family with upstream evidence that it renders on the response bullet — the narrow
 ``API Error: <4xx/5xx>`` text Claude Code prints. Common words, status-code values,
 or error vocabulary in another adapter's ordinary prose are therefore answers, not
@@ -85,6 +85,13 @@ _ROWS = (
     (
         "unexpected_status",
         r"(?:\u25a0|\u26a0\ufe0f?)\s*(?:stream error\s*:\s*)?unexpected status\s+[45]\d{2}\b.*",
+        ("codex",),
+    ),
+    # Codex content-filter / Daybreak refusal rendered on Codex's own info cell
+    # (``ⓘ This content can’t be shown``), never on the ``•`` assistant marker.
+    (
+        "content_filtered",
+        r"\u24d8\s+This content can['\u2019]t be shown\b.*",
         ("codex",),
     ),
     # Model rejection, with or without the leading HTTP status code.
@@ -158,6 +165,11 @@ _ASSISTANT_MARKERS = {
 # and a marked occurrence stays an ordinary answer. Every non-Claude adapter also keeps
 # the marker veto, where a marker-owned occurrence is an ordinary answer.
 _ERRORS_RENDERED_ON_ASSISTANT_MARKER = frozenset({("claude_code", "api_error")})
+# Signatures whose provider chrome always begins at column 0 in the rendered
+# terminal. Rejecting indented lines prevents an assistant reply that quotes
+# the notice on a continuation line under a bare ``•`` bullet from being
+# misclassified as provider chrome.
+_COLUMN_ZERO_OWNED_ERRORS = frozenset({("codex", "content_filtered")})
 _CONTEXT_UNSET: Any = object()
 
 
@@ -193,6 +205,7 @@ def _provider_owns_error_line(
         return False
 
     errors_on_marker = (provider, slug) in _ERRORS_RENDERED_ON_ASSISTANT_MARKER
+    requires_column_zero = (provider, slug) in _COLUMN_ZERO_OWNED_ERRORS
     found = False
     assistant_owned = False
     for raw_line in strip_terminal_escapes(script_output).splitlines():
@@ -208,7 +221,7 @@ def _provider_owns_error_line(
             continue
         if line == error_line:
             found = True
-            assistant_owned = False
+            assistant_owned = requires_column_zero and raw_line.rstrip() != error_line
     return found and not assistant_owned
 
 

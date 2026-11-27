@@ -147,6 +147,7 @@ _TURN_EVIDENCE_SITES = {
     "_has_visible_unattributed_reply": "dispatch_attributed",
     "_find_assistant_marker": "not_a_verdict",
     "_find_response_marker": "not_a_verdict",
+    "_find_terminal_content_refusal": "not_a_verdict",
     "_is_transcript_marker": "not_a_verdict",
     "extract_last_message_from_script": "not_a_verdict",
 }

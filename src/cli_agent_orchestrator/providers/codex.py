@@ -189,6 +189,11 @@ EXIT_CHECK_INTERVAL_S = 2.0
 BANNER_VERSION_PATTERN = r"OpenAI Codex \(v(\d+)\.(\d+)\.(\d+)"
 # A failed or interrupted turn ends with an error cell, not with the footer.
 ERROR_CELL_PATTERN = r"^■\s"
+# A content-filter / Daybreak policy refusal ends the turn on Codex's info cell
+# ("ⓘ This content can’t be shown") without drawing COMPLETION_FOOTER_PATTERN.
+# Narrowly anchored to column 0 and the refusal heading so ordinary ⓘ notices
+# or quoted text inside an assistant bullet cannot end a live turn early.
+CONTENT_REFUSAL_CELL_PATTERN = r"^ⓘ\s+This content can['\u2019]t be shown\b"
 # A row that Codex draws for a turn: the spinner, a tool row and its output
 # ("• Ran ...", "└ ..."), the reply, or an error cell.
 TURN_ACTIVITY_PATTERN = r"^[^\S\n]*[•◦└■]"
@@ -752,6 +757,23 @@ def _turn_ended_with_footer(
     if not from_user_message:
         return True
     return any(re.match(TURN_ACTIVITY_PATTERN, row) for row in rows[1:-1])
+
+
+def _find_terminal_content_refusal(turn_text: str) -> Optional[re.Match[str]]:
+    """Return the last column-0 content-refusal cell if no turn activity follows it.
+
+    A Daybreak / content-filter refusal ends a turn on Codex's ``ⓘ`` notice
+    cell without drawing COMPLETION_FOOTER_PATTERN. Requiring no subsequent
+    TURN_ACTIVITY_PATTERN row prevents an earlier refusal from ending a later
+    streaming turn prematurely.
+    """
+    matches = list(re.finditer(CONTENT_REFUSAL_CELL_PATTERN, turn_text, re.MULTILINE))
+    if not matches:
+        return None
+    last = matches[-1]
+    if re.search(TURN_ACTIVITY_PATTERN, turn_text[last.end() :], re.MULTILINE):
+        return None
+    return last
 
 
 def _body_rows(text: str) -> list[str]:
@@ -1643,6 +1665,7 @@ class CodexProvider(BaseProvider):
                     i
                     for i in range(prior_end, len(baseline))
                     if _is_completion_footer(baseline[i], self._codex_version)
+                    or re.match(CONTENT_REFUSAL_CELL_PATTERN, baseline[i])
                 ),
                 None,
             )
@@ -2628,10 +2651,14 @@ class CodexProvider(BaseProvider):
         user = None
         for user in re.finditer(USER_PREFIX_PATTERN, body, re.IGNORECASE | re.MULTILINE):
             pass
-        return _turn_ended_with_footer(
-            body[user.start() if user else 0 :],
-            self._codex_version,
-            from_user_message=user is not None,
+        turn_slice = body[user.start() if user else 0 :]
+        return (
+            _turn_ended_with_footer(
+                turn_slice,
+                self._codex_version,
+                from_user_message=user is not None,
+            )
+            or _find_terminal_content_refusal(turn_slice) is not None
         )
 
     def _has_visible_unattributed_reply(
@@ -2645,21 +2672,26 @@ class CodexProvider(BaseProvider):
         # composer, so the body can end with blank rows (#1390).
         while rows and not rows[-1].strip():
             rows.pop()
-        if not rows or not _is_completion_footer(rows[-1], self._codex_version):
+        if not rows:
             return False
         baseline_rows = set(baseline or ())
-        return rows[-1] not in baseline_rows and any(
-            row.strip() and row not in baseline_rows for row in rows[:-1]
+        if _is_completion_footer(rows[-1], self._codex_version):
+            return rows[-1] not in baseline_rows and any(
+                row.strip() and row not in baseline_rows for row in rows[:-1]
+            )
+        return any(
+            re.match(CONTENT_REFUSAL_CELL_PATTERN, row) and row not in baseline_rows for row in rows
         )
 
     def _has_current_turn_activity(self, frame: str) -> bool:
         """Apply the shared activity policy for attributed footer completions.
 
         A visible dispatch echo is direct evidence. Without one, ordinary reply
-        evidence is accepted unless the previous turn's footer can be aligned in
-        this frame; in that case only assistant activity after that boundary can
-        belong to the current turn. If the boundary is no longer visible, retain
-        the existing permissive behavior for long replies whose echo scrolled off.
+        evidence is accepted unless the previous turn's footer (or terminal
+        content-refusal cell) can be aligned in this frame; in that case only
+        activity after that boundary can belong to the current turn. If the
+        boundary is no longer visible, retain the existing permissive behavior
+        for long replies whose echo scrolled off.
         """
         if not self._has_dispatch_attribution():
             return True
@@ -2670,26 +2702,48 @@ class CodexProvider(BaseProvider):
             baseline = self._pre_dispatch_body
         has_activity = self._has_visible_unattributed_reply(frame, baseline)
 
-        prior_footer = None
+        prior_boundary = None
         if baseline:
-            prior_footer = next(
+            prior_boundary = next(
                 (
                     index
                     for index in range(len(baseline) - 1, -1, -1)
                     if _is_completion_footer(baseline[index], self._codex_version)
+                    or re.match(CONTENT_REFUSAL_CELL_PATTERN, baseline[index])
                 ),
                 None,
             )
         current_rows = _body_rows(frame)
-        mapped_footer = (
-            self._map_baseline_row(baseline, current_rows, prior_footer)
-            if baseline is not None and prior_footer is not None
+        mapped_boundary = (
+            self._map_baseline_row(baseline, current_rows, prior_boundary)
+            if baseline is not None and prior_boundary is not None
             else None
         )
-        if mapped_footer is not None:
+        # A content-refusal heading is constant across turns (unlike a timestamped
+        # completion footer), so a radius-0 match can misalign a new refusal after
+        # new tool output onto an old scrolled-off refusal. Require matching prior
+        # context when both frames have a non-empty row above the refusal.
+        if (
+            mapped_boundary is not None
+            and baseline is not None
+            and prior_boundary is not None
+            and re.match(CONTENT_REFUSAL_CELL_PATTERN, baseline[prior_boundary])
+        ):
+            base_prev = next(
+                (r for r in reversed(baseline[:prior_boundary]) if r.strip()),
+                None,
+            )
+            curr_prev = next(
+                (r for r in reversed(current_rows[:mapped_boundary]) if r.strip()),
+                None,
+            )
+            if base_prev is not None and curr_prev is not None and curr_prev != base_prev:
+                mapped_boundary = None
+        if mapped_boundary is not None:
             has_activity = any(
                 re.match(ASSISTANT_PREFIX_PATTERN, row, re.MULTILINE)
-                for row in current_rows[mapped_footer + 1 :]
+                or re.match(CONTENT_REFUSAL_CELL_PATTERN, row)
+                for row in current_rows[mapped_boundary + 1 :]
             )
         return has_activity
 
@@ -2822,10 +2876,13 @@ class CodexProvider(BaseProvider):
             self._empty_current_dispatch(clean_output)
             or (
                 self._has_current_turn_activity(clean_output)
-                and _turn_ended_with_footer(
-                    turn_text,
-                    self._codex_version,
-                    from_user_message=last_user is not None,
+                and (
+                    _turn_ended_with_footer(
+                        turn_text,
+                        self._codex_version,
+                        from_user_message=last_user is not None,
+                    )
+                    or _find_terminal_content_refusal(turn_text) is not None
                 )
             )
         )
@@ -3048,28 +3105,42 @@ class CodexProvider(BaseProvider):
 
         if user_matches:
             last_user = user_matches[-1]
+            turn_slice = clean_output[last_user.start() : cutoff_pos]
+            refusal_match = _find_terminal_content_refusal(turn_slice)
 
-            # Extraction uses a stricter anchor than status detection: skip MCP
-            # calls and at least two complete native activity cells before the
-            # model's actual reply, while preserving ambiguous compact groups.
-            asst_after_user = _find_response_marker(clean_output[last_user.start() :])
-
-            if asst_after_user:
-                response_start = last_user.start() + asst_after_user.start()
+            if refusal_match is not None:
+                response_start = last_user.start() + refusal_match.start()
             else:
-                # No assistant marker found; fall back to skipping one line
-                user_line_end = clean_output.find("\n", last_user.start())
-                if user_line_end == -1:
-                    user_line_end = len(clean_output)
-                response_start = user_line_end + 1
+                # Extraction uses a stricter anchor than status detection: skip MCP
+                # calls and at least two complete native activity cells before the
+                # model's actual reply, while preserving ambiguous compact groups.
+                asst_after_user = _find_response_marker(clean_output[last_user.start() :])
 
-            # Find extraction boundary: empty idle prompt or TUI footer area.
-            # With --no-alt-screen, the TUI footer (› hint + status bar) has no
-            # empty idle prompt. Use cutoff_pos as the boundary when TUI is present.
+                if asst_after_user:
+                    response_start = last_user.start() + asst_after_user.start()
+                else:
+                    # No assistant marker found; fall back to skipping one line
+                    user_line_end = clean_output.find("\n", last_user.start())
+                    if user_line_end == -1:
+                        user_line_end = len(clean_output)
+                    response_start = user_line_end + 1
+
+            # Find extraction boundary: empty idle prompt, next prompt/composer row,
+            # or TUI footer area. With --no-alt-screen, the TUI footer (› hint +
+            # status bar) has no empty idle prompt; when the status bar is clipped,
+            # stop before any trailing composer prompt row as well.
             idle_after = _strict_idle_prompt_start(clean_output[response_start:])
             end_pos = cutoff_pos
             if idle_after is not None:
                 end_pos = min(end_pos, response_start + idle_after)
+            if refusal_match is not None:
+                next_prompt = re.search(
+                    rf"^\s*{IDLE_PROMPT_PATTERN}",
+                    clean_output[response_start:end_pos],
+                    re.MULTILINE,
+                )
+                if next_prompt is not None:
+                    end_pos = min(end_pos, response_start + next_prompt.start())
 
             response_text = clean_output[response_start:end_pos].strip()
 
@@ -3088,6 +3159,23 @@ class CodexProvider(BaseProvider):
         # Filter out "• Called <tool>(...)" MCP tool call markers so we anchor
         # on the model's actual reply, not tool output.
         clean_output = clean_output[:cutoff_pos]
+        refusal_match = _find_terminal_content_refusal(clean_output)
+        if refusal_match is not None and not re.search(
+            USER_PREFIX_PATTERN, clean_output[refusal_match.end() :], re.IGNORECASE | re.MULTILINE
+        ):
+            start_pos = refusal_match.start()
+            idle_after = _strict_idle_prompt_start(clean_output[start_pos:])
+            end_pos = start_pos + idle_after if idle_after is not None else len(clean_output)
+            next_prompt = re.search(
+                rf"^\s*{IDLE_PROMPT_PATTERN}",
+                clean_output[start_pos:end_pos],
+                re.MULTILINE,
+            )
+            if next_prompt is not None:
+                end_pos = min(end_pos, start_pos + next_prompt.start())
+            refusal_text = clean_output[start_pos:end_pos].strip()
+            if refusal_text:
+                return refusal_text
         all_matches = list(
             re.finditer(ASSISTANT_PREFIX_PATTERN, clean_output, re.IGNORECASE | re.MULTILINE)
         )
