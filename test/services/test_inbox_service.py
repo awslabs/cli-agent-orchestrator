@@ -108,7 +108,9 @@ class TestCopilotQuietInboxRecovery:
                 send.assert_called_once_with(
                     "term-1", "hello", orchestration_type=OrchestrationType.SEND_MESSAGE
                 )
-                update.assert_called_once_with(1, MessageStatus.DELIVERED)
+                update.assert_called_once_with(
+                    1, MessageStatus.DELIVERED, expected_status=MessageStatus.PENDING
+                )
             finally:
                 subscriber.cancel()
                 await asyncio.gather(subscriber, return_exceptions=True)
@@ -240,7 +242,9 @@ class TestCopilotQuietInboxRecovery:
                 send.assert_called_once_with(
                     "term-1", "hello", orchestration_type=OrchestrationType.SEND_MESSAGE
                 )
-                update.assert_called_once_with(1, MessageStatus.DELIVERED)
+                update.assert_called_once_with(
+                    1, MessageStatus.DELIVERED, expected_status=MessageStatus.PENDING
+                )
             else:
                 assert sm._last_status.get("term-1") != TerminalStatus.IDLE
                 send.assert_not_called()
@@ -703,8 +707,11 @@ class TestCodexEmptyTurnInboxIntegration:
                 if message_states[message.id] == MessageStatus.PENDING
             ][:limit]
 
-        def update(message_id, status):
+        def update(message_id, status, expected_status=None):
+            if expected_status is not None and message_states[message_id] != expected_status:
+                return False
             message_states[message_id] = status
+            return True
 
         backend = MagicMock()
         backend.get_history.side_effect = lambda *args, **kwargs: current_capture["text"]
@@ -843,7 +850,7 @@ class TestDeliverPending:
         )
         assert InboxService().deliver_pending("term-1") == expected_result
         assert mock_update.call_args_list == [
-            call(1, MessageStatus.DELIVERED),
+            call(1, MessageStatus.DELIVERED, expected_status=MessageStatus.PENDING),
             call(1, expected_status),
         ]
 
@@ -863,8 +870,8 @@ class TestDeliverPending:
         assert InboxService().deliver_pending("term-1", num_messages=0) == 1
         assert mock_term_svc.dispatch_input.call_count == 2
         assert mock_update.call_args_list == [
-            call(1, MessageStatus.DELIVERED),
-            call(2, MessageStatus.DELIVERED),
+            call(1, MessageStatus.DELIVERED, expected_status=MessageStatus.PENDING),
+            call(2, MessageStatus.DELIVERED, expected_status=MessageStatus.PENDING),
             call(2, MessageStatus.PENDING),
         ]
 
@@ -898,7 +905,9 @@ class TestDeliverPending:
         mock_term_svc.dispatch_input.assert_called_once_with(
             "term-1", "hello", orchestration_type=OrchestrationType.SEND_MESSAGE
         )
-        mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
+        mock_update.assert_called_once_with(
+            1, MessageStatus.DELIVERED, expected_status=MessageStatus.PENDING
+        )
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
@@ -916,7 +925,9 @@ class TestDeliverPending:
         mock_term_svc.dispatch_input.assert_called_once_with(
             "term-1", "hello", orchestration_type=OrchestrationType.SEND_MESSAGE
         )
-        mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
+        mock_update.assert_called_once_with(
+            1, MessageStatus.DELIVERED, expected_status=MessageStatus.PENDING
+        )
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
@@ -956,7 +967,9 @@ class TestDeliverPending:
         mock_term_svc.dispatch_input.assert_called_once_with(
             "term-1", "hello", orchestration_type=OrchestrationType.SEND_MESSAGE
         )
-        mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
+        mock_update.assert_called_once_with(
+            1, MessageStatus.DELIVERED, expected_status=MessageStatus.PENDING
+        )
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
@@ -1176,13 +1189,10 @@ class TestDeliverPending:
 
         # Status is set to DELIVERED before send_input (#164), then reset to
         # FAILED when the send raises.
-        mock_update.assert_has_calls(
-            [
-                call(1, MessageStatus.DELIVERED),
-                call(1, MessageStatus.FAILED),
-            ]
-        )
-        assert mock_update.call_count == 2
+        assert mock_update.call_args_list == [
+            call(1, MessageStatus.DELIVERED, expected_status=MessageStatus.PENDING),
+            call(1, MessageStatus.FAILED),
+        ]
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
@@ -1202,7 +1212,7 @@ class TestDeliverPending:
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
 
         order = []
-        mock_update.side_effect = lambda *args, **kwargs: order.append(("update", args))
+        mock_update.side_effect = lambda *args, **kwargs: order.append(("update", args)) or True
         mock_term_svc.dispatch_input.side_effect = lambda *args, **kwargs: order.append(
             ("send", args)
         )
@@ -1245,8 +1255,8 @@ class TestDeliverPending:
     def test_concurrent_delivery_for_one_terminal_sends_exactly_once(
         self, mock_get, mock_monitor, mock_term_svc, mock_update
     ):
-        """deliver_pending is read(PENDING) -> status check -> mark DELIVERED -> send,
-        with no atomic claim at the DB layer. Its callers genuinely overlap on worker
+        """deliver_pending is read(PENDING) -> status check -> mark DELIVERED -> send.
+        Its callers genuinely overlap on worker
         threads (the status-event consumer, the immediate POST path, the OpenCode poller,
         the reconcile sweep), and two calls both reading the same oldest row before
         either marks it would execute one agent task twice. The per-terminal lock must
@@ -1264,12 +1274,14 @@ class TestDeliverPending:
             with store_guard:
                 return [message] if store["status"] == MessageStatus.PENDING else []
 
-        def slow_mark(message_id, status):
+        def slow_mark(message_id, status, expected_status=None):
             # Hold the read->mark window open long enough that an unserialized second
-            # thread would re-read the row as PENDING.
+            # thread would re-read the row as PENDING. The mark always succeeds here,
+            # whatever expected_status says, so only the lock can keep this to one send.
             time.sleep(0.15)
             with store_guard:
                 store["status"] = status
+            return True
 
         mock_get.side_effect = read_pending
         mock_update.side_effect = slow_mark
@@ -1289,6 +1301,70 @@ class TestDeliverPending:
 
         assert mock_term_svc.dispatch_input.call_count == 1
         assert store["status"] == MessageStatus.DELIVERED
+
+
+class TestClaimAcrossLockDomains:
+    """The DELIVERED mark is a claim on a PENDING row (#406, #709).
+
+    The per-terminal delivery lock lives in one InboxService, so two instances
+    stand in for two writers that do not share it (two server processes on one
+    database, which the server lock refuses in practice). A real database file
+    holds the row; only the dispatch and the receiver status are replaced.
+    """
+
+    def test_two_services_that_both_read_one_pending_row_send_it_once(self, isolated_memory_db):
+        from cli_agent_orchestrator.clients.database import (
+            create_inbox_message,
+            create_terminal,
+            get_inbox_messages,
+        )
+
+        create_terminal("term-1", "cao-s", "sup", "claude_code")
+        create_inbox_message("sender-1", "term-1", "run this once")
+
+        # deliver_pending reads the status once, between reading the row and
+        # marking it. Holding both calls there until both have arrived means
+        # both have read the same PENDING row before either marks it.
+        both_have_read = threading.Barrier(2)
+
+        def status_after_read(terminal_id):
+            both_have_read.wait(timeout=10)
+            return TerminalStatus.IDLE
+
+        results: list[int] = []
+        errors: list[BaseException] = []
+
+        def deliver(service: InboxService) -> None:
+            try:
+                results.append(service.deliver_pending("term-1"))
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the test thread
+                errors.append(exc)
+                both_have_read.abort()
+
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", False),
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service") as term,
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
+        ):
+            monitor.get_status.side_effect = status_after_read
+            term.dispatch_input.return_value = 0
+            threads = [
+                threading.Thread(target=deliver, args=(InboxService(),)),
+                threading.Thread(target=deliver, args=(InboxService(),)),
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+            assert not any(t.is_alive() for t in threads)
+
+        if errors:
+            raise errors[0]
+        assert monitor.get_status.call_count == 2, "both calls read the row and reached the gate"
+        assert term.dispatch_input.call_count == 1
+        assert sorted(results) == [0, 1], "the call that lost the claim delivered nothing"
+        [stored] = get_inbox_messages("term-1")
+        assert stored.status == MessageStatus.DELIVERED
 
 
 class TestEagerInboxDelivery:
@@ -2301,9 +2377,10 @@ class TestSwallowedEnterRecoveryOnRealComposers:
         def pending(tid, limit=1):
             return queue[:limit]
 
-        def mark(message_id, status):
+        def mark(message_id, status, expected_status=None):
             if status == MessageStatus.DELIVERED:
                 queue[:] = [m for m in queue if m.id != message_id]
+            return True
 
         provider_module = sys.modules[type(provider).__module__]
         with (

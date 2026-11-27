@@ -4315,9 +4315,40 @@ def delete_old_handoff_results(cutoff: datetime) -> int:
         return deleted
 
 
-def update_message_status(message_id: int, status: MessageStatus) -> bool:
-    """Update message status to MessageStatus.DELIVERED or MessageStatus.FAILED."""
+def update_message_status(
+    message_id: int,
+    status: MessageStatus,
+    *,
+    expected_status: Optional[MessageStatus] = None,
+) -> bool:
+    """Set a message's status; with ``expected_status``, only if it still has that status.
+
+    Without ``expected_status`` the write is unconditional, and False means
+    the row does not exist.
+
+    With it, the write is one ``UPDATE ... WHERE id = ? AND status = ?``, and
+    the result is True only for the caller whose statement changed the row.
+    False then means the row does not exist or no longer has the expected
+    status; the two are not told apart.
+
+    SQLite runs that statement under its write lock, so of several callers
+    claiming one PENDING row (#406, #709) one gets True and the others, after
+    waiting on the lock for up to the connection's busy timeout, get False.
+    The claim is a single statement in its own transaction and uses no
+    ``RETURNING``, so it does not depend on the SQLite version.
+    """
     with SessionLocal() as db:
+        if expected_status is not None:
+            changed = (
+                db.query(InboxModel)
+                .filter(
+                    InboxModel.id == message_id,
+                    InboxModel.status == expected_status.value,
+                )
+                .update({InboxModel.status: status.value}, synchronize_session=False)
+            )
+            db.commit()
+            return bool(changed == 1)
         message = db.query(InboxModel).filter(InboxModel.id == message_id).first()
         if message:
             message.status = status.value
