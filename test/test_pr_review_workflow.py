@@ -53,7 +53,7 @@ REVIEWS = f"{PULL}/reviews"
 REVIEWS_PAGE = f"{REVIEWS}?per_page=100&page=1"
 WAITING_RUNS = f"repos/{REPO}/actions/runs?event=pull_request&status=action_required"
 WAITING_RUNS_PAGE = f"{WAITING_RUNS}&per_page=100&page=1"
-ASSIGNEES = f"repos/{REPO}/issues/{NUMBER}/assignees"
+REQUESTED_REVIEWERS = f"{PULL}/requested_reviewers"
 RUN_URL = f"https://github.com/{REPO}/actions/runs/{RUN_ID}/attempts/2"
 ADVISORY = "This check is advisory. It is always neutral and never blocks a merge.\n"
 BOT = {"login": "github-actions[bot]", "type": "Bot"}
@@ -2386,7 +2386,7 @@ def _publish(
         ["publish", "--repo", REPO, "--pr", str(NUMBER), "--review", str(path)]
         + ["--head", HEAD, "--run-id", RUN_ID, "--run-attempt", "2"]
         + ["--server-url", "https://github.com", "--engine", "kiro_cli"]
-        + ["--reviewers", reviewers, "--actor", "octocat"]
+        + ["--reviewers", reviewers, "--actor", "octocat", "--team", "multiq"]
         + list(extra)
     )
 
@@ -2411,7 +2411,8 @@ def _github(
 
     A new comment gets ID 99. The read-back returns what the last write sent,
     changed by ``read_back``. The check run gets ID 555. The PR has no earlier
-    review, its only commit is the head, no run waits, and octocat can be assigned.
+    review, its only commit is the head, no run waits, and GitHub accepts the review request
+    to the multiq team.
     """
 
     def view(comment_id: int) -> Callable[[], Result]:
@@ -2439,7 +2440,7 @@ def _github(
     process.routes[("POST", REVIEWS)] = _ok({"id": 777, "state": "CHANGES_REQUESTED"})
     process.routes[("GET", _commits_page(1))] = _ok([{"sha": HEAD}])
     process.routes[("GET", WAITING_RUNS_PAGE)] = _ok({"total_count": 0, "workflow_runs": []})
-    process.routes[("POST", ASSIGNEES)] = _ok({"assignees": [{"login": "octocat"}]})
+    process.routes[("POST", REQUESTED_REVIEWERS)] = _ok({"requested_teams": [{"slug": "multiq"}]})
 
 
 def _collect_inputs(
@@ -2607,7 +2608,12 @@ def test_set_outputs_writes_no_output_when_a_value_holds_a_line_break(
         ["prepare", "--repo", REPO, "--pr", "7\n", "--out", "evidence"],
         ["publish", "--repo", REPO, "--pr", "7", "--review", "review.json", "--head", "HEAD"]
         + ["--run-id", RUN_ID, "--run-attempt", "1", "--server-url", "https://github.com"]
-        + ["--engine", "kiro_cli", "--reviewers", "single", "--actor", "octocat"],
+        + ["--engine", "kiro_cli", "--reviewers", "single", "--actor", "octocat"]
+        + ["--team", "multiq"],
+        ["publish", "--repo", REPO, "--pr", "7", "--review", "review.json", "--head", HEAD]
+        + ["--run-id", RUN_ID, "--run-attempt", "1", "--server-url", "https://github.com"]
+        + ["--engine", "kiro_cli", "--reviewers", "single", "--actor", "octocat"]
+        + ["--team", "awslabs/multiq"],
         ["report-failure", "--repo", REPO, "--pr", "7", "--head", HEAD, "--run-id", RUN_ID]
         + ["--run-attempt", "1", "--server-url", "https://github.com", "--engine", "kiro_cli"]
         + ["--reviewers", "single", "--job-result", "success"],
@@ -2927,7 +2933,7 @@ def test_publish_posts_one_comment_and_a_neutral_check_run(
         "Added neutral check run 555.\n"
         f"- Change request: requested changes at {HEAD} in review 777.\n"
         "- CI runs: no run of the PR's commits waits for approval.\n"
-        "- Assignee: octocat is assigned.\n"
+        "- Review request: requested a review from the multiq team.\n"
     )
     assert process.paths() == [
         PULL,
@@ -2940,9 +2946,9 @@ def test_publish_posts_one_comment_and_a_neutral_check_run(
         PULL,
         _commits_page(1),
         WAITING_RUNS_PAGE,
-        ASSIGNEES,
+        REQUESTED_REVIEWERS,
     ]
-    (method, _, comment), (_, _, check_run), (_, _, change_request), assign = process.writes()
+    (method, _, comment), (_, _, check_run), (_, _, change_request), request = process.writes()
     first_line = github_review.FIRST_LINE.format(
         engine="kiro_cli", reviewers="single", actor="octocat"
     )
@@ -2956,7 +2962,7 @@ def test_publish_posts_one_comment_and_a_neutral_check_run(
     assert (change_request["commit_id"], change_request["event"]) == (HEAD, "REQUEST_CHANGES")
     assert f"{PR_URL}#issuecomment-99" in change_request["body"]
     assert change_request["body"].endswith(f"{github_review.CHANGE_REQUEST_MARKER}\n")
-    assert assign == ("POST", ASSIGNEES, {"assignees": ["octocat"]})
+    assert request == ("POST", REQUESTED_REVIEWERS, {"team_reviewers": ["multiq"]})
     assert output.read_text(encoding="utf-8") == "comment_written=true\n"
 
 
@@ -3385,30 +3391,25 @@ def test_publish_dry_run_writes_the_requests_and_posts_nothing(
     assert payload["actions"] == {
         "change_request": "request",
         "approve_ci_runs": True,
-        "assign": "octocat",
+        "review_request": "multiq",
     }
     assert process.writes() == []
 
 
-def test_publish_dry_run_plans_no_run_approval_after_a_move_and_no_bot_assignee(
+def test_publish_dry_run_plans_no_run_approval_after_a_move(
     github_review: ModuleType, process: FakeProcess, tmp_path: Path
 ) -> None:
     _github(process, live=_live_pr(head={"sha": NEW_HEAD}))
     process.routes[("GET", _commits_page(1))] = _ok([{"sha": HEAD}, {"sha": NEW_HEAD}])
     request = tmp_path / "request.json"
 
-    code = _publish(
-        github_review,
-        tmp_path,
-        _review(**NOTHING_BLOCKS),
-        *("--dry-run", str(request), "--actor", "dependabot[bot]"),
-    )
+    code = _publish(github_review, tmp_path, _review(**NOTHING_BLOCKS), "--dry-run", str(request))
 
     assert code == 0
     assert json.loads(request.read_text(encoding="utf-8"))["actions"] == {
         "change_request": "keep",
         "approve_ci_runs": False,
-        "assign": None,
+        "review_request": "multiq",
     }
     assert process.writes() == []
 
@@ -3779,10 +3780,10 @@ def test_publish_fails_when_it_cannot_list_every_waiting_run(
             id="run-approval-refused",
         ),
         pytest.param(
-            {("POST", ASSIGNEES): _ok({"assignees": [{"login": "hubot"}]})},
-            "- Assignee failed: GitHub did not assign octocat. A PR has at most 10 assignees, "
-            "and only an account with access to the repository can be assigned.",
-            id="assignee-ignored",
+            {("POST", REQUESTED_REVIEWERS): _ok({"requested_teams": []})},
+            "- Review request failed: GitHub does not list the multiq team as a requested "
+            "reviewer.",
+            id="team-not-requested",
         ),
     ],
 )
@@ -3807,24 +3808,10 @@ def test_publish_reports_a_failed_action_and_still_runs_the_others(
     assert [text.split(":")[0].removesuffix(" failed") for text in lines[1:]] == [
         "- Change request",
         "- CI runs",
-        "- Assignee",
+        "- Review request",
     ]
     # The comment is posted, so the workflow adds no "not published" check run.
     assert output.read_text(encoding="utf-8") == "comment_written=true\n"
-
-
-def test_publish_assigns_no_one_when_a_bot_started_the_run(
-    github_review: ModuleType,
-    process: FakeProcess,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _github(process)
-
-    assert _publish(github_review, tmp_path, _review(), "--actor", "dependabot[bot]") == 0
-
-    assert "- Assignee: none, because a bot started this run.\n" in capsys.readouterr().out
-    assert ASSIGNEES not in process.paths()
 
 
 @pytest.mark.parametrize(
@@ -4416,9 +4403,11 @@ def test_publish_reports_a_review_that_is_not_published_with_a_neutral_check(
         "${{ needs.review.result == 'success' && 'publish_failure' || needs.review.result }}"
     )
     assert '--reviewers "$REVIEWERS"' in publish["run"]
-    # A re-run assigns the person who started the re-run.
+    # A re-run names the person who started the re-run.
     assert publish["env"]["ACTOR"] == "${{ github.triggering_actor }}"
     assert '--actor "$ACTOR"' in publish["run"]
+    assert publish["env"]["REVIEW_TEAM"] == "multiq"
+    assert '--team "$REVIEW_TEAM"' in publish["run"]
     assert '--job-result "$JOB_RESULT"' in failure["run"]
 
 

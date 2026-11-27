@@ -8,7 +8,8 @@ name: PR Review
 # workflow acts on the PR. If the review accepts a P1 or P2 finding, it requests
 # changes. If a later complete review of the current head accepts none, it
 # dismisses its earlier change requests. It approves the waiting CI runs of the
-# PR's commits and assigns the maintainer who started it. It never approves a PR.
+# PR's commits and requests a review from the maintainer team (REVIEW_TEAM in
+# the publish job). It never approves a PR.
 #
 # The procedure, the secrets and the trust boundaries are in
 # .github/pr-review/README.md. In short:
@@ -544,8 +545,8 @@ jobs:
       contents: read
       # Read the PR, its commits, comments and reviews. Post or update the review
       # comment, request changes, dismiss the earlier change requests of this
-      # workflow, and assign the maintainer. A PR comment and an assignee are
-      # issue writes, but this permission is enough.
+      # workflow, and request a review from the maintainer team. A PR comment is
+      # an issue write, but this permission is enough.
       pull-requests: write
       # Add the neutral check run to the reviewed head.
       checks: write
@@ -578,6 +579,9 @@ jobs:
           ENGINE: ${{ inputs.engine }}
           REVIEWERS: ${{ inputs.reviewers }}
           ACTOR: ${{ github.triggering_actor }}
+          # The team slug in this organization. GitHub cannot assign a team to a
+          # PR, so publish requests a review from it.
+          REVIEW_TEAM: multiq
         run: >-
           python3 trusted/.github/pr-review/github_review.py publish
           --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER"
@@ -586,6 +590,7 @@ jobs:
           --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
           --server-url "$GITHUB_SERVER_URL"
           --engine "$ENGINE" --reviewers "$REVIEWERS" --actor "$ACTOR"
+          --team "$REVIEW_TEAM"
 
       # The review job did not succeed, or this job did not write the review
       # comment. A neutral check run with fixed text then says so. After the

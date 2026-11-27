@@ -12,8 +12,8 @@ place on each run. It also adds a neutral check to the reviewed head commit.
 
 The review never approves a PR, and its check is always neutral. After the
 comment, the workflow requests changes when the review accepts a P1 or P2
-finding, approves the waiting CI runs of the PR's commits, and assigns the
-maintainer who started it. No step runs code from the PR. Maintainers stay
+finding, approves the waiting CI runs of the PR's commits, and requests a
+review from the maintainer team. No step runs code from the PR. Maintainers stay
 accountable for the requirements, the design, the risk, the approval and the
 merge.
 
@@ -146,7 +146,7 @@ flowchart TD
     Stale --> NotPublished["Neutral check: the review is not published"]
     Fresh -->|"Yes"| Comment["Create or update the review comment"]
     Comment --> Check["Neutral check on the reviewed head"]
-    Check --> Act["Request changes for an accepted P1 or P2,<br/>approve the waiting CI runs, assign the maintainer"]
+    Check --> Act["Request changes for an accepted P1 or P2,<br/>approve the waiting CI runs, request a review from the maintainer team"]
     Setup -.->|"A step fails or times out"| Failed["Neutral check: the review did not finish"]
 ```
 
@@ -187,7 +187,7 @@ a panel for high-risk rounds, and the step 11 eval decides. Model A runs
   complete review that accepts none, of a head that did not move, dismisses
   these change requests. Otherwise they stay until a maintainer dismisses them.
   The publisher also approves the waiting CI runs of the PR's commits, but no
-  run when the head moved, and it assigns the maintainer who started the run.
+  run when the head moved, and it requests a review from the maintainer team.
   It never approves a PR. See
   [Actions on the PR](../.github/pr-review/README.md#actions-on-the-pr).
 - **No inline comments.** A finding whose path or line is not in the head
@@ -286,7 +286,7 @@ reason given. "Later" means work after this design.
 | An always-neutral check | Model output is not deterministic, so the check is not a merge gate. A neutral check shows the result on the head commit. |
 | Request changes for an accepted P1 or P2; never approve | The owners chose this. The merge box shows the finding, and a maintainer can dismiss the request. Approval stays with a maintainer. |
 | Keep a change request until a complete review of an unchanged head | An incomplete review, or a review of an older head, did not check the finding again at the current head. |
-| Approve the waiting CI runs of each commit of the PR, and assign the maintainer | The owners chose this, so CI runs on a fork PR after its review. A run from a fork gets a read-only token and no secrets. The review reads only the head, so an earlier commit can hold a workflow change that no review read. GitHub cannot assign the workflow bot. |
+| Approve the waiting CI runs of each commit of the PR, and request a review from the maintainer team | The owners chose this, so CI runs on a fork PR after its review, and the maintainer team gets the PR. A run from a fork gets a read-only token and no secrets. The review reads only the head, so an earlier commit can hold a workflow change that no review read. GitHub cannot assign a team to a PR, so the workflow requests a review from the team. |
 | Cancel an older run of the same PR | #1350 step 10. The latest dispatch is the one that a maintainer wants. |
 | The driver waits until each seat ends | The step call can return before CAO ends the step. The driver reads the reports only after each step ends, or after a fixed wait. |
 | Copilot CLI from a lockfile, installed with `npm ci --ignore-scripts` | Pins each dependency of the CLI, not only the CLI version. The filtered environment has no `CI`, so `COPILOT_AUTO_UPDATE=false` keeps that version at run time. |
@@ -307,7 +307,7 @@ them.
 
 | Evidence layer | Required coverage |
 | --- | --- |
-| Unit tests | `test/test_pr_review_workflow.py`: the policy file, the schemas, single and panel mode, the wait for a step that ends after its step call, coverage, risk, dropped findings, the verdict rules, safe text, the read-only grant of the seat profiles, the safety rules in each prompt, the publisher checks, a refusing case for each condition that blocks either script, the comment update and the 5,000-comment limit, the neutral check, the change request and its dismissal, the CI run approval, the assignee, a failed action, the workflow permissions and triggers, and the shared constants. `test/test_codeowners_risk.py`: the code owners of `REVIEW.md` and `.github/pr-review/`. |
+| Unit tests | `test/test_pr_review_workflow.py`: the policy file, the schemas, single and panel mode, the wait for a step that ends after its step call, coverage, risk, dropped findings, the verdict rules, safe text, the read-only grant of the seat profiles, the safety rules in each prompt, the publisher checks, a refusing case for each condition that blocks either script, the comment update and the 5,000-comment limit, the neutral check, the change request and its dismissal, the CI run approval, the team review request, a failed action, the workflow permissions and triggers, and the shared constants. `test/test_codeowners_risk.py`: the code owners of `REVIEW.md` and `.github/pr-review/`. |
 | Static checks | The CI Code Quality job runs `black`, `isort` and the `ruff` dead-code gate on both scripts. The zizmor workflow audits `pr-review.yml`. The Markdown link check covers the docs. No CI job runs `mypy` or `actionlint` on these files. |
 | Live run | A dispatch for a real PR with `reviewers=single`. It creates or updates one comment, adds one neutral check to the reviewed head, and reports each action on the PR. The comment shows the policy SHA-256 and the coverage of each check. |
 | Calibration | The step 11 eval of #1350: 12 to 30 labelled cases from past PRs. It scores `single` and `panel` on the same cases. It decides the default, and any automatic trigger. |
