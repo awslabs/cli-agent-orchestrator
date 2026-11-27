@@ -223,9 +223,32 @@ memory_recall(
   limit=10,                # optional, default 10, max 100
   search_mode=None,        # optional: "hybrid" (default), "bm25", "metadata"
   sort_by=None,            # optional: "recency" (default), "score", "usage", "relevance"
-  include_related=False    # optional, expand cross-referenced memories
+  include_related=False,   # optional, expand cross-referenced memories
+  detail="full"            # optional: "full" or a 300-character "snippet"
 )
 ```
+
+Use `detail="snippet"` for a compact matched-term window plus a `memory_get`
+hint. The result order is unchanged. Fetch a note's latest entry on demand
+with:
+
+```
+memory_get(
+  key="review-checklist",
+  scope="project",         # optional when the key is unique among visible scopes
+  include_history=False,   # optional, include entries newest first
+  max_chars=8000           # optional response-body cap
+)
+```
+
+`memory_get` uses the same scope visibility and vault policy as recall. If an
+unscoped key exists in more than one visible scope it returns
+`ambiguous_scope` with those scopes; a missing key returns `not_found`. Like an
+explicit MCP recall, a successful get counts as access. Pass
+`include_history=True` to return all available entries newest first. The
+`max_chars` cap applies independently to the latest-entry `content` and the
+combined `history` body. `links_out` and `links_in` each return at most five
+links.
 
 `sort_by` controls ranking: `recency` (newest first), `score` (composite 3-factor —
 BM25 relevance + recency + usage), or `usage` (most accessed). When no `scope` is
@@ -263,6 +286,15 @@ the existing same-scope relationship predicate. `memory.lifecycle.enabled`
 does not undo this lexical-mode demotion. Explicit recall does not
 exclude superseded memories. Default recall and injection are unchanged.
 An older remote memory owner may reject the new sort value; upgrade both nodes.
+
+`memory.recall.v2_fields` defaults to `false`. Enabling it adds `fact_date`,
+`edited_at`, `match`, `status`, and `earlier_entries` to recall results, and
+makes latest-entry truncation visible through `content_truncated`. With the
+setting off and `detail="full"`, the pinned recall response is unchanged.
+`fact_date` is the earliest valid entry timestamp, including for a compiled
+article, while `edited_at` is the latest.
+For remote recall, enable `memory.recall.v2_fields` on both the worker and
+the memory-owner node; otherwise the worker omits the optional v2 fields.
 
 ### `memory_related`
 
@@ -863,9 +895,11 @@ When you discover something worth remembering — user preferences, project conv
 important decisions, recurring corrections — store it immediately using the `memory_store`
 CAO tool. Keep each memory to 1–2 sentences. Store decisions and conclusions, not conversation.
 Use `memory_recall` to check if you already know something before asking the user.
+Use `detail="snippet"` for compact search results and `memory_get` when you need
+one result's latest entry (or available history when requested).
 
-Note: `memory_store` and `memory_recall` are CAO's cross-provider memory tools, distinct from
-any provider-native memory system.
+Note: `memory_store`, `memory_recall`, and `memory_get` are CAO's cross-provider
+memory tools, distinct from any provider-native memory system.
 ```
 
 ## Self-Learning (builds on memory)

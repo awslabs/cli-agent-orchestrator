@@ -307,9 +307,20 @@ def test_parser_checks_only_timestamp_boundaries_and_first_body_marker(
             self.calls += 1
             return self.pattern.fullmatch(value)
 
+    class TrackingEntryHeadings:
+        def __init__(self, pattern: re.Pattern[str]) -> None:
+            self.calls = 0
+            self.pattern = pattern
+
+        def finditer(self, value: str) -> list[re.Match[str]]:
+            self.calls += 1
+            return list(self.pattern.finditer(value))
+
     marker = TrackingMarker(memory_service._COMPILED_MARKER_RE)
+    entry_headings = TrackingEntryHeadings(memory_service._LEGACY_ENTRY_HEADING_RE)
     monkeypatch.setattr(memory_service, "datetime", TrackingDateTime)
     monkeypatch.setattr(memory_service, "_COMPILED_MARKER_RE", marker)
+    monkeypatch.setattr(memory_service, "_LEGACY_ENTRY_HEADING_RE", entry_headings)
     sections = "\n\n".join(f"## 2026-01-{day:02d}T00:00:00Z\nbody {day}" for day in range(1, 21))
     path = _topic(tmp_path, "parse-cost", sections)
 
@@ -320,6 +331,7 @@ def test_parser_checks_only_timestamp_boundaries_and_first_body_marker(
     assert parsed is not None
     assert TrackingDateTime.parse_calls == 2
     assert marker.calls == 1
+    assert entry_headings.calls == 0
 
 
 def test_recall_returns_previously_invisible_topic(tmp_path: Path, engine: Any) -> None:

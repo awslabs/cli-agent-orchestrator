@@ -820,6 +820,7 @@ def get_memory_settings() -> Dict[str, Any]:
         "explain_enabled": True,
         "non_accessing_inspection": True,
         "parser": {"lenient": True},
+        "recall": {"v2_fields": False},
         "relationships": {"content_links": False},
         "lifecycle": {"enabled": False},
         "injection": dict(MEMORY_INJECTION_DEFAULTS),
@@ -867,6 +868,14 @@ def get_memory_settings() -> Dict[str, Any]:
     env_inspection = os.environ.get("CAO_MEMORY_NON_ACCESSING_INSPECTION")
     if env_inspection is not None and env_inspection.strip():
         result["non_accessing_inspection"] = env_inspection.strip().lower() in ("1", "true", "yes")
+
+    env_recall_v2 = os.environ.get("CAO_MEMORY_RECALL_V2_FIELDS")
+    if env_recall_v2 is not None and env_recall_v2.strip():
+        recall = result.get("recall", {})
+        result["recall"] = {
+            **(recall if isinstance(recall, dict) else {}),
+            "v2_fields": env_recall_v2.strip().lower() in ("1", "true", "yes"),
+        }
 
     # Env-var overlay: CAO_MEMORY_EXPLAIN_ENABLED beats settings.json.
     env_explain = os.environ.get("CAO_MEMORY_EXPLAIN_ENABLED")
@@ -1045,6 +1054,20 @@ def is_memory_parser_lenient() -> bool:
     except Exception:
         logger.warning("Failed to read memory.parser.lenient; defaulting to True")
         return True
+
+
+def is_memory_recall_v2_fields_enabled() -> bool:
+    """Opt-in recall-v2 fields: env > nested file value > False; errors stay off."""
+    try:
+        memory = get_memory_settings()
+        recall = memory.get("recall", {})
+        if not isinstance(recall, dict) or not isinstance(recall.get("v2_fields", False), bool):
+            logger.warning("Invalid memory.recall.v2_fields; defaulting to False")
+            return False
+        return bool(recall.get("v2_fields", False))
+    except Exception:
+        logger.warning("Failed to read memory.recall.v2_fields; defaulting to False")
+        return False
 
 
 def is_memory_content_links_enabled() -> bool:
@@ -1376,6 +1399,7 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``ranking.default_sort`` (str) — ``recency`` or ``bm25`` query recall default.
         ``non_accessing_inspection`` (bool) — operator reads without access bumps.
         ``parser.lenient`` (bool) — parse valid native topics without canonical timestamps.
+        ``recall.v2_fields`` (bool) — add recall dates, match reason, status, and history count.
         ``relationships.content_links`` (bool) — parse authored links into relationship edges.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
         ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
@@ -1432,6 +1456,7 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         "explain_enabled",
         "non_accessing_inspection",
         "parser.lenient",
+        "recall.v2_fields",
         "relationships.content_links",
     }:
         if not isinstance(value, bool):
@@ -1476,6 +1501,11 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
             if not isinstance(injection, dict):
                 injection = {}
             memory["injection"] = {**injection, key.split(".", 1)[1]: coerced}
+        elif key == "recall.v2_fields":
+            recall = memory.get("recall", {})
+            if not isinstance(recall, dict):
+                recall = {}
+            memory["recall"] = {**recall, "v2_fields": coerced}
         elif key == "relationships.content_links":
             relationships = memory.get("relationships", {})
             if not isinstance(relationships, dict):

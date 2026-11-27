@@ -143,6 +143,53 @@ class Memory(BaseModel):
         exclude=True,
         description="Transient lifecycle label (e.g. superseded); never persisted or serialized by model_dump.",
     )
+    v2_fields_present: bool = Field(
+        default=False,
+        exclude=True,
+        description="Transient remote-wire marker; never persisted or serialized.",
+    )
+    fact_date: Optional[datetime] = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "Transient date of the fact's first entry; never persisted or serialized by model_dump."
+        ),
+    )
+    edited_at: Optional[datetime] = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "Transient date of the fact's latest edit; never persisted or serialized by model_dump."
+        ),
+    )
+    earlier_entries: int = Field(
+        default=0,
+        exclude=True,
+        description=(
+            "Transient count of entries hidden by latest-entry recall; "
+            "never persisted or serialized by model_dump."
+        ),
+    )
+    match: Optional[Dict[str, Any]] = Field(
+        default=None,
+        exclude=True,
+        description="Transient recall match reason; never persisted or serialized by model_dump.",
+    )
+    status: str = Field(
+        default="active",
+        exclude=True,
+        description="Transient v2 lifecycle status; never persisted or serialized by model_dump.",
+    )
+    snippet: Optional[str] = Field(
+        default=None,
+        exclude=True,
+        description="Transient compact recall body; never persisted or serialized by model_dump.",
+    )
+    get: Optional[str] = Field(
+        default=None,
+        exclude=True,
+        description="Transient memory_get hint; never persisted or serialized by model_dump.",
+    )
     is_related: bool = Field(
         default=False,
         exclude=True,
@@ -274,7 +321,31 @@ def _mcp_stamp(value: Optional[datetime]) -> Optional[str]:
     return value.strftime(_MCP_STAMP_FORMAT) if value else None
 
 
-def recall_wire_dict(memory: "Memory") -> Dict[str, Any]:
+def _fallback_snippet(memory: "Memory", limit: int = 300) -> str:
+    """Project a useful snippet when an older owner returned only content."""
+    content = memory.content
+    if len(content) <= limit:
+        return content
+    terms = memory.match.get("terms", []) if isinstance(memory.match, dict) else []
+    positions = [
+        (match.start(), len(term))
+        for term in terms
+        if isinstance(term, str)
+        and (match := re.search(re.escape(term), content, re.IGNORECASE)) is not None
+    ]
+    start = (
+        max(0, min(position for position, _length in positions) - limit // 4) if positions else 0
+    )
+    end = min(len(content), start + limit)
+    return ("…" if start else "") + content[start:end].strip() + ("…" if end < len(content) else "")
+
+
+def recall_wire_dict(
+    memory: "Memory",
+    *,
+    detail: str = "full",
+    include_v2_fields: bool = False,
+) -> Dict[str, Any]:
     """Serialize one recalled memory for a client.
 
     Every field ``Memory`` declares without ``exclude=True``, JSON-encoded by
@@ -284,13 +355,37 @@ def recall_wire_dict(memory: "Memory") -> Dict[str, Any]:
     This is the payload ``POST /internal/memory/recall`` returns verbatim and
     the dict :func:`mcp_recall_wire_dict` projects.
     """
+    if detail not in {"full", "snippet"}:
+        raise ValueError("detail must be 'full' or 'snippet'")
     wire: Dict[str, Any] = memory.model_dump(mode="json")
+    if detail == "snippet":
+        wire.pop("content")
+        wire["snippet"] = (
+            memory.snippet if memory.snippet is not None else _fallback_snippet(memory)
+        )
+        wire["get"] = memory.get or (f"memory_get(key={memory.key!r}, scope={memory.scope!r})")
+    if include_v2_fields:
+        wire["content_truncated"] = memory.content_truncated or memory.earlier_entries > 0
+        wire.update(
+            {
+                "fact_date": _mcp_stamp(memory.fact_date),
+                "edited_at": _mcp_stamp(memory.edited_at),
+                "match": memory.match,
+                "status": memory.status,
+                "earlier_entries": memory.earlier_entries,
+            }
+        )
     if memory.lifecycle_status is not None:
         wire["lifecycle_status"] = memory.lifecycle_status
     return wire
 
 
-def mcp_recall_wire_dict(memory: "Memory") -> Dict[str, Any]:
+def mcp_recall_wire_dict(
+    memory: "Memory",
+    *,
+    detail: str = "full",
+    include_v2_fields: bool = False,
+) -> Dict[str, Any]:
     """Project :func:`recall_wire_dict` down to the MCP ``memory_recall`` shape.
 
     ``MCP_RECALL_KEYS`` selects the fields; the values come from the shared
@@ -304,13 +399,32 @@ def mcp_recall_wire_dict(memory: "Memory") -> Dict[str, Any]:
     The overrides are applied after the projection, so they land in their
     projected key positions and cannot add a key.
     """
-    wire = recall_wire_dict(memory)
+    wire = recall_wire_dict(
+        memory,
+        detail=detail,
+        include_v2_fields=include_v2_fields,
+    )
     projected: Dict[str, Any] = {}
     # lifecycle_status leads on this surface and trails on the route's; both
     # appear only when set.
     if memory.lifecycle_status is not None:
         projected["lifecycle_status"] = memory.lifecycle_status
-    projected.update({key: wire[key] for key in MCP_RECALL_KEYS})
+    for key in MCP_RECALL_KEYS:
+        if detail == "snippet" and key == "content":
+            projected["snippet"] = wire["snippet"]
+            projected["get"] = wire["get"]
+            continue
+        projected[key] = wire[key]
+    if include_v2_fields:
+        projected.update(
+            {
+                "fact_date": wire["fact_date"],
+                "edited_at": wire["edited_at"],
+                "match": wire["match"],
+                "status": wire["status"],
+                "earlier_entries": wire["earlier_entries"],
+            }
+        )
     if memory.source_kind == "vault":
         projected["file_path"] = memory.source_path
     projected["indexed_at"] = _mcp_stamp(memory.indexed_at)

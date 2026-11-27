@@ -6,7 +6,7 @@ import os
 import re
 import time
 from collections.abc import Mapping
-from typing import Annotated, Any, Dict, List, Optional, Tuple, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 from urllib.parse import quote
 
 import requests
@@ -44,7 +44,9 @@ from cli_agent_orchestrator.security.mcp_tool_gate import (
 )
 from cli_agent_orchestrator.services.memory_service import (
     MEMORY_DISABLED_MESSAGE,
+    MemoryAmbiguousScopeError,
     MemoryDisabledError,
+    MemoryNotFoundError,
     MemoryPartialWriteError,
 )
 from cli_agent_orchestrator.services.outcome_service import LEARNING_DISABLED_CODE
@@ -2099,6 +2101,13 @@ async def memory_recall(
             "preserves the non-expanded recall behaviour."
         ),
     ),
+    detail: Literal["full", "snippet"] = Field(
+        default="full",
+        description=(
+            'Response body detail: "full" preserves complete recalled content; '
+            '"snippet" returns a matched-term window and memory_get hint.'
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Retrieve memories matching a query and optional filters.
 
@@ -2121,8 +2130,11 @@ async def memory_recall(
         }
 
     try:
+        detail_value: Literal["full", "snippet"] = (
+            detail if isinstance(detail, str) and detail in {"full", "snippet"} else "full"
+        )
         terminal_context = _get_terminal_context_from_env()
-        kwargs = {
+        kwargs: Dict[str, Any] = {
             "query": query,
             "scope": scope,
             "memory_type": memory_type,
@@ -2133,30 +2145,124 @@ async def memory_recall(
             "include_related": (
                 bool(include_related) if isinstance(include_related, bool) else False
             ),
+            "detail": detail_value,
         }
         memories = (
             await recall_memory(**kwargs)
             if remote_memory_url()
             else await MemoryService().recall(**kwargs)
         )
-        # Curated recall is inserted verbatim into another terminal's context.
-        # Keep its vault/native scope set aligned with the deterministic builder:
-        # agent-scoped memories are explicit-recall-only in this release.
+        # Defence in depth for mocked/legacy services. MemoryService owns this
+        # restriction for real local and remote reads.
         from cli_agent_orchestrator.services.vault.reader import MEMORY_MANAGER_PROFILE
 
         if (terminal_context or {}).get("agent_profile") == MEMORY_MANAGER_PROFILE:
             injectable_scopes = {"session", "project", "global"}
             memories = [memory for memory in memories if memory.scope in injectable_scopes]
+        from cli_agent_orchestrator.services.settings_service import (
+            is_memory_recall_v2_fields_enabled,
+        )
+
         # One serializer for both recall surfaces (this tool and
         # POST /internal/memory/recall); see models/memory.py.
         return {
             "success": True,
-            "memories": [mcp_recall_wire_dict(m) for m in memories],
+            "memories": [
+                mcp_recall_wire_dict(
+                    m,
+                    detail=detail_value,
+                    include_v2_fields=(
+                        is_memory_recall_v2_fields_enabled()
+                        and (not remote_memory_url() or m.v2_fields_present)
+                    ),
+                )
+                for m in memories
+            ],
         }
     except MemoryDisabledError as e:
         return {"success": False, "disabled": True, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def memory_get(
+    key: str = Field(description="Exact memory key; normalized like memory_store keys."),
+    scope: Optional[str] = Field(
+        default=None,
+        description=(
+            'Scope to read: "global", "project", "session", "agent", or "federated". '
+            "Omit only when the key is unique among visible scopes."
+        ),
+    ),
+    include_history: bool = Field(
+        default=False,
+        description="Include all available entries newest first, within max_chars.",
+    ),
+    max_chars: int = Field(
+        default=8000,
+        ge=1,
+        le=100_000,
+        description="Maximum characters for each returned memory body field.",
+    ),
+) -> Dict[str, Any]:
+    """Read one visible memory by exact key.
+
+    Returns its latest entry, lifecycle status, history count, and up to five
+    links in each direction.
+    An omitted scope that matches more than one visible note returns
+    ``ambiguous_scope`` with the matching scopes.
+    """
+    from cli_agent_orchestrator.services.memory_gateway import (
+        get_memory,
+        remote_memory_url,
+    )
+    from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    if not is_memory_enabled():
+        return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
+    if scope is not None and scope not in {"global", "project", "session", "agent", "federated"}:
+        return {
+            "success": False,
+            "error_kind": "not_found",
+            "error": f"memory not found: {key!r}",
+        }
+    try:
+        terminal_context = _get_terminal_context_from_env()
+        memory = (
+            await get_memory(
+                key=key,
+                scope=scope,
+                include_history=include_history,
+                max_chars=max_chars,
+                terminal_context=terminal_context,
+            )
+            if remote_memory_url()
+            else await MemoryService().get_memory(
+                key=key,
+                scope=scope,
+                include_history=include_history,
+                max_chars=max_chars,
+                terminal_context=terminal_context,
+            )
+        )
+        return {"success": True, "memory": memory}
+    except MemoryAmbiguousScopeError as error:
+        return {
+            "success": False,
+            "error_kind": error.error_kind,
+            "error": f"memory key {error.key!r} exists in scopes: {', '.join(error.scopes)}",
+            "scopes": error.scopes,
+        }
+    except MemoryNotFoundError as error:
+        return {
+            "success": False,
+            "error_kind": error.error_kind,
+            "error": f"memory not found: {error.key!r}",
+        }
+    except Exception as error:
+        return {"success": False, "error": str(error)}
 
 
 @mcp.tool()
