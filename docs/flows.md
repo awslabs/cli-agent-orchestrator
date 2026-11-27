@@ -14,20 +14,20 @@ cao install developer
 
 ## Quick start
 
-The example flow asks a simple world trivia question every morning at 7:30 AM.
+The example flow appends a timestamp to a local log file every 10 minutes, gated by a script that can allow or skip each run.
 
 ```bash
 # 1. Start the cao server
 cao-server
 
 # 2. In another terminal, add a flow
-cao schedule add examples/flow/morning-trivia.md
+cao schedule add examples/flow/local-task.md
 
 # 3. List flows to see schedule and status
 cao schedule list
 
 # 4. Manually run a flow (optional - for testing)
-cao schedule run morning-trivia
+cao schedule run local-task-demo
 
 # 5. View flow execution (after it runs)
 tmux list-sessions
