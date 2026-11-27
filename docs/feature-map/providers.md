@@ -30,7 +30,7 @@ never came", so this file is mostly about which signals to trust.
 | `mcode` | `mcode` | [minimax-code.md](../minimax-code.md) |
 | `mock_cli` | `mock_cli` (test fixture) | [mock-cli-provider.md](../mock-cli-provider.md) |
 
-Binary names come from `GET /agents/providers` (`api/main.py:4112-4138`).
+Binary names come from `GET /agents/providers` (`api/main.py:4192-4218`).
 
 ## How a user reaches it
 
@@ -110,20 +110,20 @@ Unit tests replay captured screens in `test/providers/fixtures/*_output.txt`.
 
 - **`installed: true` only means a binary with that name is on the server's `PATH`.**
   It says nothing about login, version or whether the CLI starts
-  (`api/main.py:4134-4137`). `cursor_cli` looks for a binary called `agent`, so any
-  `agent` on `PATH` counts (`api/main.py:4128`). `mock_cli` is not listed at all.
+  (`api/main.py:4214-4217`). `cursor_cli` looks for a binary called `agent`, so any
+  `agent` on `PATH` counts (`api/main.py:4208`). `mock_cli` is not listed at all.
 - **`GET /sessions/{name}/terminals` shows the last status the monitor applied.** It
   doesn't re-detect, so a terminal nothing polls can still say `processing` after it went
-  idle ([api.md](../api.md), line 216). `GET /terminals/{id}` re-detects.
+  idle ([api.md](../api.md), line 226). `GET /terminals/{id}` re-detects.
 - **`mode=full` is not the whole history.** It's the rolling buffer, 32 KB by default
-  ([api.md](../api.md), lines 266-270). The full log of a live terminal is
+  ([api.md](../api.md), lines 276-280). The full log of a live terminal is
   `logs/terminal/<terminal-id>.log` in the CAO home. After the terminal is deleted, its
   saved screen is `logs/terminal/<terminal-id>.scrollback`
-  (`services/terminal_service.py:6610-6611`).
+  (`services/terminal_service.py:6931-6932`).
 - **The inbox delivers one pending message per idle cycle.** Several corrections sent
   to a busy worker are acted on one by one, each after a full turn, and a "stop" lands
   only after the worker has acted. Send one consolidated message
-  (`services/inbox_service.py:172-176`).
+  (`services/inbox_service.py:244-248`).
 - **`mock_cli` is not on `PATH` in an installed CAO.** `cao launch --provider mock_cli`
   fails outside a repo checkout until you add `test/providers/fixtures/bin`
   ([mock-cli-provider.md](../mock-cli-provider.md#design)). It also writes no MCP
@@ -144,46 +144,37 @@ Unit tests replay captured screens in `test/providers/fixtures/*_output.txt`.
   `Skill`, `AskUserQuestion`, `EnterPlanMode` and `ExitPlanMode` are removed whatever the
   grant (`utils/tool_mapping.py:208-218`). A helper that "can't use skills" is expected:
   CAO skills stay reachable through the `load_skill` MCP tool.
-- **A name in `--disallowedTools` that the build doesn't know is not an error.** Claude
-  Code starts anyway and only writes a debug-log line, so a typo in a deny list fails
-  open. The code notes this for `TeamCreate` and `TeamDelete` on 2.1.318
-  (`utils/tool_mapping.py:165-167`); the same holds for other names on 2.1.318, which is
-  unverified on later builds.
+- **Unknown `--disallowedTools` names are not a reliable deny.** The code records
+  `TeamCreate` and `TeamDelete` being ignored by Claude Code 2.1.318
+  (`utils/tool_mapping.py:165-167`); verify the effective deny list on your build.
 - **`WAITING_USER_ANSWER` means a dialog is open, and the inbox holds messages until it
   closes.** Pasting into Claude Code's choice widget would answer the dialog, so even eager
   delivery (`CAO_EAGER_INBOX_DELIVERY=true`) skips that state
-  (`services/inbox_service.py:254-268`; [claude-code.md](../claude-code.md#eager-inbox-delivery)).
+  (`services/inbox_service.py:370-384`; [claude-code.md](../claude-code.md#eager-inbox-delivery)).
 - **A slow start that "times out" may still be running.** CAO answers the bypass and
   folder-trust dialogs and declines the Bedrock model-upgrade nudge
-  (`providers/claude_code.py:944-962`). A dialog it doesn't know waits out
+  (`providers/claude_code.py:947-965`). A dialog it doesn't know waits out
   `provider_init_timeout` (60 s). A supervisor already working when the wait ends can
   still count as started ([claude-code.md](../claude-code.md#how-cao-knows-claude-code-has-started)).
-- **A long final message can come back cut short through a workflow `run_step`**, often
-  at a Markdown table, which loses anything after it (such as a trailing marker line).
-  The full text is in Claude Code's own session transcript (`.jsonl`). Unverified: reported from use, and nothing in this repo backs it.
 
 ## codex
 
 - **`UNKNOWN` right after you send a message is normal.** When Codex shows the user
   message with nothing under it yet, CAO can't tell a redraw from a turn that hasn't drawn
   its first row, so it returns `UNKNOWN` and the last status stays
-  (`providers/codex.py:2852-2862`; `services/status_monitor.py:515-519`). The same
+  (`providers/codex.py:2861-2871`; `services/status_monitor.py:515-519`). The same
   happens for a frame with no status bar under the composer
-  (`providers/codex.py:2829-2839`). Wait for the next poll before calling it stuck.
+  (`providers/codex.py:2838-2848`). Wait for the next poll before calling it stuck.
 - **Your Codex sandbox settings don't apply to a default CAO worker.** CAO passes
   `--yolo` (`--dangerously-bypass-approvals-and-sandbox`), so the
   `[sandbox_*]` tables in `~/.codex/config.toml`, network settings included, are inert.
   `codexProfile` drops `--yolo`, but `allowedTools: ["*"]` forces it back
-  (`providers/codex.py:1717-1770`; [codex-cli.md](../codex-cli.md#launch-flags)).
-- **Codex's own command rules still apply under `--yolo`.** A rule in
-  `~/.codex/rules/` that says "prompt" becomes a refusal, because nobody can answer it.
-  A worker that "can't run `git push`" may be hitting a local rule, not CAO. Unverified: reported from use on macOS, and nothing in this repo backs it.
-- **The launch command shows the reasoning effort CAO asked for, not the one Codex
-  runs.** CAO sends `model_reasoning_effort` as a `-c` override
-  (`providers/codex.py:1468`). The model and effort in the pane's footer are the proof.
+  (`providers/codex.py:1718-1771`; [codex-cli.md](../codex-cli.md#launch-flags)).
+- **The launch command shows the reasoning effort CAO requested.** CAO sends
+  `model_reasoning_effort` as a `-c` override (`providers/codex.py:1469`).
   Unverified: reported from use, and nothing in this repo backs it.
 - **A Codex release with a new folder-trust dialog stalls startup.** CAO knows three
-  versions of the dialog, the newest from Codex 0.156 (`providers/codex.py:250-262`).
+  versions of the dialog, the newest from Codex 0.156 (`providers/codex.py:251-263`).
   If a new release shows different text, the start waits out `provider_init_timeout`.
 
 ## kiro_cli
@@ -191,12 +182,12 @@ Unit tests replay captured screens in `test/providers/fixtures/*_output.txt`.
 - **A Kiro terminal can show a status but refuse input.** CAO types into a `kiro_cli`
   terminal only after its identity check passes (`identity_verified: true`). Until then,
   input is refused whatever `status` says: transiently while it's still starting, and
-  permanently if the start failed (`services/terminal_service.py:3915-3960`;
-  `providers/kiro_cli.py:562`, `795`, `862`). Check `identity_verified` on
+  permanently if the start failed (`services/terminal_service.py:4083-4128`;
+  `providers/kiro_cli.py:588`, `821`, `888`). Check `identity_verified` on
   `GET /sessions/{name}/terminals`. Other providers show `null`.
-- **Kiro v3 runs only on listed kiro-cli versions.** 2.35.1 is measured. 2.36.0 to 3.1.0
-  are pending and refused unless the operator opts in with
-  `kiro.v3_allow_unverified_versions`. Any other version is refused with
+- **Kiro v3 runs only on listed kiro-cli versions.** 2.35.1 is measured. The listed
+  versions from 2.36.0 through 3.1.0 are pending and refused unless the operator
+  opts in with `kiro.v3_allow_unverified_versions`. Any other version is refused with
   `kiro_v3_unsupported_version`, and v2 is unaffected
   (`providers/kiro_v3_schema.py:393-404`;
   [kiro-cli.md](../kiro-cli.md#supported-kiro-cli-versions)). A newer kiro-cli on the
@@ -209,15 +200,6 @@ Unit tests replay captured screens in `test/providers/fixtures/*_output.txt`.
 - **CAO never answers Kiro's approval prompt on v3.** The terminal reads as
   `WAITING_USER_ANSWER` until you or a supervisor answer it
   ([kiro-cli.md](../kiro-cli.md#faq)).
-- **A handoff to Kiro can return only Kiro's footer line.** The real answer is in the
-  terminal's log (`logs/terminal/<terminal-id>.log`, or `.scrollback` after delete).
-  Read it before re-sending a task that writes files. Unverified: reported from use, and nothing in this repo backs it.
-- **An `assign` to Kiro can drop the task.** The pane shows an empty prompt and
-  "1 MCP failure", and the status reads `completed`. Check the pane about 60 s after
-  assigning, and resend with `send_message`. Unverified: reported from use, and nothing in this repo backs it.
-- **On the `auto` model, Kiro can refuse `send_message` with an explicit
-  `receiver_id`,** but it calls the tool with `receiver_id` left out, which replies to
-  the caller. Unverified: reported from use, and nothing in this repo backs it.
 - **On a loaded machine, a v3 start can outlast the client's wait.** With
   `provider_init_timeout` above about 90 s, `cao launch` reports a failure while the
   server goes on to start the agent ([kiro-cli.md](../kiro-cli.md#known-limitations)).
@@ -229,7 +211,7 @@ No in-depth entries yet. Facts checked so far:
 - `hermes`: CAO writes no MCP config for it. Configure the CAO MCP server in the Hermes
   profile yourself ([hermes.md](../hermes.md#mcp-configuration)).
 - `opencode_cli`: inbox delivery is polled, logged as `trigger: opencode-poll`
-  (`services/inbox_service.py:757-768`).
+  (`services/inbox_service.py:1016-1027`).
 - `cursor_cli`: the binary is called `agent` (see above).
 
 Entries for `kimi_cli`, `qwen_cli`, `copilot_cli`, `antigravity_cli`, `omp`, `grok_cli`

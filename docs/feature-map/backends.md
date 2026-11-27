@@ -15,11 +15,11 @@ Know which backend you're on before you trust a status.
 - **`herdr-app`** (experimental): `backends/herdr_app_backend.py`. Terminals run in a
   herdr-core (`hc`) session that the Herdr desktop app can show. See
   [herdr-app.md](../herdr-app.md).
-- **`BackendFactory`** picks one at startup (`backends/factory.py:27-106`).
+- **`BackendFactory`** picks one at startup (`backends/factory.py:27-107`).
 
 ## How a user reaches it
 
-Precedence, highest first (`backends/factory.py:3-4`, `services/config_service.py:210-212`):
+Precedence, highest first (`backends/factory.py:3-4`, `services/config_service.py:230-233`):
 
 1. `cao-server --terminal tmux|herdr|herdr-app`
 2. `CAO_TERMINAL_BACKEND`
@@ -57,7 +57,8 @@ cao-<id>: 1 windows …
 ✓ Shutdown session 'cao-<id>'
 ```
 
-**herdr**, with the server started by `cao-server --terminal herdr`:
+**herdr** (captured on CAO 2.5.4 with herdr 0.9.3), with the server started by
+`cao-server --terminal herdr`:
 
 ```bash
 curl -s http://localhost:9889/health | python3 -m json.tool | grep -E 'backend|herdr'
@@ -84,8 +85,35 @@ The workspace `label` is the CAO session name. Inbox delivery on herdr logs its 
 `grep trigger: ~/.aws/cli-agent-orchestrator/logs/cao_*.log` shows whether the event path
 is alive ([herdr.md](../herdr.md#event-driven-inbox-delivery)).
 
-**herdr-app**: `cao-server --terminal herdr-app`, then `/health` shows
-`"terminal_backend": "herdr-app"`, and `HC_SESSION=cao hc ls` lists CAO's terminals.
+**herdr-app**, with a scratch `HOME` and `CAO_HOME_DIR`, and `hc` 0.1.22 on `PATH`:
+
+```bash
+export CAO_HERDR_APP_SESSION=<scratch-session> HC_SESSION=<scratch-session>
+cao-server --port 19889 --terminal herdr-app
+curl -s http://localhost:19889/health | python3 -m json.tool | grep -E 'backend|herdr'
+```
+```
+    "terminal_backend": "herdr-app",
+        "herdr": "unavailable",
+        "herdr-core": "ok",
+```
+
+```bash
+cao launch --agents developer --provider mock_cli --headless "hello app map"
+cao session status cao-<id> --json
+HC_SESSION=<scratch-session> hc ls
+```
+```
+Session created: cao-<id>
+Terminal created: developer-<suffix>
+hello app map
+{"session":"cao-<id>","conductor":{"id":"<terminal-id>","provider":"mock_cli","status":"completed","last_output":"hello app map",…}}
+{"hidden_finished":0,"terminals":[{"name":"cao-<id>",…}]}
+```
+
+Stop only the scratch core with `HC_SESSION=<scratch-session> hc server stop`.
+See [herdr-app.md](../herdr-app.md#enable-it) and its
+[dedicated CAO window](../herdr-app.md#a-dedicated-cao-window).
 
 Tests: `test/backends/` (for example `test_herdr_backend.py`,
 `test_herdr_inbox_service.py`).
@@ -96,44 +124,34 @@ Tests: `test/backends/` (for example `test_herdr_backend.py`,
   server ([tmux.md](../tmux.md#scrollback-depth-history-limit)). herdr finds its socket
   from `HOME` (or `XDG_CONFIG_HOME`) and the session name, so a scratch server with the
   default `cao` session talks to your real herdr session
-  (`backends/herdr_backend.py:1196-1207`). For a fully separate run, also set `HOME` (or
+  (`backends/herdr_backend.py:1205-1216`). For a fully separate run, also set `HOME` (or
   a different `terminal.herdr_session`) and `TMUX_TMPDIR`.
 - **`CAO_TERMINAL_BACKEND` left over in your shell beats `settings.json`.** A shell or
   pane that exported it quietly changes the backend of every server and test run started
-  there (`services/config_service.py:210`). Tests then fail in inbox and dispatch code
+  there (`services/config_service.py:230`). Tests then fail in inbox and dispatch code
   that the diff never touched. Check `curl /health` for `terminal_backend`, and unset
   `CAO_*` and `HERDR_*` before a test run.
 - **herdr.md says herdr must be running before `cao-server` starts. It needn't be.**
   CAO starts `herdr --session <name> server` itself when the socket is missing, and
-  waits up to 15 s for it (`backends/herdr_backend.py:1209-1245`). The
+  waits up to 15 s for it (`backends/herdr_backend.py:1218-1263`). The
   troubleshooting text at [herdr.md](../herdr.md#socket-connection-errors-in-cao-logs)
   predates this. herdr.md also lists `--terminal` as `tmux` or `herdr`; `herdr-app` is
-  accepted too (`api/main.py:12468-12473`).
+  accepted too (`api/main.py:12737-12742`).
 - **That herdr server outlives `cao-server`.** It's started in its own session
-  (`start_new_session=True`, `backends/herdr_backend.py:1225-1230`). After a test run or
+  (`start_new_session=True`, `backends/herdr_backend.py:1243-1248`). After a test run or
   a scratch server, a `herdr --session cao server` process stays behind. Find yours by
   the socket it holds open under your own `HOME`, and stop only that one. Seen on
   2026-11-20.
-- **herdr's own `agent_status` can say `unknown` while CAO says `completed`.** herdr
-  reports status only for agent CLIs it recognises. For others, such as `mock_cli`, CAO
-  falls back to reading the screen. Trust CAO's status, not herdr's. Seen on 2026-11-20
-  with herdr 0.9.3.
 - **`--env` values that work on tmux can fail on herdr.** On herdr, a forwarded
   value with shell characters such as `$ ; | & ! * ? < >` fails terminal creation; tmux
-  accepts it (`backends/herdr_backend.py:1276-1281`).
+  accepts it (`backends/herdr_backend.py:1294-1299`).
 - **`cao session list` empty after a server restart on herdr.** It's usually expected:
   startup removes database rows whose herdr tabs are gone, and logs
   `Startup DB cleanup: removed N ghost terminal(s)`
-  (`services/herdr_inbox_service.py:467`).
+  (`services/herdr_inbox_service.py:469`).
 - **A session visible in herdr but not in CAO.** `terminal.herdr_session` doesn't match
   the session herdr runs under. Compare with `herdr --session <name> workspace list`
   ([herdr.md](../herdr.md#session-visible-in-herdr-but-not-in-cao)).
-- **Every CAO terminal vanishes at once (`/sessions` empty, `protocol_mismatch`).** The
-  herdr binary was upgraded while its server was running. Diagnose with `herdr status`,
-  then restart the herdr server and relaunch the agents. Unverified: reported from use, and nothing in this repo backs it.
-- **Panes that a herdr session restores after a reboot are not CAO's terminals any
-  more.** They come back without their launch flags: Codex without `--yolo` or MCP, and
-  Kiro as a bare shell. Replace them with fresh CAO terminals. Unverified: reported from use, and nothing in this repo backs it.
 - **Only a short env allowlist reaches tmux agents.** `HOME`, `PATH`, `SHELL`, and the
   `CAO_*`, `KIRO_*`, `MISE_*` and `AWS_*` prefixes. Anything else needs
   `cao launch --env KEY=VALUE` ([tmux.md](../tmux.md#forwarding-env-vars-to-spawned-agents)).

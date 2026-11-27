@@ -4,7 +4,7 @@
 
 Coding agents copy what they see and guess what things are called. CAO has many
 moving parts: 13 real providers plus a mock one (`ProviderType`, `models/provider.py:4-21`),
-three terminal backends (`tmux`, `herdr`, `herdr-app`; `backends/factory.py:27-106`), sessions,
+three terminal backends (`tmux`, `herdr`, `herdr-app`; `backends/factory.py:27-107`), sessions,
 terminals, an inbox, workflows and memory. The facts about how to check each part are
 spread across `docs/`, test files, skills and PR threads. Some of the most useful facts
 are the traps: a status that reads one thing while the screen shows another.
@@ -30,7 +30,8 @@ depth instead of copying it.
 ## Conventions
 
 - Commands assume a fresh install and the default server at `http://localhost:9889`.
-- Output is pasted from a real run on CAO 2.5.4, shortened with `…`. Ids such as
+- Output is pasted from real runs on CAO 2.5.4 and 2.5.5, shortened with `…`.
+  Changed server and backend output was recaptured on 2.5.5. Ids such as
   `cao-<id>` and `<terminal-id>` stand for the random ids CAO prints.
 - A "what usually lies" item cites the code or doc that backs it (`path:line` on the
   commit the entry was last checked against). An item that could not be checked against
