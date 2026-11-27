@@ -233,11 +233,11 @@ high-risk PR.
 
 ## Approval and merge
 
-- **The workflow never approves a PR.** After its comment, it approves the
-  waiting CI runs of the PR's commits and assigns the maintainer who started
-  it. If the review accepts a P1 or P2, it requests changes. Only a dismissal
-  clears that request: by a later complete review of the PR head that accepts
-  no P1 or P2, or by a maintainer.
+- **The workflow never approves a PR.** After its comment, it assigns the
+  maintainer who started it. If the result is No blocking findings, it also
+  approves the waiting CI runs of the reviewed head. If the review accepts a P1
+  or P2, it requests changes. Only a dismissal clears that request: by a later
+  complete review of the PR head that accepts no P1 or P2, or by a maintainer.
 - **A maintainer approves** at the head that merges. A push removes an
   approval, also "Update branch", and a review posted as a comment does not
   count. Do not approve from an AI report alone: read the change and say what

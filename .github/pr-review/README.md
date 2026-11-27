@@ -10,9 +10,10 @@ adds a neutral check to the reviewed head commit.
 
 The review never approves a PR, and its check is always neutral. After the
 comment, the workflow requests changes when the review accepts a P1 or P2
-finding, approves the waiting CI runs of the PR's commits, and assigns the
-maintainer who started it. See [Actions on the PR](#actions-on-the-pr). A
-maintainer still approves and merges.
+finding, approves the waiting CI runs of the reviewed head when the result is
+No blocking findings, and assigns the maintainer who started it. See
+[Actions on the PR](#actions-on-the-pr). A maintainer still approves and
+merges.
 
 The agents apply the review policy in [`REVIEW.md`](../../REVIEW.md). The
 [design](../../docs/pr-review-design.md) explains the decisions, and how the
@@ -152,11 +153,12 @@ After the check run, `publish` does three actions. It never approves a PR.
    head again, so a push during `publish` keeps the change requests that remain.
    `publish` changes only the reviews that this workflow wrote.
 2. **CI runs.** A CI run of a PR from a fork waits until a maintainer approves
-   it. `publish` approves the waiting `pull_request` runs of the reviewed head
-   and of the PR commits before it, oldest first, when the run comes from the
-   head repository of the PR. It approves no run of a commit that a push added
-   during the review, because no review read that commit. If the PR head moved
-   during the review, it approves no run.
+   it. An approved run runs the code of the fork, so `publish` approves runs
+   only when the result is No blocking findings. Then it approves the waiting
+   `pull_request` runs of the reviewed head, oldest first, when the run comes
+   from the head repository of the PR. The review read only the head, so the
+   runs of other commits wait for a maintainer. If the PR head moved during the
+   review, it approves no run.
 3. **Assignee.** `publish` assigns the person who started the run. When a bot
    started the run, it assigns no one.
 
@@ -394,10 +396,6 @@ profiles and the PR, and all three come from the dispatched ref.
 - CAO always allows its callback tools, such as `send_message`. A seat can send
   text to another seat of the same run.
 - The PR content goes to the model provider of the selected engine.
-- `publish` approves the waiting CI runs of the reviewed head and of the PR
-  commits before it, but the review reads only the head. An earlier commit can
-  hold a workflow change that no review read. A run from a fork gets a read-only
-  job token and no secrets.
 - GitHub does not document whether a change request from `github-actions[bot]`
   blocks a merge under a ruleset. If it does, the PR stays blocked until a later
   complete review or a maintainer dismisses the request.
@@ -422,7 +420,7 @@ profiles and the PR, and all three come from the dispatched ref.
 - `publish` reads at most 5,000 comments of the PR to find the earlier review
   comment. If the PR has more, `publish` posts no comment.
 - To act on the PR, `publish` reads at most 1,000 reviews of the PR and 1,000
-  waiting runs of the repository, and GitHub lists at most 250 commits of a PR.
+  waiting runs of the repository.
   Past a limit, the action fails, and the log says what it did not do.
 
 ## Troubleshooting

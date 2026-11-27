@@ -12,10 +12,10 @@ place on each run. It also adds a neutral check to the reviewed head commit.
 
 The review never approves a PR, and its check is always neutral. After the
 comment, the workflow requests changes when the review accepts a P1 or P2
-finding, approves the waiting CI runs of the PR's commits, and assigns the
-maintainer who started it. No step runs code from the PR. Maintainers stay
-accountable for the requirements, the design, the risk, the approval and the
-merge.
+finding, approves the waiting CI runs of the reviewed head when the result is
+No blocking findings, and assigns the maintainer who started it. No step runs
+code from the PR. Maintainers stay accountable for the requirements, the
+design, the risk, the approval and the merge.
 
 [`REVIEW.md`](../REVIEW.md) is the review policy. It holds the lessons that
 maintainers learnt from earlier reviews. Each agent reads it before it starts
@@ -146,7 +146,7 @@ flowchart TD
     Stale --> NotPublished["Neutral check: the review is not published"]
     Fresh -->|"Yes"| Comment["Create or update the review comment"]
     Comment --> Check["Neutral check on the reviewed head"]
-    Check --> Act["Request changes for an accepted P1 or P2,<br/>approve the waiting CI runs, assign the maintainer"]
+    Check --> Act["Request changes for an accepted P1 or P2,<br/>approve the head's waiting CI runs if nothing blocks,<br/>assign the maintainer"]
     Setup -.->|"A step fails or times out"| Failed["Neutral check: the review did not finish"]
 ```
 
@@ -186,9 +186,9 @@ a panel for high-risk rounds, and the step 11 eval decides. Model A runs
   the reviewed head when the review accepts a P1 or P2 finding. A later
   complete review that accepts none, of a head that did not move, dismisses
   these change requests. Otherwise they stay until a maintainer dismisses them.
-  The publisher also approves the waiting CI runs of the PR's commits, but no
-  run when the head moved, and it assigns the maintainer who started the run.
-  It never approves a PR. See
+  When the result is No blocking findings and the head did not move, the
+  publisher also approves the waiting CI runs of the reviewed head. It assigns
+  the maintainer who started the run. It never approves a PR. See
   [Actions on the PR](../.github/pr-review/README.md#actions-on-the-pr).
 - **No inline comments.** A finding whose path or line is not in the head
   commit is dropped and listed, and the review is Incomplete.
@@ -286,7 +286,7 @@ reason given. "Later" means work after this design.
 | An always-neutral check | Model output is not deterministic, so the check is not a merge gate. A neutral check shows the result on the head commit. |
 | Request changes for an accepted P1 or P2; never approve | The owners chose this. The merge box shows the finding, and a maintainer can dismiss the request. Approval stays with a maintainer. |
 | Keep a change request until a complete review of an unchanged head | An incomplete review, or a review of an older head, did not check the finding again at the current head. |
-| Approve the waiting CI runs of the reviewed head and of the PR commits before it, and assign the maintainer | The owners chose this, so CI runs on a fork PR after its review. A run from a fork gets a read-only token and no secrets. The review reads only the head, so an earlier commit can hold a workflow change that no review read. GitHub cannot assign the workflow bot. |
+| Approve the waiting CI runs of the reviewed head when the result is No blocking findings, and assign the maintainer | The owners chose this, so CI runs on a fork PR after a review that blocks nothing. An approved run runs the code of the fork. So an open P1 or P2, an owner question or an incomplete review leaves the runs to a maintainer, and so do the runs of commits that the review did not read. A run from a fork gets a read-only token and no secrets. GitHub cannot assign the workflow bot. |
 | Cancel an older run of the same PR | #1350 step 10. The latest dispatch is the one that a maintainer wants. |
 | The driver waits until each seat ends | The step call can return before CAO ends the step. The driver reads the reports only after each step ends, or after a fixed wait. |
 | Copilot CLI from a lockfile, installed with `npm ci --ignore-scripts` | Pins each dependency of the CLI, not only the CLI version. The filtered environment has no `CI`, so `COPILOT_AUTO_UPDATE=false` keeps that version at run time. |

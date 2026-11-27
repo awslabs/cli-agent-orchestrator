@@ -20,8 +20,9 @@ agents never hold a GitHub write token and the publisher never runs an agent:
   place, and adds a neutral check run to the reviewed head. Then it acts on the
   PR. If the review accepts a P1 or P2 finding, it requests changes. If a later
   complete review of the current head accepts none, it dismisses its earlier
-  change requests. It approves the waiting CI runs of the PR's commits and
-  assigns the maintainer who started the run. It never approves a PR.
+  change requests. If the result is No blocking findings, it approves the
+  waiting CI runs of the reviewed head. It assigns the maintainer who started
+  the run. It never approves a PR.
 - ``report-failure`` adds only a neutral check run with fixed text, when the
   review did not finish or ``publish`` did not post the comment.
 - ``summary`` runs the local checks of ``publish`` on ``review.json`` and adds
@@ -873,33 +874,22 @@ def change_request_plan(states: list[str], moved: bool) -> tuple[str, str]:
     return "dismiss", "the review accepted no P1 or P2 finding"
 
 
+def ci_approval_plan(states: list[str], moved: bool) -> tuple[bool, str]:
+    """Whether ``publish`` approves the waiting CI runs of the reviewed head, and why.
+
+    An approval lets the code of a fork run in CI, so an open P1 or P2, an owner
+    question or an incomplete review leaves the runs to a maintainer.
+    """
+    if states != ["no_blocking_findings"]:
+        return False, f"the result is {STATE_TITLES[states[0]]}"
+    if moved:
+        return False, "the PR head moved after the review started"
+    return True, "the result is No blocking findings"
+
+
 def _live_head(repo: str, number: int) -> dict[str, Any]:
     """The head of the PR as GitHub gives it now."""
     return _dict(_dict(_gh_api(f"repos/{repo}/pulls/{number}")).get("head"))
-
-
-def _reviewed_commits(commits: list[Any], head_sha: str) -> set[str]:
-    """The reviewed head and the commits before it in ``commits``, the PR's commit list.
-
-    A commit that a push added during the review is not an ancestor of the
-    reviewed head, so it is not in the set. The set is empty if the list does not
-    have the reviewed head.
-    """
-    parents: dict[str, list[Any]] = {}
-    for item in commits:
-        entry = _dict(item)
-        sha, links = entry.get("sha"), entry.get("parents")
-        if isinstance(sha, str):
-            links = links if isinstance(links, list) else []
-            parents[sha] = [_dict(link).get("sha") for link in links]
-    found: set[str] = set()
-    todo: list[Any] = [head_sha]
-    while todo:
-        sha = todo.pop()
-        if sha in parents and sha not in found:
-            found.add(sha)
-            todo.extend(parents[sha])
-    return found
 
 
 def _change_request(
@@ -962,28 +952,24 @@ def _change_request(
     return True, f"dismissed {count}, because {reason}"
 
 
-def _approve_ci_runs(repo: str, number: int, head_sha: str) -> tuple[bool, str]:
-    """Approve the waiting runs of the reviewed head and the PR commits before it, oldest first.
+def _approve_ci_runs(
+    repo: str, number: int, head_sha: str, plan: tuple[bool, str]
+) -> tuple[bool, str]:
+    """Approve the waiting runs of the reviewed head, oldest first, if ``plan`` allows it.
 
-    A run from a fork waits for a maintainer. If the head moved after the review
-    started, no review read the new commits, so no run is approved.
+    A run from a fork waits for a maintainer. The review read only the head, so
+    a run of another commit is not approved. If the head moved after the review
+    started, no run is approved.
     """
+    approve, reason = plan
+    if not approve:
+        return True, f"approved none, because {reason}"
     head = _live_head(repo, number)
     if head.get("sha") != head_sha:
         return True, "approved none, because the PR head moved after the review started"
     head_repo = _dict(head.get("repo")).get("full_name")
     if not isinstance(head_repo, str) or not REPO_RE.fullmatch(head_repo):
         return True, "approved none, because GitHub gives no head repository for the PR"
-    commits, _ = _paged(f"repos/{repo}/pulls/{number}/commits", 3)
-    # A push after the head check adds commits that no review read.
-    reviewed = _reviewed_commits(commits, head_sha)
-    if not reviewed:
-        if len(commits) >= PR_COMMITS_CAP:
-            return False, (
-                f"approved none, because the reviewed head is not in the first {PR_COMMITS_CAP} "
-                "commits that GitHub lists for the PR"
-            )
-        return True, "approved none, because the PR head moved after the review started"
     runs, truncated = _paged(f"repos/{repo}/{WAITING_RUNS}", RUN_PAGE_LIMIT, key="workflow_runs")
     waiting = sorted(
         run["id"]
@@ -991,7 +977,7 @@ def _approve_ci_runs(repo: str, number: int, head_sha: str) -> tuple[bool, str]:
         if type(_dict(run).get("id")) is int
         and run.get("event") == "pull_request"
         and "action_required" in (run.get("status"), run.get("conclusion"))
-        and run.get("head_sha") in reviewed
+        and run.get("head_sha") == head_sha
         and _dict(run.get("head_repository")).get("full_name") == head_repo
     )
     refused = []
@@ -1000,19 +986,14 @@ def _approve_ci_runs(repo: str, number: int, head_sha: str) -> tuple[bool, str]:
             _gh_api(f"repos/{repo}/actions/runs/{run_id}/approve", method="POST")
         except GhError as exc:
             refused.append(f"{run_id} (HTTP {exc.status})" if exc.status else str(run_id))
-    if not waiting and not truncated and len(commits) < PR_COMMITS_CAP:
-        return True, "no run of the PR's commits waits for approval"
+    if not waiting and not truncated:
+        return True, "no run of the reviewed head waits for approval"
     text = f"approved {len(waiting) - len(refused)} of {_plural(len(waiting), 'waiting run')}"
     problems = []
     if refused:
         problems.append(
             f"GitHub refused {_plural(len(refused), 'run')}: {', '.join(refused)}. "
             "A maintainer can approve them on the PR"
-        )
-    if len(commits) >= PR_COMMITS_CAP:
-        problems.append(
-            f"GitHub lists only the first {PR_COMMITS_CAP} commits of a PR, so the runs of "
-            "later commits can still wait"
         )
     if truncated:
         problems.append("GitHub lists at most 1,000 waiting runs, so more runs can still wait")
@@ -1107,7 +1088,7 @@ def publish(
         )
         actions = {
             "change_request": change_request_plan(review["result_states"], bool(warning))[0],
-            "approve_ci_runs": not warning,
+            "approve_ci_runs": ci_approval_plan(review["result_states"], bool(warning))[0],
             "assign": None if actor.endswith("[bot]") else actor,
         }
         _write_json(
@@ -1144,12 +1125,13 @@ def publish(
     ]
     # A failed action does not undo an earlier write or stop the next action.
     plan = change_request_plan(review["result_states"], bool(warning))
+    approval = ci_approval_plan(review["result_states"], bool(warning))
     results = [
         _act(
             "Change request",
             lambda: _change_request(repo, number, head_sha, plan, reviewer_login, comment_url),
         ),
-        _act("CI runs", lambda: _approve_ci_runs(repo, number, head_sha)),
+        _act("CI runs", lambda: _approve_ci_runs(repo, number, head_sha, approval)),
         _act("Assignee", lambda: _assign(repo, number, actor)),
     ]
     lines += [line for _, line in results]

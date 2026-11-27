@@ -7,8 +7,9 @@ name: PR Review
 # update in place, and one neutral check run on the reviewed head. Then the
 # workflow acts on the PR. If the review accepts a P1 or P2 finding, it requests
 # changes. If a later complete review of the current head accepts none, it
-# dismisses its earlier change requests. It approves the waiting CI runs of the
-# PR's commits and assigns the maintainer who started it. It never approves a PR.
+# dismisses its earlier change requests. If the result is No blocking findings,
+# it approves the waiting CI runs of the reviewed head. It assigns the
+# maintainer who started it. It never approves a PR.
 #
 # The procedure, the secrets and the trust boundaries are in
 # .github/pr-review/README.md. In short:
@@ -549,7 +550,7 @@ jobs:
       pull-requests: write
       # Add the neutral check run to the reviewed head.
       checks: write
-      # Approve the waiting CI runs of the PR's commits (a PR from a fork). This
+      # Approve the waiting CI runs of the reviewed head (a PR from a fork). This
       # permission also lets a job cancel, re-run and start workflows. This job
       # runs only the scripts of the dispatched ref, and no agent.
       actions: write
