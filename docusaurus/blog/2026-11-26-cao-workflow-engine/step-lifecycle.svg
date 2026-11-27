@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560" role="img" aria-labelledby="title desc">
+  <title id="title">The life of one workflow step</title>
+  <desc id="desc">A step request arrives from the script. The server checks its generation; a stale generation is refused with 409. The replay check then decides: replay returns the stored result and runs nothing, stop and ask returns 409, and divergence fails the run. Otherwise begin_step writes a running row with the step's fingerprint, the agent terminal runs, and settle_step writes the state, attempt count, result and error in one statement. If CAO stops while the agent runs, the row stays running, which means the outcome is unknown.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="7" flood-color="#0f172a" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#7c3aed"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#16a34a"/>
+    </marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#d97706"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#dc2626"/>
+    </marker>
+    <marker id="arrow-slate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#475569"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .eyebrow { font-size: 13px; font-weight: 700; letter-spacing: 1.5px; fill: #64748b; }
+      .title { font-size: 30px; font-weight: 750; fill: #0f172a; }
+      .subtitle { font-size: 16px; font-weight: 450; fill: #475569; }
+      .card-title { font-size: 22px; font-weight: 720; fill: #0f172a; }
+      .card-copy { font-size: 15px; font-weight: 450; fill: #475569; }
+      .small { font-size: 13px; font-weight: 500; fill: #475569; }
+      .label { font-size: 12px; font-weight: 700; letter-spacing: 0.8px; fill: #475569; }
+      .pill { font-size: 12px; font-weight: 750; letter-spacing: 0.8px; fill: #ffffff; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; font-weight: 600; fill: #0f172a; }
+      .mono-s { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; font-weight: 600; fill: #334155; }
+    </style>
+  </defs>
+  <rect width="1200" height="560" fill="#ffffff"/>
+  <text class="eyebrow" x="60" y="54">ONE STEP</text>
+  <text class="title" x="60" y="94">Record the step before it runs, and again when it settles.</text>
+  <text class="subtitle" x="60" y="124">A crash in between leaves the row saying running: dispatched, outcome unknown.</text>
+  <g filter="url(#shadow)">
+  <rect x="40" y="190" width="160" height="96" rx="16" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  </g>
+  <text class="card-copy" style="font-size:19px;font-weight:720;fill:#0f172a" x="120.0" y="232" text-anchor="middle">Request</text>
+  <text class="small" x="120.0" y="260" text-anchor="middle">from step()</text>
+  <line x1="200" y1="238" x2="228" y2="238" stroke="#475569" stroke-width="2.5" marker-end="url(#arrow-slate)"/>
+  <g filter="url(#shadow)">
+  <rect x="232" y="190" width="160" height="96" rx="16" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2"/>
+  </g>
+  <text class="card-copy" style="font-size:19px;font-weight:720;fill:#0f172a" x="312.0" y="232" text-anchor="middle">Generation</text>
+  <text class="small" x="312.0" y="260" text-anchor="middle">check</text>
+  <line x1="392" y1="238" x2="420" y2="238" stroke="#475569" stroke-width="2.5" marker-end="url(#arrow-slate)"/>
+  <g filter="url(#shadow)">
+  <rect x="424" y="190" width="160" height="96" rx="16" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2"/>
+  </g>
+  <text class="card-copy" style="font-size:19px;font-weight:720;fill:#0f172a" x="504.0" y="232" text-anchor="middle">Replay</text>
+  <text class="small" x="504.0" y="260" text-anchor="middle">check</text>
+  <line x1="584" y1="238" x2="612" y2="238" stroke="#475569" stroke-width="2.5" marker-end="url(#arrow-slate)"/>
+  <g filter="url(#shadow)">
+  <rect x="616" y="190" width="160" height="96" rx="16" fill="#f8fafc" stroke="#475569" stroke-width="2"/>
+  </g>
+  <text class="mono" x="696.0" y="232" text-anchor="middle">begin_step</text>
+  <text class="small" x="696.0" y="260" text-anchor="middle">row: running</text>
+  <line x1="776" y1="238" x2="804" y2="238" stroke="#475569" stroke-width="2.5" marker-end="url(#arrow-slate)"/>
+  <g filter="url(#shadow)">
+  <rect x="808" y="190" width="160" height="96" rx="16" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
+  </g>
+  <text class="card-copy" style="font-size:19px;font-weight:720;fill:#0f172a" x="888.0" y="232" text-anchor="middle">Agent runs</text>
+  <text class="small" x="888.0" y="260" text-anchor="middle">in its terminal</text>
+  <line x1="968" y1="238" x2="996" y2="238" stroke="#475569" stroke-width="2.5" marker-end="url(#arrow-slate)"/>
+  <g filter="url(#shadow)">
+  <rect x="1000" y="190" width="160" height="96" rx="16" fill="#f8fafc" stroke="#475569" stroke-width="2"/>
+  </g>
+  <text class="mono" x="1080.0" y="232" text-anchor="middle">settle_step</text>
+  <text class="small" x="1080.0" y="260" text-anchor="middle">one statement</text>
+  <line x1="312.0" y1="286" x2="312.0" y2="346" stroke="#dc2626" stroke-width="2.5" marker-end="url(#arrow-red)"/>
+  <rect x="237.0" y="350" width="150" height="40" rx="10" fill="#fef2f2" stroke="#dc2626" stroke-width="1.5"/>
+  <text class="small" x="312.0" y="375" text-anchor="middle">stale: 409</text>
+  <line x1="504.0" y1="286" x2="504.0" y2="346" stroke="#7c3aed" stroke-width="2.5" marker-end="url(#arrow-purple)"/>
+  <rect x="414.0" y="350" width="180" height="40" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text class="small" x="504.0" y="375" text-anchor="middle">replay: stored result</text>
+  <rect x="414.0" y="400" width="180" height="40" rx="10" fill="#fffbeb" stroke="#d97706" stroke-width="1.5"/>
+  <text class="small" x="504.0" y="425" text-anchor="middle">stop and ask: 409</text>
+  <rect x="414.0" y="450" width="180" height="40" rx="10" fill="#fef2f2" stroke="#dc2626" stroke-width="1.5"/>
+  <text class="small" x="504.0" y="475" text-anchor="middle">diverge: run fails</text>
+  <text class="small" x="504.0" y="512" text-anchor="middle">Nothing runs on these paths.</text>
+  <text class="mono-s" x="696.0" y="316" text-anchor="middle">state = running</text>
+  <text class="mono-s" x="696.0" y="334" text-anchor="middle">+ call fingerprint</text>
+  <text class="mono-s" x="1080.0" y="316" text-anchor="middle">state, attempts,</text>
+  <text class="mono-s" x="1080.0" y="334" text-anchor="middle">result, error</text>
+  <rect x="804.0" y="160" width="168" height="156" rx="18" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="7 6"/>
+  <rect x="738.0" y="372" width="300" height="88" rx="14" fill="#fef2f2" stroke="#dc2626" stroke-width="1.5"/>
+  <text class="card-copy" x="888.0" y="400" text-anchor="middle">If CAO stops here,</text>
+  <text class="card-copy" x="888.0" y="422" text-anchor="middle">the row stays running.</text>
+  <text class="card-copy" x="888.0" y="444" text-anchor="middle">Resume treats it as unknown.</text>
+  <line x1="888.0" y1="316" x2="888.0" y2="368" stroke="#dc2626" stroke-width="2.5" stroke-dasharray="6 6" marker-end="url(#arrow-red)"/>
+</svg>
