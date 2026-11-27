@@ -57,7 +57,7 @@ An agent that needs a module refactored before continuing:
 
 The calling agent waits for the refactoring to finish and receives the result before moving on.
 
-:::note `working_directory` is off by default
+:::note[`working_directory` is off by default]
 The `working_directory` parameter is only registered on the tool when
 `CAO_ENABLE_WORKING_DIRECTORY=true` is set for the MCP server. With the default
 configuration it is absent from the tool schema, so passing it is a validation

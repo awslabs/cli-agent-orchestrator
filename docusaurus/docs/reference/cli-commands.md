@@ -107,7 +107,7 @@ cao launch "Research this codebase" --agents explorer --memory
 
 Manage active CAO sessions.
 
-:::note Session names include the `cao-` prefix
+:::note[Session names include the `cao-` prefix]
 `cao launch --session-name my-session` creates a session named `cao-my-session`.
 The subcommands below take the full prefixed name; `cao session list` shows the
 exact values.
@@ -595,7 +595,7 @@ Without both, every subcommand exits with `No fleet configured.` — neither gro
 ever falls back to the `cao-server` on this machine. See
 [Environment Variables](environment-variables.md#remote-fleets-env-var-only).
 
-:::warning `cao shutdown` and `cao fleet shutdown` are different commands
+:::warning[`cao shutdown` and `cao fleet shutdown` are different commands]
 `cao shutdown` stops tmux sessions on **this machine**. `cao fleet shutdown`
 releases workers in a **remote cluster**, and the agent sessions inside them go
 with the workers.
