@@ -148,17 +148,21 @@ After the check run, `publish` does three actions. It never approves a PR.
    requests changes at the reviewed head, with a link to the review comment. It
    does not request changes again at a head where an earlier run did. A later
    run dismisses these change requests only when its review is complete, accepts
-   no P1 or P2, and the head did not move during the review. Otherwise they stay
-   until a maintainer dismisses them. Before each dismissal, `publish` reads the
-   head again, so a push during `publish` keeps the change requests that remain.
-   `publish` changes only the reviews that this workflow wrote.
+   no P1 or P2, and the head and base branch of the PR did not change during the
+   review. Otherwise they stay until a maintainer dismisses them. Before each
+   dismissal, `publish` reads the PR again, so a push or a new base branch during
+   `publish` keeps the change requests that remain. `publish` changes only the
+   reviews that this workflow wrote.
 2. **CI runs.** A CI run of a PR from a fork waits until a maintainer approves
    it. An approved run runs the code of the fork, so `publish` approves runs
    only when the result is No blocking findings. Then it approves the waiting
    `pull_request` runs of the reviewed head, oldest first, when the run comes
-   from the head repository of the PR. The review read only the head, so the
-   runs of other commits wait for a maintainer. If the PR head moved during the
-   review, it approves no run.
+   from the head repository and head branch of the PR. The review read only the
+   head, so the runs of other commits wait for a maintainer. GitHub does not
+   link a run from a fork to its PR. So if another PR, open or closed, comes
+   from the same head branch, `publish` approves no run. Before it approves,
+   `publish` reads the PR again. If the head or base branch of the PR changed
+   during the review, it approves no run.
 3. **Assignee.** `publish` assigns the person who started the run. When a bot
    started the run, it assigns no one.
 
@@ -271,9 +275,10 @@ the earlier run, and a cancelled run posts nothing. If an earlier run still
 reaches `publish` after a later run posted, it sees the newer run ID in the
 comment marker and posts nothing.
 
-Each run reviews one head SHA. If the PR head moves during the run, `publish`
-still posts the review for the reviewed head, with a warning, while that commit
-is part of the PR. It then approves no CI run and dismisses no change request.
+Each run reviews one head SHA against one base branch. If the PR head moves or
+the base branch changes during the run, `publish` still posts the review for the
+reviewed head, with a warning, while that commit is part of the PR. It then
+approves no CI run and dismisses no change request.
 After a force push removes the commit, `publish` stops as
 Stale. It posts no comment, and adds the neutral check run
 `Review not published (advisory)` to the reviewed head.
@@ -447,6 +452,7 @@ profiles and the PR, and all three come from the dispatched ref.
 | Check run `Review did not finish (advisory)` | The `review` job failed or timed out. The check gives the job result, and the job log gives the reason. A review comment on the PR, if there is one, is from an earlier run. |
 | Check run `Review not published (advisory)` | The review finished, but `publish` did not post or update the comment, for example because the reviewed head is stale. The `publish` job log gives the reason. |
 | `- Change request failed: …`, `- CI runs failed: …` or `- Assignee failed: …` | The comment and the check run are posted, but an action on the PR failed. The line gives the reason. Do the action on the PR by hand, or dispatch again. |
+| `- CI runs: approved none, because this PR is not the only PR from its head branch, …` | Another PR, open or closed, comes from the same head branch. `publish` cannot tell which PR a waiting run is for. Approve the runs on the PR by hand. |
 | The `review` job fails before its first step, with an error about the protection rules of `ai-review` | The environment allows only the default branch. Dispatch from the default branch. |
 
 ## Run the CAO workflow without GitHub Actions

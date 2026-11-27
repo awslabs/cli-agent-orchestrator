@@ -45,6 +45,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
+from urllib.parse import quote
 
 SCHEMA_VERSION = 1
 # Check values with fullmatch: with match, "$" also accepts a final newline.
@@ -738,11 +739,31 @@ def _our_comments(repo: str, number: int, reviewer_login: str) -> list[tuple[int
     return sorted(ours)
 
 
-def drift_warning(repo: str, number: int, head_sha: str, live: dict[str, Any]) -> str:
-    """'' if the head did not move, a warning if it moved within the PR. Else ``Stop``."""
-    live_head = str((live.get("head") or {}).get("sha") or "")
-    if live_head == head_sha:
+def review_drift(live: dict[str, Any], head_sha: str, base_ref: str) -> str:
+    """'' if the PR still has the reviewed head and base branch, else what changed."""
+    if str(_dict(live.get("head")).get("sha") or "") != head_sha:
+        return "the PR head moved after the review started"
+    if str(_dict(live.get("base")).get("ref") or "") != base_ref:
+        return "the base branch of the PR changed after the review started"
+    return ""
+
+
+def drift_warning(
+    repo: str, number: int, head_sha: str, base_ref: str, live: dict[str, Any]
+) -> str:
+    """'' if the PR still has the reviewed head and base branch, else a warning.
+
+    ``Stop`` if the reviewed head is no longer a commit of the PR.
+    """
+    if not review_drift(live, head_sha, base_ref):
         return ""
+    live_head = str(_dict(live.get("head")).get("sha") or "")
+    if live_head == head_sha:
+        return (
+            f"Warning: the base branch of the PR changed from `{base_ref}` after this review "
+            f"started. This review applies to `{head_sha}` against `{base_ref}` only. "
+            "Dispatch again to review the PR against its new base branch."
+        )
     commits, _ = _paged(f"repos/{repo}/pulls/{number}/commits", 3)
     if head_sha in {str(item.get("sha") or "") for item in commits}:
         return (
@@ -860,21 +881,22 @@ def _plural(count: int, word: str) -> str:
     return f"{count} {word}" if count == 1 else f"{count} {word}s"
 
 
-def change_request_plan(states: list[str], moved: bool) -> tuple[str, str]:
+def change_request_plan(states: list[str], drift: str) -> tuple[str, str]:
     """``request``, ``keep`` or ``dismiss`` for the change requests of this workflow, and why.
 
-    Only a complete review of the current head dismisses them.
+    Only a complete review of the current head and base branch dismisses them.
+    ``drift`` is what ``review_drift`` gives.
     """
     if "changes_required" in states:
         return "request", "the review accepted a P1 or P2 finding"
     if "incomplete" in states:
         return "keep", "this review is incomplete"
-    if moved:
-        return "keep", "the PR head moved after the review started"
+    if drift:
+        return "keep", drift
     return "dismiss", "the review accepted no P1 or P2 finding"
 
 
-def ci_approval_plan(states: list[str], moved: bool) -> tuple[bool, str]:
+def ci_approval_plan(states: list[str], drift: str) -> tuple[bool, str]:
     """Whether ``publish`` approves the waiting CI runs of the reviewed head, and why.
 
     An approval lets the code of a fork run in CI, so an open P1 or P2, an owner
@@ -882,20 +904,21 @@ def ci_approval_plan(states: list[str], moved: bool) -> tuple[bool, str]:
     """
     if states != ["no_blocking_findings"]:
         return False, f"the result is {STATE_TITLES[states[0]]}"
-    if moved:
-        return False, "the PR head moved after the review started"
+    if drift:
+        return False, drift
     return True, "the result is No blocking findings"
 
 
-def _live_head(repo: str, number: int) -> dict[str, Any]:
-    """The head of the PR as GitHub gives it now."""
-    return _dict(_dict(_gh_api(f"repos/{repo}/pulls/{number}")).get("head"))
+def _live_pull(repo: str, number: int) -> dict[str, Any]:
+    """The PR as GitHub gives it now."""
+    return _dict(_gh_api(f"repos/{repo}/pulls/{number}"))
 
 
 def _change_request(
     repo: str,
     number: int,
     head_sha: str,
+    base_ref: str,
     plan: tuple[str, str],
     reviewer_login: str,
     comment_url: str,
@@ -937,13 +960,14 @@ def _change_request(
     for done, item in enumerate(ours):
         path = f"repos/{repo}/pulls/{number}/reviews/{item['id']}/dismissals"
         try:
-            # The plan comes from an earlier read, and a push since then leaves
-            # the new head unreviewed.
-            if _live_head(repo, number).get("sha") != head_sha:
+            # The plan comes from an earlier read. A push or a new base branch
+            # since then leaves the PR unreviewed.
+            drift = review_drift(_live_pull(repo, number), head_sha, base_ref)
+            if drift:
                 kept = (
                     f"dismissed {done} of {count} and kept the others" if done else f"kept {count}"
                 )
-                return True, f"{kept}, because the PR head moved after the review started"
+                return True, f"{kept}, because {drift}"
             answer = _gh_api(path, method="PUT", payload={"message": message, "event": "DISMISS"})
         except GhError as exc:
             return False, f"dismissed {done} of {count}. {exc}"
@@ -953,23 +977,41 @@ def _change_request(
 
 
 def _approve_ci_runs(
-    repo: str, number: int, head_sha: str, plan: tuple[bool, str]
+    repo: str, number: int, head_sha: str, base_ref: str, plan: tuple[bool, str]
 ) -> tuple[bool, str]:
     """Approve the waiting runs of the reviewed head, oldest first, if ``plan`` allows it.
 
     A run from a fork waits for a maintainer. The review read only the head, so
-    a run of another commit is not approved. If the head moved after the review
-    started, no run is approved.
+    a run of another commit is not approved. If the head moved or the base
+    branch changed after the review started, no run is approved. GitHub does
+    not link a run from a fork to its PR, so a run is approved only when this
+    PR is the only PR from its head branch.
     """
     approve, reason = plan
     if not approve:
         return True, f"approved none, because {reason}"
-    head = _live_head(repo, number)
-    if head.get("sha") != head_sha:
-        return True, "approved none, because the PR head moved after the review started"
+    pull = _live_pull(repo, number)
+    drift = review_drift(pull, head_sha, base_ref)
+    if drift:
+        return True, f"approved none, because {drift}"
+    head = _dict(pull.get("head"))
     head_repo = _dict(head.get("repo")).get("full_name")
-    if not isinstance(head_repo, str) or not REPO_RE.fullmatch(head_repo):
-        return True, "approved none, because GitHub gives no head repository for the PR"
+    head_ref = head.get("ref")
+    if (
+        not isinstance(head_repo, str)
+        or not REPO_RE.fullmatch(head_repo)
+        or not isinstance(head_ref, str)
+        or not head_ref
+    ):
+        return True, "approved none, because GitHub gives no head repository or branch for the PR"
+    label = quote(f"{head_repo.split('/')[0]}:{head_ref}", safe="")
+    # One page is enough: a second PR on it is already a reason to approve none.
+    pulls, _ = _paged(f"repos/{repo}/pulls?state=all&head={label}", 1)
+    if [_dict(item).get("number") for item in pulls] != [number]:
+        return True, (
+            "approved none, because this PR is not the only PR from its head branch, and "
+            "GitHub does not link a run from a fork to its PR"
+        )
     runs, truncated = _paged(f"repos/{repo}/{WAITING_RUNS}", RUN_PAGE_LIMIT, key="workflow_runs")
     waiting = sorted(
         run["id"]
@@ -979,6 +1021,7 @@ def _approve_ci_runs(
         and "action_required" in (run.get("status"), run.get("conclusion"))
         and run.get("head_sha") == head_sha
         and _dict(run.get("head_repository")).get("full_name") == head_repo
+        and run.get("head_branch") == head_ref
     )
     refused = []
     for run_id in waiting:
@@ -1052,7 +1095,9 @@ def publish(
         return _report(1, f"Blocked: {repo}#{number} is not open. Nothing is published.")
     if live.get("draft"):
         return _report(0, f"Skipped: {repo}#{number} is now a draft. Nothing is published.")
-    warning = drift_warning(repo, number, head_sha, live)
+    base_ref = review["base_ref"]
+    warning = drift_warning(repo, number, head_sha, base_ref, live)
+    drift = review_drift(live, head_sha, base_ref)
 
     ours = _our_comments(repo, number, reviewer_login)
     newer = [other for _, other in ours if other > int(run_id)]
@@ -1087,8 +1132,8 @@ def publish(
             review, run_id=run_id, run_url=run_url, comment_url=comment_url
         )
         actions = {
-            "change_request": change_request_plan(review["result_states"], bool(warning))[0],
-            "approve_ci_runs": ci_approval_plan(review["result_states"], bool(warning))[0],
+            "change_request": change_request_plan(review["result_states"], drift)[0],
+            "approve_ci_runs": ci_approval_plan(review["result_states"], drift)[0],
             "assign": None if actor.endswith("[bot]") else actor,
         }
         _write_json(
@@ -1124,14 +1169,16 @@ def publish(
         f"Added neutral check run {check_id}."
     ]
     # A failed action does not undo an earlier write or stop the next action.
-    plan = change_request_plan(review["result_states"], bool(warning))
-    approval = ci_approval_plan(review["result_states"], bool(warning))
+    plan = change_request_plan(review["result_states"], drift)
+    approval = ci_approval_plan(review["result_states"], drift)
     results = [
         _act(
             "Change request",
-            lambda: _change_request(repo, number, head_sha, plan, reviewer_login, comment_url),
+            lambda: _change_request(
+                repo, number, head_sha, base_ref, plan, reviewer_login, comment_url
+            ),
         ),
-        _act("CI runs", lambda: _approve_ci_runs(repo, number, head_sha, approval)),
+        _act("CI runs", lambda: _approve_ci_runs(repo, number, head_sha, base_ref, approval)),
         _act("Assignee", lambda: _assign(repo, number, actor)),
     ]
     lines += [line for _, line in results]

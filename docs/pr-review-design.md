@@ -184,11 +184,14 @@ a panel for high-risk rounds, and the step 11 eval decides. Model A runs
   check or a named skip, not as a run that hangs.
 - **Actions on the PR.** After the check, the publisher requests changes at
   the reviewed head when the review accepts a P1 or P2 finding. A later
-  complete review that accepts none, of a head that did not move, dismisses
-  these change requests. Otherwise they stay until a maintainer dismisses them.
-  When the result is No blocking findings and the head did not move, the
-  publisher also approves the waiting CI runs of the reviewed head. It assigns
-  the maintainer who started the run. It never approves a PR. See
+  complete review that accepts none, of a head and base branch that did not
+  change, dismisses these change requests. Otherwise they stay until a
+  maintainer dismisses them. When the result is No blocking findings and the
+  head and base branch did not change, the publisher also approves the waiting
+  CI runs of the reviewed head. GitHub does not link a run from a fork to its
+  PR, so it approves a run only from the head branch of the PR, and only when
+  no other PR comes from that branch. It assigns the maintainer who started
+  the run. It never approves a PR. See
   [Actions on the PR](../.github/pr-review/README.md#actions-on-the-pr).
 - **No inline comments.** A finding whose path or line is not in the head
   commit is dropped and listed, and the review is Incomplete.
@@ -285,8 +288,8 @@ reason given. "Later" means work after this design.
 | No inline comments | Inline comments add a thread for each finding on each run. A finding outside the head commit is dropped and makes the review Incomplete, so a reader sees the gap. |
 | An always-neutral check | Model output is not deterministic, so the check is not a merge gate. A neutral check shows the result on the head commit. |
 | Request changes for an accepted P1 or P2; never approve | The owners chose this. The merge box shows the finding, and a maintainer can dismiss the request. Approval stays with a maintainer. |
-| Keep a change request until a complete review of an unchanged head | An incomplete review, or a review of an older head, did not check the finding again at the current head. |
-| Approve the waiting CI runs of the reviewed head when the result is No blocking findings, and assign the maintainer | The owners chose this, so CI runs on a fork PR after a review that blocks nothing. An approved run runs the code of the fork. So an open P1 or P2, an owner question or an incomplete review leaves the runs to a maintainer, and so do the runs of commits that the review did not read. A run from a fork gets a read-only token and no secrets. GitHub cannot assign the workflow bot. |
+| Keep a change request until a complete review of an unchanged head and base branch | An incomplete review, or a review of an older head or another base branch, did not check the finding again for the current PR. |
+| Approve the waiting CI runs of the reviewed head when the result is No blocking findings, and assign the maintainer | The owners chose this, so CI runs on a fork PR after a review that blocks nothing. An approved run runs the code of the fork. So an open P1 or P2, an owner question or an incomplete review leaves the runs to a maintainer, and so do the runs of commits that the review did not read. GitHub does not link a run from a fork to its PR, so a run of another PR from the same branch and commit looks the same. The publisher then approves no run. A run from a fork gets a read-only token and no secrets. GitHub cannot assign the workflow bot. |
 | Cancel an older run of the same PR | #1350 step 10. The latest dispatch is the one that a maintainer wants. |
 | The driver waits until each seat ends | The step call can return before CAO ends the step. The driver reads the reports only after each step ends, or after a fixed wait. |
 | Copilot CLI from a lockfile, installed with `npm ci --ignore-scripts` | Pins each dependency of the CLI, not only the CLI version. The filtered environment has no `CI`, so `COPILOT_AUTO_UPDATE=false` keeps that version at run time. |

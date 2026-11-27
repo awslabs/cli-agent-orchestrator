@@ -54,6 +54,8 @@ REVIEWS = f"{PULL}/reviews"
 REVIEWS_PAGE = f"{REVIEWS}?per_page=100&page=1"
 WAITING_RUNS = f"repos/{REPO}/actions/runs?event=pull_request&status=action_required"
 WAITING_RUNS_PAGE = f"{WAITING_RUNS}&per_page=100&page=1"
+# The PRs from the head branch of the PR, fork:feature/cache.
+BRANCH_PULLS_PAGE = f"repos/{REPO}/pulls?state=all&head=fork%3Afeature%2Fcache&per_page=100&page=1"
 ASSIGNEES = f"repos/{REPO}/issues/{NUMBER}/assignees"
 RUN_URL = f"https://github.com/{REPO}/actions/runs/{RUN_ID}/attempts/2"
 ADVISORY = "This check is advisory. It is always neutral and never blocks a merge.\n"
@@ -2412,7 +2414,8 @@ def _github(
 
     A new comment gets ID 99. The read-back returns what the last write sent,
     changed by ``read_back``. The check run gets ID 555. The PR has no earlier
-    review, its only commit is the head, no run waits, and octocat can be assigned.
+    review, its only commit is the head, it is the only PR from its head branch,
+    no run waits, and octocat can be assigned.
     """
 
     def view(comment_id: int) -> Callable[[], Result]:
@@ -2439,6 +2442,7 @@ def _github(
     process.routes[("GET", REVIEWS_PAGE)] = _ok([])
     process.routes[("POST", REVIEWS)] = _ok({"id": 777, "state": "CHANGES_REQUESTED"})
     process.routes[("GET", _commits_page(1))] = _ok([{"sha": HEAD}])
+    process.routes[("GET", BRANCH_PULLS_PAGE)] = _ok([{"number": NUMBER}])
     process.routes[("GET", WAITING_RUNS_PAGE)] = _ok({"total_count": 0, "workflow_runs": []})
     process.routes[("POST", ASSIGNEES)] = _ok({"assignees": [{"login": "octocat"}]})
 
@@ -3285,26 +3289,49 @@ def test_publish_reads_the_pr_again_before_posting(
     assert process.paths() == [PULL]
 
 
-def test_publish_warns_when_the_head_moved_within_the_pr(
+@pytest.mark.parametrize(
+    ("live", "warning", "drift"),
+    [
+        pytest.param(
+            _live_pr(head={"sha": NEW_HEAD}),
+            f"Warning: the PR head moved to `{NEW_HEAD}` after this review started.",
+            "the PR head moved after the review started",
+            id="head-moved",
+        ),
+        pytest.param(
+            _live_pr(base={"ref": "release", "sha": "e" * 40}),
+            "Warning: the base branch of the PR changed from `main` after this review started. "
+            f"This review applies to `{HEAD}` against `main` only.",
+            "the base branch of the PR changed after the review started",
+            id="base-changed",
+        ),
+    ],
+)
+def test_publish_warns_and_keeps_its_actions_when_the_head_or_base_changed(
     github_review: ModuleType,
     process: FakeProcess,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    live: dict[str, Any],
+    warning: str,
+    drift: str,
 ) -> None:
-    _github(process, live=_live_pr(head={"sha": NEW_HEAD}))
+    _github(process, live=live)
     process.routes[("GET", _commits_page(1))] = _ok([{"sha": HEAD}, {"sha": NEW_HEAD}])
+    process.routes[("GET", REVIEWS_PAGE)] = _ok(
+        [_change_request_review(github_review, 301, OLD_HEAD)]
+    )
 
     assert _publish(github_review, tmp_path, _review(**NOTHING_BLOCKS)) == 0
 
     (_, _, comment), (_, _, check_run) = process.writes()[:2]
-    warning = f"Warning: the PR head moved to `{NEW_HEAD}` after this review started."
     assert warning in comment["body"]
     assert check_run["head_sha"] == HEAD
-    # No review read the new commits, so their runs stay waiting.
-    assert (
-        "- CI runs: approved none, because the PR head moved after the review started.\n"
-        in capsys.readouterr().out
-    )
+    # No review read the PR as it is now, so its change requests and runs wait.
+    out = capsys.readouterr().out
+    assert f"- Change request: kept 1 earlier change request, because {drift}.\n" in out
+    assert f"- CI runs: approved none, because {drift}.\n" in out
+    assert not [path for _, path, _ in process.writes() if path.endswith("/dismissals")]
     assert WAITING_RUNS_PAGE not in process.paths()
 
 
@@ -3388,10 +3415,17 @@ def test_publish_dry_run_writes_the_requests_and_posts_nothing(
     assert process.writes() == []
 
 
-def test_publish_dry_run_plans_no_run_approval_after_a_move_and_no_bot_assignee(
-    github_review: ModuleType, process: FakeProcess, tmp_path: Path
+@pytest.mark.parametrize(
+    "live",
+    [
+        pytest.param(_live_pr(head={"sha": NEW_HEAD}), id="head-moved"),
+        pytest.param(_live_pr(base={"ref": "release", "sha": "e" * 40}), id="base-changed"),
+    ],
+)
+def test_publish_dry_run_plans_no_run_approval_after_a_change_and_no_bot_assignee(
+    github_review: ModuleType, process: FakeProcess, tmp_path: Path, live: dict[str, Any]
 ) -> None:
-    _github(process, live=_live_pr(head={"sha": NEW_HEAD}))
+    _github(process, live=live)
     process.routes[("GET", _commits_page(1))] = _ok([{"sha": HEAD}, {"sha": NEW_HEAD}])
     request = tmp_path / "request.json"
 
@@ -3497,6 +3531,7 @@ def _waiting_run(run_id: int, head_sha: str = HEAD, **changes: Any) -> dict[str,
         "conclusion": "action_required",
         "head_sha": head_sha,
         "head_repository": {"full_name": "fork/widgets"},
+        "head_branch": "feature/cache",
     }
     run.update(changes)
     return run
@@ -3667,9 +3702,17 @@ def test_publish_dismisses_its_change_requests_only_after_a_complete_review_of_t
             1,
             id="read-fails",
         ),
+        pytest.param(
+            [HEAD, "new-base"],
+            "- Change request: dismissed 1 of 2 earlier change requests and kept the others, "
+            "because the base branch of the PR changed after the review started.",
+            [301],
+            0,
+            id="base-changed-after-the-first",
+        ),
     ],
 )
-def test_publish_reads_the_head_again_before_each_dismissal(
+def test_publish_reads_the_head_and_base_again_before_each_dismissal(
     github_review: ModuleType,
     process: FakeProcess,
     tmp_path: Path,
@@ -3681,13 +3724,14 @@ def test_publish_reads_the_head_again_before_each_dismissal(
 ) -> None:
     _github(process)
     # The first read finds the reviewed head, so the plan is to dismiss. A push
-    # can land before each dismissal. The last read is the one of the CI runs.
+    # or a new base branch can come before each dismissal. The last read is the
+    # one of the CI runs.
+    answers = {
+        "error": _http_error(502),
+        "new-base": _ok(_live_pr(base={"ref": "release", "sha": "e" * 40})),
+    }
     process.routes[("GET", PULL)] = [
-        (
-            _http_error(502)
-            if sha == "error"
-            else _ok(_live_pr(head={"sha": sha, "repo": {"full_name": "fork/widgets"}}))
-        )
+        answers.get(sha) or _ok(_live_pr(head={"sha": sha, "repo": {"full_name": "fork/widgets"}}))
         for sha in [HEAD, *rechecks, NEW_HEAD]
     ]
     process.routes[("GET", REVIEWS_PAGE)] = _ok(
@@ -3802,9 +3846,10 @@ def test_publish_approves_only_the_waiting_runs_of_the_reviewed_head_oldest_firs
         _waiting_run(905, conclusion="success"),
         _waiting_run(906, event="pull_request_target"),
         _waiting_run(907, NEW_HEAD),
+        _waiting_run(909, head_branch="other-branch"),
         _waiting_run(903),
     ]
-    process.routes[("GET", WAITING_RUNS_PAGE)] = _ok({"total_count": 8, "workflow_runs": runs})
+    process.routes[("GET", WAITING_RUNS_PAGE)] = _ok({"total_count": 9, "workflow_runs": runs})
     # Only runs 903 and 908 have a route, so an approval of another run fails the test.
     for run_id in (903, 908):
         process.routes[("POST", _approve_path(run_id))] = _ok({})
@@ -3818,14 +3863,22 @@ def test_publish_approves_only_the_waiting_runs_of_the_reviewed_head_oldest_firs
     ]
 
 
-def test_publish_approves_no_run_when_the_pr_has_no_head_repository(
+@pytest.mark.parametrize(
+    "head",
+    [
+        # GitHub gives no head repository when the fork is deleted.
+        pytest.param({"sha": HEAD, "ref": "feature/cache", "repo": None}, id="no-repository"),
+        pytest.param({"sha": HEAD, "repo": {"full_name": "fork/widgets"}}, id="no-branch"),
+    ],
+)
+def test_publish_approves_no_run_when_the_pr_has_no_head_repository_or_branch(
     github_review: ModuleType,
     process: FakeProcess,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    head: dict[str, Any],
 ) -> None:
-    # GitHub gives no head repository when the fork is deleted.
-    _github(process, live=_live_pr(head={"sha": HEAD, "repo": None}))
+    _github(process, live=_live_pr(head=head))
     process.routes[("GET", WAITING_RUNS_PAGE)] = _ok(
         {"workflow_runs": [_waiting_run(901, head_repository=None)]}
     )
@@ -3833,10 +3886,86 @@ def test_publish_approves_no_run_when_the_pr_has_no_head_repository(
     assert _publish(github_review, tmp_path, _review(**NOTHING_BLOCKS)) == 0
 
     assert (
-        "- CI runs: approved none, because GitHub gives no head repository for the PR.\n"
-        in capsys.readouterr().out
+        "- CI runs: approved none, because GitHub gives no head repository or branch for the "
+        "PR.\n" in capsys.readouterr().out
     )
     assert not [path for _, path, _ in process.writes() if path.endswith("/approve")]
+
+
+@pytest.mark.parametrize(
+    "pulls",
+    [
+        pytest.param([{"number": NUMBER}, {"number": 8}], id="another-pr-from-the-branch"),
+        pytest.param([{"number": 8}], id="only-another-pr"),
+        pytest.param([], id="no-pr-listed"),
+    ],
+)
+def test_publish_approves_no_run_unless_the_pr_is_the_only_pr_from_its_head_branch(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    pulls: list[dict[str, Any]],
+) -> None:
+    # GitHub links no run from a fork to its PR. A run of PR 8, from the same
+    # branch and commit, cannot be told apart from a run of this PR.
+    _github(process)
+    process.routes[("GET", BRANCH_PULLS_PAGE)] = _ok(pulls)
+    process.routes[("GET", WAITING_RUNS_PAGE)] = _ok({"workflow_runs": [_waiting_run(901)]})
+
+    assert _publish(github_review, tmp_path, _review(**NOTHING_BLOCKS)) == 0
+
+    assert (
+        "- CI runs: approved none, because this PR is not the only PR from its head branch, "
+        "and GitHub does not link a run from a fork to its PR.\n" in capsys.readouterr().out
+    )
+    assert WAITING_RUNS_PAGE not in process.paths()
+    assert not [path for _, path, _ in process.writes() if path.endswith("/approve")]
+
+
+def test_publish_finds_the_prs_of_a_head_branch_with_url_characters(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    branch = "fix/a&b#c+d"
+    _github(process, live=_live_pr(head={**_live_pr()["head"], "ref": branch}))
+    lookup = f"repos/{REPO}/pulls?state=all&head=fork%3Afix%2Fa%26b%23c%2Bd&per_page=100&page=1"
+    process.routes[("GET", lookup)] = _ok([{"number": NUMBER}])
+    process.routes[("GET", WAITING_RUNS_PAGE)] = _ok(
+        {"workflow_runs": [_waiting_run(901, head_branch=branch)]}
+    )
+    process.routes[("POST", _approve_path(901))] = _ok({})
+
+    assert _publish(github_review, tmp_path, _review(**NOTHING_BLOCKS)) == 0
+
+    assert "- CI runs: approved 1 of 1 waiting run.\n" in capsys.readouterr().out
+    assert lookup in process.paths()
+
+
+def test_publish_reads_the_base_again_before_it_approves_runs(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _github(process)
+    # The first read finds the reviewed base. The base branch changes before
+    # the read of the CI runs.
+    process.routes[("GET", PULL)] = [
+        _ok(_live_pr()),
+        _ok(_live_pr(base={"ref": "release", "sha": "e" * 40})),
+    ]
+    process.routes[("GET", WAITING_RUNS_PAGE)] = _ok({"workflow_runs": [_waiting_run(901)]})
+
+    assert _publish(github_review, tmp_path, _review(**NOTHING_BLOCKS)) == 0
+
+    assert (
+        "- CI runs: approved none, because the base branch of the PR changed after the review "
+        "started.\n" in capsys.readouterr().out
+    )
+    assert WAITING_RUNS_PAGE not in process.paths()
 
 
 def test_publish_fails_when_it_cannot_list_every_waiting_run(
@@ -3884,6 +4013,12 @@ def test_publish_fails_when_it_cannot_list_every_waiting_run(
             "(HTTP 403). A maintainer can approve them on the PR.",
             NOTHING_BLOCKS,
             id="run-approval-refused",
+        ),
+        pytest.param(
+            {("GET", BRANCH_PULLS_PAGE): _http_error(502)},
+            f"- CI runs failed: gh api {BRANCH_PULLS_PAGE} failed: gh: Request failed (HTTP 502).",
+            NOTHING_BLOCKS,
+            id="branch-pulls-read-fails",
         ),
         pytest.param(
             {("POST", ASSIGNEES): _ok({"assignees": [{"login": "hubot"}]})},
