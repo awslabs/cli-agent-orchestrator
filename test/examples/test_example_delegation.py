@@ -35,6 +35,7 @@ NAMED_SETS = (
     "aws",
     "fxmacrodata-macro",
     "serply-research",
+    "cooper-email-inbox",
     "aidlc-portfolio",
     "robotics",
 )
