@@ -160,9 +160,12 @@ After the check run, `publish` does three actions. It never approves a PR.
    from the head repository and head branch of the PR. The review read only the
    head, so the runs of other commits wait for a maintainer. GitHub does not
    link a run from a fork to its PR. So if another PR, open or closed, comes
-   from the same head branch, `publish` approves no run. Before it approves,
-   `publish` reads the PR again. If the head or base branch of the PR changed
-   during the review, it approves no run.
+   from the same head branch, `publish` approves no run. It reads the PRs of
+   the branch after it lists the runs, so it also finds a PR that opened during
+   the list. If the head or base branch of the PR changed during the review, it
+   approves no run. Before each approval, `publish` reads the PR again, so a
+   push or a new base branch during `publish` leaves the remaining runs to a
+   maintainer.
 3. **Assignee.** `publish` assigns the person who started the run. When a bot
    started the run, it assigns no one.
 

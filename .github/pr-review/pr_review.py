@@ -558,7 +558,10 @@ def _type_matches(value: Any, expected: str) -> bool:
 
 
 def schema_errors(value: Any, schema: dict[str, Any], where: str = "$") -> list[str]:
-    """Errors of ``value`` against the JSON Schema subset that the report schemas use."""
+    """Errors of ``value`` against the JSON Schema subset that the report schemas use.
+
+    A string with a lone surrogate is an error too: the reports are written as UTF-8.
+    """
     expected = schema.get("type")
     if expected is not None and not _type_matches(value, expected):
         return [f"{where} is not of type {expected}"]
@@ -572,6 +575,10 @@ def schema_errors(value: Any, schema: dict[str, Any], where: str = "$") -> list[
             errors.append(f"{where} has a length outside the limits")
         if "pattern" in schema and not re.search(schema["pattern"], value):
             errors.append(f"{where} does not match its pattern")
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            errors.append(f"{where} has a lone surrogate")
     elif type(value) is int:
         if value < schema.get("minimum", value) or value > schema.get("maximum", value):
             errors.append(f"{where} is outside the limits")

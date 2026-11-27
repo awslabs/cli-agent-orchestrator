@@ -1635,6 +1635,41 @@ def test_seat_report_reads_a_whole_number_float_as_an_integer(pr_review: ModuleT
     assert jsonschema.Draft202012Validator(schema).is_valid(json.loads(whole))
 
 
+@pytest.mark.parametrize(
+    ("changes", "detail"),
+    [
+        pytest.param({"summary": "Caché für Widgets, 日本語"}, "valid", id="non-ascii"),
+        pytest.param({"summary": "Cache \U0001f600"}, "valid", id="surrogate-pair"),
+        pytest.param(
+            {"summary": "\ude00\ud83d reversed pair"},
+            "invalid report: $.summary has a lone surrogate",
+            id="reversed-pair",
+        ),
+        pytest.param(
+            {"summary": "high \ud800"},
+            "invalid report: $.summary has a lone surrogate",
+            id="lone-high",
+        ),
+        pytest.param(
+            {"risk": {"level": "low", "reasons": ["low \udfff"]}},
+            "invalid report: $.risk.reasons[0] has a lone surrogate",
+            id="lone-low-nested",
+        ),
+    ],
+)
+def test_seat_report_rejects_text_that_utf_8_cannot_encode(
+    pr_review: ModuleType, changes: dict[str, Any], detail: str
+) -> None:
+    # json.dumps writes each non-ASCII character as a \u escape, as an agent can,
+    # so json.loads in seat_report gives a lone surrogate back.
+    report = {**_reviewer_report(), **changes}
+    item = {"id": "reviewer-a", "state": "completed", "output_json": json.dumps(report)}
+
+    assert pr_review.seat_report(
+        {"reviewer-a": item}, "reviewer-a", pr_review.reviewer_schema(6, CHECK_IDS)
+    ) == (report if detail == "valid" else None, detail)
+
+
 def test_settled_view_reads_again_until_a_timed_out_seat_ends(pr_review: ModuleType) -> None:
     views = [{"reviewer-a": {"state": state}} for state in ("pending", "running", "completed")]
     reads = iter(views)
@@ -2027,6 +2062,31 @@ def test_run_review_is_incomplete_when_only_one_panel_seat_fails(
     assert review["panel"] == {**dict.fromkeys(SEATS, "valid"), failed_seat: failed + "timed out"}
     assert review["result_states"] == ["incomplete"]
     assert review["review_complete"] is False
+    _assert_publishable(github_review, review)
+
+
+def test_run_review_treats_a_report_with_a_lone_surrogate_as_invalid(
+    pr_review: ModuleType,
+    github_review: ModuleType,
+    workspace: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The report of reviewer-b is valid JSON, but UTF-8 cannot encode its summary,
+    # so writing it to reports.json would stop the whole panel.
+    cao = FakeCao(
+        {
+            "reviewer-a": _reviewer_report(),
+            "reviewer-b": {**_reviewer_report(), "summary": "\ud800"},
+        }
+    )
+
+    review = _run_review(pr_review, workspace, monkeypatch, cao)
+
+    assert review["panel"]["reviewer-a"] == "valid"
+    assert review["panel"]["reviewer-b"] == "invalid report: $.summary has a lone surrogate"
+    assert review["result_states"] == ["incomplete"]
+    reports = workspace["evidence"] / "panel" / "reports.json"
+    assert json.loads(reports.read_text(encoding="utf-8"))["reports"]["reviewer-b"] is None
     _assert_publishable(github_review, review)
 
 
@@ -3919,7 +3979,33 @@ def test_publish_approves_no_run_unless_the_pr_is_the_only_pr_from_its_head_bran
         "- CI runs: approved none, because this PR is not the only PR from its head branch, "
         "and GitHub does not link a run from a fork to its PR.\n" in capsys.readouterr().out
     )
-    assert WAITING_RUNS_PAGE not in process.paths()
+    assert not [path for _, path, _ in process.writes() if path.endswith("/approve")]
+
+
+def test_publish_finds_a_pr_that_opens_from_the_head_branch_while_the_runs_are_listed(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The fork opens PR 8 from the same branch while publish lists the runs.
+    # Run 902 of PR 8 has the same commit and branch as run 901 of this PR.
+    _github(process)
+
+    def list_runs() -> Result:
+        process.routes[("GET", BRANCH_PULLS_PAGE)] = _ok([{"number": 8}, {"number": NUMBER}])
+        return _ok({"workflow_runs": [_waiting_run(901), _waiting_run(902)]})
+
+    process.routes[("GET", WAITING_RUNS_PAGE)] = list_runs
+    for run_id in (901, 902):
+        process.routes[("POST", _approve_path(run_id))] = _ok({})
+
+    assert _publish(github_review, tmp_path, _review(**NOTHING_BLOCKS)) == 0
+
+    assert (
+        "- CI runs: approved none, because this PR is not the only PR from its head branch, "
+        "and GitHub does not link a run from a fork to its PR.\n" in capsys.readouterr().out
+    )
     assert not [path for _, path, _ in process.writes() if path.endswith("/approve")]
 
 
@@ -3966,6 +4052,80 @@ def test_publish_reads_the_base_again_before_it_approves_runs(
         "started.\n" in capsys.readouterr().out
     )
     assert WAITING_RUNS_PAGE not in process.paths()
+
+
+RETARGETED = "the base branch of the PR changed after the review started"
+
+
+@pytest.mark.parametrize(
+    ("changed_at", "pull", "code", "approved", "line"),
+    [
+        pytest.param(
+            ("GET", WAITING_RUNS_PAGE),
+            _ok(_live_pr(base={"ref": "release", "sha": "e" * 40})),
+            0,
+            [],
+            f"- CI runs: approved none of 2 waiting runs, because {RETARGETED}.",
+            id="retargeted-while-the-runs-are-listed",
+        ),
+        pytest.param(
+            ("POST", _approve_path(901)),
+            _ok(_live_pr(base={"ref": "release", "sha": "e" * 40})),
+            0,
+            [_approve_path(901)],
+            f"- CI runs: approved 1 of 2 waiting runs and left the others, because {RETARGETED}.",
+            id="retargeted-between-approvals",
+        ),
+        pytest.param(
+            ("POST", _approve_path(901)),
+            _ok(_live_pr(head={**_live_pr()["head"], "sha": NEW_HEAD})),
+            0,
+            [_approve_path(901)],
+            "- CI runs: approved 1 of 2 waiting runs and left the others, because the PR head "
+            "moved after the review started.",
+            id="pushed-between-approvals",
+        ),
+        pytest.param(
+            ("POST", _approve_path(901)),
+            _http_error(502),
+            1,
+            [_approve_path(901)],
+            f"- CI runs failed: approved 1 of 2 waiting runs. gh api {PULL} failed: gh: "
+            "Request failed (HTTP 502).",
+            id="read-fails-between-approvals",
+        ),
+    ],
+)
+def test_publish_reads_the_pr_again_before_each_run_approval(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    changed_at: tuple[str, str],
+    pull: Result,
+    code: int,
+    approved: list[str],
+    line: str,
+) -> None:
+    _github(process)
+    process.routes[("GET", WAITING_RUNS_PAGE)] = _ok(
+        {"workflow_runs": [_waiting_run(901), _waiting_run(902)]}
+    )
+    for run_id in (901, 902):
+        process.routes[("POST", _approve_path(run_id))] = _ok({})
+    answer = process.routes[changed_at]
+
+    def change_the_pr() -> Result:
+        # From this call on, GitHub gives ``pull`` for the PR.
+        process.routes[("GET", PULL)] = pull
+        return answer
+
+    process.routes[changed_at] = change_the_pr
+
+    assert _publish(github_review, tmp_path, _review(**NOTHING_BLOCKS)) == code
+
+    assert f"{line}\n" in capsys.readouterr().out
+    assert [path for _, path, _ in process.writes() if path.endswith("/approve")] == approved
 
 
 def test_publish_fails_when_it_cannot_list_every_waiting_run(

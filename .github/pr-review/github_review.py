@@ -983,9 +983,10 @@ def _approve_ci_runs(
 
     A run from a fork waits for a maintainer. The review read only the head, so
     a run of another commit is not approved. If the head moved or the base
-    branch changed after the review started, no run is approved. GitHub does
-    not link a run from a fork to its PR, so a run is approved only when this
-    PR is the only PR from its head branch.
+    branch changed after the review started, no run is approved. The PR is read
+    again before each approval, so a change during the approvals stops them.
+    GitHub does not link a run from a fork to its PR, so a run is approved only
+    when this PR is the only PR from its head branch.
     """
     approve, reason = plan
     if not approve:
@@ -1004,14 +1005,6 @@ def _approve_ci_runs(
         or not head_ref
     ):
         return True, "approved none, because GitHub gives no head repository or branch for the PR"
-    label = quote(f"{head_repo.split('/')[0]}:{head_ref}", safe="")
-    # One page is enough: a second PR on it is already a reason to approve none.
-    pulls, _ = _paged(f"repos/{repo}/pulls?state=all&head={label}", 1)
-    if [_dict(item).get("number") for item in pulls] != [number]:
-        return True, (
-            "approved none, because this PR is not the only PR from its head branch, and "
-            "GitHub does not link a run from a fork to its PR"
-        )
     runs, truncated = _paged(f"repos/{repo}/{WAITING_RUNS}", RUN_PAGE_LIMIT, key="workflow_runs")
     waiting = sorted(
         run["id"]
@@ -1023,16 +1016,40 @@ def _approve_ci_runs(
         and _dict(run.get("head_repository")).get("full_name") == head_repo
         and run.get("head_branch") == head_ref
     )
-    refused = []
+    label = quote(f"{head_repo.split('/')[0]}:{head_ref}", safe="")
+    # Read after the run list: a run of another PR cannot exist before that PR.
+    # One page is enough: a second PR on it is already a reason to approve none.
+    pulls, _ = _paged(f"repos/{repo}/pulls?state=all&head={label}", 1)
+    if [_dict(item).get("number") for item in pulls] != [number]:
+        return True, (
+            "approved none, because this PR is not the only PR from its head branch, and "
+            "GitHub does not link a run from a fork to its PR"
+        )
+    refused: list[str] = []
+    problems: list[str] = []
+    tried = 0
     for run_id in waiting:
+        # The checks above come from earlier reads. A push or a new base branch
+        # since then leaves this run and the later ones to a maintainer.
+        try:
+            drift = review_drift(_live_pull(repo, number), head_sha, base_ref)
+        except GhError as exc:
+            problems.append(str(exc))
+            break
+        if drift:
+            break
+        tried += 1
         try:
             _gh_api(f"repos/{repo}/actions/runs/{run_id}/approve", method="POST")
         except GhError as exc:
             refused.append(f"{run_id} (HTTP {exc.status})" if exc.status else str(run_id))
     if not waiting and not truncated:
         return True, "no run of the reviewed head waits for approval"
-    text = f"approved {len(waiting) - len(refused)} of {_plural(len(waiting), 'waiting run')}"
-    problems = []
+    count = _plural(len(waiting), "waiting run")
+    text = f"approved {tried - len(refused)} of {count}"
+    if drift:
+        text = f"{text} and left the others" if tried else f"approved none of {count}"
+        text = f"{text}, because {drift}"
     if refused:
         problems.append(
             f"GitHub refused {_plural(len(refused), 'run')}: {', '.join(refused)}. "
