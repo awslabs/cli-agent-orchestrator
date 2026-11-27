@@ -1,5 +1,6 @@
 """Update command for CLI Agent Orchestrator (issue #26)."""
 
+import re
 import shlex
 import shutil
 import subprocess
@@ -30,6 +31,18 @@ _LOCAL_KINDS = (_DIRECTORY, _PATH, _EDITABLE)
 
 # Receipt ``[tool.options]`` keys that say where packages are resolved from.
 _INDEX_OPTIONS = ("index", "index-url", "extra-index-url", "find-links", "no-index")
+
+# The runbook table that turns each kind of receipt entry into a uv argument.
+# A URL, not a repository path: an install from PyPI has no ``docs/`` directory.
+_RUNBOOK = (
+    "https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/"
+    "ephemeral-agents-agent-setup.md#3-install-the-decider-into-the-servers-python"
+)
+
+# A git ref that is safe to put after ``@`` in ``git+<url>@<ref>``. uv records
+# the ``/`` of a branch such as ``feature/x`` as ``%2F`` and accepts it back in
+# that form, so that one escape is allowed and the ref is printed as recorded.
+_GIT_REF = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._/-]|%2[Ff])*")
 
 
 def _receipt_path() -> Optional[Path]:
@@ -162,8 +175,8 @@ def _with_requirement(req: object) -> Optional[str]:
     """The ``--with`` value that reinstalls one extra receipt requirement, or None.
 
     Covers the shapes uv records for a ``<name>[extras]<specifier>`` requirement, a
-    wheel ``path`` and a ``directory``. Any other shape, such as a git or URL source,
-    an editable install or a marker, returns None.
+    wheel ``path`` and a ``directory`` (both as ``<name> @ <location>``). Any other
+    shape, such as a git or URL source, an editable install or a marker, returns None.
     """
     if not isinstance(req, dict):
         return None
@@ -173,7 +186,10 @@ def _with_requirement(req: object) -> Optional[str]:
     if "path" in req or "directory" in req:
         if set(req) not in ({"name", "path"}, {"name", "directory"}):
             return None
-        return _str_field(req, "path") or _str_field(req, "directory")
+        location = _str_field(req, "path") or _str_field(req, "directory")
+        # With the name, uv refuses a wheel or directory that now holds a
+        # different project. A bare path would install whatever is there.
+        return f"{name} @ {location}" if location else None
     if set(req) - {"name", "extras", "specifier"}:
         return None
     extras = _extras(req)
@@ -181,6 +197,48 @@ def _with_requirement(req: object) -> Optional[str]:
     if extras is None or not isinstance(specifier, str):
         return None
     return name + (f"[{','.join(extras)}]" if extras else "") + specifier
+
+
+def _missing_location(req: object) -> Optional[str]:
+    """The ``path``, ``directory`` or ``editable`` location of an entry, if it no longer exists."""
+    if not isinstance(req, dict):
+        return None
+    location = (
+        _str_field(req, "path") or _str_field(req, "directory") or _str_field(req, "editable")
+    )
+    if location is None or Path(location).exists():
+        return None
+    return location
+
+
+def _hand_finish_args(req: object) -> Optional[List[str]]:
+    """The uv arguments a user needs for an entry ``cao update`` won't carry, or None.
+
+    Only the two shapes whose receipt form is wrong to paste back: an editable
+    entry needs ``--with-editable`` (``--with <path>`` makes a static copy), and
+    a pinned git entry is recorded as ``<url>?rev=<ref>``, which uv ignores, and
+    has to be written ``git+<url>@<ref>``. Anything else returns None and is
+    left as a placeholder.
+    """
+    if not isinstance(req, dict):
+        return None
+    name = _str_field(req, "name")
+    if name is None:
+        return None
+    if set(req) == {"name", "editable"}:
+        editable = _str_field(req, "editable")
+        return ["--with-editable", editable] if editable else None
+    if set(req) == {"name", "git"}:
+        git = _str_field(req, "git")
+        if git is None:
+            return None
+        url, query_mark, query = git.partition("?")
+        if not query_mark:
+            return ["--with", f"{name} @ git+{url}"]
+        ref = query[len("rev=") :] if query.startswith("rev=") else ""
+        if _GIT_REF.fullmatch(ref):
+            return ["--with", f"{name} @ git+{url}@{ref}"]
+    return None
 
 
 def _unpin_args(receipt: Optional[Path]) -> List[str]:
@@ -206,11 +264,28 @@ def _unpin_args(receipt: Optional[Path]) -> List[str]:
                 cao = f"{_PACKAGE}[{','.join(extras)}]@latest"
             continue
         value = _with_requirement(req)
+        name = _str_field(req, "name") if isinstance(req, dict) else None
+        missing = _missing_location(req)
         if value is None:
-            name = _str_field(req, "name") if isinstance(req, dict) else None
             label = repr(name) if name else "an unnamed requirement"
+            placeholder = ["--with", f"<{name or 'requirement'} source>"]
+            hand_finish = _hand_finish_args(req)
+            if hand_finish and hand_finish[0] == "--with-editable" and missing is not None:
+                # An editable checkout that was moved: the ready-made
+                # ``--with-editable <path>`` would only fail in uv.
+                problems.append(
+                    f"the extra package {label} is recorded at {missing}, which is gone"
+                )
+                with_args += placeholder
+                continue
             problems.append(f"the extra package {label} is from a source it can't rebuild")
-            with_args += ["--with", f"<{name or 'requirement'} source>"]
+            with_args += hand_finish or placeholder
+            continue
+        if missing is not None:
+            # uv would fail on the path, and the hint after a uv failure points
+            # at the wrong cause. Stop here and name the entry instead.
+            problems.append(f"the extra package {name!r} is recorded at {missing}, which is gone")
+            with_args += ["--with", f"<{name} source>"]
             continue
         with_args += ["--with", value]
 
@@ -227,11 +302,19 @@ def _unpin_args(receipt: Optional[Path]) -> List[str]:
 
     args = [cao, "--upgrade", *with_args]
     if problems:
+        if any(arg.startswith("<") for arg in args) or "[<extras>]" in cao:
+            # Pasting a recorded git ``<url>?rev=<ref>`` back makes uv ignore the
+            # ref, so the user is sent to the table and not told to copy the file.
+            how = (
+                f"yourself, replacing each <...>. {_RUNBOOK} gives the form for each "
+                "kind of entry in that file"
+            )
+        else:
+            how = "yourself"
         raise click.ClickException(
             "`cao update` can't unpin CAO without losing part of the install: "
             f"{'; '.join(problems)}. The install is recorded in {receipt}. Reinstall it "
-            "yourself, replacing each <...> with what that file records:\n  "
-            f"{shlex.join(['uv', 'tool', 'install', *args])}"
+            f"{how}:\n  {shlex.join(['uv', 'tool', 'install', *args])}"
         )
     return args
 
@@ -338,10 +421,14 @@ def update():
         # uv already printed the underlying reason (e.g. "is not installed" when
         # CAO was installed some other way). Surface a non-zero exit without
         # duplicating uv's message.
-        raise click.ClickException(
-            f"uv exited with code {result.returncode}. If CAO was not installed "
-            "via `uv tool install`, update it with the package manager you used "
-            "instead."
+        hint = (
+            "If CAO was not installed via `uv tool install`, update it with the "
+            "package manager you used instead"
         )
+        if any(" @ " in arg for arg in unpin_args or []):
+            # uv checks a carried wheel or directory against its recorded name,
+            # so a path that now holds another project fails here.
+            hint += ", or a recorded package's source changed (see uv's message above)"
+        raise click.ClickException(f"uv exited with code {result.returncode}. {hint}.")
 
     click.echo("✓ CAO is up to date. Restart any running cao-server to pick up the new version.")
