@@ -14,7 +14,7 @@ INIT = "from cli_agent_orchestrator.clients.database import init_db; init_db()"
 def generate() -> None:
     SCRATCH.mkdir(parents=True, exist_ok=True)
     homes = SCRATCH / "homes"
-    homes.mkdir(exist_ok=True)
+    homes.mkdir()
     chain = homes / "chain"
     for tag in (*TAGS, "3.0-beta1"):
         ref = "cd9d69330d5977719b8b0a620211ac62b727d561" if tag == "3.0-beta1" else tag
@@ -64,9 +64,13 @@ def write_ddl(name: str, commit: str, db: Path) -> None:
             "ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, name"
         ).fetchall()
     output = Path(__file__).parent / f"{name}.sql"
+    statements = (
+        "\n".join(line.rstrip() for line in row[0].rstrip("; ").splitlines()) + ";"
+        for row in rows
+    )
     output.write_text(
         f"-- Schema from {name}, commit {commit}; DDL only, no rows.\n"
-        + "\n\n".join(row[0].rstrip("; ") + ";" for row in rows)
+        + "\n\n".join(statements)
         + "\n",
         encoding="utf-8",
     )
