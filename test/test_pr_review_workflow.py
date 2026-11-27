@@ -49,6 +49,11 @@ ISSUE_COMMENTS = f"repos/{REPO}/issues/{NUMBER}/comments"
 ISSUE_COMMENTS_PAGE = f"{ISSUE_COMMENTS}?per_page=100&page=1"
 COMMENT = f"repos/{REPO}/issues/comments"
 CHECK_RUNS = f"repos/{REPO}/check-runs"
+REVIEWS = f"{PULL}/reviews"
+REVIEWS_PAGE = f"{REVIEWS}?per_page=100&page=1"
+WAITING_RUNS = f"repos/{REPO}/actions/runs?event=pull_request&status=action_required"
+WAITING_RUNS_PAGE = f"{WAITING_RUNS}&per_page=100&page=1"
+ASSIGNEES = f"repos/{REPO}/issues/{NUMBER}/assignees"
 RUN_URL = f"https://github.com/{REPO}/actions/runs/{RUN_ID}/attempts/2"
 ADVISORY = "This check is advisory. It is always neutral and never blocks a merge.\n"
 BOT = {"login": "github-actions[bot]", "type": "Bot"}
@@ -2338,10 +2343,12 @@ def _github(
     live: Optional[dict[str, Any]] = None,
     read_back: Optional[dict[str, Any]] = None,
 ) -> None:
-    """gh routes for ``publish``: the live PR, its comments, the write, its read-back and the check.
+    """gh routes for ``publish``: the live PR, its comments, the write, its read-back, the check
+    and the actions on the PR.
 
     A new comment gets ID 99. The read-back returns what the last write sent,
-    changed by ``read_back``. The check run gets ID 555.
+    changed by ``read_back``. The check run gets ID 555. The PR has no earlier
+    review, its only commit is the head, no run waits, and octocat can be assigned.
     """
 
     def view(comment_id: int) -> Callable[[], Result]:
@@ -2365,6 +2372,11 @@ def _github(
         process.routes[("PATCH", f"{COMMENT}/{comment['id']}")] = _ok({"id": comment["id"]})
         process.routes[("GET", f"{COMMENT}/{comment['id']}")] = view(comment["id"])
     process.routes[("POST", CHECK_RUNS)] = _ok({"id": 555})
+    process.routes[("GET", REVIEWS_PAGE)] = _ok([])
+    process.routes[("POST", REVIEWS)] = _ok({"id": 777, "state": "CHANGES_REQUESTED"})
+    process.routes[("GET", _commits_page(1))] = _ok([{"sha": HEAD}])
+    process.routes[("GET", WAITING_RUNS_PAGE)] = _ok({"total_count": 0, "workflow_runs": []})
+    process.routes[("POST", ASSIGNEES)] = _ok({"assignees": [{"login": "octocat"}]})
 
 
 def _collect_inputs(
@@ -2850,6 +2862,9 @@ def test_publish_posts_one_comment_and_a_neutral_check_run(
     assert capsys.readouterr().out == (
         f"Posted review comment 99 on {REPO}#{NUMBER} for head {HEAD}. "
         "Added neutral check run 555.\n"
+        f"- Change request: requested changes at {HEAD} in review 777.\n"
+        "- CI runs: no run of the PR's commits waits for approval.\n"
+        "- Assignee: octocat is assigned.\n"
     )
     assert process.paths() == [
         PULL,
@@ -2857,8 +2872,14 @@ def test_publish_posts_one_comment_and_a_neutral_check_run(
         ISSUE_COMMENTS,
         f"{COMMENT}/99",
         CHECK_RUNS,
+        REVIEWS_PAGE,
+        REVIEWS,
+        PULL,
+        _commits_page(1),
+        WAITING_RUNS_PAGE,
+        ASSIGNEES,
     ]
-    (method, _, comment), (_, _, check_run) = process.writes()
+    (method, _, comment), (_, _, check_run), (_, _, change_request), assign = process.writes()
     first_line = github_review.FIRST_LINE.format(
         engine="kiro_cli", reviewers="single", actor="octocat"
     )
@@ -2869,6 +2890,10 @@ def test_publish_posts_one_comment_and_a_neutral_check_run(
         f"## Result\n\n**Changes required**\n\n{marker}\n"
     }
     assert f"- Review comment: {PR_URL}#issuecomment-99\n" in check_run["output"]["summary"]
+    assert (change_request["commit_id"], change_request["event"]) == (HEAD, "REQUEST_CHANGES")
+    assert f"{PR_URL}#issuecomment-99" in change_request["body"]
+    assert change_request["body"].endswith(f"{github_review.CHANGE_REQUEST_MARKER}\n")
+    assert assign == ("POST", ASSIGNEES, {"assignees": ["octocat"]})
     assert output.read_text(encoding="utf-8") == "comment_written=true\n"
 
 
@@ -2887,11 +2912,11 @@ def test_publish_updates_the_oldest_comment_of_an_earlier_run_in_place(
 
     assert _publish(github_review, tmp_path, _review()) == 0
 
-    assert capsys.readouterr().out == (
+    assert capsys.readouterr().out.splitlines()[0] == (
         f"Updated review comment 41 on {REPO}#{NUMBER} for head {HEAD}. "
-        "Added neutral check run 555.\n"
+        "Added neutral check run 555."
     )
-    (method, path, comment), (_, _, check_run) = process.writes()
+    (method, path, comment), (_, _, check_run) = process.writes()[:2]
     assert (method, path) == ("PATCH", f"{COMMENT}/41")
     assert github_review.marker_run_id(comment["body"]) == RUN_ID
     assert f"- Review comment: {PR_URL}#issuecomment-41\n" in check_run["output"]["summary"]
@@ -2931,7 +2956,7 @@ def test_publish_ignores_a_comment_that_is_not_ours(
 
     assert _publish(github_review, tmp_path, _review()) == 0
 
-    assert [write[:2] for write in process.writes()] == [
+    assert [write[:2] for write in process.writes()[:2]] == [
         ("POST", ISSUE_COMMENTS),
         ("POST", CHECK_RUNS),
     ]
@@ -3107,12 +3132,12 @@ def test_publish_updates_a_review_comment_on_the_last_page_it_reads(
 
     assert _publish(github_review, tmp_path, _review()) == 0
 
-    assert capsys.readouterr().out == (
+    assert capsys.readouterr().out.splitlines()[0] == (
         f"Updated review comment 41 on {REPO}#{NUMBER} for head {HEAD}. "
-        "Added neutral check run 555.\n"
+        "Added neutral check run 555."
     )
     assert process.paths()[: len(pages) + 1] == [PULL, *pages]
-    assert [write[:2] for write in process.writes()] == [
+    assert [write[:2] for write in process.writes()[:2]] == [
         ("PATCH", f"{COMMENT}/41"),
         ("POST", CHECK_RUNS),
     ]
@@ -3200,17 +3225,26 @@ def test_publish_reads_the_pr_again_before_posting(
 
 
 def test_publish_warns_when_the_head_moved_within_the_pr(
-    github_review: ModuleType, process: FakeProcess, tmp_path: Path
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     _github(process, live=_live_pr(head={"sha": NEW_HEAD}))
     process.routes[("GET", _commits_page(1))] = _ok([{"sha": HEAD}, {"sha": NEW_HEAD}])
 
     assert _publish(github_review, tmp_path, _review()) == 0
 
-    (_, _, comment), (_, _, check_run) = process.writes()
+    (_, _, comment), (_, _, check_run) = process.writes()[:2]
     warning = f"Warning: the PR head moved to `{NEW_HEAD}` after this review started."
     assert warning in comment["body"]
     assert check_run["head_sha"] == HEAD
+    # No review read the new commits, so their runs stay waiting.
+    assert (
+        "- CI runs: approved none, because the PR head moved after the review started.\n"
+        in capsys.readouterr().out
+    )
+    assert WAITING_RUNS_PAGE not in process.paths()
 
 
 @pytest.mark.parametrize(
@@ -3280,11 +3314,16 @@ def test_publish_dry_run_writes_the_requests_and_posts_nothing(
         f"Dry run: the requests are in {request}. Nothing is posted.\n"
     )
     payload = json.loads(request.read_text(encoding="utf-8"))
-    assert set(payload) == {"comment", "check_run"}
+    assert set(payload) == {"comment", "check_run", "actions"}
     assert (payload["comment"]["method"], payload["comment"]["path"]) == (method, path)
     assert "reviewers `panel`" in payload["comment"]["body"]
     assert payload["check_run"]["conclusion"] == "neutral"
     assert f"- Review comment: {comment_url}\n" in payload["check_run"]["output"]["summary"]
+    assert payload["actions"] == {
+        "change_request": "request",
+        "approve_ci_runs": True,
+        "assign": "octocat",
+    }
     assert process.writes() == []
 
 
@@ -3306,9 +3345,10 @@ def test_the_check_run_is_neutral_and_holds_no_agent_text(
 
     assert _publish(github_review, tmp_path, review) == 0
 
-    (_, _, comment), (_, _, check_run) = process.writes()
+    (_, _, comment), (_, _, check_run), *actions = process.writes()
     assert agent_text in comment["body"]
     assert agent_text not in json.dumps(check_run)
+    assert agent_text not in json.dumps(actions)
     assert agent_text not in github_review.build_marker(review, RUN_ID, "2")
     assert check_run == {
         "name": "PR review (advisory)",
@@ -3333,6 +3373,298 @@ def test_the_check_run_is_neutral_and_holds_no_agent_text(
             ),
         },
     }
+
+
+# --------------------------------------------------------------------------
+# github_review.py: publish, the actions on the PR
+# --------------------------------------------------------------------------
+
+OLD_HEAD = "9" * 40
+OTHER_COMMIT = "8" * 40
+NOTHING_BLOCKS: dict[str, Any] = {
+    "result_states": ["no_blocking_findings"],
+    "severity_counts": {"P1": 0, "P2": 0, "P3": 0},
+    "accepted_finding_ids": [],
+    "rejected_finding_ids": ["F1", "F2"],
+}
+
+
+def _change_request_review(
+    github_review: ModuleType, review_id: int, commit_id: str, **changes: Any
+) -> dict[str, Any]:
+    """A change request of this workflow on ``commit_id``, by default from the bot."""
+    review = {
+        "id": review_id,
+        "user": BOT,
+        "state": "CHANGES_REQUESTED",
+        "commit_id": commit_id,
+        "body": f"An earlier change request.\n\n{github_review.CHANGE_REQUEST_MARKER}\n",
+    }
+    review.update(changes)
+    return review
+
+
+def _waiting_run(run_id: int, head_sha: str = HEAD, **changes: Any) -> dict[str, Any]:
+    """A workflow run from the fork that waits for approval, as GitHub lists it."""
+    run = {
+        "id": run_id,
+        "event": "pull_request",
+        "status": "completed",
+        "conclusion": "action_required",
+        "head_sha": head_sha,
+        "head_repository": {"full_name": "fork/widgets"},
+    }
+    run.update(changes)
+    return run
+
+
+def _approve_path(run_id: int) -> str:
+    return f"repos/{REPO}/actions/runs/{run_id}/approve"
+
+
+@pytest.mark.parametrize(
+    ("earlier_commit", "line", "requested"),
+    [
+        pytest.param(
+            HEAD, f"kept the change request of an earlier run at {HEAD}", False, id="same"
+        ),
+        pytest.param(OLD_HEAD, f"requested changes at {HEAD} in review 777", True, id="older"),
+    ],
+)
+def test_publish_requests_changes_once_for_each_head(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    earlier_commit: str,
+    line: str,
+    requested: bool,
+) -> None:
+    _github(process)
+    earlier = _change_request_review(github_review, 301, earlier_commit)
+    process.routes[("GET", REVIEWS_PAGE)] = _ok([earlier])
+
+    assert _publish(github_review, tmp_path, _review()) == 0
+
+    assert f"- Change request: {line}.\n" in capsys.readouterr().out
+    assert (("POST", REVIEWS) in [write[:2] for write in process.writes()]) is requested
+
+
+@pytest.mark.parametrize(
+    ("changes", "live_head", "line", "dismissed"),
+    [
+        pytest.param(
+            NOTHING_BLOCKS,
+            HEAD,
+            "dismissed 1 earlier change request, because the review accepted no P1 or P2 finding",
+            True,
+            id="no-blocking-findings",
+        ),
+        pytest.param(
+            {
+                **NOTHING_BLOCKS,
+                "result_states": ["owner_decision_required"],
+                "rejected_finding_ids": ["F1"],
+                "owner_question_ids": ["F2"],
+            },
+            HEAD,
+            "dismissed 1 earlier change request, because the review accepted no P1 or P2 finding",
+            True,
+            id="owner-question",
+        ),
+        pytest.param(
+            {
+                **NOTHING_BLOCKS,
+                "result_states": ["incomplete"],
+                "review_complete": False,
+                "not_checked_ids": ["A2"],
+            },
+            HEAD,
+            "kept 1 earlier change request, because this review is incomplete",
+            False,
+            id="incomplete",
+        ),
+        pytest.param(
+            NOTHING_BLOCKS,
+            NEW_HEAD,
+            "kept 1 earlier change request, because the PR head moved after the review started",
+            False,
+            id="head-moved",
+        ),
+    ],
+)
+def test_publish_dismisses_its_change_requests_only_after_a_complete_review_of_the_head(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    changes: dict[str, Any],
+    live_head: str,
+    line: str,
+    dismissed: bool,
+) -> None:
+    head = {"sha": live_head, "repo": {"full_name": "fork/widgets"}}
+    _github(process, live=_live_pr(head=head))
+    process.routes[("GET", _commits_page(1))] = _ok([{"sha": HEAD}, {"sha": NEW_HEAD}])
+    # Only review 301 is a change request of this workflow, so only it has a route.
+    process.routes[("GET", REVIEWS_PAGE)] = _ok(
+        [
+            _change_request_review(github_review, 301, OLD_HEAD),
+            _change_request_review(github_review, 302, OLD_HEAD, body="No marker."),
+            _change_request_review(github_review, 303, OLD_HEAD, user={"login": "mallory"}),
+            _change_request_review(
+                github_review, 304, OLD_HEAD, user={"login": "github-actions[bot]", "type": "User"}
+            ),
+            _change_request_review(github_review, 305, OLD_HEAD, state="DISMISSED"),
+        ]
+    )
+    process.routes[("PUT", f"{REVIEWS}/301/dismissals")] = _ok({"id": 301, "state": "DISMISSED"})
+
+    assert _publish(github_review, tmp_path, _review(**changes)) == 0
+
+    assert f"- Change request: {line}.\n" in capsys.readouterr().out
+    on_reviews = [write for write in process.writes() if write[1].startswith(REVIEWS)]
+    if dismissed:
+        [(method, path, payload)] = on_reviews
+        assert (method, path, payload["event"]) == ("PUT", f"{REVIEWS}/301/dismissals", "DISMISS")
+        assert HEAD in payload["message"]
+    else:
+        assert on_reviews == []
+    assert all((write[2] or {}).get("event") != "APPROVE" for write in process.writes())
+
+
+def test_publish_approves_the_waiting_runs_of_the_pr_commits_oldest_first(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _github(process)
+    process.routes[("GET", _commits_page(1))] = _ok([{"sha": OLD_HEAD}, {"sha": HEAD}])
+    runs = [
+        _waiting_run(903),
+        _waiting_run(901, OLD_HEAD),
+        _waiting_run(902, head_repository={"full_name": "other/widgets"}),
+        _waiting_run(904, OTHER_COMMIT),
+        _waiting_run(905, conclusion="success"),
+    ]
+    process.routes[("GET", WAITING_RUNS_PAGE)] = _ok({"total_count": 5, "workflow_runs": runs})
+    # Only runs 901 and 903 have a route, so an approval of another run fails the test.
+    for run_id in (901, 903):
+        process.routes[("POST", _approve_path(run_id))] = _ok({})
+
+    assert _publish(github_review, tmp_path, _review()) == 0
+
+    assert "- CI runs: approved 2 of 2 waiting runs.\n" in capsys.readouterr().out
+    assert [path for _, path, _ in process.writes() if path.endswith("/approve")] == [
+        _approve_path(901),
+        _approve_path(903),
+    ]
+
+
+@pytest.mark.parametrize("cut", ["commits", "runs"])
+def test_publish_fails_when_it_cannot_list_every_waiting_run(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    cut: str,
+) -> None:
+    _github(process)
+    if cut == "commits":
+        commits = [{"sha": f"{n:040x}"} for n in range(1, 250)] + [{"sha": HEAD}]
+        for page in range(3):
+            process.routes[("GET", _commits_page(page + 1))] = _ok(
+                commits[page * 100 : page * 100 + 100]
+            )
+        problem = (
+            "GitHub lists only the first 250 commits of a PR, so the runs of later commits "
+            "can still wait"
+        )
+    else:
+        for page in range(1, github_review.RUN_PAGE_LIMIT + 1):
+            path = f"{WAITING_RUNS}&per_page=100&page={page}"
+            others = [_waiting_run(page * 1000 + n, OTHER_COMMIT) for n in range(100)]
+            process.routes[("GET", path)] = _ok({"workflow_runs": others})
+        problem = "GitHub lists at most 1,000 waiting runs, so more runs can still wait"
+
+    assert _publish(github_review, tmp_path, _review()) == 1
+
+    assert (
+        f"- CI runs failed: approved 0 of 0 waiting runs. {problem}.\n" in capsys.readouterr().out
+    )
+
+
+@pytest.mark.parametrize(
+    ("routes", "line"),
+    [
+        pytest.param(
+            {("POST", REVIEWS): _http_error(422)},
+            f"- Change request failed: gh api {REVIEWS} failed: gh: Request failed (HTTP 422).",
+            id="change-request-refused",
+        ),
+        pytest.param(
+            {("POST", REVIEWS): _ok({"id": 777, "state": "COMMENTED"})},
+            "- Change request failed: GitHub did not return a review that requests changes. "
+            "Check the PR.",
+            id="change-request-not-made",
+        ),
+        pytest.param(
+            {
+                ("GET", WAITING_RUNS_PAGE): _ok({"workflow_runs": [_waiting_run(901)]}),
+                ("POST", _approve_path(901)): _http_error(403),
+            },
+            "- CI runs failed: approved 0 of 1 waiting run. GitHub refused 1 run: 901 "
+            "(HTTP 403). A maintainer can approve them on the PR.",
+            id="run-approval-refused",
+        ),
+        pytest.param(
+            {("POST", ASSIGNEES): _ok({"assignees": [{"login": "hubot"}]})},
+            "- Assignee failed: GitHub did not assign octocat. A PR has at most 10 assignees, "
+            "and only an account with access to the repository can be assigned.",
+            id="assignee-ignored",
+        ),
+    ],
+)
+def test_publish_reports_a_failed_action_and_still_runs_the_others(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    routes: dict[tuple[str, str], Result],
+    line: str,
+) -> None:
+    output = tmp_path / "github_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    _github(process)
+    process.routes.update(routes)
+
+    assert _publish(github_review, tmp_path, _review()) == 1
+
+    lines = capsys.readouterr().out.splitlines()
+    assert line in lines
+    assert [text.split(":")[0].removesuffix(" failed") for text in lines[1:]] == [
+        "- Change request",
+        "- CI runs",
+        "- Assignee",
+    ]
+    # The comment is posted, so the workflow adds no "not published" check run.
+    assert output.read_text(encoding="utf-8") == "comment_written=true\n"
+
+
+def test_publish_assigns_no_one_when_a_bot_started_the_run(
+    github_review: ModuleType,
+    process: FakeProcess,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _github(process)
+
+    assert _publish(github_review, tmp_path, _review(), "--actor", "dependabot[bot]") == 0
+
+    assert "- Assignee: none, because a bot started this run.\n" in capsys.readouterr().out
+    assert ASSIGNEES not in process.paths()
 
 
 @pytest.mark.parametrize(
@@ -3771,7 +4103,12 @@ def test_workflow_permissions_are_least_privilege(workflow: dict[Any, Any]) -> N
     assert {job_id: job["permissions"] for job_id, job in workflow["jobs"].items()} == {
         "prepare": {"contents": "read", "pull-requests": "read"},
         "review": {"contents": "read", "copilot-requests": "write"},
-        "publish": {"contents": "read", "pull-requests": "write", "checks": "write"},
+        "publish": {
+            "contents": "read",
+            "pull-requests": "write",
+            "checks": "write",
+            "actions": "write",
+        },
     }
 
 
@@ -3823,7 +4160,7 @@ def test_only_the_review_job_gets_an_engine_credential(workflow: dict[Any, Any])
             "jobs",
             "publish",
             "steps",
-            "Post or update the review comment, then add a neutral check run",
+            "Post the review comment and a neutral check run, then act on the PR",
         )
         + gh_token,
         (
@@ -3905,7 +4242,7 @@ def test_publish_reports_a_review_that_is_not_published_with_a_neutral_check(
 ) -> None:
     job = workflow["jobs"]["publish"]
     download = _step(job, "Download review.json")
-    publish = _step(job, "Post or update the review comment, then add a neutral check run")
+    publish = _step(job, "Post the review comment and a neutral check run, then act on the PR")
     failure = _step(job, "Add a neutral check run that says the review is not published")
 
     assert job["if"] == "${{ !cancelled() && needs.prepare.outputs.proceed == 'true' }}"

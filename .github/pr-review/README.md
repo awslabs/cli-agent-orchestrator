@@ -8,8 +8,11 @@ hand and selects the agent CLI: `kiro_cli` (the default) or `copilot_cli`. The
 workflow posts one comment on the PR, updates that comment on later runs, and
 adds a neutral check to the reviewed head commit.
 
-The review is advisory. It never approves a PR and never requests changes, and
-its check is always neutral, so it cannot block or allow a merge.
+The review never approves a PR, and its check is always neutral. After the
+comment, the workflow requests changes when the review accepts a P1 or P2
+finding, approves the waiting CI runs of the PR's commits, and assigns the
+maintainer who started it. See [Actions on the PR](#actions-on-the-pr). A
+maintainer still approves and merges.
 
 The agents apply the review policy in [`REVIEW.md`](../../REVIEW.md). The
 [design](../../docs/pr-review-design.md) explains the decisions, and how the
@@ -25,7 +28,7 @@ three jobs:
 | --- | --- | --- |
 | `prepare` | `contents: read`, `pull-requests: read` | Reads the PR. A closed PR fails the run. A draft PR is skipped. |
 | `review` | `contents: read`, `copilot-requests: write` | Runs in the `ai-review` environment, which holds the engine secret. Checks out the PR head as files, writes the diff, starts `cao-server` and runs the CAO workflow [`pr_review.py`](pr_review.py). Then it stops the agents, checks the result for credentials and shows the review in the run summary. |
-| `publish` | `contents: read`, `pull-requests: write`, `checks: write` | Validates `review.json` and reads the PR again. Then it posts or updates the review comment, and adds a neutral check run to the reviewed head. If the review did not finish or was not posted, it adds a neutral check run that says so. It skips with no check run in two cases: the PR is now a draft, or a newer run posted the comment. It runs no agent. |
+| `publish` | `contents: read`, `pull-requests: write`, `checks: write`, `actions: write` | Validates `review.json` and reads the PR again. Then it posts or updates the review comment, adds a neutral check run to the reviewed head, and does the [actions on the PR](#actions-on-the-pr). If the review did not finish or was not posted, it adds a neutral check run that says so. It skips with no check run in two cases: the PR is now a draft, or a newer run posted the comment. It runs no agent. |
 
 The `reviewers` input selects the seats.
 
@@ -133,8 +136,31 @@ reviewed head and the engine. Then it gives the same sections as the review
 comment. The run summary shows the review also when `publish` posts nothing, for
 example because the PR became a draft. Each person who is signed in to GitHub
 and can read the repository can see the run summary. The `publish` job adds its
-result to the run summary: the IDs of the comment and the check run, or the
-reason why it posted nothing.
+result to the run summary: the IDs of the comment and the check run and one line
+for each action on the PR, or the reason why it posted nothing.
+
+### Actions on the PR
+
+After the check run, `publish` does three actions. It never approves a PR.
+
+1. **Change request.** If the review accepts a P1 or P2 finding, `publish`
+   requests changes at the reviewed head, with a link to the review comment. It
+   does not request changes again at a head where an earlier run did. A later
+   run dismisses these change requests only when its review is complete, accepts
+   no P1 or P2, and the head did not move during the review. Otherwise they stay
+   until a maintainer dismisses them. `publish` changes only the reviews that
+   this workflow wrote.
+2. **CI runs.** A CI run of a PR from a fork waits until a maintainer approves
+   it. `publish` approves the waiting `pull_request` runs of each commit of the
+   PR, oldest first, when the run comes from the head repository of the PR. If
+   the PR head moved during the review, it approves no run, because no review
+   read the new commits.
+3. **Assignee.** `publish` assigns the person who started the run. When a bot
+   started the run, it assigns no one.
+
+Each action writes one line to the job log and the run summary. If an action
+fails, `publish` still does the next action, and the job fails at the end. A
+failed action does not remove the comment or the check run.
 
 ## Set up
 
@@ -237,7 +263,8 @@ comment marker and posts nothing.
 
 Each run reviews one head SHA. If the PR head moves during the run, `publish`
 still posts the review for the reviewed head, with a warning, while that commit
-is part of the PR. After a force push removes the commit, `publish` stops as
+is part of the PR. It then approves no CI run and dismisses no change request.
+After a force push removes the commit, `publish` stops as
 Stale. It posts no comment, and adds the neutral check run
 `Review not published (advisory)` to the reviewed head.
 
@@ -292,8 +319,10 @@ one run.
   `copilot-requests: write`. With `copilot_cli` and no `COPILOT_GITHUB_TOKEN`
   secret, the agents get the job token, and they can use it to make Copilot
   requests. Only `publish` can write to the repository, and it runs no agent. It
-  writes one comment on the PR, which later runs update in place, and neutral
-  check runs. It never approves, requests changes or posts an inline comment.
+  writes one comment on the PR, which later runs update in place, neutral check
+  runs and the [actions on the PR](#actions-on-the-pr). It never approves a PR
+  and never posts an inline comment. It needs `actions: write` to approve CI
+  runs. That permission also lets the job cancel, re-run and start workflows.
 - **Secret in an environment.** The `review` job reads the engine secret from the
   `ai-review` environment. When the environment allows only the default branch,
   a workflow file that was changed on another branch cannot read the secret. See
@@ -363,6 +392,12 @@ profiles and the PR, and all three come from the dispatched ref.
 - CAO always allows its callback tools, such as `send_message`. A seat can send
   text to another seat of the same run.
 - The PR content goes to the model provider of the selected engine.
+- `publish` approves the waiting CI runs of every commit of the PR, but the
+  review reads only the head. An earlier commit can hold a workflow change that
+  no review read. A run from a fork gets a read-only job token and no secrets.
+- GitHub does not document whether a change request from `github-actions[bot]`
+  blocks a merge under a ruleset. If it does, the PR stays blocked until a later
+  complete review or a maintainer dismisses the request.
 
 ## Limits
 
@@ -382,6 +417,9 @@ profiles and the PR, and all three come from the dispatched ref.
   `review.json` with every finding for 7 days.
 - `publish` reads at most 5,000 comments of the PR to find the earlier review
   comment. If the PR has more, `publish` posts no comment.
+- To act on the PR, `publish` reads at most 1,000 reviews of the PR and 1,000
+  waiting runs of the repository, and GitHub lists at most 250 commits of a PR.
+  Past a limit, the action fails, and the log says what it did not do.
 
 ## Troubleshooting
 
@@ -400,6 +438,7 @@ profiles and the PR, and all three come from the dispatched ref.
 | `Blocked: the review is not publishable: "the policy has no check heading of the form '### A1. Title'"` | `REVIEW.md` on the dispatched ref has no check line. The `policy` errors also include a check ID that is not valid or is used twice, and more than 40 checks. Fix `REVIEW.md`, then dispatch again. |
 | Check run `Review did not finish (advisory)` | The `review` job failed or timed out. The check gives the job result, and the job log gives the reason. A review comment on the PR, if there is one, is from an earlier run. |
 | Check run `Review not published (advisory)` | The review finished, but `publish` did not post or update the comment, for example because the reviewed head is stale. The `publish` job log gives the reason. |
+| `- Change request failed: …`, `- CI runs failed: …` or `- Assignee failed: …` | The comment and the check run are posted, but an action on the PR failed. The line gives the reason. Do the action on the PR by hand, or dispatch again. |
 | The `review` job fails before its first step, with an error about the protection rules of `ai-review` | The environment allows only the default branch. Dispatch from the default branch. |
 
 ## Run the CAO workflow without GitHub Actions
@@ -488,7 +527,7 @@ python3 "$review_dir/github_review.py" check-secrets \
 ```
 
 To see the requests without posting them, add `--dry-run /abs/request.json` to
-`github_review.py publish`.
+`github_review.py publish`. The file also gives the planned actions on the PR.
 
 When you no longer need the run, stop `cao-server` and the tmux server of the
 agents. Give tmux the socket path, so that the command cannot stop another tmux

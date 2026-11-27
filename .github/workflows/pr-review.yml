@@ -4,8 +4,11 @@ name: PR Review
 # by hand and chooses the PR, the agent CLI and the reviewers: `single` (the
 # default) runs one agent, `panel` runs two reviewers, two voters and an
 # adjudicator. The result is one issue comment on the PR, which later runs
-# update in place, and one neutral check run on the reviewed head. It never
-# approves, requests changes or blocks a merge.
+# update in place, and one neutral check run on the reviewed head. Then the
+# workflow acts on the PR. If the review accepts a P1 or P2 finding, it requests
+# changes. If a later complete review of the current head accepts none, it
+# dismisses its earlier change requests. It approves the waiting CI runs of the
+# PR's commits and assigns the maintainer who started it. It never approves a PR.
 #
 # The procedure, the secrets and the trust boundaries are in
 # .github/pr-review/README.md. In short:
@@ -529,7 +532,7 @@ jobs:
           exit 0
 
   publish:
-    name: Post the review comment and the check
+    name: Post the review and act on the PR
     needs: [prepare, review]
     # !cancelled(): this job also runs when the review job failed, to add a
     # neutral check run that says so. A cancelled run posts nothing.
@@ -539,11 +542,17 @@ jobs:
     permissions:
       # Check out the review scripts.
       contents: read
-      # Read the PR, its commits and comments, and post or update the review
-      # comment. A PR comment is an issue comment, but this permission is enough.
+      # Read the PR, its commits, comments and reviews. Post or update the review
+      # comment, request changes, dismiss the earlier change requests of this
+      # workflow, and assign the maintainer. A PR comment and an assignee are
+      # issue writes, but this permission is enough.
       pull-requests: write
       # Add the neutral check run to the reviewed head.
       checks: write
+      # Approve the waiting CI runs of the PR's commits (a PR from a fork). This
+      # permission also lets a job cancel, re-run and start workflows. This job
+      # runs only the scripts of the dispatched ref, and no agent.
+      actions: write
     steps:
       - name: Check out the review scripts from the dispatched ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -559,7 +568,7 @@ jobs:
           name: pr-review-result
           path: ${{ runner.temp }}/pr-review/result
 
-      - name: Post or update the review comment, then add a neutral check run
+      - name: Post the review comment and a neutral check run, then act on the PR
         id: publish
         if: needs.review.result == 'success'
         env:

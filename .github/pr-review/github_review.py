@@ -17,8 +17,11 @@ agents never hold a GitHub write token and the publisher never runs an agent:
   It does not check a variable that is not set or is shorter than 8 characters.
 - ``publish`` validates ``review.json`` and reads the PR again. Then it posts
   one review comment on the PR, or updates the comment of an earlier run in
-  place, and adds a neutral check run to the reviewed head. It never approves,
-  requests changes or blocks a merge.
+  place, and adds a neutral check run to the reviewed head. Then it acts on the
+  PR. If the review accepts a P1 or P2 finding, it requests changes. If a later
+  complete review of the current head accepts none, it dismisses its earlier
+  change requests. It approves the waiting CI runs of the PR's commits and
+  assigns the maintainer who started the run. It never approves a PR.
 - ``report-failure`` adds only a neutral check run with fixed text, when the
   review did not finish or ``publish`` did not post the comment.
 - ``summary`` runs the local checks of ``publish`` on ``review.json`` and adds
@@ -26,8 +29,8 @@ agents never hold a GitHub write token and the publisher never runs an agent:
   and never prints the review to the job log.
 
 Standard library only, plus the ``gh`` and ``git`` executables. Exit status 0
-means done or skipped, 1 means blocked, stale or invalid, and 2 means a usage
-error.
+means done or skipped, 1 means blocked, stale or invalid, or that an action on
+the PR failed, and 2 means a usage error.
 """
 
 from __future__ import annotations
@@ -40,7 +43,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 SCHEMA_VERSION = 1
 # Check values with fullmatch: with match, "$" also accepts a final newline.
@@ -132,6 +135,26 @@ FAILURE_SUMMARY = (
     "\n"
     f"{ADVISORY_NOTE}\n"
 )
+# ``publish`` marks its change requests, so that it changes only its own reviews.
+CHANGE_REQUEST_MARKER = "<!-- cao-pr-review-change-request -->"
+# Only fixed text and validated values, never agent text.
+CHANGE_REQUEST_BODY = (
+    "The `pr-review` workflow accepted a P1 or P2 finding at `{head_sha}`. "
+    "The review comment lists the findings: {comment_url}\n"
+    "\n"
+    "This workflow never approves a PR. A later complete review that accepts no P1 "
+    "or P2 finding dismisses this change request, or a maintainer can dismiss it.\n"
+    "\n"
+    f"{CHANGE_REQUEST_MARKER}\n"
+)
+DISMISS_MESSAGE = (
+    "A later complete review by the `pr-review` workflow at `{head_sha}` accepted no P1 "
+    "or P2 finding."
+)
+REVIEW_PAGE_LIMIT = 10
+# Runs from a fork wait for a maintainer. GitHub lists at most 1,000 runs for a filter.
+WAITING_RUNS = "actions/runs?event=pull_request&status=action_required"
+RUN_PAGE_LIMIT = 10
 # GitHub refuses a comment body over 65,536 characters.
 MAX_BODY_UTF16 = 65_000
 # Leaves room for the first line, the drift warning, the run link and the marker.
@@ -209,12 +232,17 @@ def _gh_api(path: str, *, method: str = "GET", payload: Any = None) -> Any:
         raise Stop(1, f"Blocked: gh api {path} did not return JSON.") from exc
 
 
-def _paged(path: str, max_pages: int) -> tuple[list[Any], bool]:
-    """Items of a paginated list, and whether ``max_pages`` cut the list short."""
+def _paged(path: str, max_pages: int, key: Optional[str] = None) -> tuple[list[Any], bool]:
+    """Items of a paginated list, and whether ``max_pages`` cut the list short.
+
+    ``key`` names the list in an object answer, such as ``workflow_runs``.
+    """
     items: list[Any] = []
     separator = "&" if "?" in path else "?"
     for page in range(1, max_pages + 1):
         batch = _gh_api(f"{path}{separator}per_page=100&page={page}")
+        if key is not None:
+            batch = batch.get(key) if isinstance(batch, dict) else None
         if not isinstance(batch, list):
             raise Stop(1, f"Blocked: gh api {path} did not return a list.")
         items.extend(batch)
@@ -818,6 +846,163 @@ def _checked_review(
     return review
 
 
+# --------------------------------------------------------------------------
+# publish: the actions on the PR after the review comment
+# --------------------------------------------------------------------------
+
+
+def _dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}" if count == 1 else f"{count} {word}s"
+
+
+def change_request_plan(states: list[str], moved: bool) -> tuple[str, str]:
+    """``request``, ``keep`` or ``dismiss`` for the change requests of this workflow, and why.
+
+    Only a complete review of the current head dismisses them.
+    """
+    if "changes_required" in states:
+        return "request", "the review accepted a P1 or P2 finding"
+    if "incomplete" in states:
+        return "keep", "this review is incomplete"
+    if moved:
+        return "keep", "the PR head moved after the review started"
+    return "dismiss", "the review accepted no P1 or P2 finding"
+
+
+def _change_request(
+    repo: str,
+    number: int,
+    head_sha: str,
+    plan: tuple[str, str],
+    reviewer_login: str,
+    comment_url: str,
+) -> tuple[bool, str]:
+    """Request changes, or keep or dismiss the earlier change requests, as ``plan`` says.
+
+    Only the reviews that this workflow marked are changed.
+    """
+    action, reason = plan
+    reviews, truncated = _paged(f"repos/{repo}/pulls/{number}/reviews", REVIEW_PAGE_LIMIT)
+    if truncated:
+        return False, "the PR has too many reviews to find the change requests of this workflow"
+    ours = [
+        item
+        for item in reviews
+        if type(_dict(item).get("id")) is int
+        and item.get("state") == "CHANGES_REQUESTED"
+        and _is_reviewer(item.get("user"), reviewer_login)
+        and CHANGE_REQUEST_MARKER in str(item.get("body") or "")
+    ]
+    if action == "request":
+        if any(item.get("commit_id") == head_sha for item in ours):
+            return True, f"kept the change request of an earlier run at {head_sha}"
+        body = CHANGE_REQUEST_BODY.format(head_sha=head_sha, comment_url=comment_url)
+        created = _gh_api(
+            f"repos/{repo}/pulls/{number}/reviews",
+            method="POST",
+            payload={"commit_id": head_sha, "event": "REQUEST_CHANGES", "body": body},
+        )
+        if _dict(created).get("state") != "CHANGES_REQUESTED":
+            return False, "GitHub did not return a review that requests changes. Check the PR"
+        return True, f"requested changes at {head_sha} in review {_dict(created).get('id')}"
+    if not ours:
+        return True, f"none, because {reason}"
+    count = _plural(len(ours), "earlier change request")
+    if action == "keep":
+        return True, f"kept {count}, because {reason}"
+    message = DISMISS_MESSAGE.format(head_sha=head_sha)
+    for done, item in enumerate(ours):
+        path = f"repos/{repo}/pulls/{number}/reviews/{item['id']}/dismissals"
+        try:
+            answer = _gh_api(path, method="PUT", payload={"message": message, "event": "DISMISS"})
+        except GhError as exc:
+            return False, f"dismissed {done} of {count}. {exc}"
+        if _dict(answer).get("state") != "DISMISSED":
+            return False, f"dismissed {done} of {count}. GitHub did not dismiss review {item['id']}"
+    return True, f"dismissed {count}, because {reason}"
+
+
+def _approve_ci_runs(repo: str, number: int, head_sha: str) -> tuple[bool, str]:
+    """Approve the waiting runs of the PR's commits, oldest first.
+
+    A run from a fork waits for a maintainer. If the head moved after the review
+    started, no review read the new commits, so no run is approved.
+    """
+    head = _dict(_dict(_gh_api(f"repos/{repo}/pulls/{number}")).get("head"))
+    if head.get("sha") != head_sha:
+        return True, "approved none, because the PR head moved after the review started"
+    head_repo = _dict(head.get("repo")).get("full_name")
+    if not isinstance(head_repo, str) or not REPO_RE.fullmatch(head_repo):
+        return True, "approved none, because GitHub gives no head repository for the PR"
+    commits, _ = _paged(f"repos/{repo}/pulls/{number}/commits", 3)
+    shas = {_dict(item).get("sha") for item in commits}
+    runs, truncated = _paged(f"repos/{repo}/{WAITING_RUNS}", RUN_PAGE_LIMIT, key="workflow_runs")
+    waiting = sorted(
+        run["id"]
+        for run in runs
+        if type(_dict(run).get("id")) is int
+        and run.get("event") == "pull_request"
+        and "action_required" in (run.get("status"), run.get("conclusion"))
+        and run.get("head_sha") in shas
+        and _dict(run.get("head_repository")).get("full_name") == head_repo
+    )
+    refused = []
+    for run_id in waiting:
+        try:
+            _gh_api(f"repos/{repo}/actions/runs/{run_id}/approve", method="POST")
+        except GhError as exc:
+            refused.append(f"{run_id} (HTTP {exc.status})" if exc.status else str(run_id))
+    if not waiting and not truncated and len(commits) < PR_COMMITS_CAP:
+        return True, "no run of the PR's commits waits for approval"
+    text = f"approved {len(waiting) - len(refused)} of {_plural(len(waiting), 'waiting run')}"
+    problems = []
+    if refused:
+        problems.append(
+            f"GitHub refused {_plural(len(refused), 'run')}: {', '.join(refused)}. "
+            "A maintainer can approve them on the PR"
+        )
+    if len(commits) >= PR_COMMITS_CAP:
+        problems.append(
+            f"GitHub lists only the first {PR_COMMITS_CAP} commits of a PR, so the runs of "
+            "later commits can still wait"
+        )
+    if truncated:
+        problems.append("GitHub lists at most 1,000 waiting runs, so more runs can still wait")
+    return not problems, ". ".join([text, *problems])
+
+
+def _assign(repo: str, number: int, actor: str) -> tuple[bool, str]:
+    """Assign the maintainer who started the run. GitHub cannot assign the workflow bot."""
+    if actor.endswith("[bot]"):
+        return True, "none, because a bot started this run"
+    answer = _gh_api(
+        f"repos/{repo}/issues/{number}/assignees", method="POST", payload={"assignees": [actor]}
+    )
+    assignees = _dict(answer).get("assignees")
+    if actor not in {_dict(user).get("login") for user in (assignees or [])}:
+        # GitHub ignores an account that it cannot assign, with no error.
+        return False, (
+            f"GitHub did not assign {actor}. A PR has at most 10 assignees, and only "
+            "an account with access to the repository can be assigned"
+        )
+    return True, f"{actor} is assigned"
+
+
+def _act(label: str, action: Callable[[], tuple[bool, str]]) -> tuple[bool, str]:
+    """Run one action and give its report line. A failure does not stop the next action."""
+    try:
+        ok, text = action()
+    except Stop as stop:
+        ok, text = False, stop.message
+    except GhError as exc:
+        ok, text = False, str(exc)
+    return ok, f"- {label}{'' if ok else ' failed'}: {text.rstrip('.')}."
+
+
 def publish(
     *,
     repo: str,
@@ -876,9 +1061,18 @@ def publish(
         check_run = review_check_run(
             review, run_id=run_id, run_url=run_url, comment_url=comment_url
         )
+        actions = {
+            "change_request": change_request_plan(review["result_states"], bool(warning))[0],
+            "approve_ci_runs": not warning,
+            "assign": None if actor.endswith("[bot]") else actor,
+        }
         _write_json(
             dry_run_out,
-            {"comment": {"method": method, "path": path, "body": body}, "check_run": check_run},
+            {
+                "comment": {"method": method, "path": path, "body": body},
+                "check_run": check_run,
+                "actions": actions,
+            },
         )
         return _report(0, f"Dry run: the requests are in {dry_run_out}. Nothing is posted.")
 
@@ -892,20 +1086,30 @@ def publish(
     if type(comment_id) is not int or (target is not None and comment_id != target):
         raise Stop(1, "Blocked: GitHub returned an unexpected comment ID. Check the PR by hand.")
     _verify_comment(repo, number, comment_id, body, reviewer_login)
-    check_run = review_check_run(
-        review, run_id=run_id, run_url=run_url, comment_url=f"{pr_url}#issuecomment-{comment_id}"
-    )
+    comment_url = f"{pr_url}#issuecomment-{comment_id}"
+    check_run = review_check_run(review, run_id=run_id, run_url=run_url, comment_url=comment_url)
     check_id = _create_check_run(
         repo,
         check_run,
         f"Review comment {comment_id} is posted, but the check run is not added.",
     )
     action = "Posted" if target is None else "Updated"
-    return _report(
-        0,
+    lines = [
         f"{action} review comment {comment_id} on {repo}#{number} for head {head_sha}. "
-        f"Added neutral check run {check_id}.",
-    )
+        f"Added neutral check run {check_id}."
+    ]
+    # A failed action does not undo an earlier write or stop the next action.
+    plan = change_request_plan(review["result_states"], bool(warning))
+    results = [
+        _act(
+            "Change request",
+            lambda: _change_request(repo, number, head_sha, plan, reviewer_login, comment_url),
+        ),
+        _act("CI runs", lambda: _approve_ci_runs(repo, number, head_sha)),
+        _act("Assignee", lambda: _assign(repo, number, actor)),
+    ]
+    lines += [line for _, line in results]
+    return _report(0 if all(ok for ok, _ in results) else 1, "\n".join(lines))
 
 
 # --------------------------------------------------------------------------
@@ -1016,7 +1220,7 @@ def _parser() -> argparse.ArgumentParser:
     sec.add_argument("--env", action="append", default=[], help="name of an env var to check")
 
     pub = commands.add_parser(
-        "publish", help="post or update the review comment, then add a neutral check run"
+        "publish", help="post the review comment and a neutral check run, then act on the PR"
     )
     pub.add_argument("--repo", required=True, type=repo_arg)
     pub.add_argument("--pr", required=True, type=pr_arg)
