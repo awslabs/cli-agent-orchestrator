@@ -978,6 +978,38 @@ class AntigravityCliProvider(BaseProvider):
         """Return the agy IDLE footer pattern for log-file pre-checks."""
         return IDLE_FOOTER_PATTERN_LOG
 
+    def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
+        """Read the live draft between the two matching rails at the foot of the pane."""
+        rows = [row.rstrip() for row in rendered_pane.rstrip().splitlines()]
+        if not rows:
+            return None
+
+        bottom = len(rows) - 1
+        if not re.fullmatch(SEPARATOR_PATTERN, rows[bottom]):
+            # With a draft, agy hides the shortcuts hint. The footer is then
+            # blank or contains only a model name aligned to the right rail.
+            footer = rows[bottom]
+            bottom -= 1
+            if bottom < 0 or not re.fullmatch(SEPARATOR_PATTERN, rows[bottom]):
+                return None
+            width = len(rows[bottom])
+            model_only = len(footer) == width and len(footer.lstrip(" ")) <= width // 2
+            if not re.match(IDLE_FOOTER_PATTERN, footer) and not model_only:
+                return None
+
+        rail = rows[bottom]
+        top = next((i for i in range(bottom - 1, -1, -1) if rows[i] == rail), -1)
+        if top < 0 or top + 1 == bottom:
+            return None
+
+        prompt, *continuation = rows[top + 1 : bottom]
+        if prompt != ">" and not prompt.startswith("> "):
+            return None
+        # tmux trims spaces on a completely blank row, including the indent.
+        if any(row and not row.startswith("  ") for row in continuation):
+            return None
+        return "\n".join(row[2:] for row in (prompt, *continuation)).rstrip()
+
     # ------------------------------------------------------------------ #
     # Response extraction
     # ------------------------------------------------------------------ #

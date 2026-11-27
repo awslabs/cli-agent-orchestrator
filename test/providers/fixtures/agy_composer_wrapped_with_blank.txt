@@ -1,0 +1,6 @@
+────────────────────────────────────────────────────────────────────────────────────────────────────
+> First line. Repeat this test phrase. Repeat this test phrase. Repeat this test phrase. Repeat
+  this test phrase. Repeat this test phrase.
+
+  Last line of the draft.
+────────────────────────────────────────────────────────────────────────────────────────────────────
