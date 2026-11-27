@@ -78,6 +78,17 @@ def test_newer_version_is_read_only(schema_db):
     assert hashlib.sha256(schema_db.read_bytes()).hexdigest() == before
 
 
+def test_too_new_refusal_names_recorded_backup(schema_db):
+    database_module.init_db()
+    with sqlite3.connect(schema_db) as connection:
+        connection.execute(
+            "INSERT INTO cao_schema_migrations VALUES "
+            "(2, 'future', 'applied', 'future-writer', 'now', 'now', '/local/older.db')"
+        )
+    with pytest.raises(migrations.SchemaTooNewError, match="/local/older.db"):
+        database_module.init_db()
+
+
 def test_foreign_schema_refused(schema_db):
     with sqlite3.connect(schema_db) as connection:
         connection.execute("CREATE TABLE unrelated (id INTEGER)")
@@ -131,7 +142,17 @@ def test_duplicate_null_scope_memories_tolerate_unique_index(schema_db, caplog):
             (("fixture-one", "/note-one"), ("fixture-two", "/note-two")),
         )
     database_module.init_db()
-    assert "cao memory repair" in caplog.text
+    assert "cao memory repair --apply" in caplog.text
+
+
+def test_failed_fresh_migration_names_recovery_without_none(schema_db, monkeypatch):
+    broken = migrations.Migration(1, "baseline_2_5", lambda connection: 1 / 0, False, True)
+    monkeypatch.setattr(migrations, "MIGRATIONS", (broken,))
+    with pytest.raises(migrations.MigrationFailedError) as failure:
+        database_module.init_db()
+    assert "a known-good backup" in str(failure.value)
+    assert "docs/updating.md" in str(failure.value)
+    assert "backup: None" not in str(failure.value)
 
 
 def test_started_nonrerunnable_step_is_refused(schema_db, monkeypatch):

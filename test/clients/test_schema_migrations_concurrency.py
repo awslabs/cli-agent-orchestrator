@@ -94,6 +94,25 @@ def test_server_lock_blocks_post_baseline_cli(tmp_path, monkeypatch):
         os.close(descriptor)
 
 
+def test_server_lock_does_not_block_baseline_cli(tmp_path, monkeypatch):
+    path = tmp_path / "shared.db"
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
+    _initialize(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("DELETE FROM cao_schema_migrations")
+    server_lock_path = tmp_path / "server.lock"
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.utils.server_lock.SERVER_LOCK_FILE", server_lock_path
+    )
+    descriptor = os.open(server_lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        database_module.init_db()
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def test_transactional_step_never_loses_concurrent_writer(tmp_path, monkeypatch):
     path = tmp_path / "shared.db"
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)

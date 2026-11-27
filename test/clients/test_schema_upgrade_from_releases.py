@@ -79,6 +79,10 @@ def test_released_schema_converges_with_snapshot(release, tmp_path, monkeypatch)
     with sqlite3.connect(path) as connection:
         connection.executescript((SCHEMAS / f"{release}.sql").read_text())
         snapshots = seed_all_tables(connection)
+        schema_before = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        ).fetchall()
     engine = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False})
     monkeypatch.setattr(database_module, "engine", engine)
     monkeypatch.setattr(database_module, "SessionLocal", sessionmaker(bind=engine))
@@ -94,6 +98,13 @@ def test_released_schema_converges_with_snapshot(release, tmp_path, monkeypatch)
         with sqlite3.connect(backup) as copy:
             assert copy.execute("PRAGMA quick_check").fetchone()[0] == "ok"
             assert_seeded(copy, snapshots)
+            assert (
+                copy.execute(
+                    "SELECT type, name, sql FROM sqlite_master "
+                    "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+                ).fetchall()
+                == schema_before
+            )
         assert stat.S_IMODE((tmp_path / "backups").stat().st_mode) == 0o700
         assert stat.S_IMODE(Path(backup).stat().st_mode) == 0o600
         assert len(list((tmp_path / "backups").glob("*.db"))) == 1
