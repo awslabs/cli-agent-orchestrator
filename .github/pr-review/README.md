@@ -10,8 +10,8 @@ adds a neutral check to the reviewed head commit.
 
 The review never approves a PR, and its check is always neutral. After the
 comment, the workflow requests changes when the review accepts a P1 or P2
-finding, approves the waiting CI runs of the PR's commits, and requests a
-review from the maintainer team. See [Actions on the PR](#actions-on-the-pr). A
+finding, approves the waiting CI runs of the PR's commits, and assigns the
+maintainer who started it. See [Actions on the PR](#actions-on-the-pr). A
 maintainer still approves and merges.
 
 The agents apply the review policy in [`REVIEW.md`](../../REVIEW.md). The
@@ -157,8 +157,8 @@ After the check run, `publish` does three actions. It never approves a PR.
    head repository of the PR. It approves no run of a commit that a push added
    during the review, because no review read that commit. If the PR head moved
    during the review, it approves no run.
-3. **Review request.** `publish` requests a review from the maintainer team,
-   `REVIEW_TEAM` in the workflow. GitHub cannot assign a team to a PR.
+3. **Assignee.** `publish` assigns the person who started the run. When a bot
+   started the run, it assigns no one.
 
 Each action writes one line to the job log and the run summary. If an action
 fails, `publish` still does the next action, and the job fails at the end. A
@@ -401,10 +401,6 @@ profiles and the PR, and all three come from the dispatched ref.
 - GitHub does not document whether a change request from `github-actions[bot]`
   blocks a merge under a ruleset. If it does, the PR stays blocked until a later
   complete review or a maintainer dismisses the request.
-- For a review request, GitHub lists only the permission `pull-requests: write`.
-  Other projects report that a request to a team also needs the organization
-  permission Members: read, which the job token cannot have. If GitHub refuses
-  the request, the job fails, and the log gives the reason.
 
 ## Limits
 
@@ -446,7 +442,7 @@ profiles and the PR, and all three come from the dispatched ref.
 | `Blocked: the review is not publishable: "the policy has no check heading of the form '### A1. Title'"` | `REVIEW.md` on the dispatched ref has no check line. The `policy` errors also include a check ID that is not valid or is used twice, and more than 40 checks. Fix `REVIEW.md`, then dispatch again. |
 | Check run `Review did not finish (advisory)` | The `review` job failed or timed out. The check gives the job result, and the job log gives the reason. A review comment on the PR, if there is one, is from an earlier run. |
 | Check run `Review not published (advisory)` | The review finished, but `publish` did not post or update the comment, for example because the reviewed head is stale. The `publish` job log gives the reason. |
-| `- Change request failed: …`, `- CI runs failed: …` or `- Review request failed: …` | The comment and the check run are posted, but an action on the PR failed. The line gives the reason. Do the action on the PR by hand, or dispatch again. |
+| `- Change request failed: …`, `- CI runs failed: …` or `- Assignee failed: …` | The comment and the check run are posted, but an action on the PR failed. The line gives the reason. Do the action on the PR by hand, or dispatch again. |
 | The `review` job fails before its first step, with an error about the protection rules of `ai-review` | The environment allows only the default branch. Dispatch from the default branch. |
 
 ## Run the CAO workflow without GitHub Actions

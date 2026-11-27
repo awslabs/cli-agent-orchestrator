@@ -21,7 +21,7 @@ agents never hold a GitHub write token and the publisher never runs an agent:
   PR. If the review accepts a P1 or P2 finding, it requests changes. If a later
   complete review of the current head accepts none, it dismisses its earlier
   change requests. It approves the waiting CI runs of the PR's commits and
-  requests a review from the maintainer team. It never approves a PR.
+  assigns the maintainer who started the run. It never approves a PR.
 - ``report-failure`` adds only a neutral check run with fixed text, when the
   review did not finish or ``publish`` did not post the comment.
 - ``summary`` runs the local checks of ``publish`` on ``review.json`` and adds
@@ -53,7 +53,6 @@ BRANCH_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}$")
 NUMBER_RE = re.compile(r"^[1-9][0-9]{0,9}$")
 RUN_NUMBER_RE = re.compile(r"^[1-9][0-9]{0,19}$")
 LOGIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?$")
-TEAM_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 SERVER_URL_RE = re.compile(r"^https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9._:/-]{0,100}$")
 FINDING_ID_RE = re.compile(r"^F[1-9][0-9]{0,2}$")
@@ -1020,17 +1019,21 @@ def _approve_ci_runs(repo: str, number: int, head_sha: str) -> tuple[bool, str]:
     return not problems, ". ".join([text, *problems])
 
 
-def _request_review(repo: str, number: int, team: str) -> tuple[bool, str]:
-    """Request a review from the maintainer team. GitHub can assign only people to a PR."""
+def _assign(repo: str, number: int, actor: str) -> tuple[bool, str]:
+    """Assign the maintainer who started the run. GitHub cannot assign the workflow bot."""
+    if actor.endswith("[bot]"):
+        return True, "none, because a bot started this run"
     answer = _gh_api(
-        f"repos/{repo}/pulls/{number}/requested_reviewers",
-        method="POST",
-        payload={"team_reviewers": [team]},
+        f"repos/{repo}/issues/{number}/assignees", method="POST", payload={"assignees": [actor]}
     )
-    requested = _dict(answer).get("requested_teams")
-    if team not in {_dict(item).get("slug") for item in (requested or [])}:
-        return False, f"GitHub does not list the {team} team as a requested reviewer"
-    return True, f"requested a review from the {team} team"
+    assignees = _dict(answer).get("assignees")
+    if actor not in {_dict(user).get("login") for user in (assignees or [])}:
+        # GitHub ignores an account that it cannot assign, with no error.
+        return False, (
+            f"GitHub did not assign {actor}. A PR has at most 10 assignees, and only "
+            "an account with access to the repository can be assigned"
+        )
+    return True, f"{actor} is assigned"
 
 
 def _act(label: str, action: Callable[[], tuple[bool, str]]) -> tuple[bool, str]:
@@ -1056,7 +1059,6 @@ def publish(
     engine: str,
     reviewers: str,
     actor: str,
-    team: str,
     reviewer_login: str,
     github_output: Optional[str],
     dry_run_out: Optional[Path],
@@ -1106,7 +1108,7 @@ def publish(
         actions = {
             "change_request": change_request_plan(review["result_states"], bool(warning))[0],
             "approve_ci_runs": not warning,
-            "review_request": team,
+            "assign": None if actor.endswith("[bot]") else actor,
         }
         _write_json(
             dry_run_out,
@@ -1148,7 +1150,7 @@ def publish(
             lambda: _change_request(repo, number, head_sha, plan, reviewer_login, comment_url),
         ),
         _act("CI runs", lambda: _approve_ci_runs(repo, number, head_sha)),
-        _act("Review request", lambda: _request_review(repo, number, team)),
+        _act("Assignee", lambda: _assign(repo, number, actor)),
     ]
     lines += [line for _, line in results]
     return _report(0 if all(ok for ok, _ in results) else 1, "\n".join(lines))
@@ -1272,7 +1274,6 @@ def _parser() -> argparse.ArgumentParser:
     pub.add_argument("--engine", required=True, choices=ENGINES)
     pub.add_argument("--reviewers", required=True, choices=REVIEWER_MODES)
     pub.add_argument("--actor", required=True, type=_pattern(LOGIN_RE, "login"))
-    pub.add_argument("--team", required=True, type=_pattern(TEAM_RE, "team slug"))
     pub.add_argument(
         "--reviewer-login", default=DEFAULT_REVIEWER_LOGIN, type=_pattern(LOGIN_RE, "login")
     )
@@ -1347,7 +1348,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             engine=args.engine,
             reviewers=args.reviewers,
             actor=args.actor,
-            team=args.team,
             reviewer_login=args.reviewer_login,
             github_output=os.environ.get("GITHUB_OUTPUT"),
             dry_run_out=args.dry_run,
