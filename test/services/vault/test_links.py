@@ -208,6 +208,27 @@ def test_fence_markers_only_at_line_start(content, expected) -> None:
     assert extract_wikilinks(content).links == expected
 
 
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("````\n[[Inside]]\n````\n[[After]]", ("After",)),
+        ("~~~~\n[[Inside]]\n~~~~\n[[After]]", ("After",)),
+        ("```\n[[Inside]]\n````\n[[After]]", ("After",)),
+        ("~~~\n[[Inside]]\n~~~~\n[[After]]", ("After",)),
+        ("```\n~~~\n[[Inside]]\n```\n[[After]]", ("After",)),
+        ("```\ncode ends ```\n[[Inside]]\n```\n[[After]]", ("After",)),
+        ("```\n```text\n[[Inside]]\n```\n[[After]]", ("After",)),
+        ("```npm i``` then see [[Same]]\n[[After]]", ("Same", "After")),
+        ("```\r\n[[Inside]]\r\n```\r\n[[After]]", ("After",)),
+    ],
+)
+def test_fence_closure_requires_matching_marker_and_clean_line(content, expected) -> None:
+    assert tuple(target for _, target in extract_wikilinks("[[Before]]\n" + content).links) == (
+        "Before",
+        *expected,
+    )
+
+
 def test_relative_inline_resolution_requires_source_and_matches_exact_source_relative_path():
     candidates = (
         LinkCandidate(

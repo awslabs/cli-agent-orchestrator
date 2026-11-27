@@ -2135,6 +2135,7 @@ class MemoryService:
 
         lines: list[str] = []
         seen: set[str] = set()
+        seen_blocks: set[tuple[str, ...]] = set()
         for content in contents:
             content_lines = content.splitlines()
             sections = see_also_sections(content_lines)
@@ -2145,14 +2146,34 @@ class MemoryService:
                 for index in range(start + 1, end)
                 if index not in indices
             }
+            block: list[str] = []
+            marker: str | None = None
+
+            def add_block() -> None:
+                if block and tuple(block) not in seen_blocks:
+                    seen_blocks.add(tuple(block))
+                    lines.extend(block)
+                block.clear()
+
             for index, line in enumerate(content_lines):
                 if index in fenced:
-                    lines.append(line)
+                    block.append(line)
+                    stripped = line.strip()
+                    if stripped.startswith(("```", "~~~")):
+                        current = stripped[:3]
+                        if marker == current:
+                            add_block()
+                            marker = None
+                        elif marker is None:
+                            marker = current
                 elif index in indices and line.strip():
+                    add_block()
+                    marker = None
                     stripped = line.rstrip()
                     if not SEE_ALSO_LINK_RE.fullmatch(line.strip()) and stripped not in seen:
                         seen.add(stripped)
                         lines.append(line)
+            add_block()
         return lines
 
     def _sync_content_link_edges(
