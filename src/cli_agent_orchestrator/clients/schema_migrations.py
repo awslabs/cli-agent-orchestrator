@@ -216,6 +216,12 @@ def _check_server() -> None:
         os.close(descriptor)
 
 
+def _change_counter(path: Path) -> int:
+    with path.open("rb") as database_file:
+        database_file.seek(24)
+        return int.from_bytes(database_file.read(4), "big")
+
+
 def _classify(connection: sqlite3.Connection) -> tuple[int, bool, str | None]:
     tables = {
         row[0]
@@ -257,31 +263,35 @@ def _classify(connection: sqlite3.Connection) -> tuple[int, bool, str | None]:
             "Unknown gap in schema history; restore a matching backup (see docs/updating.md)"
         )
     pending_backup = next((row[4] for row in rows if row[2] == "started"), None)
-    if pending_backup is None and "cao_schema_migration_backups" in tables:
-        backup = connection.execute(
-            "SELECT backup_path FROM cao_schema_migration_backups "
-            "WHERE target_version=? AND from_version<=?",
-            (HEAD, applied),
-        ).fetchone()
-        if backup and Path(backup[0]).is_file():
-            pending_backup = backup[0]
+    if applied < HEAD and pending_backup is None and "cao_schema_migration_backups" in tables:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(cao_schema_migration_backups)")
+        }
+        if "change_counter" in columns:
+            backup = connection.execute(
+                "SELECT backup_path, change_counter FROM cao_schema_migration_backups "
+                "WHERE target_version=? AND from_version<=?",
+                (HEAD, applied),
+            ).fetchone()
+            if (
+                backup
+                and Path(backup[0]).is_file()
+                and backup[1] == _change_counter(constants.DATABASE_FILE)
+            ):
+                pending_backup = backup[0]
     return applied, False, pending_backup
 
 
 def _schema_read_error(error: sqlite3.DatabaseError, path: Path) -> SchemaError:
     code = getattr(error, "sqlite_errorcode", 0) & 0xFF
-    if code in (
-        sqlite3.SQLITE_BUSY,
-        sqlite3.SQLITE_LOCKED,
-        sqlite3.SQLITE_READONLY,
-        sqlite3.SQLITE_IOERR,
-    ):
-        return SchemaRetryableError(
-            f"Cannot read CAO schema in {path}: {error}; retry when SQLite is available"
+    if code in (sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_ERROR):
+        return UnrecognisedSchemaError(
+            f"Cannot read CAO schema in {path}: {error}; restore a known-good "
+            "backup (see docs/updating.md)"
         )
-    return UnrecognisedSchemaError(
-        f"Cannot read CAO schema in {path}: {error}; restore a known-good "
-        "backup (see docs/updating.md)"
+    return SchemaRetryableError(
+        f"Cannot read CAO schema in {path}: {error}; retry when SQLite is available "
+        "(see docs/updating.md)"
     )
 
 
@@ -344,16 +354,35 @@ def migrate(*, caller: str = "cli") -> None:
                     raise
                 except Exception as error:
                     raise SchemaBackupError(f"Cannot back up database: {error}") from error
-                connection.execute(
-                    "CREATE TABLE IF NOT EXISTS cao_schema_migration_backups ("
-                    "target_version INTEGER PRIMARY KEY, from_version INTEGER NOT NULL, "
-                    "backup_path TEXT NOT NULL)"
-                )
-                connection.execute(
-                    "INSERT OR REPLACE INTO cao_schema_migration_backups "
-                    "(target_version, from_version, backup_path) VALUES (?, ?, ?)",
-                    (HEAD, current, backup_path),
-                )
+                counter = _change_counter(path)
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS cao_schema_migration_backups ("
+                        "target_version INTEGER PRIMARY KEY, from_version INTEGER NOT NULL, "
+                        "backup_path TEXT NOT NULL, change_counter INTEGER)"
+                    )
+                    columns = {
+                        row[1]
+                        for row in connection.execute(
+                            "PRAGMA table_info(cao_schema_migration_backups)"
+                        )
+                    }
+                    if "change_counter" not in columns:
+                        connection.execute(
+                            "ALTER TABLE cao_schema_migration_backups ADD COLUMN change_counter INTEGER"
+                        )
+                    connection.execute(
+                        "INSERT OR REPLACE INTO cao_schema_migration_backups "
+                        "(target_version, from_version, backup_path, change_counter) "
+                        "VALUES (?, ?, ?, ?)",
+                        (HEAD, current, backup_path, counter + 1),
+                    )
+                    connection.execute("COMMIT")
+                except BaseException:
+                    if connection.in_transaction:
+                        connection.execute("ROLLBACK")
+                    raise
             connection.execute(CREATE_RECORD)
             for step in steps:
                 _lock_phase(lock_descriptor, f"applying v{step.version}")
@@ -372,11 +401,26 @@ def migrate(*, caller: str = "cli") -> None:
                         "WHERE version=?",
                         (_now(), step.version),
                     )
+                    if (
+                        step.version == HEAD
+                        and backup_path is not None
+                        and connection.execute(
+                            "SELECT 1 FROM sqlite_master WHERE name='cao_schema_migration_backups'"
+                        ).fetchone()
+                    ):
+                        connection.execute(
+                            "DELETE FROM cao_schema_migration_backups WHERE target_version=?",
+                            (HEAD,),
+                        )
                     if step.transactional:
                         connection.execute("COMMIT")
                 except Exception as error:
                     if step.transactional and connection.in_transaction:
                         connection.execute("ROLLBACK")
+                    if isinstance(error, sqlite3.DatabaseError):
+                        refusal = _schema_read_error(error, path)
+                        if isinstance(refusal, SchemaRetryableError):
+                            raise refusal from error
                     raise MigrationFailedError(
                         f"Migration {step.version} ({step.name}) failed: {error}; "
                         f"restore {backup_path or 'a known-good backup'} "
@@ -386,6 +430,10 @@ def migrate(*, caller: str = "cli") -> None:
                 try:
                     _apply_baseline(connection)
                 except Exception as error:
+                    if isinstance(error, sqlite3.DatabaseError):
+                        refusal = _schema_read_error(error, path)
+                        if isinstance(refusal, SchemaRetryableError):
+                            raise refusal from error
                     raise MigrationFailedError(
                         f"Baseline verification failed: {error}; restore "
                         f"{backup_path or 'a known-good backup'} "

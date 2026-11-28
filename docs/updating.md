@@ -71,7 +71,8 @@ server is running: restart `cao-server` to let it complete the upgrade.
 
 If backup integrity verification fails, keep the original database and its
 sidecars untouched until every CAO process has stopped. Copy the damaged database
-to a separate location and recover into a **new** database file, never over the
+to a separate location together with any matching `-journal`, `-wal` and `-shm`
+files, and recover into a **new** database file, never over the
 original or a backup:
 
 ```bash

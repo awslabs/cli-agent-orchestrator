@@ -18,6 +18,14 @@ from cli_agent_orchestrator.clients import schema_migrations as migrations
 ORIGINAL_ENGINE = database_module.engine
 
 
+@pytest.fixture(autouse=True)
+def engine_is_restored_after_test(monkeypatch):
+    original_engine = database_module.engine
+    yield
+    monkeypatch.undo()
+    assert database_module.engine is original_engine
+
+
 def _initialize(path):
     from cli_agent_orchestrator import constants
     from cli_agent_orchestrator.clients import database
