@@ -2,6 +2,7 @@
 
 import sqlite3
 import subprocess
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -13,8 +14,11 @@ INIT = "from cli_agent_orchestrator.clients.database import init_db; init_db()"
 
 def generate() -> None:
     SCRATCH.mkdir(parents=True, exist_ok=True)
-    homes = SCRATCH / "homes"
-    homes.mkdir()
+    with tempfile.TemporaryDirectory(prefix="homes-", dir=SCRATCH) as temporary_homes:
+        _generate(Path(temporary_homes))
+
+
+def _generate(homes: Path) -> None:
     chain = homes / "chain"
     for tag in (*TAGS, "3.0-beta1"):
         ref = "cd9d69330d5977719b8b0a620211ac62b727d561" if tag == "3.0-beta1" else tag
@@ -29,7 +33,7 @@ def generate() -> None:
         try:
             home = homes / tag
             for target in (home, chain) if tag in TAGS else (home,):
-                scratch_home = SCRATCH / "isolated-home"
+                scratch_home = homes / "isolated-home"
                 scratch_home.mkdir(exist_ok=True)
                 subprocess.run(
                     (
