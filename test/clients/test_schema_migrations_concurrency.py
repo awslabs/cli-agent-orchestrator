@@ -9,20 +9,38 @@ import time
 from pathlib import Path
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients import database as database_module
 from cli_agent_orchestrator.clients import schema_migrations as migrations
 
+ORIGINAL_ENGINE = database_module.engine
+
 
 def _initialize(path):
-    from sqlalchemy import create_engine
-
     from cli_agent_orchestrator import constants
     from cli_agent_orchestrator.clients import database
 
     constants.DATABASE_FILE = path
     database.engine = create_engine(f"sqlite:///{path}")
     database.init_db()
+
+
+@pytest.fixture
+def isolated_database(monkeypatch):
+    engines = []
+
+    def initialize(path):
+        engine = create_engine(f"sqlite:///{path}")
+        engines.append(engine)
+        monkeypatch.setattr(database_module, "engine", engine)
+        monkeypatch.setattr(database_module, "SessionLocal", sessionmaker(bind=engine))
+        database_module.init_db()
+
+    yield initialize
+    for engine in engines:
+        engine.dispose()
 
 
 def test_eight_processes_take_one_backup(tmp_path, monkeypatch):
@@ -50,7 +68,7 @@ def test_eight_processes_take_one_backup(tmp_path, monkeypatch):
     assert len(list((tmp_path / "backups").glob("*.db"))) == 1
 
 
-def test_lock_timeout_names_lock(tmp_path, monkeypatch):
+def test_lock_timeout_names_lock(tmp_path, monkeypatch, isolated_database):
     path = tmp_path / "shared.db"
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
     monkeypatch.setattr(migrations, "SCHEMA_MIGRATE_LOCK_TIMEOUT_S", 0.1)
@@ -59,17 +77,17 @@ def test_lock_timeout_names_lock(tmp_path, monkeypatch):
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         with pytest.raises(migrations.MigrationLockTimeout, match="schema-migrate.lock"):
-            _initialize(path)
+            isolated_database(path)
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
-    _initialize(path)
+    isolated_database(path)
 
 
-def test_server_lock_blocks_post_baseline_cli(tmp_path, monkeypatch):
+def test_server_lock_blocks_post_baseline_cli(tmp_path, monkeypatch, isolated_database):
     path = tmp_path / "shared.db"
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
-    _initialize(path)
+    isolated_database(path)
     monkeypatch.setattr(
         migrations,
         "MIGRATIONS",
@@ -94,10 +112,10 @@ def test_server_lock_blocks_post_baseline_cli(tmp_path, monkeypatch):
         os.close(descriptor)
 
 
-def test_server_lock_does_not_block_baseline_cli(tmp_path, monkeypatch):
+def test_server_lock_does_not_block_baseline_cli(tmp_path, monkeypatch, isolated_database):
     path = tmp_path / "shared.db"
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
-    _initialize(path)
+    isolated_database(path)
     with sqlite3.connect(path) as connection:
         connection.execute("DELETE FROM cao_schema_migrations")
     server_lock_path = tmp_path / "server.lock"
@@ -113,10 +131,10 @@ def test_server_lock_does_not_block_baseline_cli(tmp_path, monkeypatch):
         os.close(descriptor)
 
 
-def test_transactional_step_never_loses_concurrent_writer(tmp_path, monkeypatch):
+def test_transactional_step_never_loses_concurrent_writer(tmp_path, monkeypatch, isolated_database):
     path = tmp_path / "shared.db"
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
-    _initialize(path)
+    isolated_database(path)
     writer_result = []
     writer = None
 
@@ -151,3 +169,7 @@ def test_transactional_step_never_loses_concurrent_writer(tmp_path, monkeypatch)
     with sqlite3.connect(path) as connection:
         ids = {row[0] for row in connection.execute("SELECT id FROM terminals")}
     assert ("writer" in ids) == (writer_result == ["committed"])
+
+
+def test_in_process_initialization_does_not_leak_engine():
+    assert database_module.engine is ORIGINAL_ENGINE

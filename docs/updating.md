@@ -62,12 +62,25 @@ backup: it can omit transactions or WAL data.
 
 If startup refuses a newer, unknown or interrupted migration, stop **every**
 CAO process first. Move `CAO_HOME_DIR/db/cli-agent-orchestrator.db` and any
-matching `-wal` and `-shm` files aside, then copy the indicated backup into
+matching `-journal`, `-wal` and `-shm` files aside, then copy the indicated backup into
 the original database path and reinstall the older CAO release that wrote it.
 Inspect the recorded `cao_version` and the error's backup path before choosing
 the release. Do not open a migrated database with an older CAO binary; it is
 unsupported. A CLI process cannot apply a post-baseline upgrade while the
 server is running: restart `cao-server` to let it complete the upgrade.
+
+If backup integrity verification fails, keep the original database and its
+sidecars untouched until every CAO process has stopped. Copy the damaged database
+to a separate location and recover into a **new** database file, never over the
+original or a backup:
+
+```bash
+sqlite3 damaged-copy.db '.recover' | sqlite3 recovered.db
+sqlite3 recovered.db 'PRAGMA integrity_check;'
+```
+
+Review the recovered data before replacing the original database; move its
+`-journal`, `-wal` and `-shm` sidecars aside first.
 
 ## Restarting the server
 

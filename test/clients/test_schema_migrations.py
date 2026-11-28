@@ -177,6 +177,117 @@ def test_unknown_registry_version_is_refused(schema_db):
         database_module.init_db()
 
 
+def test_gap_in_applied_history_is_refused(schema_db, monkeypatch):
+    database_module.init_db()
+    monkeypatch.setattr(
+        migrations,
+        "MIGRATIONS",
+        (
+            *migrations.MIGRATIONS,
+            migrations.Migration(3, "third", lambda connection: None, True, False),
+        ),
+    )
+    monkeypatch.setattr(migrations, "HEAD", 3)
+    with sqlite3.connect(schema_db) as connection:
+        connection.execute(
+            "INSERT INTO cao_schema_migrations VALUES (3, 'third', 'applied', 'test', 'now', 'now', NULL)"
+        )
+    with pytest.raises(migrations.SchemaTooNewError, match="gap"):
+        database_module.init_db()
+
+
+def test_renamed_baseline_is_refused(schema_db):
+    database_module.init_db()
+    with sqlite3.connect(schema_db) as connection:
+        connection.execute("UPDATE cao_schema_migrations SET name='different'")
+    with pytest.raises(migrations.SchemaTooNewError):
+        database_module.init_db()
+
+
+def test_started_baseline_reuses_backup(schema_db, monkeypatch):
+    database_module.init_db()
+    with sqlite3.connect(schema_db) as connection:
+        connection.execute("DELETE FROM cao_schema_migrations")
+    original = migrations.MIGRATIONS[0]
+
+    def fail_once(connection):
+        raise RuntimeError("retry baseline")
+
+    monkeypatch.setattr(migrations, "MIGRATIONS", (replace(original, apply=fail_once),))
+    with pytest.raises(migrations.MigrationFailedError):
+        database_module.init_db()
+    monkeypatch.setattr(migrations, "MIGRATIONS", (original,))
+    database_module.init_db()
+    assert len(list((schema_db.parent / "backups").glob("*.db"))) == 1
+
+
+@pytest.mark.parametrize("code", [sqlite3.SQLITE_READONLY_ROLLBACK, sqlite3.SQLITE_BUSY])
+def test_check_retries_hot_journal_during_migration(schema_db, monkeypatch, code):
+    database_module.init_db()
+    original = migrations._classify_safe
+
+    def transient_read(connection, path):
+        error = sqlite3.OperationalError("attempt to write a readonly database")
+        error.sqlite_errorcode = code
+        raise error
+
+    monkeypatch.setattr(migrations, "_classify_safe", transient_read)
+    migrations.check()
+    monkeypatch.setattr(migrations, "_classify_safe", original)
+    database_module.init_db()
+
+
+@pytest.mark.parametrize(
+    "code",
+    [sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_READONLY, sqlite3.SQLITE_IOERR],
+)
+def test_transient_schema_errors_do_not_advise_restore(schema_db, monkeypatch, code):
+    def fail(connection):
+        error = sqlite3.OperationalError("temporary sqlite failure")
+        error.sqlite_errorcode = code
+        raise error
+
+    monkeypatch.setattr(migrations, "_classify", fail)
+    with sqlite3.connect(":memory:") as connection:
+        with pytest.raises(migrations.SchemaError, match="retry") as refusal:
+            migrations._classify_safe(connection, schema_db)
+    assert "restore" not in str(refusal.value).lower()
+
+
+@pytest.mark.parametrize("suffix", ["%", "#", "?"])
+def test_check_handles_uri_special_characters(tmp_path, monkeypatch, suffix):
+    path = tmp_path / f"special{suffix}.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(migrations.CREATE_RECORD)
+        connection.execute(
+            "INSERT INTO cao_schema_migrations VALUES (2, 'future', 'applied', 'future', 'now', 'now', NULL)"
+        )
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", path)
+    with pytest.raises(migrations.SchemaTooNewError, match="future"):
+        migrations.check()
+
+
+def test_transactional_retry_reuses_backup(schema_db, monkeypatch):
+    database_module.init_db()
+
+    def fail(connection):
+        raise RuntimeError("retry later")
+
+    step = migrations.Migration(2, "second", fail, True, False)
+    monkeypatch.setattr(migrations, "MIGRATIONS", (*migrations.MIGRATIONS, step))
+    monkeypatch.setattr(migrations, "HEAD", 2)
+    with pytest.raises(migrations.MigrationFailedError):
+        database_module.init_db()
+    assert len(list((schema_db.parent / "backups").glob("*.db"))) == 1
+    monkeypatch.setattr(
+        migrations,
+        "MIGRATIONS",
+        (*migrations.MIGRATIONS[:1], replace(step, apply=lambda connection: None)),
+    )
+    database_module.init_db()
+    assert len(list((schema_db.parent / "backups").glob("*.db"))) == 1
+
+
 def test_insufficient_backup_space_refuses_early(schema_db, monkeypatch):
     database_module.init_db()
     with sqlite3.connect(schema_db) as connection:
@@ -275,10 +386,17 @@ def test_server_entry_refuses_before_uvicorn(schema_db, monkeypatch, capsys):
 
 def test_schema_lock_timeout_names_active_upgrader(schema_db, monkeypatch):
     monkeypatch.setattr(migrations, "SCHEMA_MIGRATE_LOCK_TIMEOUT_S", 0)
+    descriptor = migrations.os.open(
+        schema_db.parent / ".schema-migrate.lock",
+        migrations.os.O_CREAT | migrations.os.O_RDWR,
+        0o600,
+    )
+    migrations._lock_phase(descriptor, "backing up")
+    migrations.os.close(descriptor)
     monkeypatch.setattr(
         migrations.fcntl, "flock", lambda *args: (_ for _ in ()).throw(BlockingIOError())
     )
-    with pytest.raises(migrations.MigrationLockTimeout, match="retry when it finishes"):
+    with pytest.raises(migrations.MigrationLockTimeout, match=r"pid \d+, phase backing up"):
         database_module.init_db()
 
 
@@ -389,6 +507,7 @@ def test_transaction_rolls_back_failed_step(schema_db, monkeypatch):
     )
     database_module.init_db()
     assert records(schema_db)[-1][0:2] == (3, "applied")
+    assert len(list((schema_db.parent / "backups").glob("*.db"))) == 1
 
 
 def test_backup_error_prevents_upgrade(schema_db, monkeypatch):

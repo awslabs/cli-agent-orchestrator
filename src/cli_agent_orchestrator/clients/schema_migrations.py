@@ -54,6 +54,10 @@ class UnrecognisedSchemaError(SchemaError):
     """The database does not have a recognised CAO layout."""
 
 
+class SchemaRetryableError(SchemaError):
+    """A transient SQLite failure prevents checking the database."""
+
+
 class MigrationInterruptedError(SchemaError):
     """An unfinished non-rerunnable migration needs manual recovery."""
 
@@ -253,17 +257,39 @@ def _classify(connection: sqlite3.Connection) -> tuple[int, bool, str | None]:
             "Unknown gap in schema history; restore a matching backup (see docs/updating.md)"
         )
     pending_backup = next((row[4] for row in rows if row[2] == "started"), None)
+    if pending_backup is None and "cao_schema_migration_backups" in tables:
+        backup = connection.execute(
+            "SELECT backup_path FROM cao_schema_migration_backups "
+            "WHERE target_version=? AND from_version<=?",
+            (HEAD, applied),
+        ).fetchone()
+        if backup and Path(backup[0]).is_file():
+            pending_backup = backup[0]
     return applied, False, pending_backup
+
+
+def _schema_read_error(error: sqlite3.DatabaseError, path: Path) -> SchemaError:
+    code = getattr(error, "sqlite_errorcode", 0) & 0xFF
+    if code in (
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+        sqlite3.SQLITE_READONLY,
+        sqlite3.SQLITE_IOERR,
+    ):
+        return SchemaRetryableError(
+            f"Cannot read CAO schema in {path}: {error}; retry when SQLite is available"
+        )
+    return UnrecognisedSchemaError(
+        f"Cannot read CAO schema in {path}: {error}; restore a known-good "
+        "backup (see docs/updating.md)"
+    )
 
 
 def _classify_safe(connection: sqlite3.Connection, path: Path) -> tuple[int, bool, str | None]:
     try:
         return _classify(connection)
     except sqlite3.DatabaseError as error:
-        raise UnrecognisedSchemaError(
-            f"Cannot read CAO schema in {path}: {error}; restore a known-good "
-            "backup (see docs/updating.md)"
-        ) from error
+        raise _schema_read_error(error, path) from error
     except SchemaError as error:
         raise type(error)(f"{path}: {error}") from error
 
@@ -275,12 +301,24 @@ def check() -> None:
         return
     with _migration_lock(path):
         try:
-            with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as connection:
+            with closing(
+                sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+            ) as connection:
                 _classify_safe(connection, path)
+        except SchemaRetryableError as error:
+            if (
+                getattr(error.__cause__, "sqlite_errorcode", 0) == sqlite3.SQLITE_READONLY_ROLLBACK
+                or (getattr(error.__cause__, "sqlite_errorcode", 0) & 0xFF) == sqlite3.SQLITE_BUSY
+            ):
+                return
+            raise
         except sqlite3.DatabaseError as error:
-            raise UnrecognisedSchemaError(
-                f"Cannot read CAO schema in {path}: {error}; see docs/updating.md"
-            ) from error
+            if (
+                getattr(error, "sqlite_errorcode", 0) == sqlite3.SQLITE_READONLY_ROLLBACK
+                or (getattr(error, "sqlite_errorcode", 0) & 0xFF) == sqlite3.SQLITE_BUSY
+            ):
+                return
+            raise _schema_read_error(error, path) from error
 
 
 def migrate(*, caller: str = "cli") -> None:
@@ -291,9 +329,7 @@ def migrate(*, caller: str = "cli") -> None:
         try:
             connection = sqlite3.connect(path, isolation_level=None)
         except sqlite3.DatabaseError as error:
-            raise UnrecognisedSchemaError(
-                f"Cannot read CAO schema in {path}: {error}; see docs/updating.md"
-            ) from error
+            raise _schema_read_error(error, path) from error
         with closing(connection), connection:
             current, fresh, pending_backup = _classify_safe(connection, path)
             steps = [step for step in MIGRATIONS if step.version > current]
@@ -308,6 +344,16 @@ def migrate(*, caller: str = "cli") -> None:
                     raise
                 except Exception as error:
                     raise SchemaBackupError(f"Cannot back up database: {error}") from error
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS cao_schema_migration_backups ("
+                    "target_version INTEGER PRIMARY KEY, from_version INTEGER NOT NULL, "
+                    "backup_path TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "INSERT OR REPLACE INTO cao_schema_migration_backups "
+                    "(target_version, from_version, backup_path) VALUES (?, ?, ?)",
+                    (HEAD, current, backup_path),
+                )
             connection.execute(CREATE_RECORD)
             for step in steps:
                 _lock_phase(lock_descriptor, f"applying v{step.version}")
